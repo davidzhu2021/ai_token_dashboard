@@ -1,4 +1,4 @@
-﻿const sourceColors = {
+const sourceColors = {
   Cursor: "#1f7a5b",
   "Claude Code": "#b88727",
   "其他": "#2e6f9f",
@@ -6,10 +6,7 @@
 
 let currentUser = null;
 let usageData = [];
-let accessKeys = [];
 let modelCatalog = [];
-let currentKeyId = null;
-let currentNewKey = "";
 let isLoading = false;
 let authConfig = { devLoginEnabled: false, oidcConfigured: false, providerName: "飞书扫码登录" };
 
@@ -117,6 +114,22 @@ function metric(label, value, sub, chip, tone = "", iconName = "token") {
   `;
 }
 
+function metricGroup(title, subtitle, items) {
+  return `
+    <section class="metric-group">
+      <div class="metric-group-head">
+        <div>
+          <h3>${title}</h3>
+          <p>${subtitle}</p>
+        </div>
+      </div>
+      <div class="metric-pair">
+        ${items.join("")}
+      </div>
+    </section>
+  `;
+}
+
 function renderMetrics(data) {
   const sorted = [...data].sort((a, b) => a.date.localeCompare(b.date));
   const today = sorted[sorted.length - 1] || {};
@@ -139,14 +152,22 @@ function renderMetrics(data) {
   el("spendBadge").textContent = `${rangeLabel} · ${sourceText}`;
 
   el("metrics").innerHTML = [
-    metric("最近一天 Token", formatTokens(today.totalTokens || 0), `${today.date || "-"} 的个人消耗`, "最近", "", "token"),
-    metric("最近一天消耗金额", money.format(today.spend || 0), `${today.date || "-"} 的预估金额`, "最近", "gold", "cost"),
-    metric(`${rangeLabel} Token`, formatTokens(total), "按当前日期与来源筛选累计", sourceText, "gold", "trend"),
-    metric("请求次数", fmt.format(requests), "按当前筛选累计", "请求", "blue", "request"),
-    metric("Cursor Token", formatTokens(cursor), "编辑器相关消耗", "Cursor", "", "cursor"),
-    metric("Claude Code Token", formatTokens(cc), "终端工具相关消耗", "Claude Code", "blue", "terminal"),
-    metric("请求成功率", `${successRate}%`, `${fmt.format(successes)} / ${fmt.format(requests)} 次成功`, "稳定", "", "success"),
-    metric("预估成本", money.format(spend), "按上游记录汇总", "估算", "gold", "cost"),
+    metricGroup("最近一天", today.date || "暂无日期", [
+      metric("最近一天 Token", formatTokens(today.totalTokens || 0), "最新日期个人消耗", "最近", "", "token"),
+      metric("最近一天消耗金额", money.format(today.spend || 0), "最新日期预估金额", "最近", "gold", "cost"),
+    ]),
+    metricGroup("所选范围消耗", `${rangeLabel} · ${sourceText}`, [
+      metric(`${rangeLabel} Token`, formatTokens(total), "按当前日期与来源筛选累计", sourceText, "gold", "trend"),
+      metric(`${rangeLabel} 消耗金额`, money.format(spend), "按上游记录汇总", "估算", "gold", "cost"),
+    ]),
+    metricGroup("所选范围请求", `${rangeLabel} · ${sourceText}`, [
+      metric(`${rangeLabel} 请求次数`, fmt.format(requests), "按当前筛选累计", "请求", "blue", "request"),
+      metric(`${rangeLabel} 请求成功率`, `${successRate}%`, `${fmt.format(successes)} / ${fmt.format(requests)} 次成功`, "稳定", "", "success"),
+    ]),
+    metricGroup("工具消耗拆分", `${rangeLabel} · ${sourceText}`, [
+      metric(`${rangeLabel} Cursor Token`, formatTokens(cursor), "编辑器相关消耗", "Cursor", "", "cursor"),
+      metric(`${rangeLabel} Claude Code Token`, formatTokens(cc), "终端工具相关消耗", "Claude Code", "blue", "terminal"),
+    ]),
   ].join("");
 }
 
@@ -358,38 +379,6 @@ function renderTable(data) {
     : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">当前筛选范围暂无用量记录</td></tr>`;
 }
 
-function renderKeys() {
-  el("keyGrid").innerHTML = accessKeys.length
-    ? accessKeys
-        .map(
-          (key) => `
-        <article class="key-card">
-          <div class="key-head">
-            <div class="key-title">
-              <span class="key-icon">${icon("key")}</span>
-              <div>
-                <h4>${key.name}</h4>
-                <div class="masked">${key.masked}</div>
-              </div>
-            </div>
-            <span class="chip ${key.status === "正常" ? "" : "blue"}">${key.status}</span>
-          </div>
-          <p class="key-purpose">${key.purpose || "用于个人 AI 工具访问。"}</p>
-          <div class="key-meta">
-            <div class="meta-box"><span>最后使用</span><strong>${key.lastUsed || "-"}</strong></div>
-            <div class="meta-box"><span>累计消耗</span><strong>${formatTokens(key.monthTokens || 0)}</strong></div>
-          </div>
-          <button class="danger-btn" type="button" data-regenerate="${encodeURIComponent(key.id)}">
-            <span class="app-icon">${icon("refresh")}</span>
-            更新密钥
-          </button>
-        </article>
-      `,
-        )
-        .join("")
-    : `<article class="panel model-empty">当前账号暂无可管理的访问密钥。</article>`;
-}
-
 function uniqueValues(items, getter) {
   return [...new Set(items.flatMap((item) => getter(item)).filter(Boolean))].sort((a, b) => a.localeCompare(b, "zh-CN"));
 }
@@ -444,10 +433,6 @@ function renderModels() {
           </div>
           <p class="model-desc">${model.description || "当前账号可用模型。"}</p>
           <div class="tag-row">${(model.capabilities || ["通用"]).map((capability) => `<span class="chip blue">${capability}</span>`).join("")}</div>
-          <div class="model-meta">
-            <div class="meta-box"><span>上下文长度</span><strong>${model.contextWindow || "未标注"}</strong></div>
-            <div class="meta-box"><span>推荐场景</span><strong>${model.recommendedFor || "按任务需求复制模型名称后使用"}</strong></div>
-          </div>
           <button class="copy-btn" type="button" data-copy-model="${model.modelName}">
             <span class="app-icon">${icon("copy")}</span>
             复制模型名称
@@ -495,7 +480,6 @@ function render() {
   renderModelBars(usageData);
   renderSplit(usageData);
   renderTable(usageData);
-  renderKeys();
 }
 
 async function loadDashboardData() {
@@ -513,18 +497,6 @@ async function loadDashboardData() {
     render();
   } finally {
     isLoading = false;
-  }
-}
-
-async function loadKeys() {
-  try {
-    const payload = await api("/api/me/keys");
-    accessKeys = payload.keys || [];
-    renderKeys();
-  } catch (error) {
-    accessKeys = [];
-    renderKeys();
-    showToast(error.message || "访问密钥加载失败");
   }
 }
 
@@ -552,69 +524,13 @@ async function showApp(user) {
   el("welcomeTitle").textContent = `${user.name}您好，今天的 AI 工具消耗一眼看清`;
   switchView("dashboard");
   render();
-  await Promise.all([loadDashboardData(), loadKeys(), loadModels()]);
+  await Promise.all([loadDashboardData(), loadModels()]);
 }
 
 function showLogin() {
   currentUser = null;
   el("appView").classList.add("hidden");
   el("loginView").classList.remove("hidden");
-}
-
-function maskKey(value) {
-  if (!value) return "";
-  return `${value.slice(0, 14)}...${value.slice(-4)}`;
-}
-
-function openKeyModal(keyId) {
-  const decodedKeyId = decodeURIComponent(keyId);
-  const key = accessKeys.find((item) => item.id === decodedKeyId);
-  if (!key) return;
-  currentKeyId = decodedKeyId;
-  currentNewKey = "";
-  el("modalTitle").textContent = `更新访问密钥：${key.name}`;
-  el("modalSubtitle").textContent = "此操作会让旧密钥失效，需要同步更新本地工具配置。";
-  el("confirmInput").value = "";
-  el("regenerateButton").disabled = true;
-  el("confirmArea").classList.remove("hidden");
-  el("newKeyArea").classList.add("hidden");
-  el("keyModal").classList.remove("hidden");
-}
-window.openKeyModal = openKeyModal;
-
-function closeKeyModal() {
-  if (currentNewKey && currentKeyId) {
-    accessKeys = accessKeys.map((key) =>
-      key.id === currentKeyId
-        ? {
-            ...key,
-            masked: maskKey(currentNewKey),
-            lastUsed: "刚刚更新",
-            status: "正常",
-          }
-        : key,
-    );
-    renderKeys();
-  }
-  currentKeyId = null;
-  currentNewKey = "";
-  el("keyModal").classList.add("hidden");
-}
-
-async function regenerateKey() {
-  if (!currentKeyId) return;
-  el("regenerateButton").disabled = true;
-  try {
-    const payload = await api(`/api/me/keys/${encodeURIComponent(currentKeyId)}/regenerate`, { method: "POST", body: JSON.stringify({}) });
-    currentNewKey = payload.key;
-    el("newKeyValue").textContent = currentNewKey;
-    el("confirmArea").classList.add("hidden");
-    el("newKeyArea").classList.remove("hidden");
-    showToast("新访问密钥已生成");
-  } catch (error) {
-    showToast(error.message || "访问密钥更新失败");
-    el("regenerateButton").disabled = false;
-  }
 }
 
 document.addEventListener("submit", async (event) => {
@@ -655,16 +571,12 @@ el("rangeSelect").addEventListener("change", loadDashboardData);
 el("sourceSelect").addEventListener("change", loadDashboardData);
 el("refreshButton").addEventListener("click", async () => {
   if (el("modelsView").classList.contains("hidden")) {
-    await Promise.all([loadDashboardData(), loadKeys()]);
+    await loadDashboardData();
     showToast("已刷新真实用量数据");
   } else {
     await loadModels();
     showToast("已刷新模型列表");
   }
-});
-el("keyGrid").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-regenerate]");
-  if (button) openKeyModal(button.dataset.regenerate);
 });
 el("modelSearch").addEventListener("input", renderModels);
 el("providerFilter").addEventListener("change", renderModels);
@@ -672,16 +584,6 @@ el("capabilityFilter").addEventListener("change", renderModels);
 el("modelGrid").addEventListener("click", (event) => {
   const button = event.target.closest("[data-copy-model]");
   if (button) copyText(button.dataset.copyModel, "模型名称已复制");
-});
-
-el("confirmInput").addEventListener("input", (event) => {
-  el("regenerateButton").disabled = event.target.value.trim() !== "确认更新";
-});
-el("cancelModalButton").addEventListener("click", () => el("keyModal").classList.add("hidden"));
-el("regenerateButton").addEventListener("click", regenerateKey);
-el("closeModalButton").addEventListener("click", closeKeyModal);
-el("copyNewKeyButton").addEventListener("click", async () => {
-  await copyText(currentNewKey, "新访问密钥已复制");
 });
 
 async function init() {

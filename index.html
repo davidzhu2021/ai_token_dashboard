@@ -469,16 +469,39 @@
       }
 
       .top-controls {
-        display: flex;
+        display: grid;
+        grid-template-columns: minmax(320px, 420px) auto auto;
         align-items: center;
-        justify-content: flex-end;
-        flex-wrap: nowrap;
+        justify-content: end;
         gap: 8px;
         min-width: 0;
         flex: 1 1 auto;
       }
 
-      .top-controls > .ghost-btn {
+      .nav-zone,
+      .filter-zone,
+      .action-zone {
+        min-width: 0;
+      }
+
+      .nav-zone {
+        display: flex;
+        justify-content: flex-end;
+      }
+
+      .filter-zone {
+        width: 100%;
+      }
+
+      .action-zone {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 8px;
+        min-width: max-content;
+      }
+
+      .action-zone > .ghost-btn {
         min-width: 92px;
       }
 
@@ -516,8 +539,13 @@
         display: grid;
         grid-template-columns: repeat(2, minmax(132px, 1fr));
         gap: 8px;
-        width: min(360px, 34vw);
-        flex: 0 1 360px;
+        width: 100%;
+      }
+
+      .dashboard-filters.hidden {
+        display: grid !important;
+        visibility: hidden;
+        pointer-events: none;
       }
 
       .user-pill {
@@ -667,6 +695,7 @@
       }
 
       .metric-card,
+      .metric-group,
       .panel,
       .key-card {
         background: var(--panel);
@@ -676,12 +705,40 @@
         backdrop-filter: blur(18px);
       }
 
+      .metric-group {
+        padding: 16px;
+        display: grid;
+        gap: 12px;
+        min-width: 0;
+      }
+
+      .metric-group-head h3 {
+        margin: 0;
+        color: var(--ink);
+        font-size: 15px;
+        font-weight: 800;
+        letter-spacing: 0;
+      }
+
+      .metric-group-head p {
+        margin: 5px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .metric-pair {
+        display: grid;
+        gap: 10px;
+      }
+
       .metric-card {
-        padding: 20px;
-        min-height: 138px;
+        padding: 16px;
+        min-height: 124px;
         display: grid;
         align-content: space-between;
-        gap: 18px;
+        gap: 14px;
+        box-shadow: none;
+        background: rgba(255, 255, 255, 0.62);
       }
 
       .metric-label {
@@ -717,8 +774,8 @@
       }
 
       .metric-value {
-        margin-top: 16px;
-        font-size: 30px;
+        margin-top: 12px;
+        font-size: 26px;
         font-weight: 800;
         letter-spacing: 0;
       }
@@ -764,6 +821,13 @@
       .dashboard-grid {
         display: grid;
         grid-template-columns: minmax(0, 1.55fr) minmax(360px, 0.85fr);
+        gap: 18px;
+        margin-bottom: 18px;
+      }
+
+      .full-width-grid {
+        display: grid;
+        grid-template-columns: 1fr;
         gap: 18px;
         margin-bottom: 18px;
       }
@@ -892,15 +956,17 @@
 
       .source-grid {
         display: grid;
-        grid-template-columns: 190px 1fr;
-        gap: 16px;
+        grid-template-columns: 220px minmax(0, 1fr);
+        gap: 24px;
         align-items: center;
+        min-height: 214px;
       }
 
       .donut-wrap {
         position: relative;
         width: 180px;
         height: 180px;
+        justify-self: center;
       }
 
       .donut-center {
@@ -1260,17 +1326,23 @@
 
         .top-controls {
           justify-content: flex-start;
-          flex-wrap: wrap;
+          grid-template-columns: minmax(320px, 1fr) auto;
           width: 100%;
         }
 
+        .action-zone {
+          grid-column: 1 / -1;
+          justify-content: flex-start;
+        }
+
         .metrics {
-          grid-template-columns: repeat(3, minmax(0, 1fr));
+          grid-template-columns: repeat(2, minmax(0, 1fr));
         }
 
         .hero-band,
         .trend-grid,
         .dashboard-grid,
+        .full-width-grid,
         .model-hero {
           grid-template-columns: 1fr;
         }
@@ -1318,6 +1390,20 @@
           gap: 10px;
         }
 
+        .top-controls {
+          grid-template-columns: 1fr;
+        }
+
+        .nav-zone,
+        .action-zone {
+          justify-content: stretch;
+        }
+
+        .action-zone {
+          flex-wrap: wrap;
+          min-width: 0;
+        }
+
         .view-tab {
           flex: 1;
         }
@@ -1338,6 +1424,7 @@
 
         .source-grid {
           grid-template-columns: 1fr;
+          min-height: 0;
         }
 
         .donut-wrap {
@@ -1395,18 +1482,18 @@
         </div>
         <div>
           <h1>看清每一次智能工具消耗</h1>
-          <p>统一查看个人每日 Token、Cursor 与 Claude Code 使用趋势，帮助你及时发现异常消耗并管理自己的访问密钥。</p>
+          <p>统一查看个人每日 Token、Cursor 与 Claude Code 使用趋势，帮助你及时发现异常消耗。</p>
         </div>
         <div class="login-facts">
           <div class="fact"><strong>每日</strong><span>自动聚合用量趋势</span></div>
           <div class="fact"><strong>个人</strong><span>仅查看自己的数据</span></div>
-          <div class="fact"><strong>安全</strong><span>支持自助更新访问密钥</span></div>
+          <div class="fact"><strong>安全</strong><span>仅展示个人用量数据</span></div>
         </div>
       </div>
       <div class="login-panel">
         <form id="loginForm" class="login-card">
           <h2>飞书扫码登录</h2>
-          <p>使用公司飞书账号完成统一认证，登录后仅展示你的个人 AI 用量、模型与访问密钥。</p>
+          <p>使用公司飞书账号完成统一认证，登录后仅展示你的个人 AI 用量与模型。</p>
           <div id="devLoginArea" class="field hidden">
             <label for="emailInput">企业邮箱</label>
             <input id="emailInput" class="input" type="email" placeholder="name@auto-link.com.cn" autocomplete="email" />
@@ -1435,48 +1522,54 @@
             </span>
             <div>
               <strong>AI 用量中心</strong>
-              <span>个人 Token 与访问密钥管理</span>
+              <span>个人 Token 用量管理</span>
             </div>
           </div>
           <div class="top-controls">
-            <div class="view-tabs" aria-label="页面导航">
-              <button class="view-tab active" type="button" data-view="dashboard">
-                <span class="nav-icon"><svg><use href="#icon-dashboard"></use></svg></span>
-                用量看板
-              </button>
-              <button class="view-tab" type="button" data-view="models">
-                <span class="nav-icon"><svg><use href="#icon-plaza"></use></svg></span>
-                模型广场
-              </button>
-            </div>
-            <div id="dashboardFilters" class="dashboard-filters">
-              <select id="rangeSelect" class="select" aria-label="日期范围">
-                <option value="7">近 7 天</option>
-                <option value="14">近 14 天</option>
-                <option value="30" selected>近 30 天</option>
-              </select>
-              <select id="sourceSelect" class="select" aria-label="来源筛选">
-                <option value="all">全部来源</option>
-                <option value="Cursor">Cursor</option>
-                <option value="Claude Code">Claude Code</option>
-                <option value="其他">其他</option>
-              </select>
-            </div>
-            <button id="refreshButton" class="ghost-btn" type="button">
-              <span class="app-icon"><svg><use href="#icon-refresh"></use></svg></span>
-              刷新
-            </button>
-            <div class="user-pill">
-              <span id="avatar" class="avatar">员</span>
-              <div>
-                <strong id="userName">员工</strong>
-                <span id="userEmail">employee@company.com</span>
+            <div class="filter-zone">
+              <div id="dashboardFilters" class="dashboard-filters">
+                <select id="rangeSelect" class="select" aria-label="日期范围">
+                  <option value="7">近 7 天</option>
+                  <option value="14">近 14 天</option>
+                  <option value="30" selected>近 30 天</option>
+                </select>
+                <select id="sourceSelect" class="select" aria-label="来源筛选">
+                  <option value="all">全部来源</option>
+                  <option value="Cursor">Cursor</option>
+                  <option value="Claude Code">Claude Code</option>
+                  <option value="其他">其他</option>
+                </select>
               </div>
             </div>
-            <button id="logoutButton" class="ghost-btn" type="button">
-              <span class="app-icon"><svg><use href="#icon-logout"></use></svg></span>
-              退出
-            </button>
+            <div class="nav-zone">
+              <div class="view-tabs" aria-label="页面导航">
+                <button class="view-tab active" type="button" data-view="dashboard">
+                  <span class="nav-icon"><svg><use href="#icon-dashboard"></use></svg></span>
+                  用量看板
+                </button>
+                <button class="view-tab" type="button" data-view="models">
+                  <span class="nav-icon"><svg><use href="#icon-plaza"></use></svg></span>
+                  模型广场
+                </button>
+              </div>
+            </div>
+            <div class="action-zone">
+              <button id="refreshButton" class="ghost-btn" type="button">
+                <span class="app-icon"><svg><use href="#icon-refresh"></use></svg></span>
+                刷新
+              </button>
+              <div class="user-pill">
+                <span id="avatar" class="avatar">员</span>
+                <div>
+                  <strong id="userName">员工</strong>
+                  <span id="userEmail">employee@company.com</span>
+                </div>
+              </div>
+              <button id="logoutButton" class="ghost-btn" type="button">
+                <span class="app-icon"><svg><use href="#icon-logout"></use></svg></span>
+                退出
+              </button>
+            </div>
           </div>
         </div>
       </header>
@@ -1533,7 +1626,7 @@
           </div>
         </section>
 
-        <section class="dashboard-grid">
+        <section class="full-width-grid">
           <div class="panel">
             <div class="panel-header">
               <div class="panel-heading">
@@ -1614,15 +1707,6 @@
           </div>
         </section>
 
-        <section class="section-title">
-          <div>
-            <h3>访问密钥</h3>
-            <p>如果怀疑密钥泄露，可以自助更新。新密钥只显示一次，请及时同步到本地工具。</p>
-          </div>
-          <span class="chip gold">真实数据</span>
-        </section>
-
-        <section id="keyGrid" class="key-grid"></section>
         </section>
 
         <section id="modelsView" class="view-section hidden">
@@ -1650,49 +1734,10 @@
       </main>
     </section>
 
-    <div id="keyModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
-      <div class="modal">
-        <h3 id="modalTitle">更新访问密钥</h3>
-        <p id="modalSubtitle">此操作会让旧密钥失效。</p>
-        <div class="warning-box">
-          <span class="app-icon"><svg><use href="#icon-warning"></use></svg></span>
-          更新后，请立即将新密钥同步到 Cursor、Claude Code 或其他本地工具配置中。为了安全，完整新密钥关闭弹窗后不会再次显示。
-        </div>
-        <div id="confirmArea">
-          <div class="field" style="margin-top: 16px">
-            <label for="confirmInput">请输入“确认更新”继续</label>
-            <input id="confirmInput" class="input" placeholder="确认更新" />
-          </div>
-          <div class="modal-actions">
-            <button id="cancelModalButton" class="ghost-btn" type="button">取消</button>
-            <button id="regenerateButton" class="danger-btn" type="button" disabled>
-              <span class="app-icon"><svg><use href="#icon-refresh"></use></svg></span>
-              更新密钥
-            </button>
-          </div>
-        </div>
-        <div id="newKeyArea" class="new-key-box hidden">
-          <strong>新访问密钥已生成</strong>
-          <p class="hint">请现在复制并更新到你的工具配置中。关闭后仅保留脱敏展示。</p>
-          <div id="newKeyValue" class="new-key-value"></div>
-          <div class="modal-actions">
-            <button id="copyNewKeyButton" class="copy-btn" type="button">
-              <span class="app-icon"><svg><use href="#icon-copy"></use></svg></span>
-              复制新密钥
-            </button>
-            <button id="closeModalButton" class="primary-btn" type="button">
-              <span class="app-icon"><svg><use href="#icon-success"></use></svg></span>
-              我已保存，关闭
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-
     <div id="toast" class="toast">已完成</div>
     <div id="chartTooltip" class="chart-tooltip" role="tooltip"></div>
 
-    <script src="/assets/app.js?v=20260612-daily-spend"></script>
+    <script src="/assets/app.js?v=20260612-topbar-order"></script>
   </body>
 </html>
 
