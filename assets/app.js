@@ -140,6 +140,7 @@ function renderMetrics(data) {
 
   el("metrics").innerHTML = [
     metric("最近一天 Token", formatTokens(today.totalTokens || 0), `${today.date || "-"} 的个人消耗`, "最近", "", "token"),
+    metric("最近一天消耗金额", money.format(today.spend || 0), `${today.date || "-"} 的预估金额`, "最近", "gold", "cost"),
     metric(`${rangeLabel} Token`, formatTokens(total), "按当前日期与来源筛选累计", sourceText, "gold", "trend"),
     metric("请求次数", fmt.format(requests), "按当前筛选累计", "请求", "blue", "request"),
     metric("Cursor Token", formatTokens(cursor), "编辑器相关消耗", "Cursor", "", "cursor"),
@@ -548,7 +549,7 @@ async function showApp(user) {
   el("userEmail").textContent = user.email;
   el("userName").textContent = user.name;
   el("avatar").textContent = user.avatar || initials(user.email, user.name);
-  el("welcomeTitle").textContent = `${user.name}，今天的 AI 工具消耗一眼看清`;
+  el("welcomeTitle").textContent = `${user.name}您好，今天的 AI 工具消耗一眼看清`;
   switchView("dashboard");
   render();
   await Promise.all([loadDashboardData(), loadKeys(), loadModels()]);

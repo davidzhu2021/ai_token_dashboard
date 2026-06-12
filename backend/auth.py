@@ -60,6 +60,8 @@ def claim_value(claims: dict[str, Any], *names: str) -> str | None:
         value = claims.get(name)
         if isinstance(value, str) and value.strip():
             return value.strip()
+        if isinstance(value, (int, float)) and value:
+            return str(value)
     return None
 
 

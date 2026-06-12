@@ -40,14 +40,18 @@ SESSION_SECRET=<随机长字符串>
 OIDC_ISSUER_URL=http://10.68.13.198:30882
 OIDC_CLIENT_ID=<ai-token-dashboard client id>
 OIDC_CLIENT_SECRET=<ai-token-dashboard client secret>
+OIDC_DIRECT_PROVIDER=lark-provider
+OIDC_DIRECT_METHOD=signup
 OAUTH_PROVIDER_NAME=飞书扫码登录
 ALLOWED_EMAIL_DOMAIN=auto-link.com.cn
 
 DEV_LOGIN_ENABLED=false
+DEBUG_MAPPING_ENABLED=false
+DEBUG_OIDC_CLAIMS=false
 USAGE_LOG_MAX_PAGES=20
 ```
 
-如果 Casdoor 已经有 HTTPS 反代地址，`OIDC_ISSUER_URL` 优先使用 HTTPS 地址。后端同时兼容 issuer base URL 和完整 discovery URL：
+如需点击“飞书扫码登录”后直达飞书页面，`OIDC_DIRECT_PROVIDER` 需要与 Casdoor 中的飞书 Provider 名称一致；后端会把它作为 `provider_hint` 传给 Casdoor。如果 Casdoor 已经有 HTTPS 反代地址，`OIDC_ISSUER_URL` 优先使用 HTTPS 地址。后端同时兼容 issuer base URL 和完整 discovery URL：
 
 ```text
 https://casdoor.example.com
@@ -70,6 +74,7 @@ GET  /api/me/usage/logs?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD&page=1&page_si
 GET  /api/me/keys
 POST /api/me/keys/{key_id}/regenerate
 GET  /api/models
+GET  /api/debug/me-mapping  # only when DEBUG_MAPPING_ENABLED=true
 ```
 
 ## 数据说明

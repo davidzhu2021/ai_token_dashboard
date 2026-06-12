@@ -157,24 +157,67 @@ class LiteLLMClient:
     async def resolve_user(self, email: str) -> dict[str, Any]:
         email_lower = email.lower()
         email_prefix = email_lower.split("@", 1)[0]
+        matched_users: list[dict[str, Any]] = []
+        matched_user_ids: list[str] = []
+        matched_sources: dict[str, list[str]] = {}
+
+        def add_user_id(user_id: Any, source: str) -> None:
+            text = str(user_id or "").strip()
+            if not text:
+                return
+            if text not in matched_user_ids:
+                matched_user_ids.append(text)
+            matched_sources.setdefault(text, [])
+            if source not in matched_sources[text]:
+                matched_sources[text].append(source)
+
         for page in range(1, 51):
             payload = await self.request("GET", "/user/list", params={"page": page, "page_size": 100})
             for user in _records(payload):
-                candidates = [
-                    user.get("user_email"),
-                    user.get("sso_user_id"),
-                    user.get("user_id"),
-                    user.get("user_alias"),
-                ]
-                if any(str(candidate or "").lower() == email_lower for candidate in candidates):
-                    return user
-                if any(str(candidate or "").lower() == email_prefix for candidate in candidates):
-                    return user
+                user_id = user.get("user_id")
+                email_candidates = [user.get("user_email"), user.get("sso_user_id")]
+                legacy_candidates = [user.get("user_id"), user.get("user_alias")]
+                if any(str(candidate or "").lower() == email_lower for candidate in email_candidates):
+                    matched_users.append(user)
+                    add_user_id(user_id, "user_email")
+                elif any(str(candidate or "").lower() == email_prefix for candidate in legacy_candidates):
+                    matched_users.append(user)
+                    add_user_id(user_id, "legacy_user")
             if isinstance(payload, dict):
                 total_pages = _as_int(payload.get("total_pages"))
                 if total_pages and page >= total_pages:
                     break
-        raise HTTPException(status_code=404, detail="没有在上游系统中找到该员工账号")
+
+        for user_id in await self.user_ids_from_key_alias(email_prefix):
+            add_user_id(user_id, "key_alias")
+
+        if matched_user_ids:
+            primary = matched_users[0].copy() if matched_users else {}
+            primary.setdefault("user_id", matched_user_ids[0])
+            primary["matched_user_ids"] = sorted(matched_user_ids)
+            primary["matched_sources"] = matched_sources
+            primary["user_email"] = email_lower
+            primary.setdefault("user_alias", email_prefix)
+            primary["matched_by"] = "email_and_legacy"
+            return primary
+
+        raise HTTPException(status_code=404, detail="未找到当前员工对应的用量账号")
+
+    async def user_ids_from_key_alias(self, email_prefix: str) -> list[str]:
+        user_ids: list[str] = []
+        seen: set[str] = set()
+        for alias in (f"cursor-{email_prefix}", f"claude-code-{email_prefix}", email_prefix):
+            payload = await self.request(
+                "GET",
+                "/key/list",
+                params={"key_alias": alias, "return_full_object": "true", "page": 1, "size": 100},
+            )
+            for key in _records(payload):
+                user_id = str(key.get("user_id") or "").strip()
+                if user_id and user_id not in seen:
+                    seen.add(user_id)
+                    user_ids.append(user_id)
+        return user_ids
 
     async def usage_rows(self, user_id: str, start_date: str, end_date: str, source: str | None) -> list[dict[str, Any]]:
         try:
@@ -192,6 +235,12 @@ class LiteLLMClient:
         if rows:
             return rows
         return await self._usage_from_daily_activity(user_id, start_date, end_date, source)
+
+    async def usage_rows_for_user_ids(self, user_ids: list[str], start_date: str, end_date: str, source: str | None) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for user_id in user_ids:
+            rows.extend(await self.usage_rows(user_id, start_date, end_date, source))
+        return sorted(rows, key=lambda item: (item["date"], item["source"], item["model"]))
 
     async def _usage_from_key_daily_activity(self, user_id: str, start_date: str, end_date: str, source: str | None) -> list[dict[str, Any]]:
         keys = await self.keys_for_user(user_id)
@@ -342,6 +391,17 @@ class LiteLLMClient:
                     "status": status,
                 }
             )
+        return keys
+
+    async def keys_for_user_ids(self, user_ids: list[str]) -> list[dict[str, Any]]:
+        keys: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for user_id in user_ids:
+            for key in await self.keys_for_user(user_id):
+                key_id = key.get("id")
+                if key_id and key_id not in seen:
+                    seen.add(key_id)
+                    keys.append(key)
         return keys
 
     async def regenerate_key(self, key_id: str, user_id: str, changed_by: str) -> str:
