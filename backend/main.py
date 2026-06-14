@@ -1,7 +1,9 @@
 import logging
 import os
+from base64 import urlsafe_b64encode
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode, urlparse, urlunparse
 
 from authlib.integrations.base_client import OAuthError
 from dotenv import load_dotenv
@@ -100,6 +102,22 @@ def client() -> LiteLLMClient:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+def feishu_direct_url(casdoor_authorize_url: str) -> str:
+    app_id = os.getenv("FEISHU_APP_ID", "").strip()
+    redirect_uri = os.getenv("FEISHU_REDIRECT_URI", "").strip()
+    if not app_id or not redirect_uri:
+        return casdoor_authorize_url
+
+    parsed = urlparse(casdoor_authorize_url)
+    query = parsed.query
+    if query and os.getenv("OIDC_APPLICATION_NAME", "").strip() and "application=" not in query:
+        query = query + "&" + urlencode({"application": os.getenv("OIDC_APPLICATION_NAME", "").strip()})
+
+    state = urlsafe_b64encode(("?" + query).encode("utf-8")).decode("ascii")
+    params = urlencode({"app_id": app_id, "redirect_uri": redirect_uri, "state": state})
+    return urlunparse(("https", "accounts.feishu.cn", "/open-apis/authen/v1/index", "", params, ""))
+
+
 async def current_upstream_user(request: Request) -> tuple[dict[str, Any], dict[str, Any]]:
     app_user = require_user(request)
     upstream = await client().resolve_user(app_user["email"])
@@ -176,12 +194,20 @@ async def sso_start(request: Request):
     authorize_params: dict[str, str] = {}
     direct_provider = os.getenv("OIDC_DIRECT_PROVIDER", "").strip()
     direct_method = os.getenv("OIDC_DIRECT_METHOD", "").strip()
+    direct_application = os.getenv("OIDC_APPLICATION_NAME", "").strip()
+    if direct_application:
+        authorize_params["application"] = direct_application
     if direct_provider:
         authorize_params["provider_hint"] = direct_provider
         authorize_params["provider"] = direct_provider
     if direct_method:
         authorize_params["method"] = direct_method
-    return await oauth.company.authorize_redirect(request, redirect_uri, **authorize_params)
+    response = await oauth.company.authorize_redirect(request, redirect_uri, **authorize_params)
+    if env_bool("FEISHU_DIRECT_LOGIN_ENABLED", False):
+        location = response.headers.get("location")
+        if location:
+            return RedirectResponse(feishu_direct_url(location))
+    return response
 
 
 @app.get("/api/auth/callback")
