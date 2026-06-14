@@ -17,6 +17,29 @@ py -m venv .venv
 http://127.0.0.1:8000
 ```
 
+## Docker 启动
+
+先复制 `.env.example` 为 `.env` 并填入真实配置：
+
+```bash
+cp .env.example .env
+```
+
+构建并运行镜像：
+
+```bash
+docker build -t ai-token-dashboard .
+docker run --rm --env-file .env -p 8000:8000 ai-token-dashboard
+```
+
+也可以使用 Compose：
+
+```bash
+docker compose up -d --build
+```
+
+容器内服务监听 `0.0.0.0:8000`，对外通过宿主机 `http://127.0.0.1:8000` 访问。生产环境请保持 `DEV_LOGIN_ENABLED=false`，并确保 `APP_BASE_URL` 与反向代理后的公网地址一致。
+
 ## 飞书扫码登录
 
 在 Casdoor 的 `cltx` organization 下为 AI 用量中心新建独立 application：
