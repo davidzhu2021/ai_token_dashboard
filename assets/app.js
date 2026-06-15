@@ -13,6 +13,9 @@ let adminUsageData = [];
 let adminSummaryData = [];
 let adminEmployees = [];
 let selectedAdminEmployee = "";
+let departmentUsageData = [];
+let departmentEmployees = [];
+let selectedDepartmentEmployee = "";
 let modelCatalog = [];
 let isDashboardLoading = false;
 let isAdminLoading = false;
@@ -148,7 +151,7 @@ function renderMetricGroups(containerId, data, mode = "personal", summary = null
   const successes = sum(data, "successCount");
   const successRate = requests ? Math.round((successes / requests) * 1000) / 10 : 0;
   const spend = sum(data, "spend");
-  const scope = mode === "admin" ? "全员" : "个人";
+  const scope = mode === "admin" ? "全员" : mode === "department" ? "部门" : "个人";
   const label = rangeLabel();
   const source = sourceText();
 
@@ -201,6 +204,20 @@ function renderAdminMetrics(data) {
   el("adminTrendBadge").textContent = `${label} · ${source}`;
   el("adminSpendBadge").textContent = `${label} · ${source}`;
   renderMetricGroups("adminMetrics", totalData, "admin", null, data);
+}
+
+function renderDepartmentMetrics(data) {
+  const total = sum(data, "totalTokens");
+  const requests = sum(data, "requestCount");
+  const label = rangeLabel();
+  const source = sourceText();
+  el("departmentHeroTotal").textContent = formatTokens(total);
+  el("departmentHeroTotalLabel").textContent = selectedDepartmentEmployee ? "员工 Token" : "部门 Token";
+  el("departmentHeroRequests").textContent = fmt.format(requests);
+  el("departmentActiveUsers").textContent = fmt.format(departmentEmployees.length);
+  el("departmentTrendBadge").textContent = `${label} · ${source}`;
+  el("departmentSpendBadge").textContent = `${label} · ${source}`;
+  renderMetricGroups("departmentMetrics", data, "department");
 }
 
 function showChartTooltip(event, html) {
@@ -378,6 +395,55 @@ function renderTable(data) {
     : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">当前筛选范围暂无用量记录</td></tr>`;
 }
 
+const departmentMockEmployees = [
+  { employeeId: "dept-liwen", employeeName: "李文", employeeEmail: "liwen@auto-link.com.cn", role: "前端工程师" },
+  { employeeId: "dept-chenyi", employeeName: "陈一", employeeEmail: "chenyi@auto-link.com.cn", role: "后端工程师" },
+  { employeeId: "dept-wanglu", employeeName: "王璐", employeeEmail: "wanglu@auto-link.com.cn", role: "测试工程师" },
+  { employeeId: "dept-zhaoxin", employeeName: "赵鑫", employeeEmail: "zhaoxin@auto-link.com.cn", role: "算法工程师" },
+  { employeeId: "dept-sunhao", employeeName: "孙浩", employeeEmail: "sunhao@auto-link.com.cn", role: "产品经理" },
+];
+
+const departmentMockModels = ["gpt-4.1", "claude-sonnet-4", "gemini-2.5-pro", "deepseek-coder"];
+const departmentMockSources = ["Cursor", "Claude Code", "其他"];
+
+function buildDepartmentMockRows() {
+  const rows = [];
+  const today = new Date();
+  for (let offset = 0; offset < 30; offset += 1) {
+    const date = new Date(today);
+    date.setDate(today.getDate() - offset);
+    const day = localDate(date);
+    departmentMockEmployees.forEach((employee, employeeIndex) => {
+      departmentMockSources.forEach((source, sourceIndex) => {
+        const base = 8800 + employeeIndex * 2100 + sourceIndex * 1450 + (offset % 6) * 760;
+        const sourceWeight = source === "Cursor" ? 1.2 : source === "Claude Code" ? 1.0 : 0.42;
+        const totalTokens = Math.round(base * sourceWeight);
+        const promptTokens = Math.round(totalTokens * (0.42 + (employeeIndex % 3) * 0.04));
+        const completionTokens = totalTokens - promptTokens;
+        const requestCount = Math.max(3, Math.round(totalTokens / 1850) + sourceIndex * 2);
+        const failureCount = (offset + employeeIndex + sourceIndex) % 11 === 0 ? 1 : 0;
+        rows.push({
+          date: day,
+          source,
+          model: departmentMockModels[(employeeIndex + sourceIndex + offset) % departmentMockModels.length],
+          promptTokens,
+          completionTokens,
+          totalTokens,
+          requestCount,
+          successCount: Math.max(0, requestCount - failureCount),
+          failureCount,
+          spend: Number((totalTokens * 0.0000024 + requestCount * 0.0007).toFixed(4)),
+          employeeId: employee.employeeId,
+          employeeName: employee.employeeName,
+          employeeEmail: employee.employeeEmail,
+          bindStatus: "演示数据",
+        });
+      });
+    });
+  }
+  return rows;
+}
+
 function sortedAdminEmployees(items) {
   return items.slice().sort((a, b) => {
     const tokenDiff = Number(b.totalTokens || 0) - Number(a.totalTokens || 0);
@@ -392,11 +458,49 @@ function sortedAdminEmployees(items) {
   });
 }
 
-function renderAdminUsers() {
-  const employees = sortedAdminEmployees(adminEmployees);
-  el("adminUserCount").textContent = `${adminEmployees.length} 人`;
-  el("adminUserTable").innerHTML = employees.length
-    ? employees
+function employeeSummariesFromRows(rows) {
+  const grouped = {};
+  const sourceTotals = {};
+  rows.forEach((row) => {
+    const employeeId = row.employeeId || row.employeeEmail || "mock-employee";
+    if (!grouped[employeeId]) {
+      grouped[employeeId] = {
+        employeeId,
+        employeeName: row.employeeName || employeeId,
+        employeeEmail: row.employeeEmail || "",
+        bindStatus: row.bindStatus || "演示数据",
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        requestCount: 0,
+        successCount: 0,
+        failureCount: 0,
+        spend: 0,
+        primarySource: "其他",
+      };
+      sourceTotals[employeeId] = {};
+    }
+    grouped[employeeId].promptTokens += Number(row.promptTokens || 0);
+    grouped[employeeId].completionTokens += Number(row.completionTokens || 0);
+    grouped[employeeId].totalTokens += Number(row.totalTokens || 0);
+    grouped[employeeId].requestCount += Number(row.requestCount || 0);
+    grouped[employeeId].successCount += Number(row.successCount || 0);
+    grouped[employeeId].failureCount += Number(row.failureCount || 0);
+    grouped[employeeId].spend += Number(row.spend || 0);
+    sourceTotals[employeeId][row.source || "其他"] = (sourceTotals[employeeId][row.source || "其他"] || 0) + Number(row.totalTokens || 0);
+  });
+  Object.keys(grouped).forEach((employeeId) => {
+    const sources = Object.entries(sourceTotals[employeeId]);
+    if (sources.length) grouped[employeeId].primarySource = sources.sort((a, b) => b[1] - a[1])[0][0];
+  });
+  return sortedAdminEmployees(Object.values(grouped));
+}
+
+function renderEmployeeRanking(tableId, countId, employees, emptyText) {
+  const sorted = sortedAdminEmployees(employees);
+  el(countId).textContent = `${sorted.length} 人`;
+  el(tableId).innerHTML = sorted.length
+    ? sorted
         .map((item) => {
           const requests = Number(item.requestCount || 0);
           const successRate = requests ? Math.round((Number(item.successCount || 0) / requests) * 1000) / 10 : 0;
@@ -414,7 +518,15 @@ function renderAdminUsers() {
           `;
         })
         .join("")
-    : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">当前筛选范围暂无员工用量</td></tr>`;
+    : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">${emptyText}</td></tr>`;
+}
+
+function renderAdminUsers() {
+  renderEmployeeRanking("adminUserTable", "adminUserCount", adminEmployees, "当前筛选范围暂无员工用量");
+}
+
+function renderDepartmentUsers() {
+  renderEmployeeRanking("departmentUserTable", "departmentUserCount", departmentEmployees, "当前筛选范围暂无部门员工用量");
 }
 
 function loadingLine(width = "100%") {
@@ -599,9 +711,28 @@ function renderAdmin() {
   }
 }
 
+function renderDepartment() {
+  renderDepartmentMetrics(departmentUsageData);
+  renderTrendTo("departmentTrendChart", departmentUsageData);
+  renderSpendTrendTo("departmentSpendChart", departmentUsageData);
+  renderDonutTo("departmentSourceDonut", "departmentDonutTotal", "departmentSourceLegend", departmentUsageData);
+  renderModelBarsTo("departmentModelBars", departmentUsageData);
+  renderSplitTo("departmentSplitChart", departmentUsageData);
+  renderDepartmentUsers();
+
+  const detailCard = el("departmentDetailCard");
+  detailCard.classList.toggle("show", Boolean(selectedDepartmentEmployee));
+  if (selectedDepartmentEmployee) {
+    const employee = departmentEmployees.find((item) => item.employeeEmail === selectedDepartmentEmployee || item.employeeId === selectedDepartmentEmployee);
+    el("departmentDetailTitle").textContent = `${employee?.employeeName || selectedDepartmentEmployee} 的用量详情`;
+    el("departmentDetailSubtitle").textContent = employee?.employeeEmail || employee?.employeeId || selectedDepartmentEmployee;
+  }
+}
+
 function render() {
   renderPersonal();
   if (currentUser?.isAdmin) renderAdmin();
+  renderDepartment();
 }
 
 function uniqueValues(items, getter) {
@@ -681,11 +812,13 @@ function switchView(view) {
   currentView = view;
   el("dashboardView").classList.toggle("hidden", view !== "dashboard");
   el("adminView").classList.toggle("hidden", view !== "admin");
+  el("departmentView").classList.toggle("hidden", view !== "department");
   el("modelsView").classList.toggle("hidden", view !== "models");
   el("dashboardFilters").classList.toggle("hidden", view === "models");
   document.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
   if (view === "models") renderModels();
   if (view === "admin" && !adminUsageData.length) loadAdminData();
+  if (view === "department" && !departmentUsageData.length) loadDepartmentData();
 }
 
 async function loadDashboardData() {
@@ -740,6 +873,26 @@ async function loadAdminData() {
   }
 }
 
+async function loadDepartmentData() {
+  const { startDate, endDate } = selectedDateRange();
+  const source = el("sourceSelect").value;
+  const search = el("departmentEmployeeSearch").value.trim().toLowerCase();
+  const employee = (selectedDepartmentEmployee || search).toLowerCase();
+  departmentUsageData = buildDepartmentMockRows().filter((row) => {
+    const inRange = row.date >= startDate && row.date <= endDate;
+    const sourceMatched = source === "all" || row.source === source;
+    const employeeMatched =
+      !employee ||
+      String(row.employeeId || "").toLowerCase().includes(employee) ||
+      String(row.employeeName || "").toLowerCase().includes(employee) ||
+      String(row.employeeEmail || "").toLowerCase().includes(employee);
+    return inRange && sourceMatched && employeeMatched;
+  });
+  departmentEmployees = employeeSummariesFromRows(departmentUsageData);
+  el("departmentLimitHint").textContent = "演示数据 · 默认按 Token 从高到低排序";
+  renderDepartment();
+}
+
 async function loadModels() {
   try {
     const payload = await api("/api/models");
@@ -764,19 +917,23 @@ async function showApp(user) {
   el("avatar").textContent = user.avatar || initials(user.email, user.name);
   el("welcomeTitle").textContent = `${user.name}您好，今天的 AI 工具消耗一眼看清`;
   el("adminWelcomeTitle").textContent = `${user.name}您好，全员 AI 用量一眼看清`;
+  el("departmentWelcomeTitle").textContent = `${user.name}您好，智能应用部 AI 用量一眼看清`;
   switchView(user.isAdmin ? "admin" : "dashboard");
   render();
-  await Promise.all([loadDashboardData(), user.isAdmin ? loadAdminData() : Promise.resolve(), loadModels()]);
+  await Promise.all([loadDashboardData(), loadDepartmentData(), user.isAdmin ? loadAdminData() : Promise.resolve(), loadModels()]);
 }
 
 function showLogin() {
   currentUser = null;
   selectedAdminEmployee = "";
+  selectedDepartmentEmployee = "";
   usageData = [];
   usageSummary = null;
   adminUsageData = [];
   adminSummaryData = [];
   adminEmployees = [];
+  departmentUsageData = [];
+  departmentEmployees = [];
   el("appView").classList.add("hidden");
   el("loginView").classList.remove("hidden");
 }
@@ -816,12 +973,14 @@ document.querySelectorAll("[data-view]").forEach((button) => button.addEventList
 
 el("rangeSelect").addEventListener("change", async () => {
   selectedAdminEmployee = "";
-  await Promise.all([loadDashboardData(), currentUser?.isAdmin ? loadAdminData() : Promise.resolve()]);
+  selectedDepartmentEmployee = "";
+  await Promise.all([loadDashboardData(), loadDepartmentData(), currentUser?.isAdmin ? loadAdminData() : Promise.resolve()]);
 });
 
 el("sourceSelect").addEventListener("change", async () => {
   selectedAdminEmployee = "";
-  await Promise.all([loadDashboardData(), currentUser?.isAdmin ? loadAdminData() : Promise.resolve()]);
+  selectedDepartmentEmployee = "";
+  await Promise.all([loadDashboardData(), loadDepartmentData(), currentUser?.isAdmin ? loadAdminData() : Promise.resolve()]);
 });
 
 el("refreshButton").addEventListener("click", async () => {
@@ -831,6 +990,9 @@ el("refreshButton").addEventListener("click", async () => {
   } else if (currentView === "admin") {
     await loadAdminData();
     showToast("已刷新全员用量数据");
+  } else if (currentView === "department") {
+    await loadDepartmentData();
+    showToast("已刷新部门演示数据");
   } else {
     await loadDashboardData();
     showToast(lastPersonalUsageCacheHit ? "已加载缓存用量数据" : "已刷新真实用量数据");
@@ -861,6 +1023,32 @@ el("adminClearEmployee").addEventListener("click", async () => {
   selectedAdminEmployee = "";
   el("adminEmployeeSearch").value = "";
   await loadAdminData();
+});
+
+el("departmentSearchButton").addEventListener("click", async () => {
+  selectedDepartmentEmployee = "";
+  await loadDepartmentData();
+});
+
+el("departmentEmployeeSearch").addEventListener("keydown", async (event) => {
+  if (event.key === "Enter") {
+    selectedDepartmentEmployee = "";
+    await loadDepartmentData();
+  }
+});
+
+el("departmentUserTable").addEventListener("click", async (event) => {
+  const row = event.target.closest("[data-employee]");
+  if (!row) return;
+  selectedDepartmentEmployee = row.dataset.employee;
+  el("departmentEmployeeSearch").value = "";
+  await loadDepartmentData();
+});
+
+el("departmentClearEmployee").addEventListener("click", async () => {
+  selectedDepartmentEmployee = "";
+  el("departmentEmployeeSearch").value = "";
+  await loadDepartmentData();
 });
 
 el("modelSearch").addEventListener("input", renderModels);
