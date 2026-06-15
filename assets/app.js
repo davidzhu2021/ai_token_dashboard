@@ -732,7 +732,7 @@ function renderDepartment() {
 function render() {
   renderPersonal();
   if (currentUser?.isAdmin) renderAdmin();
-  renderDepartment();
+  if (currentUser?.isAdmin) renderDepartment();
 }
 
 function uniqueValues(items, getter) {
@@ -809,6 +809,7 @@ async function copyText(text, successMessage) {
 
 function switchView(view) {
   if (view === "admin" && !currentUser?.isAdmin) view = "dashboard";
+  if (view === "department" && !currentUser?.isAdmin) view = "dashboard";
   currentView = view;
   el("dashboardView").classList.toggle("hidden", view !== "dashboard");
   el("adminView").classList.toggle("hidden", view !== "admin");
@@ -874,6 +875,7 @@ async function loadAdminData() {
 }
 
 async function loadDepartmentData() {
+  if (!currentUser?.isAdmin) return;
   const { startDate, endDate } = selectedDateRange();
   const source = el("sourceSelect").value;
   const search = el("departmentEmployeeSearch").value.trim().toLowerCase();
@@ -912,6 +914,7 @@ async function showApp(user) {
   el("loginView").classList.add("hidden");
   el("appView").classList.remove("hidden");
   el("adminTab").classList.toggle("hidden", !user.isAdmin);
+  el("departmentTab").classList.toggle("hidden", !user.isAdmin);
   el("userEmail").textContent = user.email;
   el("userName").textContent = user.name;
   el("avatar").textContent = user.avatar || initials(user.email, user.name);
@@ -920,7 +923,7 @@ async function showApp(user) {
   el("departmentWelcomeTitle").textContent = `${user.name}您好，智能应用部 AI 用量一眼看清`;
   switchView(user.isAdmin ? "admin" : "dashboard");
   render();
-  await Promise.all([loadDashboardData(), loadDepartmentData(), user.isAdmin ? loadAdminData() : Promise.resolve(), loadModels()]);
+  await Promise.all([loadDashboardData(), user.isAdmin ? loadDepartmentData() : Promise.resolve(), user.isAdmin ? loadAdminData() : Promise.resolve(), loadModels()]);
 }
 
 function showLogin() {
@@ -974,13 +977,13 @@ document.querySelectorAll("[data-view]").forEach((button) => button.addEventList
 el("rangeSelect").addEventListener("change", async () => {
   selectedAdminEmployee = "";
   selectedDepartmentEmployee = "";
-  await Promise.all([loadDashboardData(), loadDepartmentData(), currentUser?.isAdmin ? loadAdminData() : Promise.resolve()]);
+  await Promise.all([loadDashboardData(), currentUser?.isAdmin ? loadDepartmentData() : Promise.resolve(), currentUser?.isAdmin ? loadAdminData() : Promise.resolve()]);
 });
 
 el("sourceSelect").addEventListener("change", async () => {
   selectedAdminEmployee = "";
   selectedDepartmentEmployee = "";
-  await Promise.all([loadDashboardData(), loadDepartmentData(), currentUser?.isAdmin ? loadAdminData() : Promise.resolve()]);
+  await Promise.all([loadDashboardData(), currentUser?.isAdmin ? loadDepartmentData() : Promise.resolve(), currentUser?.isAdmin ? loadAdminData() : Promise.resolve()]);
 });
 
 el("refreshButton").addEventListener("click", async () => {
