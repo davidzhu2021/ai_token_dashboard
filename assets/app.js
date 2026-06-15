@@ -1,7 +1,11 @@
-﻿const sourceColors = {
+const sourceColors = {
   Cursor: "#1f7a5b",
   "Claude Code": "#b88727",
   "其他": "#2e6f9f",
+};
+
+const sourceLabels = {
+  Cursor: "Codex",
 };
 
 let currentUser = null;
@@ -135,7 +139,12 @@ function metricGroup(title, subtitle, items) {
 }
 
 function sourceText() {
-  return el("sourceSelect").value === "all" ? "全部来源" : el("sourceSelect").value;
+  const source = el("sourceSelect").value;
+  return source === "all" ? "全部来源" : displaySource(source);
+}
+
+function displaySource(source) {
+  return sourceLabels[source] || source || "其他";
 }
 
 function rangeLabel() {
@@ -169,7 +178,7 @@ function renderMetricGroups(containerId, data, mode = "personal", summary = null
       metric(`${label} 请求成功率`, `${successRate}%`, `${fmt.format(successes)} / ${fmt.format(requests)} 次成功`, "稳定", "", "success"),
     ]),
     metricGroup("工具消耗拆分", `${label} · ${source}`, [
-      metric(`${label} Cursor Token`, formatTokens(cursor), "编辑器相关消耗", "Cursor", "", "cursor"),
+      metric(`${label} Codex Token`, formatTokens(cursor), "Codex 相关消耗", "Codex", "", "cursor"),
       metric(`${label} Claude Code Token`, formatTokens(cc), "终端工具相关消耗", "Claude Code", "blue", "terminal"),
     ]),
   ].join("");
@@ -343,7 +352,7 @@ function renderDonutTo(svgId, totalId, legendId, data) {
   el(legendId).innerHTML = totals
     .map((item) => {
       const pct = total ? Math.round((item.value / total) * 100) : 0;
-      return `<div class="legend-item"><span><i class="dot" style="background:${sourceColors[item.source]}"></i>${item.source}</span><strong>${pct}%</strong></div>`;
+      return `<div class="legend-item"><span><i class="dot" style="background:${sourceColors[item.source]}"></i>${displaySource(item.source)}</span><strong>${pct}%</strong></div>`;
     })
     .join("");
 }
@@ -389,7 +398,7 @@ function renderTable(data) {
         .reverse()
         .map((item) => {
           const status = item.failureCount > 0 ? `<span class="chip rose">${item.failureCount} 次失败</span>` : `<span class="chip">正常</span>`;
-          return `<tr><td>${item.date}</td><td>${item.source}</td><td>${item.model}</td><td class="num">${fmt.format(item.requestCount || 0)}</td><td class="num">${fmt.format(item.promptTokens || 0)}</td><td class="num">${fmt.format(item.completionTokens || 0)}</td><td class="num"><strong>${fmt.format(item.totalTokens || 0)}</strong></td><td>${status}</td></tr>`;
+          return `<tr><td>${item.date}</td><td>${displaySource(item.source)}</td><td>${item.model}</td><td class="num">${fmt.format(item.requestCount || 0)}</td><td class="num">${fmt.format(item.promptTokens || 0)}</td><td class="num">${fmt.format(item.completionTokens || 0)}</td><td class="num"><strong>${fmt.format(item.totalTokens || 0)}</strong></td><td>${status}</td></tr>`;
         })
         .join("")
     : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">当前筛选范围暂无用量记录</td></tr>`;
@@ -508,7 +517,7 @@ function renderEmployeeRanking(tableId, countId, employees, emptyText) {
             <tr class="admin-employee-row" data-employee="${item.employeeEmail || item.employeeId}">
               <td><strong>${item.employeeName || item.employeeId}</strong></td>
               <td>${item.employeeEmail || "未绑定邮箱"}</td>
-              <td>${item.primarySource || "其他"}</td>
+              <td>${displaySource(item.primarySource)}</td>
               <td class="num">${fmt.format(requests)}</td>
               <td class="num"><strong>${formatTokens(item.totalTokens || 0)}</strong></td>
               <td class="num">${money.format(item.spend || 0)}</td>
