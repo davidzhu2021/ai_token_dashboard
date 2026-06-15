@@ -105,6 +105,7 @@ OIDC_ISSUER_URL=http://10.68.13.198:30882
 OIDC_CLIENT_ID=<casdoor-application-client-id>
 OIDC_CLIENT_SECRET=<casdoor-application-client-secret>
 OIDC_CASDOOR_APPLICATION_ID=admin/ai-token-dashboard
+OIDC_APPLICATION_NAME=ai-token-dashboard
 OIDC_DIRECT_PROVIDER=lark-provider
 OIDC_DIRECT_METHOD=signup
 OIDC_SKIP_CASDOOR_PAGE=true
@@ -113,6 +114,10 @@ OAUTH_PROVIDER_NAME=飞书扫码登录
 ALLOWED_EMAIL_DOMAIN=auto-link.com.cn
 
 ADMIN_EMAILS=admin1@auto-link.com.cn,admin2@auto-link.com.cn
+
+FEISHU_DIRECT_LOGIN_ENABLED=false
+FEISHU_APP_ID=<飞书应用 app_id，仅用于直达飞书登录页>
+FEISHU_REDIRECT_URI=http://10.68.13.198:30882/callback
 
 DEV_LOGIN_ENABLED=false
 DEBUG_MAPPING_ENABLED=false
@@ -144,6 +149,10 @@ Casdoor 侧建议配置：
 - Redirect URI：
   - 本地：`http://127.0.0.1:8010/api/auth/callback`
   - 生产：`https://ai-usage.auto-link.com.cn/api/auth/callback`
+
+如需点击“飞书扫码登录”后直达飞书页面，`OIDC_APPLICATION_NAME` 需要与 Casdoor Application 名称一致，`OIDC_DIRECT_PROVIDER` 需要与 Casdoor 中的飞书 Provider 名称一致；后端会把它们随授权请求传给 Casdoor。如果 Casdoor 已经有 HTTPS 反代地址，`OIDC_ISSUER_URL` 优先使用 HTTPS 地址。后端同时兼容 issuer base URL 和完整 discovery URL。
+
+如果 Casdoor 当前版本仍显示中间页，可启用 `FEISHU_DIRECT_LOGIN_ENABLED=true`。此模式仍由 Casdoor 完成 OIDC 回调校验，只是把用户第一跳直接送到飞书授权页；`FEISHU_REDIRECT_URI` 必须是 Casdoor 的 `/callback` 地址，并已加入飞书开放平台的重定向 URL 白名单。
 
 后端登录入口：
 

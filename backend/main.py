@@ -1,11 +1,12 @@
-﻿import base64
+import base64
 import logging
 import os
 import re
+from base64 import urlsafe_b64encode
 from html import unescape
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, unquote, urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, unquote, urljoin, urlparse, urlunparse
 
 import httpx
 from authlib.integrations.base_client import OAuthError
@@ -264,6 +265,22 @@ def usage_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def feishu_direct_url(casdoor_authorize_url: str) -> str:
+    app_id = os.getenv("FEISHU_APP_ID", "").strip()
+    redirect_uri = os.getenv("FEISHU_REDIRECT_URI", "").strip()
+    if not app_id or not redirect_uri:
+        return casdoor_authorize_url
+
+    parsed = urlparse(casdoor_authorize_url)
+    query = parsed.query
+    if query and os.getenv("OIDC_APPLICATION_NAME", "").strip() and "application=" not in query:
+        query = query + "&" + urlencode({"application": os.getenv("OIDC_APPLICATION_NAME", "").strip()})
+
+    state = urlsafe_b64encode(("?" + query).encode("utf-8")).decode("ascii")
+    params = urlencode({"app_id": app_id, "redirect_uri": redirect_uri, "state": state})
+    return urlunparse(("https", "accounts.feishu.cn", "/open-apis/authen/v1/index", "", params, ""))
+
+
 async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_date: str, source: str) -> dict[str, Any]:
     cache_key = personal_usage_cache_key(app_user["email"], start_date, end_date, source)
     hit, value, ttl_seconds = personal_usage_cache.get(cache_key)
@@ -412,6 +429,9 @@ async def sso_start(request: Request):
     authorize_params: dict[str, str] = {}
     direct_provider = os.getenv("OIDC_DIRECT_PROVIDER", "").strip()
     direct_method = os.getenv("OIDC_DIRECT_METHOD", "").strip()
+    direct_application = os.getenv("OIDC_APPLICATION_NAME", "").strip()
+    if direct_application:
+        authorize_params["application"] = direct_application
     if direct_provider:
         authorize_params["provider_hint"] = direct_provider
         authorize_params["provider"] = direct_provider
@@ -419,6 +439,8 @@ async def sso_start(request: Request):
         authorize_params["method"] = direct_method
     casdoor_response = await oauth.company.authorize_redirect(request, redirect_uri, **authorize_params)
     casdoor_url = casdoor_response.headers.get("location")
+    if env_bool("FEISHU_DIRECT_LOGIN_ENABLED", False) and casdoor_url:
+        return RedirectResponse(feishu_direct_url(casdoor_url))
     if env_bool("OIDC_SKIP_CASDOOR_PAGE", False) and casdoor_url:
         provider_url = await resolve_provider_login_url(casdoor_url)
         if provider_url:
