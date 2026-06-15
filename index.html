@@ -875,6 +875,83 @@
         height: 286px;
       }
 
+      .loading-card {
+        min-height: 124px;
+        padding: 16px;
+        border-radius: var(--radius-sm);
+        background: rgba(255, 255, 255, 0.62);
+        display: grid;
+        align-content: space-between;
+        gap: 14px;
+      }
+
+      .loading-line,
+      .loading-pill,
+      .loading-block {
+        position: relative;
+        overflow: hidden;
+        border-radius: 999px;
+        background: linear-gradient(90deg, rgba(226, 232, 226, 0.72), rgba(243, 246, 241, 0.9), rgba(226, 232, 226, 0.72));
+        background-size: 220% 100%;
+        animation: loadingShimmer 1.35s ease-in-out infinite;
+      }
+
+      .loading-line {
+        height: 12px;
+      }
+
+      .loading-pill {
+        height: 24px;
+        width: 72px;
+      }
+
+      .loading-block {
+        border-radius: 16px;
+      }
+
+      .loading-title {
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 800;
+      }
+
+      .loading-chart {
+        height: 286px;
+        border-radius: 14px;
+      }
+
+      .loading-donut {
+        width: 180px;
+        height: 180px;
+        border-radius: 50%;
+        margin: 0 auto;
+      }
+
+      .loading-table-row {
+        display: grid;
+        grid-template-columns: 1fr 0.8fr 1.2fr 0.7fr 0.8fr;
+        gap: 14px;
+        padding: 16px 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .loading-status {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        color: var(--muted);
+        font-weight: 800;
+      }
+
+      @keyframes loadingShimmer {
+        0% {
+          background-position: 120% 0;
+        }
+        100% {
+          background-position: -120% 0;
+        }
+      }
+
       .chart-hit {
         pointer-events: all;
         cursor: crosshair;
@@ -1960,7 +2037,7 @@
     <div id="toast" class="toast">已完成</div>
     <div id="chartTooltip" class="chart-tooltip" role="tooltip"></div>
 
-    <script src="/assets/app.js?v=20260615-admin-dashboard"></script>
+    <script src="/assets/app.js?v=20260615-loading-skeleton"></script>
   </body>
 </html>
 

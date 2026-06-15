@@ -400,7 +400,156 @@ function renderAdminUsers() {
     : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">当前筛选范围暂无员工用量</td></tr>`;
 }
 
+function loadingLine(width = "100%") {
+  return `<div class="loading-line" style="width:${width}"></div>`;
+}
+
+function renderMetricSkeleton(containerId) {
+  el(containerId).innerHTML = Array.from({ length: 4 })
+    .map(
+      (_, index) => `
+        <section class="metric-group" aria-busy="true">
+          <div class="metric-group-head">
+            <div>
+              <div class="loading-status">
+                <span class="loading-pill" style="width:28px"></span>
+                <span>${index === 0 ? "数据加载中" : "正在汇总"}</span>
+              </div>
+              <div style="margin-top:8px">${loadingLine("62%")}</div>
+            </div>
+          </div>
+          <div class="metric-pair">
+            <article class="loading-card">
+              ${loadingLine("46%")}
+              <div>
+                <div class="loading-block" style="width:72%;height:30px"></div>
+                <div style="margin-top:10px">${loadingLine("58%")}</div>
+              </div>
+            </article>
+            <article class="loading-card">
+              ${loadingLine("54%")}
+              <div>
+                <div class="loading-block" style="width:64%;height:30px"></div>
+                <div style="margin-top:10px">${loadingLine("50%")}</div>
+              </div>
+            </article>
+          </div>
+        </section>
+      `,
+    )
+    .join("");
+}
+
+function renderChartSkeleton(svgId) {
+  const svg = el(svgId);
+  svg.setAttribute("viewBox", "0 0 900 280");
+  svg.innerHTML = `
+    <rect width="900" height="280" rx="8" fill="#fffdf6"/>
+    <text x="450" y="126" fill="#65736f" font-size="16" font-weight="800" text-anchor="middle">数据加载中</text>
+    <text x="450" y="154" fill="#8a938f" font-size="13" text-anchor="middle">正在从后端汇总当前筛选范围</text>
+    <rect x="64" y="196" width="772" height="14" rx="7" fill="#e5ebe3"/>
+    <rect x="64" y="224" width="512" height="10" rx="5" fill="#edf1ea"/>
+  `;
+}
+
+function renderDonutSkeleton(totalId, legendId) {
+  el(totalId).textContent = "--";
+  el(legendId).innerHTML = `
+    <div class="loading-status"><span class="loading-pill"></span><span>数据加载中</span></div>
+    <div style="margin-top:18px">${loadingLine("86%")}</div>
+    <div style="margin-top:14px">${loadingLine("72%")}</div>
+    <div style="margin-top:14px">${loadingLine("64%")}</div>
+  `;
+}
+
+function renderBarsSkeleton(containerId) {
+  el(containerId).innerHTML = Array.from({ length: 5 })
+    .map(
+      (_, index) => `
+        <div class="bar-row">
+          <strong><span class="loading-line" style="display:block;width:${70 - index * 6}px"></span></strong>
+          <div class="bar-track"><div class="bar-fill" style="width:${78 - index * 10}%;background:#dfe6de"></div></div>
+          <span class="num">--</span>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function renderSplitSkeleton(svgId) {
+  const svg = el(svgId);
+  svg.setAttribute("viewBox", "0 0 820 236");
+  svg.innerHTML = `
+    <rect width="820" height="236" rx="8" fill="#fffdf6"/>
+    <text x="410" y="102" fill="#65736f" font-size="16" font-weight="800" text-anchor="middle">数据加载中</text>
+    <rect x="30" y="132" width="760" height="24" rx="8" fill="#e5ebe3"/>
+    <rect x="30" y="176" width="520" height="16" rx="8" fill="#edf1ea"/>
+  `;
+}
+
+function renderTableSkeleton(tableId, countId, colSpan, label = "数据加载中") {
+  if (countId) el(countId).textContent = label;
+  el(tableId).innerHTML = Array.from({ length: 5 })
+    .map(
+      () => `
+        <tr>
+          <td colspan="${colSpan}">
+            <div class="loading-table-row" aria-busy="true">
+              ${loadingLine("74%")}
+              ${loadingLine("62%")}
+              ${loadingLine("82%")}
+              ${loadingLine("55%")}
+              ${loadingLine("68%")}
+            </div>
+          </td>
+        </tr>
+      `,
+    )
+    .join("");
+}
+
+function renderPersonalLoading() {
+  const label = rangeLabel();
+  const source = sourceText();
+  el("heroTotal").textContent = "加载中";
+  el("heroSuccess").textContent = "--";
+  el("heroRequests").textContent = "--";
+  el("heroTotalLabel").textContent = `${label} Token`;
+  el("trendBadge").textContent = `${label} · ${source}`;
+  el("spendBadge").textContent = `${label} · ${source}`;
+  renderMetricSkeleton("metrics");
+  renderChartSkeleton("trendChart");
+  renderChartSkeleton("spendChart");
+  renderDonutSkeleton("donutTotal", "sourceLegend");
+  renderBarsSkeleton("modelBars");
+  renderSplitSkeleton("splitChart");
+  renderTableSkeleton("usageTable", "tableCount", 8);
+}
+
+function renderAdminLoading() {
+  const label = rangeLabel();
+  const source = sourceText();
+  el("adminHeroTotal").textContent = "加载中";
+  el("adminHeroTotalLabel").textContent = selectedAdminEmployee ? "员工 Token" : "全员 Token";
+  el("adminHeroRequests").textContent = "--";
+  el("adminActiveUsers").textContent = "--";
+  el("adminTrendBadge").textContent = `${label} · ${source}`;
+  el("adminSpendBadge").textContent = `${label} · ${source}`;
+  el("adminLimitHint").textContent = "数据加载中";
+  renderMetricSkeleton("adminMetrics");
+  renderChartSkeleton("adminTrendChart");
+  renderChartSkeleton("adminSpendChart");
+  renderDonutSkeleton("adminDonutTotal", "adminSourceLegend");
+  renderBarsSkeleton("adminModelBars");
+  renderSplitSkeleton("adminSplitChart");
+  renderTableSkeleton("adminUserTable", "adminUserCount", 8);
+}
+
 function renderPersonal() {
+  if (isDashboardLoading) {
+    renderPersonalLoading();
+    return;
+  }
   renderPersonalMetrics(usageData);
   renderTrendTo("trendChart", usageData);
   renderSpendTrendTo("spendChart", usageData);
@@ -411,6 +560,10 @@ function renderPersonal() {
 }
 
 function renderAdmin() {
+  if (isAdminLoading) {
+    renderAdminLoading();
+    return;
+  }
   renderAdminMetrics(adminUsageData);
   renderTrendTo("adminTrendChart", adminUsageData);
   renderSpendTrendTo("adminSpendChart", adminUsageData);
@@ -520,6 +673,7 @@ function switchView(view) {
 async function loadDashboardData() {
   if (!currentUser || isDashboardLoading) return;
   isDashboardLoading = true;
+  renderPersonal();
   const { startDate, endDate } = selectedDateRange();
   const source = el("sourceSelect").value;
   try {
@@ -527,20 +681,20 @@ async function loadDashboardData() {
     usageData = payload.rows || [];
     usageSummary = payload.summary || null;
     lastPersonalUsageCacheHit = Boolean(payload.cache?.hit);
-    renderPersonal();
   } catch (error) {
     showToast(error.message || "用量数据加载失败");
     usageData = [];
     usageSummary = null;
-    renderPersonal();
   } finally {
     isDashboardLoading = false;
+    renderPersonal();
   }
 }
 
 async function loadAdminData() {
   if (!currentUser?.isAdmin || isAdminLoading) return;
   isAdminLoading = true;
+  renderAdmin();
   const { startDate, endDate } = selectedDateRange();
   const source = el("sourceSelect").value;
   const search = el("adminEmployeeSearch").value.trim();
@@ -552,14 +706,13 @@ async function loadAdminData() {
     adminUsageData = payload.rows || [];
     adminEmployees = payload.employees || [];
     el("adminLimitHint").textContent = `最多读取 ${payload.pageLimit || "-"} 页日志，按当前筛选范围统计`;
-    renderAdmin();
   } catch (error) {
     showToast(error.message || "全员数据加载失败");
     adminUsageData = [];
     adminEmployees = [];
-    renderAdmin();
   } finally {
     isAdminLoading = false;
+    renderAdmin();
   }
 }
 
