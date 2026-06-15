@@ -1,0 +1,195 @@
+<title>AI Token 用量中心工程架构说明（代码阅读版）</title>
+
+<callout emoji="✅" background-color="light-green" border-color="green" text-color="green">
+  <p>本文基于当前仓库代码重新梳理，而不是仅按部署现状描述。核心实现集中在 backend/main.py、backend/auth.py、backend/litellm_client.py 和 assets/app.js：FastAPI 负责认证与数据代理，LiteLLMClient 负责上游数据适配，前端原生 JS 负责状态、筛选和图表渲染。</p>
+</callout>
+
+<h1>1. 代码架构</h1>
+<p>项目是一个轻量单体应用：后端同时提供 API 与静态页面，前端没有构建步骤，所有浏览器逻辑集中在 assets/app.js。</p>
+<table>
+  <thead><tr><th background-color="light-gray">模块</th><th background-color="light-gray">关键代码</th><th background-color="light-gray">真实职责</th></tr></thead>
+  <tbody>
+    <tr><td>backend/main.py</td><td>app、SessionMiddleware、/api/* routes</td><td>创建 FastAPI app，挂载 /assets，返回 index.html，编排登录、session、用量、模型、密钥接口。</td></tr>
+    <tr><td>backend/auth.py</td><td>build_oauth、require_user、validate_company_email、normalize_user</td><td>注册 Casdoor OIDC client，校验企业邮箱域，从 request.session 取用户，并把 claims 归一化为前端用户对象。</td></tr>
+    <tr><td>backend/litellm_client.py</td><td>LiteLLMClient、resolve_user、usage_rows、keys_for_user、models</td><td>用 LITELLM_ADMIN_KEY 调 LiteLLM Admin API，做用户映射、用量 fallback 聚合、key 所属权校验和模型适配。</td></tr>
+    <tr><td>assets/app.js</td><td>api、init、showApp、loadDashboardData、render*</td><td>维护 currentUser / usageData / modelCatalog，调用 /api/me/usage 和 /api/models，渲染指标、SVG 图表、模型卡片。</td></tr>
+    <tr><td>index.html</td><td>DOM 节点、登录页、仪表盘容器、SVG symbol</td><td>提供静态页面骨架和样式，后端通过 FileResponse 直接返回。</td></tr>
+  </tbody>
+</table>
+
+<callout emoji="📌" background-color="light-blue" border-color="blue" text-color="blue">
+  <p>真实依赖方向是：assets/app.js → FastAPI /api → backend/main.py → auth.py / litellm_client.py → Casdoor / LiteLLM。前端不直接接触 Casdoor token、LiteLLM admin key 或任意 user_id。</p>
+</callout>
+
+<hr/>
+
+<h1>2. 后端请求入口与路由分层</h1>
+<p>backend/main.py 是系统编排层，几乎所有路由都在这里声明。它不直接写复杂上游适配逻辑，而是通过 auth.py 和 LiteLLMClient 做具体能力。</p>
+<table>
+  <thead><tr><th background-color="light-gray">路由</th><th background-color="light-gray">实现要点</th><th background-color="light-gray">返回/副作用</th></tr></thead>
+  <tbody>
+    <tr><td>GET /api/health</td><td>health()</td><td>返回 {status: ok}，用于 Docker healthcheck 和外部验证。</td></tr>
+    <tr><td>GET /api/auth/config</td><td>auth_config()</td><td>返回 devLoginEnabled、oidcConfigured、providerName、allowedEmailDomain。</td></tr>
+    <tr><td>GET /api/auth/me</td><td>auth_me()</td><td>读取 request.session[SESSION_USER_KEY]，无 session 返回 401。</td></tr>
+    <tr><td>POST /api/auth/dev-login</td><td>dev_login()</td><td>仅 DEV_LOGIN_ENABLED=true 可用；校验邮箱域后调用 client().resolve_user() 确认上游员工存在。</td></tr>
+    <tr><td>GET /api/auth/sso/start</td><td>sso_start()</td><td>生成 Casdoor OIDC 授权请求；启用 FEISHU_DIRECT_LOGIN_ENABLED 时第一跳改为飞书 accounts.feishu.cn。</td></tr>
+    <tr><td>GET /api/auth/callback</td><td>sso_callback()</td><td>authorize_access_token → userinfo → claim_value(email/name) → validate_company_email → 写 session。</td></tr>
+    <tr><td>GET /api/me/usage</td><td>my_usage()</td><td>require_user → resolve_user → upstream_user_ids → usage_rows_for_user_ids。</td></tr>
+    <tr><td>GET /api/me/usage/logs</td><td>my_usage_logs()</td><td>目前复用 usage_rows_for_user_ids 后在内存分页，并非直接返回原始 logs。</td></tr>
+    <tr><td>GET /api/me/keys</td><td>my_keys()</td><td>按当前用户映射出的 user_ids 合并 keys_for_user_ids。</td></tr>
+    <tr><td>POST /api/me/keys/{key_id}/regenerate</td><td>regenerate_my_key()</td><td>逐个 user_id 调 regenerate_key，成功后写 audit.log。</td></tr>
+    <tr><td>GET /api/models</td><td>models()</td><td>require_user 后返回 LiteLLMClient.models() 适配后的模型列表。</td></tr>
+  </tbody>
+</table>
+
+<hr/>
+
+<h1>3. 认证架构：Casdoor OIDC + 飞书直达</h1>
+<p>auth.py 的 build_oauth() 使用 Authlib 注册名为 company 的 OIDC client，server_metadata_url 来自 OIDC_ISSUER_URL。main.py 的 sso_start() 再按环境变量组装 provider、method、application 等授权参数。</p>
+
+<pre lang="mermaid" caption="登录链路时序图"><code>sequenceDiagram
+  participant Browser as Browser
+  participant App as FastAPI
+  participant Casdoor as Casdoor
+  participant Feishu as Feishu
+  Browser-&gt;&gt;App: GET /api/auth/sso/start
+  App-&gt;&gt;Casdoor: build OIDC authorize URL and session state
+  App--&gt;&gt;Browser: 307 Redirect to accounts.feishu.cn
+  Browser-&gt;&gt;Feishu: scan and approve
+  Feishu--&gt;&gt;Casdoor: callback /callback
+  Casdoor--&gt;&gt;App: callback /api/auth/callback
+  App--&gt;&gt;Browser: set session and redirect /</code></pre>
+
+<table>
+  <thead><tr><th background-color="light-gray">函数/变量</th><th background-color="light-gray">作用</th></tr></thead>
+  <tbody>
+    <tr><td>FEISHU_DIRECT_LOGIN_ENABLED</td><td>为 true 时，后端不把用户停在 Casdoor 页面，而是把第一跳重定向到飞书。</td></tr>
+    <tr><td>feishu_direct_url()</td><td>从 Authlib 生成的 Casdoor authorize URL 取 query，加 application 后 base64-url 编码到飞书 state。</td></tr>
+    <tr><td>FEISHU_APP_ID</td><td>飞书应用 app_id，用于 accounts.feishu.cn 授权页。</td></tr>
+    <tr><td>FEISHU_REDIRECT_URI</td><td>飞书回调 Casdoor 的 /callback 地址，不是本应用 /api/auth/callback。</td></tr>
+    <tr><td>OIDC_APPLICATION_NAME</td><td>传给 Casdoor 的 application=ai-token-dashboard，用于选择正确应用上下文。</td></tr>
+    <tr><td>validate_company_email()</td><td>最终根据 ALLOWED_EMAIL_DOMAIN 限制企业邮箱。</td></tr>
+  </tbody>
+</table>
+
+<hr/>
+
+<h1>4. LiteLLM 数据适配逻辑</h1>
+<p>LiteLLMClient 是本项目最核心的数据适配层。它不是简单透传上游接口，而是做了用户解析、source 识别、用量 fallback 和字段归一化。</p>
+
+<h2>4.1 用户映射 resolve_user()</h2>
+<table>
+  <thead><tr><th background-color="light-gray">步骤</th><th background-color="light-gray">代码逻辑</th></tr></thead>
+  <tbody>
+    <tr><td>邮箱标准化</td><td>email_lower = email.lower()，email_prefix = @ 前缀。</td></tr>
+    <tr><td>分页扫用户</td><td>循环 /user/list page 1..50，每页 100。</td></tr>
+    <tr><td>邮箱匹配</td><td>user_email 或 sso_user_id 等于完整邮箱时，记录 user_id，source=user_email。</td></tr>
+    <tr><td>legacy 匹配</td><td>user_id 或 user_alias 等于邮箱前缀时，记录 user_id，source=legacy_user。</td></tr>
+    <tr><td>key alias 兜底</td><td>user_ids_from_key_alias() 查询 cursor-{prefix}、claude-code-{prefix}、prefix 三种 key_alias。</td></tr>
+    <tr><td>输出</td><td>返回 matched_user_ids、matched_sources、matched_by=email_and_legacy。</td></tr>
+  </tbody>
+</table>
+
+<h2>4.2 用量查询 usage_rows()</h2>
+<whiteboard type="mermaid">
+flowchart TD
+  A[usage_rows user_id/date/source] --> B{按 key 日聚合可用?}
+  B -->|是| C[_usage_from_key_daily_activity]
+  B -->|否| D{明细日志可用?}
+  D -->|是| E[_usage_from_logs /spend/logs/v2]
+  D -->|否| F[_usage_from_daily_activity]
+  C --> G[统一 row 字段]
+  E --> G
+  F --> G
+  G --> H[date/source/model/promptTokens/completionTokens/totalTokens/requestCount/successCount/failureCount/spend]
+</whiteboard>
+
+<table>
+  <thead><tr><th background-color="light-gray">来源</th><th background-color="light-gray">触发条件</th><th background-color="light-gray">特点</th></tr></thead>
+  <tbody>
+    <tr><td>_usage_from_key_daily_activity</td><td>默认优先，先 keys_for_user(user_id)，最多取前 25 个 key</td><td>用 detect_source_from_key() 把 key 归类为 Cursor / Claude Code / 其他。</td></tr>
+    <tr><td>_usage_from_logs</td><td>key 日聚合失败或无数据</td><td>读 /spend/logs/v2，按 day/source/model 分组累加，受 USAGE_LOG_MAX_PAGES 控制。</td></tr>
+    <tr><td>_usage_from_daily_activity</td><td>logs 也失败或无数据</td><td>先 /user/daily/activity/aggregated，失败再 /user/daily/activity。</td></tr>
+  </tbody>
+</table>
+
+<h2>4.3 密钥与模型</h2>
+<ul>
+  <li>keys_for_user() 调 /key/list?user_id=...&amp;return_full_object=true，返回 id、name、purpose、masked、lastUsed、monthTokens、spend、status。</li>
+  <li>regenerate_key() 先重新查 owned_keys，确认 key_id 属于当前 user_id，再 POST /key/regenerate，并设置 litellm-changed-by。</li>
+  <li>models() 调 /models，把 model_name/provider/capabilities/contextWindow 等字段归一化；provider 缺失时由 provider_from_model() 通过模型名推断。</li>
+</ul>
+
+<hr/>
+
+<h1>5. 前端代码路径</h1>
+<p>assets/app.js 是无框架前端。所有数据请求走 api(path, options)，自动带 credentials: same-origin，所以依赖后端 session cookie。</p>
+<table>
+  <thead><tr><th background-color="light-gray">函数</th><th background-color="light-gray">作用</th><th background-color="light-gray">后端依赖</th></tr></thead>
+  <tbody>
+    <tr><td>init()</td><td>先拉 /api/auth/config，再拉 /api/auth/me 判断是否已登录。</td><td>/api/auth/config、/api/auth/me</td></tr>
+    <tr><td>showLogin()</td><td>隐藏 appView，展示 loginView。</td><td>无</td></tr>
+    <tr><td>ssoButton click</td><td>如果 OIDC 已配置，window.location.href=/api/auth/sso/start。</td><td>/api/auth/sso/start</td></tr>
+    <tr><td>showApp(user)</td><td>写入用户邮箱、姓名、头像，切到 dashboard，并并发加载 usage 和 models。</td><td>/api/me/usage、/api/models</td></tr>
+    <tr><td>loadDashboardData()</td><td>根据 selectedDateRange() 和 sourceSelect 请求用量。</td><td>/api/me/usage</td></tr>
+    <tr><td>loadModels()</td><td>加载模型广场并初始化 provider/capability 筛选。</td><td>/api/models</td></tr>
+    <tr><td>render*()</td><td>前端本地聚合 usageData，渲染指标、折线图、donut、模型排行、表格。</td><td>无额外请求</td></tr>
+  </tbody>
+</table>
+
+<callout emoji="❗" background-color="light-yellow" border-color="yellow" text-color="yellow">
+  <p>代码阅读发现：后端已实现 /api/me/keys 和 key regenerate，但当前 assets/app.js 没有实际加载 /api/me/keys，也没有绑定 regenerate key 的 UI 流程；文档中不应把“密钥页面已由前端完整使用”描述为已完成。</p>
+</callout>
+
+<hr/>
+
+<h1>6. 真实数据流转图</h1>
+<pre lang="mermaid" caption="真实数据流转图"><code>flowchart LR
+  Init[assets/app.js init] --&gt; Config[GET /api/auth/config]
+  Init --&gt; Me[GET /api/auth/me]
+  Login[SSO Button] --&gt; SSO[GET /api/auth/sso/start]
+  SSO --&gt; OAuth[auth.py build_oauth]
+  Callback[GET /api/auth/callback] --&gt; Email[validate_company_email]
+  Callback --&gt; Session[request.session user]
+  LoadUsage[loadDashboardData] --&gt; Usage[GET /api/me/usage]
+  Usage --&gt; Resolve[LiteLLMClient resolve_user]
+  Resolve --&gt; UserList[LiteLLM /user/list]
+  Resolve --&gt; KeyAlias[LiteLLM /key/list by alias]
+  Usage --&gt; KeyDaily[key daily activity]
+  Usage --&gt; Logs[LiteLLM /spend/logs/v2]
+  Usage --&gt; Daily[LiteLLM /user/daily/activity]
+  LoadModels[loadModels] --&gt; Models[GET /api/models]
+  Models --&gt; ModelAPI[LiteLLM /models]
+  Usage --&gt; Render[renderMetrics renderTrend renderTable]</code></pre>
+
+<hr/>
+
+<h1>7. 技术部署架构</h1>
+<table>
+  <thead><tr><th background-color="light-gray">层</th><th background-color="light-gray">当前实现</th><th background-color="light-gray">代码/配置依据</th></tr></thead>
+  <tbody>
+    <tr><td>应用运行</td><td>Docker 容器 ai-token-dashboard-s3，uvicorn backend.main:app --host 0.0.0.0 --port 8000。</td><td>Dockerfile CMD</td></tr>
+    <tr><td>静态资源</td><td>FastAPI StaticFiles 挂载 /assets，/ 和 SPA fallback 返回 index.html。</td><td>app.mount('/assets')、index()、spa_fallback()</td></tr>
+    <tr><td>公网入口</td><td>myai.carher.net 通过 cloudflared-myai 专用 tunnel 进入 Docker 网络。</td><td>188 上 cloudflared-myai.yml</td></tr>
+    <tr><td>应用端口</td><td>宿主机仅 127.0.0.1:18080 映射到容器 8000。</td><td>docker-compose.s3.yml</td></tr>
+    <tr><td>会话</td><td>Starlette SessionMiddleware，secret_key 来自 SESSION_SECRET，APP_BASE_URL 为 https 时 cookie https_only=true。</td><td>backend/main.py</td></tr>
+  </tbody>
+</table>
+
+<hr/>
+
+<h1>8. 代码阅读发现的问题与建议</h1>
+<table>
+  <thead><tr><th background-color="light-gray">发现</th><th background-color="light-gray">影响</th><th background-color="light-gray">建议</th></tr></thead>
+  <tbody>
+    <tr><td>assets/app.js 的 renderLineChart() 中 const path 重复声明。</td><td>在浏览器 JS 中同一作用域重复 const 会导致语法错误，可能阻断前端脚本执行。</td><td>删除重复的 const path 声明，重新浏览器验证首页和仪表盘。</td></tr>
+    <tr><td>showApp() 连续两次 el('appView').classList.remove('hidden')。</td><td>无功能性影响，但说明代码有重复。</td><td>清理重复语句。</td></tr>
+    <tr><td>后端实现了 keys 接口，但前端没有调用 /api/me/keys。</td><td>密钥查询/更新能力后端存在，用户界面未真正串起来。</td><td>补 key 列表加载、regenerate 按钮绑定和一次性新 key 展示。</td></tr>
+    <tr><td>/api/me/usage/logs 当前返回聚合 rows 的分页，不是原始日志。</td><td>接口名 logs 容易误导调用方。</td><td>要么改名/文案，要么新增原始日志查询逻辑。</td></tr>
+    <tr><td>LiteLLM resolve_user() 最多扫描 /user/list 50 页。</td><td>用户数超过 5000 或分页异常时可能找不到员工。</td><td>优先使用服务端精确查询能力；没有则保留 debug mapping 便于排查。</td></tr>
+  </tbody>
+</table>
+
+<callout emoji="⚠️" background-color="light-red" border-color="red" text-color="red">
+  <p>最优先修复项是 assets/app.js 中 renderLineChart() 的重复 const path。这个问题属于前端启动级风险，比文档或部署配置更紧急。</p>
+</callout>
