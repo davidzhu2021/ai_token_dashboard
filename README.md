@@ -1,41 +1,78 @@
-# AI 鐢ㄩ噺涓績
+# AI 用量中心
 
-杩欐槸涓€涓腑鏂?AI Token 鐢ㄩ噺鏌ヨ绯荤粺锛屽綋鍓嶅凡鎺ュ叆鐙珛 FastAPI 鍚庣锛屽苟鎸夊叕鍙哥幇鏈?**Casdoor + 椋炰功 SSO** 鏂规鎻愪緵鎵爜鐧诲綍銆傚墠绔彧璋冪敤鏈郴缁熺殑 `/api/*` 鎺ュ彛锛岀鐞嗗憳瀵嗛挜銆丱IDC client secret 鍜岃璇?token 閮藉彧淇濆瓨鍦ㄥ悗绔€?
-## 鏈湴鍚姩
+AI 用量中心是一个面向公司员工的 AI 工具用量查询系统。项目由 FastAPI 后端和静态前端组成，后端负责登录、权限校验、真实用量聚合与模型列表查询，前端负责中文看板、图表和模型广场展示。
+
+系统入口默认由后端统一提供，避免前后端跨域配置：
+
+```powershell
+http://127.0.0.1:8010
+```
+
+## 当前能力
+
+- 飞书扫码登录：复用公司 Casdoor + 飞书 SSO 登录链路。
+- 我的用量：员工登录后只查看自己的 Token、金额、请求次数、成功率、来源拆分和模型排行。
+- 模型广场：展示当前员工可用模型，支持搜索、筛选和复制模型名称。
+- 管理员全员看板：管理员邮箱白名单登录后可查看全员聚合用量和员工排行。
+- 个人看板缓存：员工映射缓存 30 分钟，个人用量结果缓存 5 分钟，提升重复加载速度。
+
+## 目录结构
+
+```text
+D:\ai-token-dashboard
+├── backend\
+│   ├── auth.py              # 登录用户、管理员权限和会话处理
+│   ├── cache.py             # 轻量内存 TTL 缓存
+│   ├── litellm_client.py    # 上游网关接口封装与数据聚合
+│   └── main.py              # FastAPI 路由入口
+├── assets\
+│   └── app.js               # 前端交互、图表和页面渲染
+├── index.html               # 静态前端页面
+├── requirements.txt         # Python 依赖
+├── .env.example             # 环境变量模板
+└── README.md
+```
+
+## 本地启动
+
+在 PowerShell 中执行：
 
 ```powershell
 cd D:\ai-token-dashboard
 py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+Copy-Item .env.example .env
 ```
 
-鎵撳紑锛?
-```text
-http://127.0.0.1:8000
+编辑 `D:\ai-token-dashboard\.env`，填入后端真实配置。不要把 `.env` 提交到 Git。
+
+启动服务：
+
+```powershell
+cd D:\ai-token-dashboard
+.\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8010 --reload
 ```
 
-## 椋炰功鎵爜鐧诲綍
+浏览器打开：
 
-鍦?Casdoor 鐨?`cltx` organization 涓嬩负 AI 鐢ㄩ噺涓績鏂板缓鐙珛 application锛?
 ```text
-Application name: ai-token-dashboard
-Organization: cltx
-Provider: 鐜版湁椋炰功 Provider
-Redirect URI: https://ai-usage.auto-link.com.cn/api/auth/callback
+http://127.0.0.1:8010
 ```
 
-鍚庣 `.env` 鎺ㄨ崘閰嶇疆锛?
-```text
+## 环境变量
+
+`.env.example` 只放模板值，真实密钥只写入本地或部署环境的 `.env` / Secret。
+
+```env
 LITELLM_BASE_URL=https://cc.auto-link.com.cn/pro
-LITELLM_ADMIN_KEY=<绠＄悊鍛樺瘑閽ワ紝浠呭悗绔繚瀛?
+LITELLM_ADMIN_KEY=<backend-admin-key>
 
-APP_BASE_URL=https://ai-usage.auto-link.com.cn
-SESSION_SECRET=<闅忔満闀垮瓧绗︿覆>
+APP_BASE_URL=http://127.0.0.1:8010
+SESSION_SECRET=<random-long-session-secret>
 
 OIDC_ISSUER_URL=http://10.68.13.198:30882
-OIDC_CLIENT_ID=<ai-token-dashboard client id>
-OIDC_CLIENT_SECRET=<ai-token-dashboard client secret>
+OIDC_CLIENT_ID=<casdoor-application-client-id>
+OIDC_CLIENT_SECRET=<casdoor-application-client-secret>
 OIDC_CASDOOR_APPLICATION_ID=admin/ai-token-dashboard
 OIDC_DIRECT_PROVIDER=lark-provider
 OIDC_DIRECT_METHOD=signup
@@ -44,75 +81,179 @@ OIDC_PROVIDER_LOGIN_HOST=accounts.feishu.cn
 OAUTH_PROVIDER_NAME=飞书扫码登录
 ALLOWED_EMAIL_DOMAIN=auto-link.com.cn
 
+ADMIN_EMAILS=admin1@auto-link.com.cn,admin2@auto-link.com.cn
+
 DEV_LOGIN_ENABLED=false
 DEBUG_MAPPING_ENABLED=false
 DEBUG_OIDC_CLAIMS=false
 USAGE_LOG_MAX_PAGES=20
-```
-
-濡傞渶鐐瑰嚮鈥滈涔︽壂鐮佺櫥褰曗€濆悗鐩磋揪椋炰功椤甸潰锛宍OIDC_DIRECT_PROVIDER` 闇€瑕佷笌 Casdoor 涓殑椋炰功 Provider 鍚嶇О涓€鑷达紱鍚庣浼氭妸瀹冧綔涓?`provider_hint` 浼犵粰 Casdoor銆傚鏋?Casdoor 宸茬粡鏈?HTTPS 鍙嶄唬鍦板潃锛宍OIDC_ISSUER_URL` 浼樺厛浣跨敤 HTTPS 鍦板潃銆傚悗绔悓鏃跺吋瀹?issuer base URL 鍜屽畬鏁?discovery URL锛?
-```text
-https://casdoor.example.com
-https://casdoor.example.com/.well-known/openid-configuration
-```
-
-鏈湴寮€鍙戦獙璇佺湡瀹炴暟鎹椂鍙复鏃跺惎鐢?`DEV_LOGIN_ENABLED=true`锛涚敓浜х幆澧冨繀椤诲叧闂€?
-## 宸插疄鐜版帴鍙?
-```text
-GET  /api/auth/config
-GET  /api/auth/me
-GET  /api/auth/sso/start
-GET  /api/auth/callback
-POST /api/auth/logout
-POST /api/auth/dev-login
-GET  /api/me/usage?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD&source=all
-GET  /api/me/usage/logs?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD&page=1&page_size=50
-GET  /api/me/keys
-POST /api/me/keys/{key_id}/regenerate
-GET  /api/models
-GET  /api/debug/me-mapping  # only when DEBUG_MAPPING_ENABLED=true
-```
-
-## 鏁版嵁璇存槑
-
-- 椋炰功鎵爜鐧诲綍鍚庯紝鍚庣鍙繚瀛樻渶灏?session 淇℃伅锛氶偖绠便€佸鍚嶃€佸ご鍍忛瀛楁瘝銆?- 鍙湁 `ALLOWED_EMAIL_DOMAIN` 鎸囧畾鐨勫叕鍙搁偖绠卞厑璁哥櫥褰曘€?- 鍛樺伐韬唤閫氳繃閭鍖归厤涓婃父鐢ㄦ埛鐨?`user_email`銆乣sso_user_id` 鎴?`user_id`銆?- 鐢ㄩ噺鏁版嵁浼樺厛鎸変釜浜鸿闂瘑閽ユ煡璇㈡棩鑱氬悎锛屽啀鍥為€€鍒版槑缁嗘棩蹇楀拰鐢ㄦ埛鏃ヨ仛鍚堟帴鍙ｃ€?- 璁块棶瀵嗛挜鏉ヨ嚜 `/key/list?user_id=<褰撳墠鍛樺伐>&return_full_object=true`锛屽墠绔彧灞曠ず鑴辨晱鍊笺€?- 妯″瀷骞垮満鏉ヨ嚜 `/models`锛屽墠绔睍绀哄悗绔繑鍥炵殑褰撳墠璐﹀彿鍙敤妯″瀷銆?
-## 瀹夊叏绾︽潫
-
-- 绠＄悊鍛樺瘑閽ヤ笉寰楄繘鍏ュ墠绔唬鐮併€佹祻瑙堝櫒瀛樺偍鎴栨棩蹇椼€?- OIDC `client_secret`銆佽璇?token銆乮d_token 涓嶅緱杩涘叆鍓嶇浠ｇ爜銆佹祻瑙堝櫒瀛樺偍鎴栨棩蹇椼€?- 鍓嶇涓嶈兘浼犱换鎰?`user_id` 鏌ヨ鏁版嵁锛屽悗绔缁堜粠褰撳墠浼氳瘽璇嗗埆鍛樺伐銆?- 鏇存柊璁块棶瀵嗛挜鍓嶏紝鍚庣浼氭牎楠岃瀵嗛挜灞炰簬褰撳墠鍛樺伐銆?- 瀹屾暣鏂板瘑閽ュ彧鍦ㄦ洿鏂板悗杩斿洖涓€娆°€?- 鐢熶骇鐜蹇呴』浣跨敤椋炰功鎵爜鐧诲綍锛屽苟淇濇寔 `DEV_LOGIN_ENABLED=false`銆?- `.env`銆佽櫄鎷熺幆澧冨拰瀹¤鏃ュ織宸插姞鍏?`.gitignore`銆?
-## 绠＄悊鍛樺叏鍛樼湅鏉?
-鍦ㄥ悗绔?`.env` 涓厤缃鐞嗗憳閭鐧藉悕鍗曞悗锛屽搴斿憳宸ラ涔︾櫥褰曚細鐪嬪埌鈥滃叏鍛樼湅鏉库€濓細
-
-```text
-ADMIN_EMAILS=zhuyida@auto-link.com.cn,leader@auto-link.com.cn
+USER_MAPPING_CACHE_TTL_SECONDS=1800
+PERSONAL_USAGE_CACHE_TTL_SECONDS=300
 ADMIN_USAGE_LOG_MAX_PAGES=30
 ADMIN_USAGE_PAGE_SIZE=100
 ```
 
-绠＄悊鍛樻帴鍙ｏ細
+说明：
+
+- `LITELLM_ADMIN_KEY` 只允许后端读取，前端永远不能保存或展示。
+- `APP_BASE_URL` 本地开发可用 `http://127.0.0.1:8010`，生产环境改为正式域名。
+- `SESSION_SECRET` 必须使用随机长字符串，生产环境不要使用示例值。
+- `ADMIN_EMAILS` 是管理员白名单，普通员工不会看到全员看板入口。
+- `ADMIN_USAGE_PAGE_SIZE` 必须小于等于 100；上游接口单页最大值就是 100。想扩大覆盖范围时增加 `ADMIN_USAGE_LOG_MAX_PAGES`，不要增大单页大小。
+
+## 飞书扫码登录配置
+
+系统使用 Casdoor 作为 OIDC 中枢，飞书作为登录 Provider。
+
+Casdoor 侧建议配置：
+
+- Organization：`cltx`
+- Application：`ai-token-dashboard`
+- Provider：`lark-provider`
+- Redirect URI：
+  - 本地：`http://127.0.0.1:8010/api/auth/callback`
+  - 生产：`https://ai-usage.auto-link.com.cn/api/auth/callback`
+
+后端登录入口：
 
 ```text
-GET /api/admin/usage?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD&source=all&employee=
-GET /api/admin/users?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD&source=all&q=
+GET /api/auth/sso/start
 ```
 
-璇存槑锛?
-- 绠＄悊鍛樿韩浠藉彧鐢卞悗绔?`.env` 鐨?`ADMIN_EMAILS` 鍒ゆ柇锛屽墠绔笉鑳借嚜琛屽０鏄庣鐞嗗憳銆?- `/api/admin/*` 蹇呴』鐧诲綍涓斿睘浜庣鐞嗗憳鐧藉悕鍗曪紝鏅€氬憳宸ヨ闂繑鍥?403銆?- 鍏ㄥ憳鐪嬫澘鍙繑鍥炶仛鍚堢粺璁°€佸憳宸ュ鍚?閭銆佹ā鍨嬪拰宸ュ叿鏉ユ簮锛屼笉杩斿洖 prompt/response 鍐呭锛屼篃涓嶈繑鍥?`sk-...` 瀵嗛挜銆?- 鍏ㄥ憳鏃ュ織鏉ヨ嚜涓婃父 `/spend/logs/v2`锛宍ADMIN_USAGE_LOG_MAX_PAGES` 鍜?`ADMIN_USAGE_PAGE_SIZE` 鐢ㄤ簬闄愬埗棣栫増鏌ヨ瑙勬ā锛岄伩鍏嶄竴娆¤鍙栬繃澶с€?
+如果 `OIDC_SKIP_CASDOOR_PAGE=true`，后端会尝试提取飞书真实登录地址并直接跳转到飞书扫码页。提取失败时会回退到标准 Casdoor 授权页，保证登录链路不中断。
 
+## 接口概览
 
+认证接口：
 
+- `GET /api/auth/config`：返回登录按钮名称和开发登录开关。
+- `GET /api/auth/me`：返回当前登录员工信息和 `isAdmin`。
+- `GET /api/auth/sso/start`：发起飞书扫码登录。
+- `GET /api/auth/callback`：OIDC 登录回调。
+- `POST /api/auth/logout`：退出登录。
 
-## ??????
+员工接口：
 
-?????????????????????????????????????
+- `GET /api/me/usage`：返回我的用量汇总、趋势、来源拆分、模型排行和明细。
+- `GET /api/me/usage/logs`：返回我的用量明细分页。
+- `GET /api/models`：返回当前员工可用模型列表。
+
+管理员接口：
+
+- `GET /api/admin/usage`：返回全员或指定员工聚合用量。
+- `GET /api/admin/users`：返回员工用量排行。
+
+调试接口：
+
+- `GET /api/debug/me-mapping`：开发环境查看当前邮箱匹配到的上游账号。
+- `GET /api/debug/me-usage-compare`：开发环境对比不同上游口径的个人用量聚合。
+
+调试接口只有在 `DEBUG_MAPPING_ENABLED=true` 时可用，生产环境应保持关闭。
+
+## 数据口径
+
+我的用量以当前登录员工邮箱为主身份：
+
+- 优先匹配上游用户列表中的 `user_email`。
+- 兼容旧账号命名，例如 `cursor-邮箱前缀`、`claude-code-邮箱前缀`、`邮箱前缀`。
+- 员工不能通过前端传入任意 `user_id` 查询他人数据。
+
+前端展示口径：
+
+- 最近一天：当前筛选结果中最新日期的整日汇总，不是最新一条明细。
+- 所选日期范围：按当前日期范围和来源筛选累计。
+- 金额：使用后端返回的 `spend` 汇总，展示为预估美元金额。
+- 请求成功率：成功请求数除以请求总数。
+- 来源拆分：当前区分 Cursor 和 Claude Code。
+
+缓存口径：
+
+- 用户映射缓存默认 1800 秒。
+- 个人用量缓存默认 300 秒。
+- 缓存 key 按员工邮箱、开始日期、结束日期和来源隔离。
+- 数据允许最多 5 分钟延迟；点击刷新或缓存过期后会重新查询上游。
+
+## 管理员全员看板
+
+管理员身份由后端 `.env` 的 `ADMIN_EMAILS` 决定。登录邮箱命中白名单后，`/api/auth/me` 会返回：
+
+```json
+{
+  "isAdmin": true
+}
+```
+
+管理员可以查看：
+
+- 全员 Token、金额、请求次数、成功率。
+- 活跃员工数。
+- Cursor / Claude Code 来源拆分。
+- 每日 Token 趋势和每日金额消费趋势。
+- 员工排行和员工详情。
+
+管理员看板不展示访问密钥明文，不返回 prompt 或 response 内容。
+
+## 安全规则
+
+- 管理员 key、OIDC client secret、session secret 只保存在后端环境变量或部署 Secret 中。
+- 前端不保存管理员 key、OIDC token 或访问密钥明文。
+- 普通员工只能访问 `/api/me/*` 下自己的数据。
+- 管理员全员数据只能通过 `/api/admin/*` 获取，且必须命中 `ADMIN_EMAILS`。
+- 不在日志中打印管理员 key、OIDC token、访问密钥明文、prompt 或 response 内容。
+- `.env` 已加入忽略规则，不应提交到远端仓库。
+
+## 常见问题
+
+### 登录按钮显示乱码
+
+检查 `.env` 和 `.env.example`：
+
+```env
+OAUTH_PROVIDER_NAME=飞书扫码登录
+```
+
+如果 `.env` 曾被错误编码保存，建议用支持 UTF-8 的编辑器重新保存，然后重启后端。
+
+### 点击飞书扫码登录后仍短暂看到 Casdoor 页面
+
+确认以下配置：
+
+```env
+OIDC_DIRECT_PROVIDER=lark-provider
+OIDC_DIRECT_METHOD=signup
+OIDC_SKIP_CASDOOR_PAGE=true
+OIDC_PROVIDER_LOGIN_HOST=accounts.feishu.cn
+```
+
+如果 Casdoor 页面结构变化，后端提取飞书链接可能失败，会自动回退到标准登录流程。
+
+### 全员看板报 page_size 超过限制
+
+上游接口单页最大值为 100。确认：
+
+```env
+ADMIN_USAGE_PAGE_SIZE=100
+```
+
+修改后需要重启后端。
+
+### 我的用量加载慢
+
+首次加载需要查询上游并聚合数据，后续同一日期范围和来源会命中 5 分钟个人用量缓存。可以检查 `/api/me/usage` 响应中的 `cache.hit` 判断是否命中缓存。
+
+### 我的用量和公司原系统不一致
+
+先确认日期范围、来源筛选和员工账号映射是否一致。开发环境可临时开启：
+
+```env
+DEBUG_MAPPING_ENABLED=true
+```
+
+然后访问：
 
 ```text
-USER_MAPPING_CACHE_TTL_SECONDS=1800
-PERSONAL_USAGE_CACHE_TTL_SECONDS=300
+/api/debug/me-mapping
+/api/debug/me-usage-compare
 ```
 
-???
-
-- ????????????????????????????????
-- ???????????????????????????? 5 ???
-- ??????????????????????? token ? `sk-...` ???
-- ???????????????????????? SQLite ? Redis?
+排查完成后应关闭调试开关并重启服务。
