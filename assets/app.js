@@ -378,10 +378,25 @@ function renderTable(data) {
     : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">当前筛选范围暂无用量记录</td></tr>`;
 }
 
+function sortedAdminEmployees(items) {
+  return items.slice().sort((a, b) => {
+    const tokenDiff = Number(b.totalTokens || 0) - Number(a.totalTokens || 0);
+    if (tokenDiff) return tokenDiff;
+    const spendDiff = Number(b.spend || 0) - Number(a.spend || 0);
+    if (spendDiff) return spendDiff;
+    const requestDiff = Number(b.requestCount || 0) - Number(a.requestCount || 0);
+    if (requestDiff) return requestDiff;
+    const aName = a.employeeName || a.employeeEmail || a.employeeId || "";
+    const bName = b.employeeName || b.employeeEmail || b.employeeId || "";
+    return aName.localeCompare(bName, "zh-CN");
+  });
+}
+
 function renderAdminUsers() {
+  const employees = sortedAdminEmployees(adminEmployees);
   el("adminUserCount").textContent = `${adminEmployees.length} 人`;
-  el("adminUserTable").innerHTML = adminEmployees.length
-    ? adminEmployees
+  el("adminUserTable").innerHTML = employees.length
+    ? employees
         .map((item) => {
           const requests = Number(item.requestCount || 0);
           const successRate = requests ? Math.round((Number(item.successCount || 0) / requests) * 1000) / 10 : 0;
@@ -710,9 +725,9 @@ async function loadAdminData() {
     adminSummaryData = payload.summaryRows || adminUsageData;
     adminEmployees = payload.employees || [];
     if (payload.truncated) {
-      el("adminLimitHint").textContent = `日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），员工排行可能不完整`;
+      el("adminLimitHint").textContent = `默认按 Token 从高到低排序；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），员工排行可能不完整`;
     } else {
-      el("adminLimitHint").textContent = `已读取 ${payload.pagesRead || 0} 页日志，按当前筛选范围统计`;
+      el("adminLimitHint").textContent = `默认按 Token 从高到低排序；已读取 ${payload.pagesRead || 0} 页日志，按当前筛选范围统计`;
     }
   } catch (error) {
     showToast(error.message || "全员数据加载失败");

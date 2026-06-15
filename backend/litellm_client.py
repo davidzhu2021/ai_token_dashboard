@@ -706,7 +706,16 @@ class LiteLLMClient:
             sources = source_totals.get(employee_id, {})
             if sources:
                 summary["primarySource"] = max(sources.items(), key=lambda item: item[1])[0]
-        return sorted(grouped.values(), key=lambda item: item["totalTokens"], reverse=True)
+        return sorted(grouped.values(), key=self._admin_employee_sort_key)
+
+    def _admin_employee_sort_key(self, employee: dict[str, Any]) -> tuple[float, float, float, str]:
+        name = str(employee.get("employeeName") or employee.get("employeeEmail") or employee.get("employeeId") or "")
+        return (
+            -_as_number(employee.get("totalTokens")),
+            -_as_number(employee.get("spend")),
+            -_as_number(employee.get("requestCount")),
+            name.lower(),
+        )
 
     async def models(self) -> list[dict[str, Any]]:
         payload = await self.request("GET", "/models")
