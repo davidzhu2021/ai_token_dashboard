@@ -1,6 +1,6 @@
-import os
+﻿import os
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Any
 
 import httpx
@@ -50,15 +50,11 @@ def _date_text(value: Any) -> str:
     return text[:10]
 
 
-def _contains_any(value: Any, words: tuple[str, ...]) -> bool:
-    text = str(value or "").lower()
-    return any(word in text for word in words)
-
-
 def detect_source(record: dict[str, Any]) -> str:
     metadata = _first(record, "metadata", "request_tags", "tags", default={})
     values = [
         _first(record, "source", "tool", "client", "application", default=""),
+        _first(record, "user", "user_id", "end_user", default=""),
         _first(record, "key_alias", "key_name", "api_key_alias", default=""),
         metadata,
     ]
@@ -152,7 +148,7 @@ class LiteLLMClient:
             return "管理员密钥无权限或已失效"
         if response.status_code == 404:
             return "上游接口不存在或资源未找到"
-        return f"上游接口失败，HTTP {response.status_code}"
+        return f"上游接口失败：HTTP {response.status_code}"
 
     async def resolve_user(self, email: str) -> dict[str, Any]:
         email_lower = email.lower()
@@ -183,10 +179,9 @@ class LiteLLMClient:
                 elif any(str(candidate or "").lower() == email_prefix for candidate in legacy_candidates):
                     matched_users.append(user)
                     add_user_id(user_id, "legacy_user")
-            if isinstance(payload, dict):
-                total_pages = _as_int(payload.get("total_pages"))
-                if total_pages and page >= total_pages:
-                    break
+            total_pages = _as_int(payload.get("total_pages")) if isinstance(payload, dict) else 0
+            if total_pages and page >= total_pages:
+                break
 
         for user_id in await self.user_ids_from_key_alias(email_prefix):
             add_user_id(user_id, "key_alias")
@@ -227,7 +222,6 @@ class LiteLLMClient:
         if rows:
             return rows
 
-        rows: list[dict[str, Any]] = []
         try:
             rows = await self._usage_from_logs(user_id, start_date, end_date, source)
         except HTTPException:
@@ -249,16 +243,31 @@ class LiteLLMClient:
             key_source = detect_source_from_key(key)
             if source and source != "all" and key_source != source:
                 continue
-            key_rows = await self._usage_from_daily_activity(
-                user_id=user_id,
-                start_date=start_date,
-                end_date=end_date,
-                source="all",
-                api_key=key["id"],
-                source_override=key_source,
+            rows.extend(
+                await self._usage_from_daily_activity(
+                    user_id=user_id,
+                    start_date=start_date,
+                    end_date=end_date,
+                    source="all",
+                    api_key=key["id"],
+                    source_override=key_source,
+                )
             )
-            rows.extend(key_rows)
         return rows
+
+    async def usage_from_daily_activity_for_debug(self, user_id: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
+        return await self._usage_from_daily_activity(user_id, start_date, end_date, "all")
+
+    async def usage_from_logs_for_debug(self, user_id: str, start_date: str, end_date: str, max_pages: int = 3) -> list[dict[str, Any]]:
+        original = os.getenv("USAGE_LOG_MAX_PAGES")
+        os.environ["USAGE_LOG_MAX_PAGES"] = str(max(1, max_pages))
+        try:
+            return await self._usage_from_logs(user_id, start_date, end_date, "all")
+        finally:
+            if original is None:
+                os.environ.pop("USAGE_LOG_MAX_PAGES", None)
+            else:
+                os.environ["USAGE_LOG_MAX_PAGES"] = original
 
     async def _usage_from_logs(self, user_id: str, start_date: str, end_date: str, source: str | None) -> list[dict[str, Any]]:
         max_pages = max(1, int(os.getenv("USAGE_LOG_MAX_PAGES", "20")))
@@ -287,38 +296,41 @@ class LiteLLMClient:
                 model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
                 day = _date_text(_first(log, "startTime", "start_time", "created_at", "date"))
                 key = (day, detected_source, model)
-                row = grouped.setdefault(
-                    key,
-                    {
-                        "date": day,
-                        "source": detected_source,
-                        "model": model,
-                        "promptTokens": 0,
-                        "completionTokens": 0,
-                        "totalTokens": 0,
-                        "requestCount": 0,
-                        "successCount": 0,
-                        "failureCount": 0,
-                        "spend": 0.0,
-                    },
-                )
-                prompt = _as_int(_first(log, "prompt_tokens", "promptTokens", "input_tokens"))
-                completion = _as_int(_first(log, "completion_tokens", "completionTokens", "output_tokens"))
-                total = _as_int(_first(log, "total_tokens", "totalTokens", default=prompt + completion))
-                status = str(_first(log, "status", "status_filter", "response_status", default="success")).lower()
-                row["promptTokens"] += prompt
-                row["completionTokens"] += completion
-                row["totalTokens"] += total
-                row["requestCount"] += 1
-                row["spend"] += _as_number(_first(log, "spend", "cost", "total_spend"))
-                if "fail" in status or "error" in status:
-                    row["failureCount"] += 1
-                else:
-                    row["successCount"] += 1
+                row = grouped.setdefault(key, self._empty_usage_row(day, detected_source, model))
+                self._add_log_to_row(row, log)
             total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=0)) if isinstance(payload, dict) else 0
             if total_pages and page >= total_pages:
                 break
         return sorted(grouped.values(), key=lambda item: (item["date"], item["source"], item["model"]))
+
+    def _empty_usage_row(self, day: str, source: str, model: str) -> dict[str, Any]:
+        return {
+            "date": day,
+            "source": source,
+            "model": model,
+            "promptTokens": 0,
+            "completionTokens": 0,
+            "totalTokens": 0,
+            "requestCount": 0,
+            "successCount": 0,
+            "failureCount": 0,
+            "spend": 0.0,
+        }
+
+    def _add_log_to_row(self, row: dict[str, Any], log: dict[str, Any]) -> None:
+        prompt = _as_int(_first(log, "prompt_tokens", "promptTokens", "input_tokens"))
+        completion = _as_int(_first(log, "completion_tokens", "completionTokens", "output_tokens"))
+        total = _as_int(_first(log, "total_tokens", "totalTokens", default=prompt + completion))
+        status = str(_first(log, "status", "status_filter", "response_status", default="success")).lower()
+        row["promptTokens"] += prompt
+        row["completionTokens"] += completion
+        row["totalTokens"] += total
+        row["requestCount"] += 1
+        row["spend"] += _as_number(_first(log, "spend", "cost", "total_spend"))
+        if "fail" in status or "error" in status:
+            row["failureCount"] += 1
+        else:
+            row["successCount"] += 1
 
     async def _usage_from_daily_activity(
         self,
@@ -375,7 +387,6 @@ class LiteLLMClient:
         for item in _records(payload):
             token = str(_first(item, "token", "key", "api_key", default=""))
             alias = str(_first(item, "key_alias", "key_name", default="个人访问密钥") or "个人访问密钥")
-            spend = _as_number(_first(item, "spend", "total_spend"))
             metadata = _first(item, "metadata", default={})
             status = "已禁用" if _first(item, "blocked", "deleted", default=False) else "正常"
             last_used = _first(item, "last_used_at", "updated_at", "created_at", default="-")
@@ -387,7 +398,7 @@ class LiteLLMClient:
                     "masked": mask_key(token),
                     "lastUsed": _date_text(last_used) if last_used != "-" else "-",
                     "monthTokens": _as_int(_first(item, "total_tokens", "token_usage", default=0)),
-                    "spend": spend,
+                    "spend": _as_number(_first(item, "spend", "total_spend")),
                     "status": status,
                 }
             )
@@ -419,6 +430,149 @@ class LiteLLMClient:
         if not new_key:
             raise HTTPException(status_code=502, detail="上游未返回新的访问密钥")
         return str(new_key)
+
+    async def users(self) -> list[dict[str, Any]]:
+        users: list[dict[str, Any]] = []
+        for page in range(1, 101):
+            payload = await self.request("GET", "/user/list", params={"page": page, "page_size": 100})
+            users.extend(_records(payload))
+            total_pages = _as_int(payload.get("total_pages")) if isinstance(payload, dict) else 0
+            if total_pages and page >= total_pages:
+                break
+        return users
+
+    async def admin_usage_rows(self, start_date: str, end_date: str, source: str | None, employee: str | None = None) -> dict[str, Any]:
+        users = await self.users()
+        user_map = self._admin_user_map(users)
+        employee_filter = (employee or "").strip().lower()
+        grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        employees: dict[str, dict[str, Any]] = {}
+        max_pages = max(1, int(os.getenv("ADMIN_USAGE_LOG_MAX_PAGES", "30")))
+        page_size = max(1, min(100, int(os.getenv("ADMIN_USAGE_PAGE_SIZE", "100"))))
+
+        for page in range(1, max_pages + 1):
+            payload = await self.request(
+                "GET",
+                "/spend/logs/v2",
+                params={
+                    "start_date": f"{start_date} 00:00:00",
+                    "end_date": f"{end_date} 23:59:59",
+                    "page": page,
+                    "page_size": page_size,
+                    "sort_by": "startTime",
+                    "sort_order": "desc",
+                },
+            )
+            logs = _records(payload)
+            if not logs:
+                break
+            for log in logs:
+                raw_user = str(_first(log, "user", "user_id", "end_user", default="未绑定账号") or "未绑定账号")
+                employee_info = self._admin_employee_info(raw_user, user_map)
+                if employee_filter and not self._admin_employee_matches(employee_info, employee_filter):
+                    continue
+                detected_source = detect_source(log)
+                if source and source != "all" and detected_source != source:
+                    continue
+
+                employee_key = employee_info["id"]
+                employees.setdefault(employee_key, employee_info)
+                model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
+                day = _date_text(_first(log, "startTime", "start_time", "created_at", "date"))
+                key = (day, employee_key, detected_source, model)
+                row = grouped.setdefault(key, self._admin_empty_row(day, employee_info, detected_source, model))
+                self._add_log_to_row(row, log)
+
+            total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=0)) if isinstance(payload, dict) else 0
+            if total_pages and page >= total_pages:
+                break
+
+        rows = sorted(grouped.values(), key=lambda item: (item["date"], item["employeeName"], item["source"], item["model"]))
+        return {
+            "rows": rows,
+            "employees": self._admin_employee_summaries(rows, employees),
+            "pageLimit": max_pages,
+            "pageSize": page_size,
+        }
+
+    def _admin_empty_row(self, day: str, employee_info: dict[str, Any], source: str, model: str) -> dict[str, Any]:
+        row = self._empty_usage_row(day, source, model)
+        row.update(
+            {
+                "employeeId": employee_info["id"],
+                "employeeName": employee_info["name"],
+                "employeeEmail": employee_info["email"],
+                "bindStatus": employee_info["bindStatus"],
+            }
+        )
+        return row
+
+    def _admin_user_map(self, users: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        mapping: dict[str, dict[str, Any]] = {}
+        for user in users:
+            user_id = str(user.get("user_id") or "").strip()
+            if not user_id:
+                continue
+            email = str(user.get("user_email") or user.get("sso_user_id") or "").strip().lower()
+            alias = str(user.get("user_alias") or "").strip()
+            info = {
+                "id": user_id,
+                "name": alias or email.split("@", 1)[0] or user_id,
+                "email": email,
+                "bindStatus": "已绑定邮箱" if email else "未绑定邮箱",
+            }
+            mapping[user_id.lower()] = info
+            if email:
+                mapping[email] = info
+        return mapping
+
+    def _admin_employee_info(self, raw_user: str, user_map: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        normalized = raw_user.strip().lower()
+        if normalized in user_map:
+            return user_map[normalized]
+        return {"id": raw_user, "name": raw_user, "email": "", "bindStatus": "未绑定邮箱"}
+
+    def _admin_employee_matches(self, employee_info: dict[str, Any], employee_filter: str) -> bool:
+        values = [employee_info.get("id"), employee_info.get("name"), employee_info.get("email")]
+        return any(employee_filter in str(value or "").lower() for value in values)
+
+    def _admin_employee_summaries(self, rows: list[dict[str, Any]], employees: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        grouped: dict[str, dict[str, Any]] = {}
+        source_totals: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for row in rows:
+            employee_id = str(row["employeeId"])
+            employee = employees.get(employee_id, {})
+            summary = grouped.setdefault(
+                employee_id,
+                {
+                    "employeeId": employee_id,
+                    "employeeName": employee.get("name") or row.get("employeeName") or employee_id,
+                    "employeeEmail": employee.get("email") or row.get("employeeEmail") or "",
+                    "bindStatus": employee.get("bindStatus") or row.get("bindStatus") or "未绑定邮箱",
+                    "promptTokens": 0,
+                    "completionTokens": 0,
+                    "totalTokens": 0,
+                    "requestCount": 0,
+                    "successCount": 0,
+                    "failureCount": 0,
+                    "spend": 0.0,
+                    "primarySource": "其他",
+                },
+            )
+            summary["promptTokens"] += _as_int(row.get("promptTokens"))
+            summary["completionTokens"] += _as_int(row.get("completionTokens"))
+            summary["totalTokens"] += _as_int(row.get("totalTokens"))
+            summary["requestCount"] += _as_int(row.get("requestCount"))
+            summary["successCount"] += _as_int(row.get("successCount"))
+            summary["failureCount"] += _as_int(row.get("failureCount"))
+            summary["spend"] += _as_number(row.get("spend"))
+            source_totals[employee_id][str(row.get("source") or "其他")] += _as_int(row.get("totalTokens"))
+
+        for employee_id, summary in grouped.items():
+            sources = source_totals.get(employee_id, {})
+            if sources:
+                summary["primarySource"] = max(sources.items(), key=lambda item: item[1])[0]
+        return sorted(grouped.values(), key=lambda item: item["totalTokens"], reverse=True)
 
     async def models(self) -> list[dict[str, Any]]:
         payload = await self.request("GET", "/models")

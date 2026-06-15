@@ -1,13 +1,20 @@
-const sourceColors = {
+﻿const sourceColors = {
   Cursor: "#1f7a5b",
   "Claude Code": "#b88727",
   "其他": "#2e6f9f",
 };
 
 let currentUser = null;
+let currentView = "dashboard";
 let usageData = [];
+let usageSummary = null;
+let lastPersonalUsageCacheHit = false;
+let adminUsageData = [];
+let adminEmployees = [];
+let selectedAdminEmployee = "";
 let modelCatalog = [];
-let isLoading = false;
+let isDashboardLoading = false;
+let isAdminLoading = false;
 let authConfig = { devLoginEnabled: false, oidcConfigured: false, providerName: "飞书扫码登录" };
 
 const el = (id) => document.getElementById(id);
@@ -117,22 +124,22 @@ function metric(label, value, sub, chip, tone = "", iconName = "token") {
 function metricGroup(title, subtitle, items) {
   return `
     <section class="metric-group">
-      <div class="metric-group-head">
-        <div>
-          <h3>${title}</h3>
-          <p>${subtitle}</p>
-        </div>
-      </div>
-      <div class="metric-pair">
-        ${items.join("")}
-      </div>
+      <div class="metric-group-head"><div><h3>${title}</h3><p>${subtitle}</p></div></div>
+      <div class="metric-pair">${items.join("")}</div>
     </section>
   `;
 }
 
-function renderMetrics(data) {
-  const sorted = [...data].sort((a, b) => a.date.localeCompare(b.date));
-  const today = sorted[sorted.length - 1] || {};
+function sourceText() {
+  return el("sourceSelect").value === "all" ? "全部来源" : el("sourceSelect").value;
+}
+
+function rangeLabel() {
+  return `近 ${el("rangeSelect").value} 天`;
+}
+
+function renderMetricGroups(containerId, data, mode = "personal", summary = null) {
+  const latest = summary?.latestDay || aggregateByDate(data).slice(-1)[0] || {};
   const total = sum(data, "totalTokens");
   const cursor = sum(data.filter((item) => item.source === "Cursor"), "totalTokens");
   const cc = sum(data.filter((item) => item.source === "Claude Code"), "totalTokens");
@@ -140,35 +147,58 @@ function renderMetrics(data) {
   const successes = sum(data, "successCount");
   const successRate = requests ? Math.round((successes / requests) * 1000) / 10 : 0;
   const spend = sum(data, "spend");
-  const rangeDays = el("rangeSelect").value;
-  const sourceText = el("sourceSelect").value === "all" ? "全部来源" : el("sourceSelect").value;
-  const rangeLabel = `近 ${rangeDays} 天`;
+  const scope = mode === "admin" ? "全员" : "个人";
+  const label = rangeLabel();
+  const source = sourceText();
 
+  el(containerId).innerHTML = [
+    metricGroup("最近一天", latest.date || "暂无日期", [
+      metric("最近一天 Token", formatTokens(latest.totalTokens || 0), latest.date ? `${latest.date} 的整日汇总` : `最新日期${scope}消耗`, "最近", "", "token"),
+      metric("最近一天消耗金额", money.format(latest.spend || 0), latest.date ? `${latest.date} 的整日预估金额` : "最新日期预估金额", "最近", "gold", "cost"),
+    ]),
+    metricGroup("所选范围消耗", `${label} · ${source}`, [
+      metric(`${label} Token`, formatTokens(total), "按当前日期与来源筛选累计", source, "gold", "trend"),
+      metric(`${label} 消耗金额`, money.format(spend), "按上游记录汇总", "估算", "gold", "cost"),
+    ]),
+    metricGroup("所选范围请求", `${label} · ${source}`, [
+      metric(`${label} 请求次数`, fmt.format(requests), "按当前筛选累计", "请求", "blue", "request"),
+      metric(`${label} 请求成功率`, `${successRate}%`, `${fmt.format(successes)} / ${fmt.format(requests)} 次成功`, "稳定", "", "success"),
+    ]),
+    metricGroup("工具消耗拆分", `${label} · ${source}`, [
+      metric(`${label} Cursor Token`, formatTokens(cursor), "编辑器相关消耗", "Cursor", "", "cursor"),
+      metric(`${label} Claude Code Token`, formatTokens(cc), "终端工具相关消耗", "Claude Code", "blue", "terminal"),
+    ]),
+  ].join("");
+}
+
+function renderPersonalMetrics(data) {
+  const total = sum(data, "totalTokens");
+  const requests = sum(data, "requestCount");
+  const successes = sum(data, "successCount");
+  const successRate = requests ? Math.round((successes / requests) * 1000) / 10 : 0;
+  const label = rangeLabel();
+  const source = sourceText();
   el("heroTotal").textContent = formatTokens(total);
   el("heroSuccess").textContent = `${successRate}%`;
   el("heroRequests").textContent = fmt.format(requests);
-  el("heroTotalLabel").textContent = `${rangeLabel} Token`;
-  el("trendBadge").textContent = `${rangeLabel} · ${sourceText}`;
-  el("spendBadge").textContent = `${rangeLabel} · ${sourceText}`;
+  el("heroTotalLabel").textContent = `${label} Token`;
+  el("trendBadge").textContent = `${label} · ${source}`;
+  el("spendBadge").textContent = `${label} · ${source}`;
+  renderMetricGroups("metrics", data, "personal", usageSummary);
+}
 
-  el("metrics").innerHTML = [
-    metricGroup("最近一天", today.date || "暂无日期", [
-      metric("最近一天 Token", formatTokens(today.totalTokens || 0), "最新日期个人消耗", "最近", "", "token"),
-      metric("最近一天消耗金额", money.format(today.spend || 0), "最新日期预估金额", "最近", "gold", "cost"),
-    ]),
-    metricGroup("所选范围消耗", `${rangeLabel} · ${sourceText}`, [
-      metric(`${rangeLabel} Token`, formatTokens(total), "按当前日期与来源筛选累计", sourceText, "gold", "trend"),
-      metric(`${rangeLabel} 消耗金额`, money.format(spend), "按上游记录汇总", "估算", "gold", "cost"),
-    ]),
-    metricGroup("所选范围请求", `${rangeLabel} · ${sourceText}`, [
-      metric(`${rangeLabel} 请求次数`, fmt.format(requests), "按当前筛选累计", "请求", "blue", "request"),
-      metric(`${rangeLabel} 请求成功率`, `${successRate}%`, `${fmt.format(successes)} / ${fmt.format(requests)} 次成功`, "稳定", "", "success"),
-    ]),
-    metricGroup("工具消耗拆分", `${rangeLabel} · ${sourceText}`, [
-      metric(`${rangeLabel} Cursor Token`, formatTokens(cursor), "编辑器相关消耗", "Cursor", "", "cursor"),
-      metric(`${rangeLabel} Claude Code Token`, formatTokens(cc), "终端工具相关消耗", "Claude Code", "blue", "terminal"),
-    ]),
-  ].join("");
+function renderAdminMetrics(data) {
+  const total = sum(data, "totalTokens");
+  const requests = sum(data, "requestCount");
+  const label = rangeLabel();
+  const source = sourceText();
+  el("adminHeroTotal").textContent = formatTokens(total);
+  el("adminHeroTotalLabel").textContent = selectedAdminEmployee ? "员工 Token" : "全员 Token";
+  el("adminHeroRequests").textContent = fmt.format(requests);
+  el("adminActiveUsers").textContent = fmt.format(adminEmployees.length);
+  el("adminTrendBadge").textContent = `${label} · ${source}`;
+  el("adminSpendBadge").textContent = `${label} · ${source}`;
+  renderMetricGroups("adminMetrics", data, "admin");
 }
 
 function showChartTooltip(event, html) {
@@ -190,18 +220,12 @@ function hideChartTooltip() {
 }
 
 function tooltipMarkup(date, rows) {
-  return `
-    <div class="tooltip-date">${date}</div>
-    ${rows.map((row) => `<div class="tooltip-row"><span>${row.label}</span><strong>${row.value}</strong></div>`).join("")}
-  `;
+  return `<div class="tooltip-date">${date}</div>${rows.map((row) => `<div class="tooltip-row"><span>${row.label}</span><strong>${row.value}</strong></div>`).join("")}`;
 }
 
 function renderEmptyChart(svg, label) {
   svg.setAttribute("viewBox", "0 0 900 280");
-  svg.innerHTML = `
-    <rect width="900" height="280" rx="8" fill="#fffdf6"/>
-    <text x="450" y="140" fill="#65736f" font-size="16" text-anchor="middle">${label}</text>
-  `;
+  svg.innerHTML = `<rect width="900" height="280" rx="8" fill="#fffdf6"/><text x="450" y="140" fill="#65736f" font-size="16" text-anchor="middle">${label}</text>`;
 }
 
 function renderLineChart({ svg, points, valueField, color, fill, axisFormatter, tooltipRows }) {
@@ -216,7 +240,7 @@ function renderLineChart({ svg, points, valueField, color, fill, axisFormatter, 
   const max = Math.max(1, ...points.map((p) => Number(p[valueField] || 0)));
   const xStep = points.length > 1 ? (width - pad.left - pad.right) / (points.length - 1) : 1;
   const y = (value) => height - pad.bottom - (Number(value || 0) / max) * (height - pad.top - pad.bottom);
-  const x = (index) => points.length > 1 ? pad.left + index * xStep : width / 2;
+  const x = (index) => (points.length > 1 ? pad.left + index * xStep : width / 2);
   const path = points.map((p, index) => `${index ? "L" : "M"} ${x(index)} ${y(p[valueField])}`).join(" ");
   const area = `${path} L ${x(points.length - 1 || 0)} ${height - pad.bottom} L ${x(0)} ${height - pad.bottom} Z`;
   const grid = [0, 0.25, 0.5, 0.75, 1]
@@ -229,10 +253,7 @@ function renderLineChart({ svg, points, valueField, color, fill, axisFormatter, 
     .map((p, index) => {
       const cx = x(index);
       const cy = y(p[valueField]);
-      return `
-        <circle cx="${cx}" cy="${cy}" r="4.5" fill="${color}"/>
-        <circle class="chart-hit" cx="${cx}" cy="${cy}" r="16" fill="transparent" data-tooltip="${encodeURIComponent(tooltipMarkup(p.date, tooltipRows(p)))}"/>
-      `;
+      return `<circle cx="${cx}" cy="${cy}" r="4.5" fill="${color}"/><circle class="chart-hit" cx="${cx}" cy="${cy}" r="16" fill="transparent" data-tooltip="${encodeURIComponent(tooltipMarkup(p.date, tooltipRows(p)))}"/>`;
     })
     .join("");
   const labelEvery = Math.max(1, Math.ceil(points.length / 5));
@@ -244,14 +265,7 @@ function renderLineChart({ svg, points, valueField, color, fill, axisFormatter, 
     })
     .join("");
 
-  svg.innerHTML = `
-    <rect width="${width}" height="${height}" rx="8" fill="#fffdf6"/>
-    ${grid}
-    <path d="${area}" fill="${fill}"/>
-    <path d="${path}" fill="none" stroke="${color}" stroke-width="4"/>
-    ${dots}
-    ${labels}
-  `;
+  svg.innerHTML = `<rect width="${width}" height="${height}" rx="8" fill="#fffdf6"/>${grid}<path d="${area}" fill="${fill}"/><path d="${path}" fill="none" stroke="${color}" stroke-width="4"/>${dots}${labels}`;
   svg.querySelectorAll(".chart-hit").forEach((node) => {
     node.addEventListener("pointermove", (event) => showChartTooltip(event, decodeURIComponent(node.dataset.tooltip)));
     node.addEventListener("pointerleave", hideChartTooltip);
@@ -259,10 +273,10 @@ function renderLineChart({ svg, points, valueField, color, fill, axisFormatter, 
   svg.addEventListener("pointerleave", hideChartTooltip);
 }
 
-function renderTrend(data) {
+function renderTrendTo(svgId, data) {
   const points = aggregateByDate(data);
   renderLineChart({
-    svg: el("trendChart"),
+    svg: el(svgId),
     points,
     valueField: "totalTokens",
     color: "#1f7a5b",
@@ -276,10 +290,10 @@ function renderTrend(data) {
   });
 }
 
-function renderSpendTrend(data) {
+function renderSpendTrendTo(svgId, data) {
   const points = aggregateByDate(data);
   renderLineChart({
-    svg: el("spendChart"),
+    svg: el(svgId),
     points,
     valueField: "spend",
     color: "#b17916",
@@ -289,12 +303,9 @@ function renderSpendTrend(data) {
   });
 }
 
-function renderDonut(data) {
+function renderDonutTo(svgId, totalId, legendId, data) {
   const grouped = groupBy(data, "source");
-  const totals = Object.keys(sourceColors).map((source) => ({
-    source,
-    value: grouped[source] ? sum(grouped[source], "totalTokens") : 0,
-  }));
+  const totals = Object.keys(sourceColors).map((source) => ({ source, value: grouped[source] ? sum(grouped[source], "totalTokens") : 0 }));
   const total = totals.reduce((acc, item) => acc + item.value, 0);
   const radius = 68;
   const circumference = 2 * Math.PI * radius;
@@ -308,9 +319,9 @@ function renderDonut(data) {
       return circle;
     })
     .join("");
-  el("sourceDonut").innerHTML = `<circle cx="90" cy="90" r="${radius}" fill="none" stroke="#edf0e8" stroke-width="18"/>${circles}`;
-  el("donutTotal").textContent = formatTokens(total);
-  el("sourceLegend").innerHTML = totals
+  el(svgId).innerHTML = `<circle cx="90" cy="90" r="${radius}" fill="none" stroke="#edf0e8" stroke-width="18"/>${circles}`;
+  el(totalId).textContent = formatTokens(total);
+  el(legendId).innerHTML = totals
     .map((item) => {
       const pct = total ? Math.round((item.value / total) * 100) : 0;
       return `<div class="legend-item"><span><i class="dot" style="background:${sourceColors[item.source]}"></i>${item.source}</span><strong>${pct}%</strong></div>`;
@@ -318,25 +329,22 @@ function renderDonut(data) {
     .join("");
 }
 
-function renderModelBars(data) {
+function renderModelBarsTo(containerId, data) {
   const grouped = groupBy(data, "model");
   const rows = Object.keys(grouped)
     .map((model) => ({ model, value: sum(grouped[model], "totalTokens") }))
     .sort((a, b) => b.value - a.value)
     .slice(0, 5);
   const max = Math.max(1, ...rows.map((row) => row.value));
-  el("modelBars").innerHTML = rows.length
+  el(containerId).innerHTML = rows.length
     ? rows
-        .map((row) => {
-          const width = Math.max(3, (row.value / max) * 100);
-          return `<div class="bar-row"><strong>${row.model}</strong><div class="bar-track"><div class="bar-fill" style="width:${width}%"></div></div><span class="num">${formatTokens(row.value)}</span></div>`;
-        })
+        .map((row) => `<div class="bar-row"><strong>${row.model}</strong><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3, (row.value / max) * 100)}%"></div></div><span class="num">${formatTokens(row.value)}</span></div>`)
         .join("")
     : `<div class="model-empty">当前筛选范围暂无模型用量</div>`;
 }
 
-function renderSplit(data) {
-  const svg = el("splitChart");
+function renderSplitTo(svgId, data) {
+  const svg = el(svgId);
   const prompt = sum(data, "promptTokens");
   const completion = sum(data, "completionTokens");
   const total = Math.max(1, prompt + completion);
@@ -362,21 +370,67 @@ function renderTable(data) {
         .reverse()
         .map((item) => {
           const status = item.failureCount > 0 ? `<span class="chip rose">${item.failureCount} 次失败</span>` : `<span class="chip">正常</span>`;
+          return `<tr><td>${item.date}</td><td>${item.source}</td><td>${item.model}</td><td class="num">${fmt.format(item.requestCount || 0)}</td><td class="num">${fmt.format(item.promptTokens || 0)}</td><td class="num">${fmt.format(item.completionTokens || 0)}</td><td class="num"><strong>${fmt.format(item.totalTokens || 0)}</strong></td><td>${status}</td></tr>`;
+        })
+        .join("")
+    : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">当前筛选范围暂无用量记录</td></tr>`;
+}
+
+function renderAdminUsers() {
+  el("adminUserCount").textContent = `${adminEmployees.length} 人`;
+  el("adminUserTable").innerHTML = adminEmployees.length
+    ? adminEmployees
+        .map((item) => {
+          const requests = Number(item.requestCount || 0);
+          const successRate = requests ? Math.round((Number(item.successCount || 0) / requests) * 1000) / 10 : 0;
           return `
-            <tr>
-              <td>${item.date}</td>
-              <td>${item.source}</td>
-              <td>${item.model}</td>
-              <td class="num">${fmt.format(item.requestCount || 0)}</td>
-              <td class="num">${fmt.format(item.promptTokens || 0)}</td>
-              <td class="num">${fmt.format(item.completionTokens || 0)}</td>
-              <td class="num"><strong>${fmt.format(item.totalTokens || 0)}</strong></td>
-              <td>${status}</td>
+            <tr class="admin-employee-row" data-employee="${item.employeeEmail || item.employeeId}">
+              <td><strong>${item.employeeName || item.employeeId}</strong></td>
+              <td>${item.employeeEmail || "未绑定邮箱"}</td>
+              <td>${item.primarySource || "其他"}</td>
+              <td class="num">${fmt.format(requests)}</td>
+              <td class="num"><strong>${formatTokens(item.totalTokens || 0)}</strong></td>
+              <td class="num">${money.format(item.spend || 0)}</td>
+              <td class="num">${successRate}%</td>
+              <td><span class="chip ${item.bindStatus === "未绑定邮箱" ? "rose" : "blue"}">${item.bindStatus || "已绑定邮箱"}</span></td>
             </tr>
           `;
         })
         .join("")
-    : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">当前筛选范围暂无用量记录</td></tr>`;
+    : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">当前筛选范围暂无员工用量</td></tr>`;
+}
+
+function renderPersonal() {
+  renderPersonalMetrics(usageData);
+  renderTrendTo("trendChart", usageData);
+  renderSpendTrendTo("spendChart", usageData);
+  renderDonutTo("sourceDonut", "donutTotal", "sourceLegend", usageData);
+  renderModelBarsTo("modelBars", usageData);
+  renderSplitTo("splitChart", usageData);
+  renderTable(usageData);
+}
+
+function renderAdmin() {
+  renderAdminMetrics(adminUsageData);
+  renderTrendTo("adminTrendChart", adminUsageData);
+  renderSpendTrendTo("adminSpendChart", adminUsageData);
+  renderDonutTo("adminSourceDonut", "adminDonutTotal", "adminSourceLegend", adminUsageData);
+  renderModelBarsTo("adminModelBars", adminUsageData);
+  renderSplitTo("adminSplitChart", adminUsageData);
+  renderAdminUsers();
+
+  const detailCard = el("adminDetailCard");
+  detailCard.classList.toggle("show", Boolean(selectedAdminEmployee));
+  if (selectedAdminEmployee) {
+    const employee = adminEmployees.find((item) => item.employeeEmail === selectedAdminEmployee || item.employeeId === selectedAdminEmployee);
+    el("adminDetailTitle").textContent = `${employee?.employeeName || selectedAdminEmployee} 的用量详情`;
+    el("adminDetailSubtitle").textContent = employee?.employeeEmail || employee?.employeeId || selectedAdminEmployee;
+  }
+}
+
+function render() {
+  renderPersonal();
+  if (currentUser?.isAdmin) renderAdmin();
 }
 
 function uniqueValues(items, getter) {
@@ -399,11 +453,7 @@ function filteredModels() {
   const provider = el("providerFilter").value;
   const capability = el("capabilityFilter").value;
   return modelCatalog.filter((model) => {
-    const matchesKeyword =
-      !keyword ||
-      model.modelName.toLowerCase().includes(keyword) ||
-      model.provider.toLowerCase().includes(keyword) ||
-      String(model.recommendedFor || "").toLowerCase().includes(keyword);
+    const matchesKeyword = !keyword || model.modelName.toLowerCase().includes(keyword) || model.provider.toLowerCase().includes(keyword) || String(model.recommendedFor || "").toLowerCase().includes(keyword);
     const matchesProvider = provider === "all" || model.provider === provider;
     const matchesCapability = capability === "all" || (model.capabilities || []).includes(capability);
     return matchesKeyword && matchesProvider && matchesCapability;
@@ -424,19 +474,13 @@ function renderModels() {
           <div class="model-card-head">
             <div class="key-title">
               <span class="key-icon">${icon("model")}</span>
-              <div>
-                <h3 class="model-name">${model.modelName}</h3>
-                <div class="provider">${model.provider}</div>
-              </div>
+              <div><h3 class="model-name">${model.modelName}</h3><div class="provider">${model.provider}</div></div>
             </div>
             <span class="chip ${model.status === "推荐" || model.status === "默认" ? "" : "blue"}">${model.status || "可用"}</span>
           </div>
           <p class="model-desc">${model.description || "当前账号可用模型。"}</p>
           <div class="tag-row">${(model.capabilities || ["通用"]).map((capability) => `<span class="chip blue">${capability}</span>`).join("")}</div>
-          <button class="copy-btn" type="button" data-copy-model="${model.modelName}">
-            <span class="app-icon">${icon("copy")}</span>
-            复制模型名称
-          </button>
+          <button class="copy-btn" type="button" data-copy-model="${model.modelName}"><span class="app-icon">${icon("copy")}</span>复制模型名称</button>
         </article>
       `,
     )
@@ -462,41 +506,60 @@ async function copyText(text, successMessage) {
 }
 
 function switchView(view) {
-  const isModels = view === "models";
-  el("dashboardView").classList.toggle("hidden", isModels);
-  el("modelsView").classList.toggle("hidden", !isModels);
-  el("dashboardFilters").classList.toggle("hidden", isModels);
-  document.querySelectorAll("[data-view]").forEach((button) => {
-    button.classList.toggle("active", button.dataset.view === view);
-  });
-  if (isModels) renderModels();
-}
-
-function render() {
-  renderMetrics(usageData);
-  renderTrend(usageData);
-  renderSpendTrend(usageData);
-  renderDonut(usageData);
-  renderModelBars(usageData);
-  renderSplit(usageData);
-  renderTable(usageData);
+  if (view === "admin" && !currentUser?.isAdmin) view = "dashboard";
+  currentView = view;
+  el("dashboardView").classList.toggle("hidden", view !== "dashboard");
+  el("adminView").classList.toggle("hidden", view !== "admin");
+  el("modelsView").classList.toggle("hidden", view !== "models");
+  el("dashboardFilters").classList.toggle("hidden", view === "models");
+  document.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
+  if (view === "models") renderModels();
+  if (view === "admin" && !adminUsageData.length) loadAdminData();
 }
 
 async function loadDashboardData() {
-  if (!currentUser || isLoading) return;
-  isLoading = true;
+  if (!currentUser || isDashboardLoading) return;
+  isDashboardLoading = true;
   const { startDate, endDate } = selectedDateRange();
   const source = el("sourceSelect").value;
   try {
     const payload = await api(`/api/me/usage?start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&source=${encodeURIComponent(source)}`);
     usageData = payload.rows || [];
-    render();
+    usageSummary = payload.summary || null;
+    lastPersonalUsageCacheHit = Boolean(payload.cache?.hit);
+    renderPersonal();
   } catch (error) {
     showToast(error.message || "用量数据加载失败");
     usageData = [];
-    render();
+    usageSummary = null;
+    renderPersonal();
   } finally {
-    isLoading = false;
+    isDashboardLoading = false;
+  }
+}
+
+async function loadAdminData() {
+  if (!currentUser?.isAdmin || isAdminLoading) return;
+  isAdminLoading = true;
+  const { startDate, endDate } = selectedDateRange();
+  const source = el("sourceSelect").value;
+  const search = el("adminEmployeeSearch").value.trim();
+  const employee = selectedAdminEmployee || search;
+  const query = new URLSearchParams({ start_date: startDate, end_date: endDate, source });
+  if (employee) query.set("employee", employee);
+  try {
+    const payload = await api(`/api/admin/usage?${query.toString()}`);
+    adminUsageData = payload.rows || [];
+    adminEmployees = payload.employees || [];
+    el("adminLimitHint").textContent = `最多读取 ${payload.pageLimit || "-"} 页日志，按当前筛选范围统计`;
+    renderAdmin();
+  } catch (error) {
+    showToast(error.message || "全员数据加载失败");
+    adminUsageData = [];
+    adminEmployees = [];
+    renderAdmin();
+  } finally {
+    isAdminLoading = false;
   }
 }
 
@@ -518,17 +581,24 @@ async function showApp(user) {
   currentUser = user;
   el("loginView").classList.add("hidden");
   el("appView").classList.remove("hidden");
+  el("adminTab").classList.toggle("hidden", !user.isAdmin);
   el("userEmail").textContent = user.email;
   el("userName").textContent = user.name;
   el("avatar").textContent = user.avatar || initials(user.email, user.name);
   el("welcomeTitle").textContent = `${user.name}您好，今天的 AI 工具消耗一眼看清`;
-  switchView("dashboard");
+  el("adminWelcomeTitle").textContent = `${user.name}您好，全员 AI 用量一眼看清`;
+  switchView(user.isAdmin ? "admin" : "dashboard");
   render();
-  await Promise.all([loadDashboardData(), loadModels()]);
+  await Promise.all([loadDashboardData(), user.isAdmin ? loadAdminData() : Promise.resolve(), loadModels()]);
 }
 
 function showLogin() {
   currentUser = null;
+  selectedAdminEmployee = "";
+  usageData = [];
+  usageSummary = null;
+  adminUsageData = [];
+  adminEmployees = [];
   el("appView").classList.add("hidden");
   el("loginView").classList.remove("hidden");
 }
@@ -564,20 +634,57 @@ el("logoutButton").addEventListener("click", async () => {
   showLogin();
 });
 
-document.querySelectorAll("[data-view]").forEach((button) => {
-  button.addEventListener("click", () => switchView(button.dataset.view));
+document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
+
+el("rangeSelect").addEventListener("change", async () => {
+  selectedAdminEmployee = "";
+  await Promise.all([loadDashboardData(), currentUser?.isAdmin ? loadAdminData() : Promise.resolve()]);
 });
-el("rangeSelect").addEventListener("change", loadDashboardData);
-el("sourceSelect").addEventListener("change", loadDashboardData);
+
+el("sourceSelect").addEventListener("change", async () => {
+  selectedAdminEmployee = "";
+  await Promise.all([loadDashboardData(), currentUser?.isAdmin ? loadAdminData() : Promise.resolve()]);
+});
+
 el("refreshButton").addEventListener("click", async () => {
-  if (el("modelsView").classList.contains("hidden")) {
-    await loadDashboardData();
-    showToast("已刷新真实用量数据");
-  } else {
+  if (currentView === "models") {
     await loadModels();
     showToast("已刷新模型列表");
+  } else if (currentView === "admin") {
+    await loadAdminData();
+    showToast("已刷新全员用量数据");
+  } else {
+    await loadDashboardData();
+    showToast(lastPersonalUsageCacheHit ? "已加载缓存用量数据" : "已刷新真实用量数据");
   }
 });
+
+el("adminSearchButton").addEventListener("click", async () => {
+  selectedAdminEmployee = "";
+  await loadAdminData();
+});
+
+el("adminEmployeeSearch").addEventListener("keydown", async (event) => {
+  if (event.key === "Enter") {
+    selectedAdminEmployee = "";
+    await loadAdminData();
+  }
+});
+
+el("adminUserTable").addEventListener("click", async (event) => {
+  const row = event.target.closest("[data-employee]");
+  if (!row) return;
+  selectedAdminEmployee = row.dataset.employee;
+  el("adminEmployeeSearch").value = "";
+  await loadAdminData();
+});
+
+el("adminClearEmployee").addEventListener("click", async () => {
+  selectedAdminEmployee = "";
+  el("adminEmployeeSearch").value = "";
+  await loadAdminData();
+});
+
 el("modelSearch").addEventListener("input", renderModels);
 el("providerFilter").addEventListener("change", renderModels);
 el("capabilityFilter").addEventListener("change", renderModels);
@@ -600,7 +707,6 @@ async function init() {
     ? `开发登录已启用，仅允许 ${authConfig.allowedEmailDomain || "公司邮箱"} 账号；生产环境请关闭。`
     : "使用公司飞书账号扫码登录；本页面不会保存真实密码、认证令牌或管理员密钥。";
   setupModelFilters();
-  render();
   try {
     const user = await api("/api/auth/me");
     await showApp(user);
@@ -610,3 +716,4 @@ async function init() {
 }
 
 init();
+

@@ -1,4 +1,4 @@
-import os
+﻿import os
 from typing import Any
 
 from authlib.integrations.starlette_client import OAuth
@@ -13,6 +13,15 @@ def env_bool(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def admin_emails() -> set[str]:
+    raw = os.getenv("ADMIN_EMAILS", "")
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
+def is_admin_email(email: str) -> bool:
+    return email.strip().lower() in admin_emails()
 
 
 def initials(email: str, name: str | None = None) -> str:
@@ -38,6 +47,7 @@ def normalize_user(email: str, name: str | None = None, extra: dict[str, Any] | 
         "name": normalized_name,
         "avatar": initials(normalized_email, normalized_name),
         "department": (extra or {}).get("department", "研发中心"),
+        "isAdmin": is_admin_email(normalized_email),
     }
 
 
@@ -69,6 +79,14 @@ def require_user(request: Request) -> dict[str, Any]:
     user = request.session.get(SESSION_USER_KEY)
     if not user:
         raise HTTPException(status_code=401, detail="请先登录后再查看个人数据")
+    user["isAdmin"] = is_admin_email(str(user.get("email", "")))
+    return user
+
+
+def require_admin(request: Request) -> dict[str, Any]:
+    user = require_user(request)
+    if not user.get("isAdmin"):
+        raise HTTPException(status_code=403, detail="当前账号没有管理员看板权限")
     return user
 
 

@@ -1010,6 +1010,59 @@
         overflow-x: auto;
       }
 
+      .admin-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 16px;
+      }
+
+      .admin-search {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-width: min(100%, 420px);
+      }
+
+      .admin-search .input {
+        min-width: 240px;
+      }
+
+      .admin-detail-card {
+        display: none;
+        margin-bottom: 18px;
+      }
+
+      .admin-detail-card.show {
+        display: block;
+      }
+
+      .admin-detail-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+      }
+
+      .admin-detail-head h3 {
+        margin: 0;
+        font-size: 20px;
+      }
+
+      .admin-detail-head p {
+        margin: 6px 0 0;
+        color: var(--muted);
+      }
+
+      .admin-employee-row {
+        cursor: pointer;
+      }
+
+      .admin-employee-row:hover {
+        background: rgba(31, 122, 91, 0.06);
+      }
+
       table {
         width: 100%;
         border-collapse: collapse;
@@ -1390,6 +1443,22 @@
           gap: 10px;
         }
 
+        .admin-toolbar,
+        .admin-detail-head {
+          align-items: stretch;
+          flex-direction: column;
+        }
+
+        .admin-search {
+          min-width: 0;
+          width: 100%;
+        }
+
+        .admin-search .input {
+          min-width: 0;
+          width: 100%;
+        }
+
         .top-controls {
           grid-template-columns: 1fr;
         }
@@ -1543,9 +1612,13 @@
             </div>
             <div class="nav-zone">
               <div class="view-tabs" aria-label="页面导航">
+                <button id="adminTab" class="view-tab hidden" type="button" data-view="admin">
+                  <span class="nav-icon"><svg><use href="#icon-dashboard"></use></svg></span>
+                  全员看板
+                </button>
                 <button class="view-tab active" type="button" data-view="dashboard">
                   <span class="nav-icon"><svg><use href="#icon-dashboard"></use></svg></span>
-                  用量看板
+                  我的用量
                 </button>
                 <button class="view-tab" type="button" data-view="models">
                   <span class="nav-icon"><svg><use href="#icon-plaza"></use></svg></span>
@@ -1709,6 +1782,156 @@
 
         </section>
 
+        <section id="adminView" class="view-section hidden">
+          <section class="hero-band">
+            <div class="hero-copy">
+              <span class="eyebrow">管理员视图</span>
+              <h2 id="adminWelcomeTitle">全员 AI 用量总览</h2>
+              <p>按当前日期范围和工具来源聚合全员使用记录，快速定位 Token、金额、请求质量和高消耗员工。</p>
+            </div>
+            <div class="status-card">
+              <div>
+                <span id="adminHeroTotalLabel">全员 Token</span>
+                <strong id="adminHeroTotal">0</strong>
+              </div>
+              <div class="status-grid">
+                <div class="status-mini"><span>活跃员工</span><strong id="adminActiveUsers">0</strong></div>
+                <div class="status-mini"><span>请求次数</span><strong id="adminHeroRequests">0</strong></div>
+              </div>
+            </div>
+          </section>
+
+          <section id="adminMetrics" class="metrics"></section>
+
+          <section id="adminDetailCard" class="panel admin-detail-card">
+            <div class="admin-detail-head">
+              <div>
+                <h3 id="adminDetailTitle">员工详情</h3>
+                <p id="adminDetailSubtitle">点击员工排行中的一行查看个人明细。</p>
+              </div>
+              <button id="adminClearEmployee" class="ghost-btn" type="button">返回全员</button>
+            </div>
+          </section>
+
+          <section class="trend-grid">
+            <div class="panel">
+              <div class="panel-header">
+                <div class="panel-heading">
+                  <span class="panel-icon"><svg><use href="#icon-trend"></use></svg></span>
+                  <div>
+                    <h3 class="panel-title">全员每日 Token 趋势</h3>
+                    <p class="panel-desc">按日期汇总全员 Prompt 与 Completion Token。</p>
+                  </div>
+                </div>
+                <span id="adminTrendBadge" class="chip">近 30 天</span>
+              </div>
+              <svg id="adminTrendChart" class="chart" role="img" aria-label="全员每日 Token 趋势图"></svg>
+            </div>
+
+            <div class="panel">
+              <div class="panel-header">
+                <div class="panel-heading">
+                  <span class="panel-icon"><svg><use href="#icon-cost"></use></svg></span>
+                  <div>
+                    <h3 class="panel-title">全员每日金额消费趋势</h3>
+                    <p class="panel-desc">按日期汇总全员预估消费金额。</p>
+                  </div>
+                </div>
+                <span id="adminSpendBadge" class="chip gold">近 30 天</span>
+              </div>
+              <svg id="adminSpendChart" class="chart" role="img" aria-label="全员每日金额消费趋势图"></svg>
+            </div>
+          </section>
+
+          <section class="full-width-grid">
+            <div class="panel">
+              <div class="panel-header">
+                <div class="panel-heading">
+                  <span class="panel-icon"><svg><use href="#icon-donut"></use></svg></span>
+                  <div>
+                    <h3 class="panel-title">全员来源占比</h3>
+                    <p class="panel-desc">Cursor、Claude Code 与其他来源。</p>
+                  </div>
+                </div>
+              </div>
+              <div class="source-grid">
+                <div class="donut-wrap">
+                  <svg id="adminSourceDonut" width="180" height="180" viewBox="0 0 180 180"></svg>
+                  <div class="donut-center">
+                    <div><strong id="adminDonutTotal">0</strong><br /><span class="hint">Token</span></div>
+                  </div>
+                </div>
+                <div id="adminSourceLegend" class="legend"></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="dashboard-grid">
+            <div class="panel">
+              <div class="panel-header">
+                <div class="panel-heading">
+                  <span class="panel-icon"><svg><use href="#icon-model"></use></svg></span>
+                  <div>
+                    <h3 class="panel-title">全员模型使用排行</h3>
+                    <p class="panel-desc">按总 Token 消耗排序。</p>
+                  </div>
+                </div>
+              </div>
+              <div id="adminModelBars" class="bars"></div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-header">
+                <div class="panel-heading">
+                  <span class="panel-icon"><svg><use href="#icon-split"></use></svg></span>
+                  <div>
+                    <h3 class="panel-title">全员 Prompt / Completion 拆分</h3>
+                    <p class="panel-desc">观察全员输入输出 Token 比例。</p>
+                  </div>
+                </div>
+              </div>
+              <svg id="adminSplitChart" class="chart chart-short" role="img" aria-label="全员 Token 拆分图"></svg>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div class="panel-heading">
+                <span class="panel-icon"><svg><use href="#icon-table"></use></svg></span>
+                <div>
+                  <h3 class="panel-title">员工用量排行</h3>
+                  <p class="panel-desc">点击员工行查看该员工在当前筛选范围内的明细。</p>
+                </div>
+              </div>
+              <span id="adminUserCount" class="chip blue">0 人</span>
+            </div>
+            <div class="admin-toolbar">
+              <div class="admin-search">
+                <input id="adminEmployeeSearch" class="input" type="search" placeholder="搜索姓名、邮箱或账号" aria-label="搜索员工" />
+                <button id="adminSearchButton" class="ghost-btn" type="button">搜索</button>
+              </div>
+              <span id="adminLimitHint" class="hint">按当前筛选范围统计</span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>员工</th>
+                    <th>邮箱</th>
+                    <th>主要来源</th>
+                    <th class="num">请求数</th>
+                    <th class="num">总 Token</th>
+                    <th class="num">金额</th>
+                    <th class="num">成功率</th>
+                    <th>状态</th>
+                  </tr>
+                </thead>
+                <tbody id="adminUserTable"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
         <section id="modelsView" class="view-section hidden">
           <section class="model-hero">
             <div class="hero-copy">
@@ -1737,7 +1960,7 @@
     <div id="toast" class="toast">已完成</div>
     <div id="chartTooltip" class="chart-tooltip" role="tooltip"></div>
 
-    <script src="/assets/app.js?v=20260612-topbar-order"></script>
+    <script src="/assets/app.js?v=20260615-admin-dashboard"></script>
   </body>
 </html>
 

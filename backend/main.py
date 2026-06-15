@@ -1,8 +1,13 @@
+﻿import base64
 import logging
 import os
+import re
+from html import unescape
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, unquote, urljoin, urlparse
 
+import httpx
 from authlib.integrations.base_client import OAuthError
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -10,6 +15,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
+from .cache import TTLCache
 from .auth import (
     SESSION_USER_KEY,
     allowed_email_domain,
@@ -18,6 +24,7 @@ from .auth import (
     env_bool,
     normalize_user,
     oidc_configured,
+    require_admin,
     require_user,
     validate_company_email,
 )
@@ -40,6 +47,109 @@ app.add_middleware(
     https_only=os.getenv("APP_BASE_URL", "").startswith("https://"),
 )
 oauth = build_oauth()
+user_mapping_cache = TTLCache()
+personal_usage_cache = TTLCache()
+
+
+def allowed_provider_login_url(url: str) -> str | None:
+    parsed = urlparse(url)
+    allowed_host = os.getenv("OIDC_PROVIDER_LOGIN_HOST", "accounts.feishu.cn").strip().lower()
+    if parsed.scheme != "https" or parsed.hostname != allowed_host:
+        return None
+    return url
+
+
+def find_provider_login_url(text: str, base_url: str) -> str | None:
+    allowed_host = os.getenv("OIDC_PROVIDER_LOGIN_HOST", "accounts.feishu.cn").strip().lower()
+    pattern = rf"https://{re.escape(allowed_host)}[^\s\"'<>]+"
+    for match in re.findall(pattern, text):
+        candidate = unquote(unescape(match)).rstrip(").,;")
+        if allowed := allowed_provider_login_url(candidate):
+            return allowed
+    for match in re.findall(r"""(?:href|src)=["']([^"']+)["']""", text, flags=re.IGNORECASE):
+        candidate = unquote(unescape(urljoin(base_url, match)))
+        if allowed := allowed_provider_login_url(candidate):
+            return allowed
+    return None
+
+
+async def resolve_provider_login_url(authorize_url: str) -> str | None:
+    if provider_url := await build_lark_provider_login_url(authorize_url):
+        return provider_url
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0), follow_redirects=False) as http_client:
+            response = await http_client.get(authorize_url, headers={"Accept": "text/html,application/xhtml+xml"})
+    except httpx.HTTPError as exc:
+        logger.warning("provider shortcut fetch failed: %s", exc.__class__.__name__)
+        return None
+
+    location = response.headers.get("location")
+    if location:
+        candidate = unquote(unescape(urljoin(authorize_url, location)))
+        if allowed := allowed_provider_login_url(candidate):
+            return allowed
+
+    content_type = response.headers.get("content-type", "")
+    if "text/html" in content_type or response.text:
+        return find_provider_login_url(response.text, str(response.url))
+    return None
+
+
+async def build_lark_provider_login_url(authorize_url: str) -> str | None:
+    provider_name = os.getenv("OIDC_DIRECT_PROVIDER", "").strip()
+    if not provider_name:
+        return None
+    app_id = os.getenv("OIDC_CASDOOR_APPLICATION_ID", "admin/ai-token-dashboard").strip()
+    issuer = os.getenv("OIDC_ISSUER_URL", "").strip()
+    if not app_id or not issuer:
+        return None
+    casdoor_base = issuer.removesuffix("/.well-known/openid-configuration").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0)) as http_client:
+            response = await http_client.get(f"{casdoor_base}/api/get-application", params={"id": app_id})
+            response.raise_for_status()
+            application = (response.json() or {}).get("data") or {}
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("provider shortcut application lookup failed: %s", exc.__class__.__name__)
+        return None
+
+    provider = None
+    for item in application.get("providers") or []:
+        candidate = item.get("provider") if isinstance(item, dict) else None
+        if isinstance(candidate, dict) and candidate.get("name") == provider_name:
+            provider = candidate
+            break
+    if not provider or provider.get("type") != "Lark" or not provider.get("clientId"):
+        logger.warning("provider shortcut missing Lark provider: %s", provider_name)
+        return None
+
+    parsed = urlparse(authorize_url)
+    query_pairs = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key not in {"provider_hint", "provider", "method", "application"}
+    ]
+    method = os.getenv("OIDC_DIRECT_METHOD", "signup").strip() or "signup"
+    query_pairs.extend(
+        [
+            ("application", application.get("name") or app_id.rsplit("/", 1)[-1]),
+            ("provider", provider_name),
+            ("method", method),
+        ]
+    )
+    state_payload = "?" + urlencode(query_pairs)
+    state = base64.b64encode(state_payload.encode("utf-8")).decode("ascii")
+    provider_host = os.getenv("OIDC_PROVIDER_LOGIN_HOST", "accounts.feishu.cn").strip()
+    provider_query = urlencode(
+        {
+            "app_id": provider["clientId"],
+            "redirect_uri": f"{casdoor_base}/callback",
+            "state": state,
+        }
+    )
+    provider_url = f"https://{provider_host}/open-apis/authen/v1/index?{provider_query}"
+    return allowed_provider_login_url(provider_url)
 
 
 def auth_error_response(message: str, status_code: int = 400) -> HTMLResponse:
@@ -51,43 +161,14 @@ def auth_error_response(message: str, status_code: int = 400) -> HTMLResponse:
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>登录失败</title>
         <style>
-          body {{
-            margin: 0;
-            min-height: 100vh;
-            display: grid;
-            place-items: center;
-            background: #f6f8f5;
-            color: #16231f;
-            font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
-          }}
-          main {{
-            width: min(520px, calc(100vw - 40px));
-            padding: 32px;
-            border: 1px solid #dfe8df;
-            border-radius: 24px;
-            background: rgba(255, 255, 255, .86);
-            box-shadow: 0 24px 60px rgba(24, 44, 36, .12);
-          }}
+          body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f6f8f5; color: #16231f; font-family: "Microsoft YaHei", "PingFang SC", sans-serif; }}
+          main {{ width: min(520px, calc(100vw - 40px)); padding: 32px; border: 1px solid #dfe8df; border-radius: 24px; background: rgba(255,255,255,.86); box-shadow: 0 24px 60px rgba(24,44,36,.12); }}
           h1 {{ margin: 0 0 12px; font-size: 24px; }}
           p {{ margin: 0 0 22px; color: #64716c; line-height: 1.7; }}
-          a {{
-            display: inline-flex;
-            padding: 12px 18px;
-            border-radius: 999px;
-            background: #163f35;
-            color: white;
-            text-decoration: none;
-            font-weight: 700;
-          }}
+          a {{ display: inline-flex; padding: 12px 18px; border-radius: 999px; background: #163f35; color: white; text-decoration: none; font-weight: 700; }}
         </style>
       </head>
-      <body>
-        <main>
-          <h1>登录没有完成</h1>
-          <p>{message}</p>
-          <a href="/">返回首页重新扫码</a>
-        </main>
-      </body>
+      <body><main><h1>登录没有完成</h1><p>{message}</p><a href="/">返回首页重新扫码</a></main></body>
     </html>
     """
     return HTMLResponse(html, status_code=status_code)
@@ -100,9 +181,120 @@ def client() -> LiteLLMClient:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+def safe_provider_name() -> str:
+    value = os.getenv("OAUTH_PROVIDER_NAME", "").strip()
+    if not value or "\ufffd" in value:
+        return "飞书扫码登录"
+    if any(ord(char) < 32 for char in value):
+        return "飞书扫码登录"
+    if not any(word in value for word in ("飞书", "扫码", "登录", "企业", "SSO", "sso")):
+        return "飞书扫码登录"
+    return value
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+async def cached_resolve_user(email: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    normalized_email = email.strip().lower()
+    cache_key = f"user-map:{normalized_email}"
+    hit, value, ttl_seconds = user_mapping_cache.get(cache_key)
+    if hit:
+        return value, {"hit": True, "ttlSeconds": ttl_seconds}
+    upstream = await client().resolve_user(normalized_email)
+    user_mapping_cache.set(cache_key, upstream, env_int("USER_MAPPING_CACHE_TTL_SECONDS", 1800))
+    return upstream, {"hit": False, "ttlSeconds": 0}
+
+
+def personal_usage_cache_key(email: str, start_date: str, end_date: str, source: str) -> str:
+    return f"usage:v2:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
+
+
+def empty_usage_totals() -> dict[str, Any]:
+    return {
+        "promptTokens": 0,
+        "completionTokens": 0,
+        "totalTokens": 0,
+        "requestCount": 0,
+        "successCount": 0,
+        "failureCount": 0,
+        "spend": 0.0,
+    }
+
+
+def add_usage_totals(target: dict[str, Any], row: dict[str, Any]) -> None:
+    for field in ("promptTokens", "completionTokens", "totalTokens", "requestCount", "successCount", "failureCount"):
+        target[field] += int(row.get(field) or 0)
+    target["spend"] += float(row.get("spend") or 0)
+
+
+def usage_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    by_date: dict[str, dict[str, Any]] = {}
+    by_source: dict[str, dict[str, Any]] = {}
+    by_model: dict[str, dict[str, Any]] = {}
+    range_total = empty_usage_totals()
+
+    for row in rows:
+        add_usage_totals(range_total, row)
+        day = str(row.get("date") or "")
+        if day:
+            date_bucket = by_date.setdefault(day, {"date": day, **empty_usage_totals()})
+            add_usage_totals(date_bucket, row)
+        source = str(row.get("source") or "其他")
+        source_bucket = by_source.setdefault(source, {"source": source, **empty_usage_totals()})
+        add_usage_totals(source_bucket, row)
+        model = str(row.get("model") or "未知模型")
+        model_bucket = by_model.setdefault(model, {"model": model, **empty_usage_totals()})
+        add_usage_totals(model_bucket, row)
+
+    latest_day = None
+    if by_date:
+        latest_key = sorted(by_date)[-1]
+        latest_day = by_date[latest_key]
+
+    return {
+        "latestDay": latest_day,
+        "rangeTotal": range_total,
+        "sourceBreakdown": sorted(by_source.values(), key=lambda item: item["totalTokens"], reverse=True),
+        "modelBreakdown": sorted(by_model.values(), key=lambda item: item["totalTokens"], reverse=True),
+    }
+
+
+async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_date: str, source: str) -> dict[str, Any]:
+    cache_key = personal_usage_cache_key(app_user["email"], start_date, end_date, source)
+    hit, value, ttl_seconds = personal_usage_cache.get(cache_key)
+    if hit:
+        payload = dict(value)
+        payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+        return payload
+
+    upstream_user, mapping_cache = await cached_resolve_user(app_user["email"])
+    user_ids = upstream_user_ids(upstream_user)
+    if not user_ids:
+        raise HTTPException(status_code=502, detail="上游员工记录缺少 user_id")
+    rows = await client().usage_rows_for_user_ids(user_ids, start_date, end_date, source)
+    payload = {
+        "user": app_user,
+        "startDate": start_date,
+        "endDate": end_date,
+        "source": source,
+        "rows": rows,
+        "summary": usage_summary(rows),
+        "mappingCache": mapping_cache,
+    }
+    personal_usage_cache.set(cache_key, payload, env_int("PERSONAL_USAGE_CACHE_TTL_SECONDS", 300))
+    payload = dict(payload)
+    payload["cache"] = {"hit": False, "ttlSeconds": 0}
+    return payload
+
+
 async def current_upstream_user(request: Request) -> tuple[dict[str, Any], dict[str, Any]]:
     app_user = require_user(request)
-    upstream = await client().resolve_user(app_user["email"])
+    upstream, _ = await cached_resolve_user(app_user["email"])
     return app_user, upstream
 
 
@@ -129,6 +321,39 @@ async def debug_me_mapping(request: Request) -> dict[str, Any]:
     }
 
 
+@app.get("/api/debug/me-usage-compare")
+async def debug_me_usage_compare(
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    log_pages: int = Query(3, ge=1, le=10),
+) -> dict[str, Any]:
+    if not env_bool("DEBUG_MAPPING_ENABLED", False):
+        raise HTTPException(status_code=404, detail="接口不存在")
+    app_user = require_user(request)
+    if not start_date or not end_date:
+        start_date, end_date = default_date_range()
+    upstream, mapping_cache = await cached_resolve_user(app_user["email"])
+    user_ids = upstream_user_ids(upstream)
+    litellm = client()
+    current_rows = await litellm.usage_rows_for_user_ids(user_ids, start_date, end_date, "all")
+    daily_rows: list[dict[str, Any]] = []
+    log_rows: list[dict[str, Any]] = []
+    for user_id in user_ids:
+        daily_rows.extend(await litellm.usage_from_daily_activity_for_debug(user_id, start_date, end_date))
+        log_rows.extend(await litellm.usage_from_logs_for_debug(user_id, start_date, end_date, log_pages))
+    return {
+        "user": {"email": app_user["email"], "name": app_user["name"]},
+        "userIds": user_ids,
+        "startDate": start_date,
+        "endDate": end_date,
+        "mappingCache": mapping_cache,
+        "current": usage_summary(current_rows),
+        "dailyActivity": usage_summary(daily_rows),
+        "spendLogsSample": {"pages": log_pages, "summary": usage_summary(log_rows)},
+    }
+
+
 @app.get("/api/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -139,17 +364,14 @@ async def auth_config() -> dict[str, Any]:
     return {
         "devLoginEnabled": env_bool("DEV_LOGIN_ENABLED", False),
         "oidcConfigured": oidc_configured(),
-        "providerName": os.getenv("OAUTH_PROVIDER_NAME", "飞书扫码登录"),
+        "providerName": safe_provider_name(),
         "allowedEmailDomain": allowed_email_domain(),
     }
 
 
 @app.get("/api/auth/me")
 async def auth_me(request: Request) -> dict[str, Any]:
-    user = request.session.get(SESSION_USER_KEY)
-    if not user:
-        raise HTTPException(status_code=401, detail="未登录")
-    return user
+    return require_user(request)
 
 
 @app.post("/api/auth/dev-login")
@@ -161,7 +383,6 @@ async def dev_login(request: Request) -> dict[str, Any]:
     if "@" not in email:
         raise HTTPException(status_code=400, detail="请输入有效的企业邮箱")
     email = validate_company_email(email)
-    # Validate that the employee exists upstream before creating a local session.
     await client().resolve_user(email)
     user = normalize_user(email)
     request.session[SESSION_USER_KEY] = user
@@ -181,7 +402,14 @@ async def sso_start(request: Request):
         authorize_params["provider"] = direct_provider
     if direct_method:
         authorize_params["method"] = direct_method
-    return await oauth.company.authorize_redirect(request, redirect_uri, **authorize_params)
+    casdoor_response = await oauth.company.authorize_redirect(request, redirect_uri, **authorize_params)
+    casdoor_url = casdoor_response.headers.get("location")
+    if env_bool("OIDC_SKIP_CASDOOR_PAGE", False) and casdoor_url:
+        provider_url = await resolve_provider_login_url(casdoor_url)
+        if provider_url:
+            return RedirectResponse(provider_url)
+        logger.warning("provider shortcut unavailable; falling back to Casdoor authorize page")
+    return casdoor_response
 
 
 @app.get("/api/auth/callback")
@@ -228,20 +456,10 @@ async def my_usage(
     end_date: str | None = None,
     source: str = Query("all"),
 ) -> dict[str, Any]:
-    app_user, upstream_user = await current_upstream_user(request)
-    user_ids = upstream_user_ids(upstream_user)
-    if not user_ids:
-        raise HTTPException(status_code=502, detail="上游员工记录缺少 user_id")
+    app_user = require_user(request)
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
-    rows = await client().usage_rows_for_user_ids(user_ids, start_date, end_date, source)
-    return {
-        "user": app_user,
-        "startDate": start_date,
-        "endDate": end_date,
-        "source": source,
-        "rows": rows,
-    }
+    return await personal_usage_payload(app_user, start_date, end_date, source)
 
 
 @app.get("/api/me/usage/logs")
@@ -253,14 +471,58 @@ async def my_usage_logs(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=100),
 ) -> dict[str, Any]:
-    app_user, upstream_user = await current_upstream_user(request)
-    user_ids = upstream_user_ids(upstream_user)
+    app_user = require_user(request)
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
-    rows = await client().usage_rows_for_user_ids(user_ids, start_date, end_date, source)
+    payload = await personal_usage_payload(app_user, start_date, end_date, source)
+    rows = payload["rows"]
     start = (page - 1) * page_size
     end = start + page_size
-    return {"user": app_user, "rows": rows[start:end], "total": len(rows), "page": page, "pageSize": page_size}
+    return {
+        "user": app_user,
+        "rows": rows[start:end],
+        "total": len(rows),
+        "page": page,
+        "pageSize": page_size,
+        "cache": payload.get("cache", {"hit": False, "ttlSeconds": 0}),
+    }
+
+
+@app.get("/api/admin/usage")
+async def admin_usage(
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    source: str = Query("all"),
+    employee: str | None = None,
+) -> dict[str, Any]:
+    admin = require_admin(request)
+    if not start_date or not end_date:
+        start_date, end_date = default_date_range()
+    payload = await client().admin_usage_rows(start_date, end_date, source, employee)
+    return {
+        "admin": {"email": admin["email"], "name": admin["name"]},
+        "startDate": start_date,
+        "endDate": end_date,
+        "source": source,
+        "employee": employee or "",
+        **payload,
+    }
+
+
+@app.get("/api/admin/users")
+async def admin_users(
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    source: str = Query("all"),
+    q: str | None = None,
+) -> dict[str, Any]:
+    require_admin(request)
+    if not start_date or not end_date:
+        start_date, end_date = default_date_range()
+    payload = await client().admin_usage_rows(start_date, end_date, source, q)
+    return {"users": payload["employees"], "total": len(payload["employees"]), "startDate": start_date, "endDate": end_date, "source": source}
 
 
 @app.get("/api/me/keys")
