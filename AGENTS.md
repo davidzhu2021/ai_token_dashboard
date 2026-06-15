@@ -34,6 +34,10 @@ Use 4-space indentation and type hints for Python. Keep route handlers small and
 
 Frontend JavaScript uses plain browser APIs, camelCase names, `const`/`let`, and small rendering helpers. Keep UI copy consistent with the current Chinese product language.
 
+## LiteLLM Reference Requirement
+
+Before making code changes, review the relevant LiteLLM behavior against the local official project checkout at `D:\litellm` and the LiteLLM Proxy UI documentation at `https://docs.litellm.ai/docs/proxy/ui`. Prefer the local source for implementation details and the official documentation for product/API intent. Do not guess LiteLLM endpoint names, request fields, or response shapes when they can be confirmed from those sources.
+
 ## Testing Guidelines
 
 When adding tests, prefer `pytest` for backend code and place files as `tests/test_*.py`. Mock upstream LiteLLM and OIDC calls rather than using production services. Cover authentication gates, email-domain validation, date-range handling, and key-regeneration ownership checks.
