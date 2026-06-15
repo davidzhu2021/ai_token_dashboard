@@ -59,6 +59,37 @@ cd D:\ai-token-dashboard
 http://127.0.0.1:8010
 ```
 
+## Docker 启动
+
+Docker 镜像内部使用 `8000` 端口，建议本地映射到 `8010`，这样可以继续复用当前 Casdoor 本地回调地址 `http://127.0.0.1:8010/api/auth/callback`。
+
+构建镜像：
+
+```powershell
+cd D:\ai-token-dashboard
+docker build -t ai-token-dashboard .
+```
+
+单容器运行：
+
+```powershell
+docker run --rm --env-file .env -p 8010:8000 ai-token-dashboard
+```
+
+使用 Compose 运行：
+
+```powershell
+docker compose up -d --build
+```
+
+访问地址：
+
+```text
+http://127.0.0.1:8010
+```
+
+注意：`.dockerignore` 已排除 `.env`、`.venv`、`.git`、缓存和日志，避免真实密钥或本地环境进入镜像构建上下文。
+
 ## 环境变量
 
 `.env.example` 只放模板值，真实密钥只写入本地或部署环境的 `.env` / Secret。

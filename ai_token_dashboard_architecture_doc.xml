@@ -1,0 +1,156 @@
+<title>AI Token 用量中心工程架构说明</title>
+
+<callout emoji="✅" background-color="light-green" border-color="green" text-color="green">
+  <p>本文梳理 AI Token 用量中心的代码架构、技术架构与数据流转。系统采用静态单页前端 + FastAPI 后端，认证通过 Casdoor / 飞书完成，数据由后端安全访问 LiteLLM Admin API，当前以 Docker 方式部署在 S3/188，并通过专用 Cloudflare Tunnel 暴露为 https://myai.carher.net。</p>
+</callout>
+
+<h1>1. 工程定位与核心边界</h1>
+<p>AI Token 用量中心面向公司员工展示个人 AI 工具消耗，包括 Token 趋势、费用估算、请求成功率、访问密钥与可用模型。系统边界清晰：前端只调用本系统 /api/*，所有管理员密钥、OIDC client secret 和认证 token 均留在后端。</p>
+<table>
+  <thead><tr><th background-color="light-gray">边界</th><th background-color="light-gray">说明</th></tr></thead>
+  <tbody>
+    <tr><td>用户入口</td><td>https://myai.carher.net，Cloudflare Tunnel 转发到 188 Docker 服务。</td></tr>
+    <tr><td>认证入口</td><td>用户点击飞书扫码登录后，后端直接跳转飞书授权页；Casdoor 仍负责 OIDC 协议和回调校验。</td></tr>
+    <tr><td>数据入口</td><td>后端通过 LiteLLM Admin API 查询个人用量、密钥和模型列表。</td></tr>
+    <tr><td>安全边界</td><td>前端不接触管理员密钥，不允许传任意 user_id 查询他人数据。</td></tr>
+  </tbody>
+</table>
+
+<hr/>
+
+<h1>2. 代码架构</h1>
+<p>代码库是轻量单体结构，后端负责认证、鉴权、数据聚合和静态文件托管，前端负责页面交互与展示。</p>
+<table>
+  <thead><tr><th background-color="light-gray">路径</th><th background-color="light-gray">职责</th><th background-color="light-gray">关键说明</th></tr></thead>
+  <tbody>
+    <tr><td>index.html</td><td>单页应用 HTML 与主要样式</td><td>承载登录页、仪表盘布局、图标定义和视觉样式。</td></tr>
+    <tr><td>assets/app.js</td><td>前端状态与渲染逻辑</td><td>处理登录态、API 请求、指标卡片、趋势图、密钥更新和模型广场。</td></tr>
+    <tr><td>backend/main.py</td><td>FastAPI 应用入口</td><td>定义 /api 路由、静态资源挂载、SSO 发起和 OIDC 回调。</td></tr>
+    <tr><td>backend/auth.py</td><td>认证辅助模块</td><td>封装 Casdoor OIDC 注册、邮箱域校验、session 用户规范化。</td></tr>
+    <tr><td>backend/litellm_client.py</td><td>LiteLLM API 客户端</td><td>封装用户匹配、用量查询、key 查询/更新、模型列表。</td></tr>
+    <tr><td>Dockerfile / docker-compose.yml</td><td>容器化配置</td><td>构建 FastAPI 镜像，生产以 uvicorn backend.main:app 运行。</td></tr>
+  </tbody>
+</table>
+
+<callout emoji="📌" background-color="light-blue" border-color="blue" text-color="blue">
+  <p>模块依赖方向保持单向：前端只依赖 /api；backend/main.py 编排请求；backend/auth.py 和 backend/litellm_client.py 提供可复用能力；LiteLLM 与 Casdoor 均作为外部系统接入。</p>
+</callout>
+
+<hr/>
+
+<h1>3. 技术架构</h1>
+<p>当前线上部署由浏览器、Cloudflare Tunnel、188 Docker 应用、Casdoor、飞书和 LiteLLM 组成。Cloudflare 使用专用 tunnel，避免复用共享 tunnel 带来的多 connector 配置不一致问题。</p>
+
+<whiteboard type="mermaid">
+flowchart LR
+  U[用户浏览器] --> CF[Cloudflare Tunnel\nmyai.carher.net]
+  CF --> T[cloudflared-myai\n专用 Tunnel 容器]
+  T --> APP[ai-token-dashboard-s3\nFastAPI + 静态前端]
+  APP --> CAS[Casdoor\n10.68.13.198:30882]
+  CAS --> FS[飞书扫码登录]
+  APP --> LLM[LiteLLM Admin API\ncc.auto-link.com.cn/pro]
+</whiteboard>
+
+<table>
+  <thead><tr><th background-color="light-gray">组件</th><th background-color="light-gray">技术/位置</th><th background-color="light-gray">职责</th></tr></thead>
+  <tbody>
+    <tr><td>Frontend</td><td>原生 HTML/CSS/JavaScript</td><td>展示登录页、指标卡、趋势、明细、密钥和模型。</td></tr>
+    <tr><td>Backend</td><td>FastAPI + Uvicorn</td><td>提供认证、session、数据聚合和安全代理接口。</td></tr>
+    <tr><td>Auth</td><td>Casdoor + 飞书 Provider</td><td>完成企业身份认证和 OIDC token 交换。</td></tr>
+    <tr><td>Usage Source</td><td>LiteLLM Admin API</td><td>提供用户、key、usage、models 等上游数据。</td></tr>
+    <tr><td>Deploy</td><td>Docker on S3/188</td><td>应用容器仅绑定 127.0.0.1:18080，公网通过专用 tunnel 进入。</td></tr>
+  </tbody>
+</table>
+
+<hr/>
+
+<h1>4. 数据流转图</h1>
+<p>数据流转分为登录链路和业务查询链路。登录链路中用户感知是“直接到飞书”，但后端仍保留 Casdoor OIDC state/session，保证回调校验完整。</p>
+
+<whiteboard type="mermaid">
+sequenceDiagram
+  participant B as 浏览器
+  participant A as FastAPI 后端
+  participant F as 飞书授权页
+  participant C as Casdoor
+  participant L as LiteLLM Admin API
+
+  B->>A: GET /api/auth/sso/start
+  A->>A: 生成 Casdoor OIDC state/session
+  A-->>B: 307 Redirect 到 accounts.feishu.cn
+  B->>F: 飞书扫码/确认登录
+  F-->>C: 回调 Casdoor /callback
+  C-->>A: 回调 /api/auth/callback?code=...
+  A->>C: 交换 token 并获取 userinfo
+  A->>A: 校验企业邮箱域并写入 session
+  B->>A: GET /api/me/usage
+  A->>L: 按邮箱匹配 LiteLLM 用户
+  A->>L: 查询 usage / keys / models
+  A-->>B: 返回个人可见数据
+</whiteboard>
+
+<table>
+  <thead><tr><th background-color="light-gray">阶段</th><th background-color="light-gray">输入</th><th background-color="light-gray">处理</th><th background-color="light-gray">输出</th></tr></thead>
+  <tbody>
+    <tr><td>登录发起</td><td>浏览器点击登录</td><td>后端生成 OIDC state，并构造飞书直达 URL</td><td>跳转飞书授权页</td></tr>
+    <tr><td>身份回调</td><td>飞书 code，经 Casdoor 转换</td><td>后端通过 Casdoor 换 token，读取邮箱和名称</td><td>写入后端 session</td></tr>
+    <tr><td>用户映射</td><td>session 中的企业邮箱</td><td>匹配 LiteLLM user_email / sso_user_id / user_id</td><td>得到当前员工 user_id 列表</td></tr>
+    <tr><td>用量查询</td><td>日期范围、来源筛选</td><td>按当前员工身份查询聚合和明细</td><td>返回 Token、费用、请求数、成功率</td></tr>
+    <tr><td>密钥操作</td><td>key_id</td><td>校验 key 属于当前员工后再更新</td><td>只返回一次完整新 key，并记录 audit.log</td></tr>
+  </tbody>
+</table>
+
+<hr/>
+
+<h1>5. 主要 API 说明</h1>
+<table>
+  <thead><tr><th background-color="light-gray">接口</th><th background-color="light-gray">用途</th><th background-color="light-gray">鉴权</th></tr></thead>
+  <tbody>
+    <tr><td>GET /api/health</td><td>容器和负载健康检查</td><td>无需登录</td></tr>
+    <tr><td>GET /api/auth/config</td><td>返回登录方式、允许邮箱域等前端配置</td><td>无需登录</td></tr>
+    <tr><td>GET /api/auth/sso/start</td><td>发起飞书/Casdoor 登录</td><td>无需登录</td></tr>
+    <tr><td>GET /api/auth/callback</td><td>OIDC 登录回调</td><td>Casdoor 回调</td></tr>
+    <tr><td>GET /api/me/usage</td><td>查询个人用量聚合</td><td>需要 session</td></tr>
+    <tr><td>GET /api/me/usage/logs</td><td>查询个人明细日志</td><td>需要 session</td></tr>
+    <tr><td>GET /api/me/keys</td><td>查询个人访问密钥</td><td>需要 session</td></tr>
+    <tr><td>POST /api/me/keys/{key_id}/regenerate</td><td>更新个人访问密钥</td><td>需要 session + 所属权校验</td></tr>
+    <tr><td>GET /api/models</td><td>查询当前账号可用模型</td><td>需要 session</td></tr>
+  </tbody>
+</table>
+
+<hr/>
+
+<h1>6. 部署与配置</h1>
+<p>当前部署在 S3/188，以 Docker 运行。应用服务和 Cloudflare 专用 tunnel 独立于服务器上的其他业务容器。</p>
+<table>
+  <thead><tr><th background-color="light-gray">项目</th><th background-color="light-gray">当前值</th></tr></thead>
+  <tbody>
+    <tr><td>部署目录</td><td>/home/cltx/apps/ai_token_dashboard/current</td></tr>
+    <tr><td>应用容器</td><td>ai-token-dashboard-s3</td></tr>
+    <tr><td>应用监听</td><td>127.0.0.1:18080 -&gt; 8000</td></tr>
+    <tr><td>专用 Tunnel 容器</td><td>cloudflared-myai</td></tr>
+    <tr><td>访问域名</td><td>https://myai.carher.net</td></tr>
+    <tr><td>Casdoor Application</td><td>ai-token-dashboard</td></tr>
+    <tr><td>飞书直达登录</td><td>FEISHU_DIRECT_LOGIN_ENABLED=true</td></tr>
+  </tbody>
+</table>
+
+<callout emoji="⚠️" background-color="light-yellow" border-color="yellow" text-color="yellow">
+  <p>生产配置中 DEV_LOGIN_ENABLED 必须保持 false；LITELLM_ADMIN_KEY、OIDC_CLIENT_SECRET、SESSION_SECRET 不进入前端、不写入日志、不提交到 Git。</p>
+</callout>
+
+<hr/>
+
+<h1>7. 安全设计</h1>
+<ul>
+  <li>管理员密钥仅保存在后端 .env，浏览器永远不直接访问 LiteLLM Admin API。</li>
+  <li>后端始终从 session 识别当前员工，不接受前端传入任意 user_id。</li>
+  <li>企业邮箱域通过 ALLOWED_EMAIL_DOMAIN 校验，非公司邮箱拒绝访问。</li>
+  <li>更新访问密钥前会校验 key 属于当前员工，完整新 key 只返回一次。</li>
+  <li>Cloudflare 使用专用 tunnel，避免共享 tunnel 多 connector 配置不一致导致访问漂移。</li>
+</ul>
+
+<h1>8. 后续建议</h1>
+<checkbox done="false">补充 pytest 覆盖 auth callback、邮箱域校验、LiteLLM 用户映射和 key 所属权校验。</checkbox>
+<checkbox done="false">将 docker-compose.s3.yml 和 cloudflared-myai.yml 的部署形态固化到仓库或部署脚本中。</checkbox>
+<checkbox done="false">为 Casdoor Application、飞书 Provider、Cloudflare Tunnel 建立变更记录，避免手工配置漂移。</checkbox>

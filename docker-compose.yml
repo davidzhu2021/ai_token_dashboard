@@ -1,0 +1,11 @@
+services:
+  ai-token-dashboard:
+    build:
+      context: .
+    image: ai-token-dashboard:latest
+    container_name: ai-token-dashboard
+    env_file:
+      - .env
+    ports:
+      - "8010:8000"
+    restart: unless-stopped
