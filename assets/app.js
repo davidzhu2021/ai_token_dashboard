@@ -10,6 +10,7 @@ let usageData = [];
 let usageSummary = null;
 let lastPersonalUsageCacheHit = false;
 let adminUsageData = [];
+let adminSummaryData = [];
 let adminEmployees = [];
 let selectedAdminEmployee = "";
 let modelCatalog = [];
@@ -138,11 +139,11 @@ function rangeLabel() {
   return `近 ${el("rangeSelect").value} 天`;
 }
 
-function renderMetricGroups(containerId, data, mode = "personal", summary = null) {
+function renderMetricGroups(containerId, data, mode = "personal", summary = null, splitData = data) {
   const latest = summary?.latestDay || aggregateByDate(data).slice(-1)[0] || {};
   const total = sum(data, "totalTokens");
-  const cursor = sum(data.filter((item) => item.source === "Cursor"), "totalTokens");
-  const cc = sum(data.filter((item) => item.source === "Claude Code"), "totalTokens");
+  const cursor = sum(splitData.filter((item) => item.source === "Cursor"), "totalTokens");
+  const cc = sum(splitData.filter((item) => item.source === "Claude Code"), "totalTokens");
   const requests = sum(data, "requestCount");
   const successes = sum(data, "successCount");
   const successRate = requests ? Math.round((successes / requests) * 1000) / 10 : 0;
@@ -188,8 +189,9 @@ function renderPersonalMetrics(data) {
 }
 
 function renderAdminMetrics(data) {
-  const total = sum(data, "totalTokens");
-  const requests = sum(data, "requestCount");
+  const totalData = adminSummaryData.length ? adminSummaryData : data;
+  const total = sum(totalData, "totalTokens");
+  const requests = sum(totalData, "requestCount");
   const label = rangeLabel();
   const source = sourceText();
   el("adminHeroTotal").textContent = formatTokens(total);
@@ -198,7 +200,7 @@ function renderAdminMetrics(data) {
   el("adminActiveUsers").textContent = fmt.format(adminEmployees.length);
   el("adminTrendBadge").textContent = `${label} · ${source}`;
   el("adminSpendBadge").textContent = `${label} · ${source}`;
-  renderMetricGroups("adminMetrics", data, "admin");
+  renderMetricGroups("adminMetrics", totalData, "admin", null, data);
 }
 
 function showChartTooltip(event, html) {
@@ -564,9 +566,10 @@ function renderAdmin() {
     renderAdminLoading();
     return;
   }
+  const totalData = adminSummaryData.length ? adminSummaryData : adminUsageData;
   renderAdminMetrics(adminUsageData);
-  renderTrendTo("adminTrendChart", adminUsageData);
-  renderSpendTrendTo("adminSpendChart", adminUsageData);
+  renderTrendTo("adminTrendChart", totalData);
+  renderSpendTrendTo("adminSpendChart", totalData);
   renderDonutTo("adminSourceDonut", "adminDonutTotal", "adminSourceLegend", adminUsageData);
   renderModelBarsTo("adminModelBars", adminUsageData);
   renderSplitTo("adminSplitChart", adminUsageData);
@@ -704,11 +707,17 @@ async function loadAdminData() {
   try {
     const payload = await api(`/api/admin/usage?${query.toString()}`);
     adminUsageData = payload.rows || [];
+    adminSummaryData = payload.summaryRows || adminUsageData;
     adminEmployees = payload.employees || [];
-    el("adminLimitHint").textContent = `最多读取 ${payload.pageLimit || "-"} 页日志，按当前筛选范围统计`;
+    if (payload.truncated) {
+      el("adminLimitHint").textContent = `日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），员工排行可能不完整`;
+    } else {
+      el("adminLimitHint").textContent = `已读取 ${payload.pagesRead || 0} 页日志，按当前筛选范围统计`;
+    }
   } catch (error) {
     showToast(error.message || "全员数据加载失败");
     adminUsageData = [];
+    adminSummaryData = [];
     adminEmployees = [];
   } finally {
     isAdminLoading = false;
@@ -751,6 +760,7 @@ function showLogin() {
   usageData = [];
   usageSummary = null;
   adminUsageData = [];
+  adminSummaryData = [];
   adminEmployees = [];
   el("appView").classList.add("hidden");
   el("loginView").classList.remove("hidden");

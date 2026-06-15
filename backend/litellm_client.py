@@ -1,6 +1,6 @@
 ﻿import os
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -50,6 +50,40 @@ def _date_text(value: Any) -> str:
     return text[:10]
 
 
+def usage_timezone_offset_minutes() -> int:
+    raw_value = os.getenv("USAGE_TIMEZONE_OFFSET_MINUTES", "-480")
+    try:
+        return int(raw_value)
+    except ValueError:
+        return -480
+
+
+def _local_date_window_as_utc_text(start_date: str, end_date: str) -> tuple[str, str]:
+    offset = timedelta(minutes=usage_timezone_offset_minutes())
+    local_start = datetime.strptime(start_date, "%Y-%m-%d")
+    local_end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    utc_start = local_start + offset
+    utc_end = local_end + offset
+    return utc_start.strftime("%Y-%m-%d %H:%M:%S"), utc_end.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _date_text_in_usage_timezone(value: Any) -> str:
+    if not value:
+        return date.today().isoformat()
+    text = str(value).strip()
+    if "T" not in text and " " not in text:
+        return _date_text(text)
+    try:
+        normalized = text.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        local = parsed.astimezone(timezone.utc) - timedelta(minutes=usage_timezone_offset_minutes())
+        return local.date().isoformat()
+    except ValueError:
+        return _date_text(text)
+
+
 def detect_source(record: dict[str, Any]) -> str:
     metadata = _first(record, "metadata", "request_tags", "tags", default={})
     values = [
@@ -61,7 +95,7 @@ def detect_source(record: dict[str, Any]) -> str:
     haystack = " ".join(str(value) for value in values).lower()
     if any(word in haystack for word in ("cursor", "curosr")):
         return "Cursor"
-    if any(word in haystack for word in ("claude code", "claude-code", "claudecode", "cc")):
+    if any(word in haystack for word in ("claude code", "claude-code", "claudecode")):
         return "Claude Code"
     return "其他"
 
@@ -71,7 +105,7 @@ def detect_source_from_key(key: dict[str, Any]) -> str:
     haystack = " ".join(str(value or "") for value in values).lower()
     if "cursor" in haystack:
         return "Cursor"
-    if any(word in haystack for word in ("claude code", "claude-code", "claudecode", "cc")):
+    if any(word in haystack for word in ("claude code", "claude-code", "claudecode")):
         return "Claude Code"
     return "其他"
 
@@ -271,6 +305,7 @@ class LiteLLMClient:
 
     async def _usage_from_logs(self, user_id: str, start_date: str, end_date: str, source: str | None) -> list[dict[str, Any]]:
         max_pages = max(1, int(os.getenv("USAGE_LOG_MAX_PAGES", "20")))
+        utc_start, utc_end = _local_date_window_as_utc_text(start_date, end_date)
         grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
         for page in range(1, max_pages + 1):
             payload = await self.request(
@@ -278,8 +313,8 @@ class LiteLLMClient:
                 "/spend/logs/v2",
                 params={
                     "user_id": user_id,
-                    "start_date": f"{start_date} 00:00:00",
-                    "end_date": f"{end_date} 23:59:59",
+                    "start_date": utc_start,
+                    "end_date": utc_end,
                     "page": page,
                     "page_size": 100,
                     "sort_by": "startTime",
@@ -294,7 +329,7 @@ class LiteLLMClient:
                 if source and source != "all" and detected_source != source:
                     continue
                 model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
-                day = _date_text(_first(log, "startTime", "start_time", "created_at", "date"))
+                day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
                 key = (day, detected_source, model)
                 row = grouped.setdefault(key, self._empty_usage_row(day, detected_source, model))
                 self._add_log_to_row(row, log)
@@ -332,6 +367,32 @@ class LiteLLMClient:
         else:
             row["successCount"] += 1
 
+    def _row_from_daily_activity_item(self, item: dict[str, Any], source: str, fallback_model: str = "全部模型") -> dict[str, Any]:
+        metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else item
+        breakdown = item.get("breakdown") if isinstance(item.get("breakdown"), dict) else {}
+        models = breakdown.get("models") if isinstance(breakdown.get("models"), dict) else {}
+        model = str(_first(item, "model", "model_group", default=None) or next(iter(models.keys()), fallback_model))
+        prompt = _as_int(_first(metrics, "prompt_tokens", "promptTokens", "total_prompt_tokens"))
+        completion = _as_int(_first(metrics, "completion_tokens", "completionTokens", "total_completion_tokens"))
+        total = _as_int(_first(metrics, "total_tokens", "totalTokens", default=prompt + completion))
+        requests = _as_int(_first(metrics, "api_requests", "total_api_requests", "requestCount"))
+        successes = _as_int(_first(metrics, "successful_requests", "total_successful_requests", "successCount"))
+        failures = _as_int(_first(metrics, "failed_requests", "total_failed_requests", "failureCount"))
+        if not successes and requests:
+            successes = max(0, requests - failures)
+        return {
+            "date": _date_text(_first(item, "date", "day")),
+            "source": source,
+            "model": model,
+            "promptTokens": prompt,
+            "completionTokens": completion,
+            "totalTokens": total,
+            "requestCount": requests,
+            "successCount": successes,
+            "failureCount": failures,
+            "spend": _as_number(_first(metrics, "spend", "total_spend")),
+        }
+
     async def _usage_from_daily_activity(
         self,
         user_id: str,
@@ -352,29 +413,7 @@ class LiteLLMClient:
             payload = await self.request("GET", "/user/daily/activity", params=params)
         rows = []
         for item in _records(payload):
-            metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else item
-            breakdown = item.get("breakdown") if isinstance(item.get("breakdown"), dict) else {}
-            models = breakdown.get("models") if isinstance(breakdown.get("models"), dict) else {}
-            model = str(_first(item, "model", "model_group", default=None) or next(iter(models.keys()), "全部模型"))
-            prompt = _as_int(_first(metrics, "prompt_tokens", "promptTokens", "total_prompt_tokens"))
-            completion = _as_int(_first(metrics, "completion_tokens", "completionTokens", "total_completion_tokens"))
-            total = _as_int(_first(metrics, "total_tokens", "totalTokens", default=prompt + completion))
-            requests = _as_int(_first(metrics, "api_requests", "total_api_requests", "requestCount"))
-            failures = _as_int(_first(metrics, "failed_requests", "total_failed_requests", "failureCount"))
-            rows.append(
-                {
-                    "date": _date_text(_first(item, "date", "day")),
-                    "source": source_override or "其他",
-                    "model": model,
-                    "promptTokens": prompt,
-                    "completionTokens": completion,
-                    "totalTokens": total,
-                    "requestCount": requests,
-                    "successCount": max(0, requests - failures),
-                    "failureCount": failures,
-                    "spend": _as_number(_first(metrics, "spend", "total_spend")),
-                }
-            )
+            rows.append(self._row_from_daily_activity_item(item, source_override or "其他"))
         return rows
 
     async def keys_for_user(self, user_id: str) -> list[dict[str, Any]]:
@@ -441,6 +480,19 @@ class LiteLLMClient:
                 break
         return users
 
+    async def admin_daily_activity_rows(self, start_date: str, end_date: str) -> list[dict[str, Any]]:
+        payload = await self.request(
+            "GET",
+            "/user/daily/activity/aggregated",
+            params={
+                "start_date": start_date,
+                "end_date": end_date,
+                "timezone": usage_timezone_offset_minutes(),
+            },
+        )
+        rows = [self._row_from_daily_activity_item(item, "其他", "全量") for item in _records(payload)]
+        return sorted(rows, key=lambda item: (item["date"], item["model"]))
+
     async def admin_usage_rows(self, start_date: str, end_date: str, source: str | None, employee: str | None = None) -> dict[str, Any]:
         users = await self.users()
         user_map = self._admin_user_map(users)
@@ -449,20 +501,28 @@ class LiteLLMClient:
         employees: dict[str, dict[str, Any]] = {}
         max_pages = max(1, int(os.getenv("ADMIN_USAGE_LOG_MAX_PAGES", "30")))
         page_size = max(1, min(100, int(os.getenv("ADMIN_USAGE_PAGE_SIZE", "100"))))
+        utc_start, utc_end = _local_date_window_as_utc_text(start_date, end_date)
+        pages_read = 0
+        total_pages = 0
+        total_records = 0
 
         for page in range(1, max_pages + 1):
             payload = await self.request(
                 "GET",
                 "/spend/logs/v2",
                 params={
-                    "start_date": f"{start_date} 00:00:00",
-                    "end_date": f"{end_date} 23:59:59",
+                    "start_date": utc_start,
+                    "end_date": utc_end,
                     "page": page,
                     "page_size": page_size,
                     "sort_by": "startTime",
                     "sort_order": "desc",
                 },
             )
+            pages_read = page
+            if isinstance(payload, dict):
+                total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=total_pages))
+                total_records = _as_int(_first(payload, "total", "total_count", "count", default=total_records))
             logs = _records(payload)
             if not logs:
                 break
@@ -478,22 +538,79 @@ class LiteLLMClient:
                 employee_key = employee_info["id"]
                 employees.setdefault(employee_key, employee_info)
                 model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
-                day = _date_text(_first(log, "startTime", "start_time", "created_at", "date"))
+                day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
                 key = (day, employee_key, detected_source, model)
                 row = grouped.setdefault(key, self._admin_empty_row(day, employee_info, detected_source, model))
                 self._add_log_to_row(row, log)
 
-            total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=0)) if isinstance(payload, dict) else 0
             if total_pages and page >= total_pages:
                 break
 
         rows = sorted(grouped.values(), key=lambda item: (item["date"], item["employeeName"], item["source"], item["model"]))
+        summary_rows: list[dict[str, Any]] = []
+        if (not employee_filter) and (not source or source == "all"):
+            try:
+                summary_rows = await self.admin_daily_activity_rows(start_date, end_date)
+            except HTTPException:
+                summary_rows = []
+        truncated = bool(total_pages and pages_read < total_pages)
         return {
             "rows": rows,
+            "summaryRows": summary_rows or rows,
             "employees": self._admin_employee_summaries(rows, employees),
             "pageLimit": max_pages,
             "pageSize": page_size,
+            "pagesRead": pages_read,
+            "totalPages": total_pages,
+            "totalRecords": total_records,
+            "truncated": truncated,
+            "dataQuality": {
+                "summarySource": "official_daily_activity" if summary_rows else "spend_logs",
+                "rankingSource": "spend_logs",
+                "timezoneOffsetMinutes": usage_timezone_offset_minutes(),
+            },
         }
+
+    async def admin_usage_compare(self, start_date: str, end_date: str, source: str | None) -> dict[str, Any]:
+        payload = await self.admin_usage_rows(start_date, end_date, source, None)
+        rows = payload.get("rows", [])
+        summary_rows = payload.get("summaryRows", [])
+        employee_ids = {str(row.get("employeeId") or "") for row in rows}
+        employee_emails = {str(row.get("employeeEmail") or "").lower() for row in rows if row.get("employeeEmail")}
+        return {
+            "startDate": start_date,
+            "endDate": end_date,
+            "source": source or "all",
+            "officialDailyActivity": self._usage_totals(summary_rows),
+            "spendLogs": self._usage_totals(rows),
+            "truncated": payload.get("truncated", False),
+            "pagesRead": payload.get("pagesRead", 0),
+            "totalPages": payload.get("totalPages", 0),
+            "totalRecords": payload.get("totalRecords", 0),
+            "employeesAfterMerge": len(employee_ids),
+            "boundEmailCount": len(employee_emails),
+            "dataQuality": payload.get("dataQuality", {}),
+        }
+
+    def _usage_totals(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        totals = {
+            "promptTokens": 0,
+            "completionTokens": 0,
+            "totalTokens": 0,
+            "requestCount": 0,
+            "successCount": 0,
+            "failureCount": 0,
+            "spend": 0.0,
+        }
+        for row in rows:
+            totals["promptTokens"] += _as_int(row.get("promptTokens"))
+            totals["completionTokens"] += _as_int(row.get("completionTokens"))
+            totals["totalTokens"] += _as_int(row.get("totalTokens"))
+            totals["requestCount"] += _as_int(row.get("requestCount"))
+            totals["successCount"] += _as_int(row.get("successCount"))
+            totals["failureCount"] += _as_int(row.get("failureCount"))
+            totals["spend"] += _as_number(row.get("spend"))
+        return totals
 
     def _admin_empty_row(self, day: str, employee_info: dict[str, Any], source: str, model: str) -> dict[str, Any]:
         row = self._empty_usage_row(day, source, model)
@@ -509,18 +626,35 @@ class LiteLLMClient:
 
     def _admin_user_map(self, users: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         mapping: dict[str, dict[str, Any]] = {}
+        by_email: dict[str, dict[str, Any]] = {}
         for user in users:
             user_id = str(user.get("user_id") or "").strip()
             if not user_id:
                 continue
             email = str(user.get("user_email") or user.get("sso_user_id") or "").strip().lower()
             alias = str(user.get("user_alias") or "").strip()
-            info = {
-                "id": user_id,
-                "name": alias or email.split("@", 1)[0] or user_id,
-                "email": email,
-                "bindStatus": "已绑定邮箱" if email else "未绑定邮箱",
-            }
+            if email and email in by_email:
+                info = by_email[email]
+                if not info.get("name") and alias:
+                    info["name"] = alias
+            else:
+                info = {
+                    "id": email or user_id,
+                    "name": alias or email.split("@", 1)[0] or user_id,
+                    "email": email,
+                    "bindStatus": "已绑定邮箱" if email else "未绑定邮箱",
+                }
+                if email:
+                    by_email[email] = info
+            info.setdefault("userIds", [])
+            if user_id not in info["userIds"]:
+                info["userIds"].append(user_id)
+            info.update(
+                {
+                    "email": email,
+                    "bindStatus": "已绑定邮箱" if email else "未绑定邮箱",
+                }
+            )
             mapping[user_id.lower()] = info
             if email:
                 mapping[email] = info

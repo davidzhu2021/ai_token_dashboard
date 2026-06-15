@@ -354,6 +354,21 @@ async def debug_me_usage_compare(
     }
 
 
+@app.get("/api/debug/admin-usage-compare")
+async def debug_admin_usage_compare(
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    source: str = Query("all"),
+) -> dict[str, Any]:
+    if not env_bool("DEBUG_MAPPING_ENABLED", False):
+        raise HTTPException(status_code=404, detail="接口不存在")
+    require_admin(request)
+    if not start_date or not end_date:
+        start_date, end_date = default_date_range()
+    return await client().admin_usage_compare(start_date, end_date, source)
+
+
 @app.get("/api/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
