@@ -56,6 +56,42 @@ Pull requests should include a brief change summary, configuration or migration 
 After modifying project files, finish by reviewing `git diff`, committing the intended changes, and pushing them to the configured GitHub remote. After a successful push, synchronize the remote production server and update the running system from the pushed GitHub revision. Do not include `.env`, secrets, generated logs, virtual environments, or unrelated user changes in those commits.
 
 
+## Production Sync: JSZX-AI-03 / 188
+
+After a successful GitHub push, update the production server from the pushed `master` revision. Production details:
+
+- Public URL: `https://myai.carher.net`
+- JumpServer asset: `JSZX-AI-03`
+- Server: `JSZX-AI-03 / 188`
+- Deploy directory: `/home/cltx/apps/ai-token-dashboard/current`
+- Docker Compose service/container: `ai-token-dashboard`
+- Port mapping: host `8010` -> container `8000`
+
+Standard sync command from Windows PowerShell:
+
+```powershell
+wsl bash -lc "cd /home/zhuyida/codes/carher-admin/scripts && ./jms ssh JSZX-AI-03 'cd /home/cltx/apps/ai-token-dashboard/current && git pull origin master && docker compose up -d --build && sleep 5 && curl -fsS http://127.0.0.1:8010/api/health'"
+```
+
+Post-deploy verification:
+
+```powershell
+# Public health check from local Windows
+Invoke-RestMethod -Uri 'https://myai.carher.net/api/health' -TimeoutSec 12
+
+# Optional server-side status check
+wsl bash -lc "cd /home/zhuyida/codes/carher-admin/scripts && ./jms ssh JSZX-AI-03 'cd /home/cltx/apps/ai-token-dashboard/current && docker compose ps && git log --oneline -1'"
+```
+
+Operational rules:
+
+- Only sync production after `git push origin master` succeeds.
+- Do not hot-edit code on the server; make changes locally, commit, push, then pull on the server.
+- Never print, copy, or commit the server `.env` file or any secret values.
+- If the first health check fails with a connection reset immediately after `docker compose up`, wait 5-10 seconds and retry once; the container may still be starting.
+- If JumpServer, DNS, GitHub, or Docker fails, report the exact failing step and stop. Do not use destructive cleanup commands such as `docker system prune -a`, `git reset --hard`, or deleting shared Docker resources unless the user explicitly approves.
+
+
 ## Security & Configuration Tips
 
 Never commit `.env`, admin keys, OIDC client secrets, auth tokens, generated audit logs, or full regenerated keys. Production must use SSO with `DEV_LOGIN_ENABLED=false`; debug flags such as `DEBUG_MAPPING_ENABLED` and `DEBUG_OIDC_CLAIMS` should remain disabled outside troubleshooting sessions.
