@@ -13,6 +13,8 @@ let currentView = "dashboard";
 let usageData = [];
 let usageSummary = null;
 let lastPersonalUsageCacheHit = false;
+let lastAdminUsageCacheHit = false;
+let lastDepartmentUsageCacheHit = false;
 let adminUsageData = [];
 let adminSummaryData = [];
 let adminEmployees = [];
@@ -154,11 +156,24 @@ function rangeLabel() {
   return `近 ${el("rangeSelect").value} 天`;
 }
 
+function selectedDepartmentInfo() {
+  if (!selectedDepartment) return null;
+  const matched = departmentRankings.find((item) => item.departmentId === selectedDepartment || item.departmentName === selectedDepartment);
+  return {
+    id: matched?.departmentId || selectedDepartment,
+    name: matched?.departmentName || selectedDepartment,
+    bindStatus: matched?.bindStatus || "部门字段",
+  };
+}
+
+function departmentScopeLabel() {
+  return selectedDepartmentInfo()?.name || "全部部门";
+}
+
 function metricScopeSuffix(mode) {
   if (mode !== "department") return "";
   if (!selectedDepartment) return " · 全部部门";
-  const department = departmentRankings.find((item) => item.departmentId === selectedDepartment);
-  return ` · ${department?.departmentName || selectedDepartment}`;
+  return ` · ${departmentScopeLabel()}`;
 }
 
 function renderMetricGroups(containerId, data, mode = "personal", summary = null, splitData = data) {
@@ -231,19 +246,29 @@ function renderDepartmentMetrics(data) {
   const requests = sum(data, "requestCount");
   const label = rangeLabel();
   const source = sourceText();
-  const department = selectedDepartment ? departmentRankings.find((item) => item.departmentId === selectedDepartment) : null;
-  const departmentName = department?.departmentName || selectedDepartment;
+  const scopeLabel = departmentScopeLabel();
   el("departmentHeroTotal").textContent = formatTokens(total);
-  el("departmentHeroTotalLabel").textContent = selectedDepartment ? `${departmentName} Token` : "全部部门 Token";
+  el("departmentHeroTotalLabel").textContent = `${scopeLabel} Token`;
   el("departmentHeroRequests").textContent = fmt.format(requests);
   el("departmentActiveUsers").textContent = fmt.format(selectedDepartment ? departmentEmployees.length : departmentRankings.length);
+  el("departmentRequestLabel").textContent = `${scopeLabel}请求次数`;
   el("departmentTrendBadge").textContent = `${label} · ${source}`;
   el("departmentSpendBadge").textContent = `${label} · ${source}`;
-  el("departmentWelcomeTitle").textContent = selectedDepartment ? `${departmentName} AI 用量总览` : "全部部门 AI 用量总览";
+  el("departmentWelcomeTitle").textContent = `${scopeLabel} AI 用量总览`;
   el("departmentWelcomeDesc").textContent = selectedDepartment
-    ? `当前展示 ${departmentName} 在所选日期范围内的用量明细。`
-    : "当前展示所有部门在所选日期范围内的汇总数据。";
+    ? `当前展示 ${scopeLabel} 在所选日期范围与来源筛选下的员工用量明细。`
+    : "当前展示所有部门在所选日期范围与来源筛选下的汇总数据。";
   el("departmentActiveLabel").textContent = selectedDepartment ? "活跃员工" : "活跃部门";
+  el("departmentTrendTitle").textContent = `${scopeLabel}每日 Token 趋势`;
+  el("departmentTrendDesc").textContent = `按日期汇总${scopeLabel} Prompt 与 Completion Token。`;
+  el("departmentSpendTitle").textContent = `${scopeLabel}每日金额消费趋势`;
+  el("departmentSpendDesc").textContent = `按日期汇总${scopeLabel}预估消费金额。`;
+  el("departmentSourceTitle").textContent = `${scopeLabel}来源占比`;
+  el("departmentSourceDesc").textContent = `${scopeLabel} Codex、Claude Code 与其他来源占比。`;
+  el("departmentModelTitle").textContent = `${scopeLabel}模型使用排行`;
+  el("departmentModelDesc").textContent = `按${scopeLabel}总 Token 消耗排序。`;
+  el("departmentSplitTitle").textContent = `${scopeLabel} Prompt / Completion 拆分`;
+  el("departmentSplitDesc").textContent = `观察${scopeLabel}输入输出 Token 比例。`;
   renderMetricGroups("departmentMetrics", data, "department");
 }
 
@@ -543,13 +568,15 @@ function renderAdminUsers() {
 }
 
 function renderDepartmentUsers() {
+  const scopeLabel = departmentScopeLabel();
+  el("departmentBackButton").classList.toggle("hidden", !selectedDepartment);
   if (selectedDepartment) {
-    el("departmentRankingTitle").textContent = "部门员工排行";
-    el("departmentRankingDesc").textContent = "当前部门内员工用量，默认按 Token 从高到低排序。";
+    el("departmentRankingTitle").textContent = `${scopeLabel}员工排行`;
+    el("departmentRankingDesc").textContent = `当前展示 ${scopeLabel} 内员工用量，默认按 Token 从高到低排序。`;
     renderEmployeeRanking("departmentUserTable", "departmentUserCount", departmentEmployees, "当前筛选范围暂无部门员工用量");
   } else {
     el("departmentRankingTitle").textContent = "部门用量排行";
-    el("departmentRankingDesc").textContent = "点击部门行查看该部门员工排行和明细。";
+    el("departmentRankingDesc").textContent = "当前展示全部部门汇总排行，点击部门行查看该部门员工排行。";
     renderDepartmentRanking("departmentUserTable", "departmentUserCount", departmentRankings, "当前筛选范围暂无部门用量");
   }
 }
@@ -702,9 +729,11 @@ function renderAdminLoading() {
 function renderDepartmentLoading() {
   const label = rangeLabel();
   const source = sourceText();
+  const scopeLabel = departmentScopeLabel();
   el("departmentHeroTotal").textContent = "加载中";
-  el("departmentHeroTotalLabel").textContent = selectedDepartment ? "部门 Token" : "全部部门 Token";
+  el("departmentHeroTotalLabel").textContent = `${scopeLabel} Token`;
   el("departmentHeroRequests").textContent = "--";
+  el("departmentRequestLabel").textContent = `${scopeLabel}请求次数`;
   el("departmentActiveUsers").textContent = "--";
   el("departmentActiveLabel").textContent = selectedDepartment ? "活跃员工" : "活跃部门";
   el("departmentTrendBadge").textContent = `${label} · ${source}`;
@@ -773,10 +802,9 @@ function renderDepartment() {
   const detailCard = el("departmentDetailCard");
   detailCard.classList.toggle("show", Boolean(selectedDepartment));
   if (selectedDepartment) {
-    const department = departmentRankings.find((item) => item.departmentId === selectedDepartment);
-    const departmentName = department?.departmentName || selectedDepartment;
-    el("departmentDetailTitle").textContent = `${departmentName} 的部门详情`;
-    el("departmentDetailSubtitle").textContent = `部门 ID：${department?.departmentId || selectedDepartment} · 数据来源：${department?.bindStatus || "部门字段"} · 下方排行已切换为该部门员工用量`;
+    const department = selectedDepartmentInfo();
+    el("departmentDetailTitle").textContent = `${department.name} 的部门详情`;
+    el("departmentDetailSubtitle").textContent = `部门 ID：${department.id} · 数据来源：${department.bindStatus} · 下方排行已切换为该部门员工用量`;
   }
 }
 
@@ -868,19 +896,30 @@ function switchView(view) {
   el("modelsView").classList.toggle("hidden", view !== "models");
   el("dashboardFilters").classList.toggle("hidden", view === "models");
   document.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
-  if (view === "models") renderModels();
+  if (view === "models") {
+    renderModels();
+    if (!modelCatalog.length) loadModels();
+  }
+  if (view === "dashboard" && !usageData.length) loadDashboardData();
   if (view === "admin" && !adminUsageData.length) loadAdminData();
   if (view === "department" && !departmentUsageData.length) loadDepartmentData();
 }
 
-async function loadDashboardData() {
+async function loadCurrentViewData(forceRefresh = false) {
+  if (currentView === "models") return loadModels();
+  if (currentView === "admin") return loadAdminData(forceRefresh);
+  if (currentView === "department") return loadDepartmentData(forceRefresh);
+  return loadDashboardData(forceRefresh);
+}
+
+async function loadDashboardData(forceRefresh = false) {
   if (!currentUser || isDashboardLoading) return;
   isDashboardLoading = true;
   renderPersonal();
   const { startDate, endDate } = selectedDateRange();
   const source = el("sourceSelect").value;
   try {
-    const payload = await api(`/api/me/usage?start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&source=${encodeURIComponent(source)}`);
+    const payload = await api(`/api/me/usage?start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&source=${encodeURIComponent(source)}${forceRefresh ? "&refresh=1" : ""}`);
     usageData = payload.rows || [];
     usageSummary = payload.summary || null;
     lastPersonalUsageCacheHit = Boolean(payload.cache?.hit);
@@ -894,7 +933,7 @@ async function loadDashboardData() {
   }
 }
 
-async function loadAdminData() {
+async function loadAdminData(forceRefresh = false) {
   if (!currentUser?.isAdmin || isAdminLoading) return;
   isAdminLoading = true;
   renderAdmin();
@@ -904,11 +943,13 @@ async function loadAdminData() {
   const employee = selectedAdminEmployee || search;
   const query = new URLSearchParams({ start_date: startDate, end_date: endDate, source });
   if (employee) query.set("employee", employee);
+  if (forceRefresh) query.set("refresh", "1");
   try {
     const payload = await api(`/api/admin/usage?${query.toString()}`);
     adminUsageData = payload.rows || [];
     adminSummaryData = payload.summaryRows || adminUsageData;
     adminEmployees = payload.employees || [];
+    lastAdminUsageCacheHit = Boolean(payload.cache?.hit);
     if (payload.truncated) {
       el("adminLimitHint").textContent = `默认按 Token 从高到低排序；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），员工排行可能不完整`;
     } else {
@@ -925,7 +966,7 @@ async function loadAdminData() {
   }
 }
 
-async function loadDepartmentData() {
+async function loadDepartmentData(forceRefresh = false) {
   if (!currentUser?.isAdmin || isDepartmentLoading) return;
   isDepartmentLoading = true;
   renderDepartment();
@@ -935,12 +976,14 @@ async function loadDepartmentData() {
   const department = selectedDepartment || search;
   const query = new URLSearchParams({ start_date: startDate, end_date: endDate, source });
   if (department) query.set("department", department);
+  if (forceRefresh) query.set("refresh", "1");
   try {
     const payload = await api(`/api/admin/departments/usage?${query.toString()}`);
     departmentUsageData = payload.rows || [];
     departmentSummaryData = payload.summaryRows || departmentUsageData;
     departmentRankings = payload.departments || [];
     departmentEmployees = payload.employees || [];
+    lastDepartmentUsageCacheHit = Boolean(payload.cache?.hit);
     const rankingSubject = selectedDepartment ? "员工排行" : "部门排行";
     if (payload.truncated) {
       el("departmentLimitHint").textContent = `${rankingSubject}默认按 Token 从高到低排序；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），排行可能不完整`;
@@ -987,7 +1030,7 @@ async function showApp(user) {
   el("departmentWelcomeTitle").textContent = `${user.name}您好，部门 AI 用量一眼看清`;
   switchView(user.isAdmin ? "admin" : "dashboard");
   render();
-  await Promise.all([loadDashboardData(), user.isAdmin ? loadDepartmentData() : Promise.resolve(), user.isAdmin ? loadAdminData() : Promise.resolve(), loadModels()]);
+  await Promise.all([loadCurrentViewData(), loadModels()]);
 }
 
 function showLogin() {
@@ -1043,28 +1086,28 @@ document.querySelectorAll("[data-view]").forEach((button) => button.addEventList
 el("rangeSelect").addEventListener("change", async () => {
   selectedAdminEmployee = "";
   selectedDepartment = "";
-  await Promise.all([loadDashboardData(), currentUser?.isAdmin ? loadDepartmentData() : Promise.resolve(), currentUser?.isAdmin ? loadAdminData() : Promise.resolve()]);
+  await loadCurrentViewData();
 });
 
 el("sourceSelect").addEventListener("change", async () => {
   selectedAdminEmployee = "";
   selectedDepartment = "";
-  await Promise.all([loadDashboardData(), currentUser?.isAdmin ? loadDepartmentData() : Promise.resolve(), currentUser?.isAdmin ? loadAdminData() : Promise.resolve()]);
+  await loadCurrentViewData();
 });
 
 el("refreshButton").addEventListener("click", async () => {
   if (currentView === "models") {
     await loadModels();
-    showToast("已刷新模型列表");
+    showToast("\u5df2\u5237\u65b0\u6a21\u578b\u5217\u8868");
   } else if (currentView === "admin") {
-    await loadAdminData();
-    showToast("已刷新全员用量数据");
+    await loadAdminData(true);
+    showToast(lastAdminUsageCacheHit ? "\u5df2\u52a0\u8f7d\u7f13\u5b58\u5168\u5458\u6570\u636e" : "\u5df2\u5237\u65b0\u5168\u5458\u7528\u91cf\u6570\u636e");
   } else if (currentView === "department") {
-    await loadDepartmentData();
-    showToast("已刷新部门用量数据");
+    await loadDepartmentData(true);
+    showToast(lastDepartmentUsageCacheHit ? "\u5df2\u52a0\u8f7d\u7f13\u5b58\u90e8\u95e8\u6570\u636e" : "\u5df2\u5237\u65b0\u90e8\u95e8\u7528\u91cf\u6570\u636e");
   } else {
-    await loadDashboardData();
-    showToast(lastPersonalUsageCacheHit ? "已加载缓存用量数据" : "已刷新真实用量数据");
+    await loadDashboardData(true);
+    showToast(lastPersonalUsageCacheHit ? "\u5df2\u52a0\u8f7d\u7f13\u5b58\u7528\u91cf\u6570\u636e" : "\u5df2\u5237\u65b0\u771f\u5b9e\u7528\u91cf\u6570\u636e");
   }
 });
 
@@ -1115,6 +1158,12 @@ el("departmentUserTable").addEventListener("click", async (event) => {
 });
 
 el("departmentClearEmployee").addEventListener("click", async () => {
+  selectedDepartment = "";
+  el("departmentEmployeeSearch").value = "";
+  await loadDepartmentData();
+});
+
+el("departmentBackButton").addEventListener("click", async () => {
   selectedDepartment = "";
   el("departmentEmployeeSearch").value = "";
   await loadDepartmentData();

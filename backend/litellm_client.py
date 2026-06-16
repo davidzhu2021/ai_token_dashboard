@@ -1,11 +1,37 @@
 ﻿import json
+import asyncio
+import logging
 import os
+import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 from fastapi import HTTPException
+
+from .cache import TTLCache
+
+
+logger = logging.getLogger("ai-token-dashboard.litellm")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _source_filter_applies(source: str | None) -> bool:
+    return bool(source and source != "all")
 
 
 def _as_number(value: Any) -> float:
@@ -157,19 +183,31 @@ class LiteLLMClient:
         self.base_url = base_url
         self.admin_key = admin_key
         self.timeout = httpx.Timeout(20.0, connect=8.0)
+        self.http_client = httpx.AsyncClient(timeout=self.timeout)
+        self._semaphore = asyncio.Semaphore(max(1, _env_int("LITELLM_MAX_CONCURRENCY", 4)))
+        self._key_cache = TTLCache()
+        self._model_cache = TTLCache()
+
+    async def close(self) -> None:
+        await self.http_client.aclose()
 
     async def request(self, method: str, path: str, **kwargs: Any) -> Any:
-        headers = kwargs.pop("headers", {})
+        headers = dict(kwargs.pop("headers", {}))
         headers["Authorization"] = f"Bearer {self.admin_key}"
         headers.setdefault("Accept", "application/json")
         url = f"{self.base_url}{path}"
+        started = time.perf_counter()
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.request(method, url, headers=headers, **kwargs)
+            async with self._semaphore:
+                response = await self.http_client.request(method, url, headers=headers, **kwargs)
         except httpx.TimeoutException as exc:
             raise HTTPException(status_code=504, detail="上游服务响应超时，请稍后重试") from exc
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"无法连接上游服务：{exc}") from exc
+        finally:
+            duration_ms = round((time.perf_counter() - started) * 1000)
+            if duration_ms >= _env_int("LITELLM_SLOW_REQUEST_MS", 800):
+                logger.info("litellm request %s %s took %sms", method, path, duration_ms)
 
         if response.status_code >= 400:
             detail = self._error_detail(response)
@@ -269,29 +307,32 @@ class LiteLLMClient:
         if rows:
             return rows
 
-        try:
-            rows = await self._usage_from_logs(user_id, start_date, end_date, source)
-        except HTTPException:
-            rows = []
-        if rows:
-            return rows
+        if _env_bool("PERSONAL_USAGE_LOG_FALLBACK_ENABLED", False):
+            try:
+                rows = await self._usage_from_logs(user_id, start_date, end_date, source)
+            except HTTPException:
+                rows = []
+            if rows:
+                return rows
         return await self._usage_from_daily_activity(user_id, start_date, end_date, source)
 
     async def usage_rows_for_user_ids(self, user_ids: list[str], start_date: str, end_date: str, source: str | None) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        for user_id in user_ids:
-            rows.extend(await self.usage_rows(user_id, start_date, end_date, source))
+        batches = await asyncio.gather(*(self.usage_rows(user_id, start_date, end_date, source) for user_id in user_ids))
+        rows = [row for batch in batches for row in batch]
         return sorted(rows, key=lambda item: (item["date"], item["source"], item["model"]))
 
     async def _usage_from_key_daily_activity(self, user_id: str, start_date: str, end_date: str, source: str | None) -> list[dict[str, Any]]:
         keys = await self.keys_for_user(user_id)
-        rows: list[dict[str, Any]] = []
+        selected_keys: list[tuple[dict[str, Any], str]] = []
         for key in keys[:25]:
             key_source = detect_source_from_key(key)
-            if source and source != "all" and key_source != source:
+            if _source_filter_applies(source) and key_source != source:
                 continue
-            rows.extend(
-                await self._usage_from_daily_activity(
+            selected_keys.append((key, key_source))
+
+        batches = await asyncio.gather(
+            *(
+                self._usage_from_daily_activity(
                     user_id=user_id,
                     start_date=start_date,
                     end_date=end_date,
@@ -299,8 +340,10 @@ class LiteLLMClient:
                     api_key=key["id"],
                     source_override=key_source,
                 )
+                for key, key_source in selected_keys
             )
-        return rows
+        )
+        return [row for batch in batches for row in batch]
 
     async def usage_from_daily_activity_for_debug(self, user_id: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
         return await self._usage_from_daily_activity(user_id, start_date, end_date, "all")
@@ -415,7 +458,7 @@ class LiteLLMClient:
         api_key: str | None = None,
         source_override: str | None = None,
     ) -> list[dict[str, Any]]:
-        if source and source != "all":
+        if _source_filter_applies(source):
             return []
         params = {"user_id": user_id, "start_date": start_date, "end_date": end_date, "page": 1, "page_size": 1000}
         if api_key:
@@ -430,6 +473,10 @@ class LiteLLMClient:
         return rows
 
     async def keys_for_user(self, user_id: str) -> list[dict[str, Any]]:
+        cache_key = f"keys:{user_id}"
+        hit, value, _ = self._key_cache.get(cache_key)
+        if hit:
+            return value
         payload = await self.request(
             "GET",
             "/key/list",
@@ -454,13 +501,15 @@ class LiteLLMClient:
                     "status": status,
                 }
             )
+        self._key_cache.set(cache_key, keys, _env_int("KEY_LIST_CACHE_TTL_SECONDS", 300))
         return keys
 
     async def keys_for_user_ids(self, user_ids: list[str]) -> list[dict[str, Any]]:
+        batches = await asyncio.gather(*(self.keys_for_user(user_id) for user_id in user_ids))
         keys: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for user_id in user_ids:
-            for key in await self.keys_for_user(user_id):
+        for batch in batches:
+            for key in batch:
                 key_id = key.get("id")
                 if key_id and key_id not in seen:
                     seen.add(key_id)
@@ -988,6 +1037,9 @@ class LiteLLMClient:
         )
 
     async def models(self) -> list[dict[str, Any]]:
+        hit, value, _ = self._model_cache.get("models")
+        if hit:
+            return value
         payload = await self.request("GET", "/models")
         raw_models = _records(payload)
         if not raw_models and isinstance(payload, dict):
@@ -1013,6 +1065,7 @@ class LiteLLMClient:
                     "recommendedFor": str(_first(item, "recommended_for", default="按任务需求复制模型名称后使用")),
                 }
             )
+        self._model_cache.set("models", models, _env_int("MODEL_CACHE_TTL_SECONDS", 1800))
         return models
 
 

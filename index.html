@@ -852,6 +852,14 @@
         margin-bottom: 18px;
       }
 
+      .panel-actions {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
       .panel-heading {
         display: flex;
         align-items: flex-start;
@@ -2017,8 +2025,8 @@
           <section class="hero-band">
             <div class="hero-copy">
               <span class="eyebrow">部门视图 · 真实数据</span>
-              <h2 id="departmentWelcomeTitle">部门 AI 用量总览</h2>
-              <p id="departmentWelcomeDesc">当前展示所有部门在所选日期范围内的汇总数据。</p>
+              <h2 id="departmentWelcomeTitle">全部部门 AI 用量总览</h2>
+              <p id="departmentWelcomeDesc">当前展示所有部门在所选日期范围与来源筛选下的汇总数据。</p>
             </div>
             <div class="status-card">
               <div>
@@ -2027,7 +2035,7 @@
               </div>
               <div class="status-grid">
                 <div class="status-mini"><span id="departmentActiveLabel">活跃部门</span><strong id="departmentActiveUsers">0</strong></div>
-                <div class="status-mini"><span>请求次数</span><strong id="departmentHeroRequests">0</strong></div>
+                <div class="status-mini"><span id="departmentRequestLabel">全部部门请求次数</span><strong id="departmentHeroRequests">0</strong></div>
               </div>
             </div>
           </section>
@@ -2050,8 +2058,8 @@
                 <div class="panel-heading">
                   <span class="panel-icon"><svg><use href="#icon-trend"></use></svg></span>
                   <div>
-                    <h3 class="panel-title">部门每日 Token 趋势</h3>
-                    <p class="panel-desc">按日期汇总部门 Prompt 与 Completion Token。</p>
+                    <h3 id="departmentTrendTitle" class="panel-title">全部部门每日 Token 趋势</h3>
+                    <p id="departmentTrendDesc" class="panel-desc">按日期汇总全部部门 Prompt 与 Completion Token。</p>
                   </div>
                 </div>
                 <span id="departmentTrendBadge" class="chip">近 30 天</span>
@@ -2064,8 +2072,8 @@
                 <div class="panel-heading">
                   <span class="panel-icon"><svg><use href="#icon-cost"></use></svg></span>
                   <div>
-                    <h3 class="panel-title">部门每日金额消费趋势</h3>
-                    <p class="panel-desc">按日期汇总部门预估消费金额。</p>
+                    <h3 id="departmentSpendTitle" class="panel-title">全部部门每日金额消费趋势</h3>
+                    <p id="departmentSpendDesc" class="panel-desc">按日期汇总全部部门预估消费金额。</p>
                   </div>
                 </div>
                 <span id="departmentSpendBadge" class="chip gold">近 30 天</span>
@@ -2080,8 +2088,8 @@
                 <div class="panel-heading">
                   <span class="panel-icon"><svg><use href="#icon-donut"></use></svg></span>
                   <div>
-                    <h3 class="panel-title">部门来源占比</h3>
-                    <p class="panel-desc">Codex、Claude Code 与其他来源。</p>
+                    <h3 id="departmentSourceTitle" class="panel-title">全部部门来源占比</h3>
+                    <p id="departmentSourceDesc" class="panel-desc">全部部门 Codex、Claude Code 与其他来源占比。</p>
                   </div>
                 </div>
               </div>
@@ -2103,8 +2111,8 @@
                 <div class="panel-heading">
                   <span class="panel-icon"><svg><use href="#icon-model"></use></svg></span>
                   <div>
-                    <h3 class="panel-title">部门模型使用排行</h3>
-                    <p class="panel-desc">按总 Token 消耗排序。</p>
+                    <h3 id="departmentModelTitle" class="panel-title">全部部门模型使用排行</h3>
+                    <p id="departmentModelDesc" class="panel-desc">按全部部门总 Token 消耗排序。</p>
                   </div>
                 </div>
               </div>
@@ -2116,8 +2124,8 @@
                 <div class="panel-heading">
                   <span class="panel-icon"><svg><use href="#icon-split"></use></svg></span>
                   <div>
-                    <h3 class="panel-title">部门 Prompt / Completion 拆分</h3>
-                    <p class="panel-desc">观察部门输入输出 Token 比例。</p>
+                    <h3 id="departmentSplitTitle" class="panel-title">全部部门 Prompt / Completion 拆分</h3>
+                    <p id="departmentSplitDesc" class="panel-desc">观察全部部门输入输出 Token 比例。</p>
                   </div>
                 </div>
               </div>
@@ -2134,7 +2142,10 @@
                   <p id="departmentRankingDesc" class="panel-desc">点击部门行查看该部门员工排行和明细。</p>
                 </div>
               </div>
-              <span id="departmentUserCount" class="chip blue">0 人</span>
+              <div class="panel-actions">
+                <button id="departmentBackButton" class="ghost-btn hidden" type="button">返回全部部门</button>
+                <span id="departmentUserCount" class="chip blue">0 人</span>
+              </div>
             </div>
             <div class="admin-toolbar">
               <div class="admin-search">
@@ -2191,7 +2202,7 @@
     <div id="toast" class="toast">已完成</div>
     <div id="chartTooltip" class="chart-tooltip" role="tooltip"></div>
 
-    <script src="/assets/app.js?v=20260616-department-copy"></script>
+    <script src="/assets/app.js?v=20260616-lazy-cache"></script>
   </body>
 </html>
 

@@ -50,6 +50,9 @@ app.add_middleware(
 oauth = build_oauth()
 user_mapping_cache = TTLCache()
 personal_usage_cache = TTLCache()
+admin_usage_cache = TTLCache()
+department_usage_cache = TTLCache()
+_litellm_client: LiteLLMClient | None = None
 
 
 def allowed_provider_login_url(url: str) -> str | None:
@@ -176,10 +179,21 @@ def auth_error_response(message: str, status_code: int = 400) -> HTMLResponse:
 
 
 def client() -> LiteLLMClient:
+    global _litellm_client
     try:
-        return LiteLLMClient()
+        if _litellm_client is None:
+            _litellm_client = LiteLLMClient()
+        return _litellm_client
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.on_event("shutdown")
+async def close_litellm_client() -> None:
+    global _litellm_client
+    if _litellm_client is not None:
+        await _litellm_client.close()
+        _litellm_client = None
 
 
 def safe_provider_name() -> str:
@@ -213,6 +227,14 @@ async def cached_resolve_user(email: str) -> tuple[dict[str, Any], dict[str, Any
 
 def personal_usage_cache_key(email: str, start_date: str, end_date: str, source: str) -> str:
     return f"usage:v2:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
+
+
+def admin_usage_cache_key(email: str, start_date: str, end_date: str, source: str, employee: str | None) -> str:
+    return f"admin-usage:v1:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(employee or '').strip().lower()}"
+
+
+def department_usage_cache_key(email: str, start_date: str, end_date: str, source: str, department: str | None) -> str:
+    return f"department-usage:v1:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(department or '').strip().lower()}"
 
 
 def empty_usage_totals() -> dict[str, Any]:
@@ -281,10 +303,10 @@ def feishu_direct_url(casdoor_authorize_url: str) -> str:
     return urlunparse(("https", "accounts.feishu.cn", "/open-apis/authen/v1/index", "", params, ""))
 
 
-async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_date: str, source: str) -> dict[str, Any]:
+async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_date: str, source: str, refresh: bool = False) -> dict[str, Any]:
     cache_key = personal_usage_cache_key(app_user["email"], start_date, end_date, source)
     hit, value, ttl_seconds = personal_usage_cache.get(cache_key)
-    if hit:
+    if hit and not refresh:
         payload = dict(value)
         payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
         return payload
@@ -304,6 +326,36 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
         "mappingCache": mapping_cache,
     }
     personal_usage_cache.set(cache_key, payload, env_int("PERSONAL_USAGE_CACHE_TTL_SECONDS", 300))
+    payload = dict(payload)
+    payload["cache"] = {"hit": False, "ttlSeconds": 0}
+    return payload
+
+
+async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: str, source: str, employee: str | None, refresh: bool = False) -> dict[str, Any]:
+    cache_key = admin_usage_cache_key(admin["email"], start_date, end_date, source, employee)
+    if not refresh:
+        hit, value, ttl_seconds = admin_usage_cache.get(cache_key)
+        if hit:
+            payload = dict(value)
+            payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+            return payload
+    payload = await client().admin_usage_rows(start_date, end_date, source, employee)
+    admin_usage_cache.set(cache_key, payload, env_int("ADMIN_USAGE_CACHE_TTL_SECONDS", 300))
+    payload = dict(payload)
+    payload["cache"] = {"hit": False, "ttlSeconds": 0}
+    return payload
+
+
+async def department_usage_payload(admin: dict[str, Any], start_date: str, end_date: str, source: str, department: str | None, refresh: bool = False) -> dict[str, Any]:
+    cache_key = department_usage_cache_key(admin["email"], start_date, end_date, source, department)
+    if not refresh:
+        hit, value, ttl_seconds = department_usage_cache.get(cache_key)
+        if hit:
+            payload = dict(value)
+            payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+            return payload
+    payload = await client().admin_department_usage_rows(start_date, end_date, source, department)
+    department_usage_cache.set(cache_key, payload, env_int("DEPARTMENT_USAGE_CACHE_TTL_SECONDS", 300))
     payload = dict(payload)
     payload["cache"] = {"hit": False, "ttlSeconds": 0}
     return payload
@@ -377,6 +429,7 @@ async def debug_admin_usage_compare(
     start_date: str | None = None,
     end_date: str | None = None,
     source: str = Query("all"),
+    refresh: bool = Query(False),
 ) -> dict[str, Any]:
     if not env_bool("DEBUG_MAPPING_ENABLED", False):
         raise HTTPException(status_code=404, detail="接口不存在")
@@ -492,11 +545,12 @@ async def my_usage(
     start_date: str | None = None,
     end_date: str | None = None,
     source: str = Query("all"),
+    refresh: bool = Query(False),
 ) -> dict[str, Any]:
     app_user = require_user(request)
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
-    return await personal_usage_payload(app_user, start_date, end_date, source)
+    return await personal_usage_payload(app_user, start_date, end_date, source, refresh)
 
 
 @app.get("/api/me/usage/logs")
@@ -532,11 +586,12 @@ async def admin_usage(
     end_date: str | None = None,
     source: str = Query("all"),
     employee: str | None = None,
+    refresh: bool = Query(False),
 ) -> dict[str, Any]:
     admin = require_admin(request)
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
-    payload = await client().admin_usage_rows(start_date, end_date, source, employee)
+    payload = await admin_usage_payload(admin, start_date, end_date, source, employee, refresh)
     return {
         "admin": {"email": admin["email"], "name": admin["name"]},
         "startDate": start_date,
@@ -554,12 +609,13 @@ async def admin_users(
     end_date: str | None = None,
     source: str = Query("all"),
     q: str | None = None,
+    refresh: bool = Query(False),
 ) -> dict[str, Any]:
-    require_admin(request)
+    admin = require_admin(request)
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
-    payload = await client().admin_usage_rows(start_date, end_date, source, q)
-    return {"users": payload["employees"], "total": len(payload["employees"]), "startDate": start_date, "endDate": end_date, "source": source}
+    payload = await admin_usage_payload(admin, start_date, end_date, source, q, refresh)
+    return {"users": payload["employees"], "total": len(payload["employees"]), "startDate": start_date, "endDate": end_date, "source": source, "cache": payload.get("cache", {"hit": False, "ttlSeconds": 0})}
 
 
 @app.get("/api/admin/departments/usage")
@@ -569,11 +625,12 @@ async def admin_departments_usage(
     end_date: str | None = None,
     source: str = Query("all"),
     department: str | None = None,
+    refresh: bool = Query(False),
 ) -> dict[str, Any]:
     admin = require_admin(request)
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
-    payload = await client().admin_department_usage_rows(start_date, end_date, source, department)
+    payload = await department_usage_payload(admin, start_date, end_date, source, department, refresh)
     return {
         "admin": {"email": admin["email"], "name": admin["name"]},
         "startDate": start_date,
