@@ -2018,7 +2018,7 @@
             <div class="hero-copy">
               <span class="eyebrow">部门视图 · 真实数据</span>
               <h2 id="departmentWelcomeTitle">部门 AI 用量总览</h2>
-              <p>按部门汇总 Token、金额、请求次数与模型使用情况，部门口径优先使用 LiteLLM Team。</p>
+              <p id="departmentWelcomeDesc">当前展示所有部门在所选日期范围内的汇总数据。</p>
             </div>
             <div class="status-card">
               <div>
@@ -2026,7 +2026,7 @@
                 <strong id="departmentHeroTotal">0</strong>
               </div>
               <div class="status-grid">
-                <div class="status-mini"><span>活跃员工</span><strong id="departmentActiveUsers">0</strong></div>
+                <div class="status-mini"><span id="departmentActiveLabel">活跃部门</span><strong id="departmentActiveUsers">0</strong></div>
                 <div class="status-mini"><span>请求次数</span><strong id="departmentHeroRequests">0</strong></div>
               </div>
             </div>
@@ -2040,7 +2040,7 @@
                 <h3 id="departmentDetailTitle">员工详情</h3>
                 <p id="departmentDetailSubtitle">点击部门排行中的一行查看部门明细。</p>
               </div>
-              <button id="departmentClearEmployee" class="ghost-btn" type="button">返回部门</button>
+              <button id="departmentClearEmployee" class="ghost-btn" type="button">返回全部部门</button>
             </div>
           </section>
 
@@ -2191,7 +2191,7 @@
     <div id="toast" class="toast">已完成</div>
     <div id="chartTooltip" class="chart-tooltip" role="tooltip"></div>
 
-    <script src="/assets/app.js?v=20260616-real-departments"></script>
+    <script src="/assets/app.js?v=20260616-department-copy"></script>
   </body>
 </html>
 

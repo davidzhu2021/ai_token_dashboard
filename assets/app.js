@@ -154,6 +154,13 @@ function rangeLabel() {
   return `近 ${el("rangeSelect").value} 天`;
 }
 
+function metricScopeSuffix(mode) {
+  if (mode !== "department") return "";
+  if (!selectedDepartment) return " · 全部部门";
+  const department = departmentRankings.find((item) => item.departmentId === selectedDepartment);
+  return ` · ${department?.departmentName || selectedDepartment}`;
+}
+
 function renderMetricGroups(containerId, data, mode = "personal", summary = null, splitData = data) {
   const latest = summary?.latestDay || aggregateByDate(data).slice(-1)[0] || {};
   const total = sum(data, "totalTokens");
@@ -166,21 +173,22 @@ function renderMetricGroups(containerId, data, mode = "personal", summary = null
   const scope = mode === "admin" ? "全员" : mode === "department" ? "部门" : "个人";
   const label = rangeLabel();
   const source = sourceText();
+  const scopeSuffix = metricScopeSuffix(mode);
 
   el(containerId).innerHTML = [
     metricGroup("最近一天", latest.date || "暂无日期", [
       metric("最近一天 Token", formatTokens(latest.totalTokens || 0), latest.date ? `${latest.date} 的整日汇总` : `最新日期${scope}消耗`, "最近", "", "token"),
       metric("最近一天消耗金额", money.format(latest.spend || 0), latest.date ? `${latest.date} 的整日预估金额` : "最新日期预估金额", "最近", "gold", "cost"),
     ]),
-    metricGroup("所选范围消耗", `${label} · ${source}`, [
+    metricGroup("所选范围消耗", `${label} · ${source}${scopeSuffix}`, [
       metric(`${label} Token`, formatTokens(total), "按当前日期与来源筛选累计", source, "gold", "trend"),
       metric(`${label} 消耗金额`, money.format(spend), "按上游记录汇总", "估算", "gold", "cost"),
     ]),
-    metricGroup("所选范围请求", `${label} · ${source}`, [
+    metricGroup("所选范围请求", `${label} · ${source}${scopeSuffix}`, [
       metric(`${label} 请求次数`, fmt.format(requests), "按当前筛选累计", "请求", "blue", "request"),
       metric(`${label} 请求成功率`, `${successRate}%`, `${fmt.format(successes)} / ${fmt.format(requests)} 次成功`, "稳定", "", "success"),
     ]),
-    metricGroup("工具消耗拆分", `${label} · ${source}`, [
+    metricGroup("工具消耗拆分", `${label} · ${source}${scopeSuffix}`, [
       metric(`${label} Codex Token`, formatTokens(cursor), "Codex 相关消耗", "Codex", "", "cursor"),
       metric(`${label} Claude Code Token`, formatTokens(cc), "终端工具相关消耗", "Claude Code", "blue", "terminal"),
     ]),
@@ -223,12 +231,19 @@ function renderDepartmentMetrics(data) {
   const requests = sum(data, "requestCount");
   const label = rangeLabel();
   const source = sourceText();
+  const department = selectedDepartment ? departmentRankings.find((item) => item.departmentId === selectedDepartment) : null;
+  const departmentName = department?.departmentName || selectedDepartment;
   el("departmentHeroTotal").textContent = formatTokens(total);
-  el("departmentHeroTotalLabel").textContent = selectedDepartment ? "部门 Token" : "全部部门 Token";
+  el("departmentHeroTotalLabel").textContent = selectedDepartment ? `${departmentName} Token` : "全部部门 Token";
   el("departmentHeroRequests").textContent = fmt.format(requests);
   el("departmentActiveUsers").textContent = fmt.format(selectedDepartment ? departmentEmployees.length : departmentRankings.length);
   el("departmentTrendBadge").textContent = `${label} · ${source}`;
   el("departmentSpendBadge").textContent = `${label} · ${source}`;
+  el("departmentWelcomeTitle").textContent = selectedDepartment ? `${departmentName} AI 用量总览` : "全部部门 AI 用量总览";
+  el("departmentWelcomeDesc").textContent = selectedDepartment
+    ? `当前展示 ${departmentName} 在所选日期范围内的用量明细。`
+    : "当前展示所有部门在所选日期范围内的汇总数据。";
+  el("departmentActiveLabel").textContent = selectedDepartment ? "活跃员工" : "活跃部门";
   renderMetricGroups("departmentMetrics", data, "department");
 }
 
@@ -691,6 +706,7 @@ function renderDepartmentLoading() {
   el("departmentHeroTotalLabel").textContent = selectedDepartment ? "部门 Token" : "全部部门 Token";
   el("departmentHeroRequests").textContent = "--";
   el("departmentActiveUsers").textContent = "--";
+  el("departmentActiveLabel").textContent = selectedDepartment ? "活跃员工" : "活跃部门";
   el("departmentTrendBadge").textContent = `${label} · ${source}`;
   el("departmentSpendBadge").textContent = `${label} · ${source}`;
   el("departmentLimitHint").textContent = "数据加载中";
@@ -758,8 +774,9 @@ function renderDepartment() {
   detailCard.classList.toggle("show", Boolean(selectedDepartment));
   if (selectedDepartment) {
     const department = departmentRankings.find((item) => item.departmentId === selectedDepartment);
-    el("departmentDetailTitle").textContent = `${department?.departmentName || selectedDepartment} 的部门详情`;
-    el("departmentDetailSubtitle").textContent = "下方排行已切换为该部门员工用量";
+    const departmentName = department?.departmentName || selectedDepartment;
+    el("departmentDetailTitle").textContent = `${departmentName} 的部门详情`;
+    el("departmentDetailSubtitle").textContent = `部门 ID：${department?.departmentId || selectedDepartment} · 数据来源：${department?.bindStatus || "部门字段"} · 下方排行已切换为该部门员工用量`;
   }
 }
 
@@ -924,10 +941,11 @@ async function loadDepartmentData() {
     departmentSummaryData = payload.summaryRows || departmentUsageData;
     departmentRankings = payload.departments || [];
     departmentEmployees = payload.employees || [];
+    const rankingSubject = selectedDepartment ? "员工排行" : "部门排行";
     if (payload.truncated) {
-      el("departmentLimitHint").textContent = `默认按 Token 从高到低排序；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），排行可能不完整`;
+      el("departmentLimitHint").textContent = `${rankingSubject}默认按 Token 从高到低排序；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），排行可能不完整`;
     } else {
-      el("departmentLimitHint").textContent = `默认按 Token 从高到低排序；已读取 ${payload.pagesRead || 0} 页日志，按当前筛选范围统计`;
+      el("departmentLimitHint").textContent = `${rankingSubject}默认按 Token 从高到低排序；已读取 ${payload.pagesRead || 0} 页日志，按当前筛选范围统计`;
     }
   } catch (error) {
     showToast(error.message || "部门数据加载失败");
