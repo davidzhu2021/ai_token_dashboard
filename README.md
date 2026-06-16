@@ -204,7 +204,7 @@ GET /api/auth/sso/start
 - 所选日期范围：按当前日期范围和来源筛选累计。
 - 金额：使用后端返回的 `spend` 汇总，展示为预估美元金额。
 - 请求成功率：成功请求数除以请求总数。
-- 来源拆分：当前区分 Cursor 和 Claude Code。
+- 来源拆分：前端展示为 Codex 和 Claude Code；后端仍按上游 Cursor 口径查询。
 
 缓存口径：
 
@@ -227,11 +227,30 @@ GET /api/auth/sso/start
 
 - 全员 Token、金额、请求次数、成功率。
 - 活跃员工数。
-- Cursor / Claude Code 来源拆分。
+- Codex / Claude Code 来源拆分。
 - 每日 Token 趋势和每日金额消费趋势。
 - 员工排行和员工详情。
 
 管理员看板不展示访问密钥明文，不返回 prompt 或 response 内容。
+
+## 管理员部门看板
+
+部门看板仅管理员可见，接口为 `GET /api/admin/departments/usage`。
+
+部门口径：
+
+- 优先使用 LiteLLM Team，`team_id` 作为部门 ID，`team_alias` 作为部门名称。
+- 如果日志中没有 Team 信息，则兜底读取 `metadata.department`、`metadata.department_name` 或组织字段。
+- 仍无法识别时归入“未绑定部门”，方便后续补充上游数据。
+
+部门看板可以查看：
+
+- 每个部门的 Token、金额、请求次数、成功率和活跃员工数。
+- 部门每日 Token 趋势和每日金额消费趋势。
+- 部门来源占比、模型排行、Prompt / Completion 拆分。
+- 部门用量排行；点击部门后查看该部门员工排行。
+
+总览优先使用 LiteLLM `/team/daily/activity`，部门排行、员工排行和模型拆分来自 `/spend/logs/v2` 聚合；如果日志读取达到页数上限，页面会提示排行可能不完整。
 
 ## 安全规则
 

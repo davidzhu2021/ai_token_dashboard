@@ -2016,9 +2016,9 @@
         <section id="departmentView" class="view-section hidden">
           <section class="hero-band">
             <div class="hero-copy">
-              <span class="eyebrow">部门视图 · 演示数据</span>
+              <span class="eyebrow">部门视图 · 真实数据</span>
               <h2 id="departmentWelcomeTitle">部门 AI 用量总览</h2>
-              <p>当前为前端 Mock 原型，用于预览部门 leader 视角。正式接入后将按登录账号权限展示部门真实数据。</p>
+              <p>按部门汇总 Token、金额、请求次数与模型使用情况，部门口径优先使用 LiteLLM Team。</p>
             </div>
             <div class="status-card">
               <div>
@@ -2038,7 +2038,7 @@
             <div class="admin-detail-head">
               <div>
                 <h3 id="departmentDetailTitle">员工详情</h3>
-                <p id="departmentDetailSubtitle">点击部门员工排行中的一行查看个人明细。</p>
+                <p id="departmentDetailSubtitle">点击部门排行中的一行查看部门明细。</p>
               </div>
               <button id="departmentClearEmployee" class="ghost-btn" type="button">返回部门</button>
             </div>
@@ -2130,25 +2130,25 @@
               <div class="panel-heading">
                 <span class="panel-icon"><svg><use href="#icon-table"></use></svg></span>
                 <div>
-                  <h3 class="panel-title">部门员工排行</h3>
-                  <p class="panel-desc">点击员工行查看该员工在当前筛选范围内的演示明细。</p>
+                  <h3 id="departmentRankingTitle" class="panel-title">部门用量排行</h3>
+                  <p id="departmentRankingDesc" class="panel-desc">点击部门行查看该部门员工排行和明细。</p>
                 </div>
               </div>
               <span id="departmentUserCount" class="chip blue">0 人</span>
             </div>
             <div class="admin-toolbar">
               <div class="admin-search">
-                <input id="departmentEmployeeSearch" class="input" type="search" placeholder="搜索姓名、邮箱或账号" aria-label="搜索部门员工" />
+                <input id="departmentEmployeeSearch" class="input" type="search" placeholder="搜索部门名称或部门 ID" aria-label="搜索部门" />
                 <button id="departmentSearchButton" class="ghost-btn" type="button">搜索</button>
               </div>
-              <span id="departmentLimitHint" class="hint">演示数据 · 默认按 Token 从高到低排序</span>
+              <span id="departmentLimitHint" class="hint">默认按 Token 从高到低排序</span>
             </div>
             <div class="table-wrap">
               <table>
                 <thead>
                   <tr>
-                    <th>员工</th>
-                    <th>邮箱</th>
+                    <th>部门 / 员工</th>
+                    <th>ID / 邮箱</th>
                     <th>主要来源</th>
                     <th class="num">请求数</th>
                     <th class="num">总 Token</th>
@@ -2191,7 +2191,7 @@
     <div id="toast" class="toast">已完成</div>
     <div id="chartTooltip" class="chart-tooltip" role="tooltip"></div>
 
-    <script src="/assets/app.js?v=20260615-codex-label"></script>
+    <script src="/assets/app.js?v=20260616-real-departments"></script>
   </body>
 </html>
 

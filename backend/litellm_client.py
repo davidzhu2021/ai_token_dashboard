@@ -1,4 +1,5 @@
-﻿import os
+﻿import json
+import os
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -32,11 +33,23 @@ def _records(payload: Any) -> list[dict[str, Any]]:
         return [item for item in payload if isinstance(item, dict)]
     if not isinstance(payload, dict):
         return []
-    for key in ("data", "results", "items", "logs", "keys", "models", "users"):
+    for key in ("data", "results", "items", "logs", "keys", "models", "users", "teams"):
         value = payload.get(key)
         if isinstance(value, list):
             return [item for item in value if isinstance(item, dict)]
     return []
+
+
+def _metadata_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except ValueError:
+            return {}
+    return {}
 
 
 def _date_text(value: Any) -> str:
@@ -590,6 +603,263 @@ class LiteLLMClient:
             "employeesAfterMerge": len(employee_ids),
             "boundEmailCount": len(employee_emails),
             "dataQuality": payload.get("dataQuality", {}),
+        }
+
+    async def team_map(self) -> dict[str, dict[str, str]]:
+        mapping: dict[str, dict[str, str]] = {}
+        for path in ("/v2/team/list", "/team/list"):
+            for page in range(1, 51):
+                try:
+                    payload = await self.request("GET", path, params={"page": page, "page_size": 100})
+                except HTTPException:
+                    break
+                for team in _records(payload):
+                    team_id = str(_first(team, "team_id", "id", default="") or "").strip()
+                    if not team_id:
+                        continue
+                    team_alias = str(_first(team, "team_alias", "alias", "name", default="") or "").strip()
+                    mapping[team_id.lower()] = {"id": team_id, "name": team_alias or team_id}
+                total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=0)) if isinstance(payload, dict) else 0
+                has_more = bool(payload.get("has_more")) if isinstance(payload, dict) else False
+                if total_pages and page >= total_pages:
+                    break
+                if not total_pages and not has_more:
+                    break
+            if mapping:
+                break
+        return mapping
+
+    def _department_info_from_log(self, log: dict[str, Any], team_map: dict[str, dict[str, str]]) -> dict[str, str]:
+        metadata = _metadata_dict(_first(log, "metadata", "request_tags", "tags", default={}))
+        team_id = str(
+            _first(log, "team_id", "teamId", default="")
+            or metadata.get("team_id")
+            or metadata.get("teamId")
+            or ""
+        ).strip()
+        team_alias = str(
+            _first(log, "team_alias", "team_name", "teamName", default="")
+            or metadata.get("team_alias")
+            or metadata.get("team_name")
+            or metadata.get("teamName")
+            or ""
+        ).strip()
+        if team_id:
+            known = team_map.get(team_id.lower())
+            return {"id": team_id, "name": known.get("name", team_alias or team_id) if known else team_alias or team_id, "bindStatus": "已绑定部门"}
+
+        department = str(
+            _first(log, "department", "department_name", "departmentName", default="")
+            or metadata.get("department")
+            or metadata.get("department_name")
+            or metadata.get("departmentName")
+            or ""
+        ).strip()
+        if department:
+            return {"id": department, "name": department, "bindStatus": "来自部门字段"}
+
+        org_id = str(
+            _first(log, "organization_id", "org_id", "organizationId", "orgId", default="")
+            or metadata.get("organization_id")
+            or metadata.get("org_id")
+            or metadata.get("organizationId")
+            or metadata.get("orgId")
+            or ""
+        ).strip()
+        if org_id:
+            return {"id": org_id, "name": org_id, "bindStatus": "来自组织字段"}
+        return {"id": "unassigned", "name": "未绑定部门", "bindStatus": "未绑定部门"}
+
+    def _department_empty_row(self, day: str, department_info: dict[str, str], source: str, model: str, employee_info: dict[str, Any]) -> dict[str, Any]:
+        row = self._admin_empty_row(day, employee_info, source, model)
+        row.update(
+            {
+                "departmentId": department_info["id"],
+                "departmentName": department_info["name"],
+                "departmentBindStatus": department_info["bindStatus"],
+            }
+        )
+        return row
+
+    def _department_sort_key(self, department: dict[str, Any]) -> tuple[float, float, float, str]:
+        name = str(department.get("departmentName") or department.get("departmentId") or "")
+        return (
+            -_as_number(department.get("totalTokens")),
+            -_as_number(department.get("spend")),
+            -_as_number(department.get("requestCount")),
+            name.lower(),
+        )
+
+    def _department_summaries(self, rows: list[dict[str, Any]], departments: dict[str, dict[str, str]]) -> list[dict[str, Any]]:
+        grouped: dict[str, dict[str, Any]] = {}
+        source_totals: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        employees: dict[str, set[str]] = defaultdict(set)
+        for row in rows:
+            department_id = str(row.get("departmentId") or "unassigned")
+            department = departments.get(department_id, {})
+            summary = grouped.setdefault(
+                department_id,
+                {
+                    "departmentId": department_id,
+                    "departmentName": department.get("name") or row.get("departmentName") or department_id,
+                    "bindStatus": department.get("bindStatus") or row.get("departmentBindStatus") or "未绑定部门",
+                    "promptTokens": 0,
+                    "completionTokens": 0,
+                    "totalTokens": 0,
+                    "requestCount": 0,
+                    "successCount": 0,
+                    "failureCount": 0,
+                    "spend": 0.0,
+                    "primarySource": "其他",
+                    "activeEmployees": 0,
+                },
+            )
+            summary["promptTokens"] += _as_int(row.get("promptTokens"))
+            summary["completionTokens"] += _as_int(row.get("completionTokens"))
+            summary["totalTokens"] += _as_int(row.get("totalTokens"))
+            summary["requestCount"] += _as_int(row.get("requestCount"))
+            summary["successCount"] += _as_int(row.get("successCount"))
+            summary["failureCount"] += _as_int(row.get("failureCount"))
+            summary["spend"] += _as_number(row.get("spend"))
+            source_totals[department_id][str(row.get("source") or "其他")] += _as_int(row.get("totalTokens"))
+            employee_id = str(row.get("employeeId") or row.get("employeeEmail") or "")
+            if employee_id:
+                employees[department_id].add(employee_id)
+
+        for department_id, summary in grouped.items():
+            sources = source_totals.get(department_id, {})
+            if sources:
+                summary["primarySource"] = max(sources.items(), key=lambda item: item[1])[0]
+            summary["activeEmployees"] = len(employees.get(department_id, set()))
+        return sorted(grouped.values(), key=self._department_sort_key)
+
+    async def _team_daily_activity_rows(self, start_date: str, end_date: str, department: str | None, team_map: dict[str, dict[str, str]]) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"start_date": start_date, "end_date": end_date, "page": 1, "page_size": 100}
+        if department and department != "unassigned":
+            params["team_ids"] = department
+        payload = await self.request("GET", "/team/daily/activity", params=params)
+        rows: list[dict[str, Any]] = []
+        for item in _records(payload):
+            metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else item
+            breakdown = item.get("breakdown") if isinstance(item.get("breakdown"), dict) else {}
+            entities = breakdown.get("entities") if isinstance(breakdown.get("entities"), dict) else {}
+            if entities:
+                for team_id, entity in entities.items():
+                    entity_metrics = entity.get("metrics") if isinstance(entity, dict) and isinstance(entity.get("metrics"), dict) else entity
+                    known = team_map.get(str(team_id).lower(), {})
+                    rows.append(
+                        {
+                            "date": _date_text(_first(item, "date", "day")),
+                            "source": "其他",
+                            "model": "全量",
+                            "promptTokens": _as_int(_first(entity_metrics, "prompt_tokens", "promptTokens", "total_prompt_tokens")),
+                            "completionTokens": _as_int(_first(entity_metrics, "completion_tokens", "completionTokens", "total_completion_tokens")),
+                            "totalTokens": _as_int(_first(entity_metrics, "total_tokens", "totalTokens")),
+                            "requestCount": _as_int(_first(entity_metrics, "api_requests", "total_api_requests", "requestCount")),
+                            "successCount": _as_int(_first(entity_metrics, "successful_requests", "total_successful_requests", "successCount")),
+                            "failureCount": _as_int(_first(entity_metrics, "failed_requests", "total_failed_requests", "failureCount")),
+                            "spend": _as_number(_first(entity_metrics, "spend", "total_spend")),
+                            "departmentId": str(team_id),
+                            "departmentName": known.get("name") or str(team_id),
+                            "departmentBindStatus": "已绑定部门",
+                        }
+                    )
+            else:
+                row = self._row_from_daily_activity_item(item, "其他", "全量")
+                team_id = str(_first(item, "team_id", "teamId", default=department or "") or department or "all")
+                known = team_map.get(team_id.lower(), {})
+                row.update({"departmentId": team_id, "departmentName": known.get("name") or team_id, "departmentBindStatus": "已绑定部门"})
+                rows.append(row)
+        return rows
+
+    async def admin_department_usage_rows(self, start_date: str, end_date: str, source: str | None, department: str | None = None) -> dict[str, Any]:
+        users = await self.users()
+        user_map = self._admin_user_map(users)
+        team_map = await self.team_map()
+        department_filter = (department or "").strip().lower()
+        grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+        departments: dict[str, dict[str, str]] = {}
+        employees: dict[str, dict[str, Any]] = {}
+        max_pages = max(1, int(os.getenv("ADMIN_USAGE_LOG_MAX_PAGES", "30")))
+        page_size = max(1, min(100, int(os.getenv("ADMIN_USAGE_PAGE_SIZE", "100"))))
+        utc_start, utc_end = _local_date_window_as_utc_text(start_date, end_date)
+        pages_read = 0
+        total_pages = 0
+        total_records = 0
+
+        for page in range(1, max_pages + 1):
+            payload = await self.request(
+                "GET",
+                "/spend/logs/v2",
+                params={
+                    "start_date": utc_start,
+                    "end_date": utc_end,
+                    "page": page,
+                    "page_size": page_size,
+                    "sort_by": "startTime",
+                    "sort_order": "desc",
+                },
+            )
+            pages_read = page
+            if isinstance(payload, dict):
+                total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=total_pages))
+                total_records = _as_int(_first(payload, "total", "total_count", "count", default=total_records))
+            logs = _records(payload)
+            if not logs:
+                break
+            for log in logs:
+                department_info = self._department_info_from_log(log, team_map)
+                if department_filter and department_filter not in {department_info["id"].lower(), department_info["name"].lower()}:
+                    continue
+                detected_source = detect_source(log)
+                if source and source != "all" and detected_source != source:
+                    continue
+
+                raw_user = str(_first(log, "user", "user_id", "end_user", default="未绑定账号") or "未绑定账号")
+                employee_info = self._admin_employee_info(raw_user, user_map)
+                department_id = department_info["id"]
+                departments.setdefault(department_id, department_info)
+                employees.setdefault(employee_info["id"], employee_info)
+                model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
+                day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
+                key = (day, department_id, employee_info["id"], detected_source, model)
+                row = grouped.setdefault(key, self._department_empty_row(day, department_info, detected_source, model, employee_info))
+                self._add_log_to_row(row, log)
+
+            if total_pages and page >= total_pages:
+                break
+
+        rows = sorted(grouped.values(), key=lambda item: (item["date"], item["departmentName"], item["employeeName"], item["source"], item["model"]))
+        summary_rows: list[dict[str, Any]] = []
+        if not source or source == "all":
+            try:
+                summary_rows = await self._team_daily_activity_rows(start_date, end_date, department, team_map)
+                if department_filter:
+                    summary_rows = [
+                        row
+                        for row in summary_rows
+                        if department_filter in {str(row.get("departmentId", "")).lower(), str(row.get("departmentName", "")).lower()}
+                    ]
+            except HTTPException:
+                summary_rows = []
+
+        truncated = bool(total_pages and pages_read < total_pages)
+        return {
+            "rows": rows,
+            "summaryRows": summary_rows or rows,
+            "departments": self._department_summaries(rows, departments),
+            "employees": self._admin_employee_summaries(rows, employees),
+            "pageLimit": max_pages,
+            "pageSize": page_size,
+            "pagesRead": pages_read,
+            "totalPages": total_pages,
+            "totalRecords": total_records,
+            "truncated": truncated,
+            "dataQuality": {
+                "summarySource": "team_daily_activity" if summary_rows else "spend_logs",
+                "rankingSource": "spend_logs",
+                "timezoneOffsetMinutes": usage_timezone_offset_minutes(),
+            },
         }
 
     def _usage_totals(self, rows: list[dict[str, Any]]) -> dict[str, Any]:

@@ -562,6 +562,28 @@ async def admin_users(
     return {"users": payload["employees"], "total": len(payload["employees"]), "startDate": start_date, "endDate": end_date, "source": source}
 
 
+@app.get("/api/admin/departments/usage")
+async def admin_departments_usage(
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    source: str = Query("all"),
+    department: str | None = None,
+) -> dict[str, Any]:
+    admin = require_admin(request)
+    if not start_date or not end_date:
+        start_date, end_date = default_date_range()
+    payload = await client().admin_department_usage_rows(start_date, end_date, source, department)
+    return {
+        "admin": {"email": admin["email"], "name": admin["name"]},
+        "startDate": start_date,
+        "endDate": end_date,
+        "source": source,
+        "department": department or "",
+        **payload,
+    }
+
+
 @app.get("/api/me/keys")
 async def my_keys(request: Request) -> dict[str, Any]:
     _, upstream_user = await current_upstream_user(request)
