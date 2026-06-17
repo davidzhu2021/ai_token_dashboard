@@ -1,9 +1,10 @@
-﻿import json
 import asyncio
+import json
 import logging
 import os
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -32,6 +33,15 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def _source_filter_applies(source: str | None) -> bool:
     return bool(source and source != "all")
+
+
+@dataclass(frozen=True)
+class LiteLLMBackend:
+    id: str
+    label: str
+    base_url: str
+    admin_key: str
+    source: str | None = None
 
 
 def _as_number(value: Any) -> float:
@@ -76,6 +86,19 @@ def _metadata_dict(value: Any) -> dict[str, Any]:
         except ValueError:
             return {}
     return {}
+
+
+def _clean_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _normal_email(value: Any) -> str:
+    text = _clean_text(value).lower()
+    return text if "@" in text else ""
+
+
+def _has_cjk(value: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in value)
 
 
 def _date_text(value: Any) -> str:
@@ -180,6 +203,16 @@ class LiteLLMClient:
         admin_key = os.getenv("LITELLM_ADMIN_KEY", "").strip()
         if not base_url or not admin_key:
             raise RuntimeError("请先在 .env 中配置 LITELLM_BASE_URL 和 LITELLM_ADMIN_KEY")
+        self.backends = [
+            LiteLLMBackend(id="primary", label="AI 用量中心", base_url=base_url, admin_key=admin_key),
+        ]
+        her_base_url = os.getenv("HER_LITELLM_BASE_URL", "").strip().rstrip("/")
+        her_admin_key = os.getenv("HER_LITELLM_ADMIN_KEY", "").strip()
+        if her_base_url and her_admin_key:
+            self.backends.append(
+                LiteLLMBackend(id="her", label=os.getenv("HER_SOURCE_LABEL", "Her").strip() or "Her", base_url=her_base_url, admin_key=her_admin_key, source="Her")
+            )
+        self._backend_map = {backend.id: backend for backend in self.backends}
         self.base_url = base_url
         self.admin_key = admin_key
         self.timeout = httpx.Timeout(20.0, connect=8.0)
@@ -187,15 +220,19 @@ class LiteLLMClient:
         self._semaphore = asyncio.Semaphore(max(1, _env_int("LITELLM_MAX_CONCURRENCY", 4)))
         self._key_cache = TTLCache()
         self._model_cache = TTLCache()
+        self._account_index_cache = TTLCache()
 
     async def close(self) -> None:
         await self.http_client.aclose()
 
     async def request(self, method: str, path: str, **kwargs: Any) -> Any:
+        return await self.request_backend(self.backends[0], method, path, **kwargs)
+
+    async def request_backend(self, backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> Any:
         headers = dict(kwargs.pop("headers", {}))
-        headers["Authorization"] = f"Bearer {self.admin_key}"
+        headers["Authorization"] = f"Bearer {backend.admin_key}"
         headers.setdefault("Accept", "application/json")
-        url = f"{self.base_url}{path}"
+        url = f"{backend.base_url}{path}"
         started = time.perf_counter()
         try:
             async with self._semaphore:
@@ -203,11 +240,11 @@ class LiteLLMClient:
         except httpx.TimeoutException as exc:
             raise HTTPException(status_code=504, detail="上游服务响应超时，请稍后重试") from exc
         except httpx.HTTPError as exc:
-            raise HTTPException(status_code=502, detail=f"无法连接上游服务：{exc}") from exc
+            raise HTTPException(status_code=502, detail=f"无法连接 {backend.label}：{exc}") from exc
         finally:
             duration_ms = round((time.perf_counter() - started) * 1000)
             if duration_ms >= _env_int("LITELLM_SLOW_REQUEST_MS", 800):
-                logger.info("litellm request %s %s took %sms", method, path, duration_ms)
+                logger.info("litellm request %s %s %s took %sms", backend.id, method, path, duration_ms)
 
         if response.status_code >= 400:
             detail = self._error_detail(response)
@@ -235,46 +272,199 @@ class LiteLLMClient:
             return "上游接口不存在或资源未找到"
         return f"上游接口失败：HTTP {response.status_code}"
 
-    async def resolve_user(self, email: str) -> dict[str, Any]:
-        email_lower = email.lower()
-        email_prefix = email_lower.split("@", 1)[0]
-        matched_users: list[dict[str, Any]] = []
-        matched_user_ids: list[str] = []
-        matched_sources: dict[str, list[str]] = {}
+    def _encode_account_id(self, backend: LiteLLMBackend, user_id: str) -> str:
+        return user_id if backend.id == "primary" else f"{backend.id}:{user_id}"
 
-        def add_user_id(user_id: Any, source: str) -> None:
-            text = str(user_id or "").strip()
-            if not text:
-                return
-            if text not in matched_user_ids:
-                matched_user_ids.append(text)
-            matched_sources.setdefault(text, [])
-            if source not in matched_sources[text]:
-                matched_sources[text].append(source)
+    def _decode_account_id(self, account_id: str) -> tuple[LiteLLMBackend, str]:
+        if ":" in account_id:
+            backend_id, user_id = account_id.split(":", 1)
+            return self._backend_map.get(backend_id, self.backends[0]), user_id
+        return self.backends[0], account_id
 
-        for page in range(1, 51):
-            payload = await self.request("GET", "/user/list", params={"page": page, "page_size": 100})
+    def _is_backend_usage_account(self, backend: LiteLLMBackend, user_id: Any) -> bool:
+        text = _clean_text(user_id).lower()
+        if backend.source == "Her":
+            return text.startswith("carher-")
+        return bool(text)
+
+    def _empty_account_index(self) -> dict[str, Any]:
+        return {
+            "emails": defaultdict(dict),
+            "names": defaultdict(dict),
+        }
+
+    def _add_account_index_entry(
+        self,
+        index: dict[str, Any],
+        user_id: Any,
+        source: str,
+        email: Any = None,
+        names: list[Any] | None = None,
+    ) -> None:
+        text_user_id = _clean_text(user_id)
+        if not text_user_id:
+            return
+        email_text = _normal_email(email)
+        if email_text:
+            bucket = index["emails"][email_text].setdefault(text_user_id, {"emails": set(), "sources": set(), "names": set()})
+            bucket["emails"].add(email_text)
+            bucket["sources"].add(source)
+        for raw_name in names or []:
+            name = _clean_text(raw_name)
+            if not name:
+                continue
+            bucket = index["names"][name].setdefault(text_user_id, {"emails": set(), "sources": set(), "names": set()})
+            if email_text:
+                bucket["emails"].add(email_text)
+            bucket["sources"].add(source)
+            bucket["names"].add(name)
+
+    async def her_account_index(self, backend: LiteLLMBackend) -> dict[str, Any]:
+        cache_key = f"account-index:{backend.id}"
+        hit, value, _ = self._account_index_cache.get(cache_key)
+        if hit:
+            return value
+
+        index = self._empty_account_index()
+        for page in range(1, 101):
+            payload = await self.request_backend(backend, "GET", "/user/list", params={"page": page, "page_size": 100})
             for user in _records(payload):
+                metadata = _metadata_dict(user.get("metadata"))
                 user_id = user.get("user_id")
-                email_candidates = [user.get("user_email"), user.get("sso_user_id")]
-                legacy_candidates = [user.get("user_id"), user.get("user_alias")]
-                if any(str(candidate or "").lower() == email_lower for candidate in email_candidates):
-                    matched_users.append(user)
-                    add_user_id(user_id, "user_email")
-                elif any(str(candidate or "").lower() == email_prefix for candidate in legacy_candidates):
-                    matched_users.append(user)
-                    add_user_id(user_id, "legacy_user")
+                email = _normal_email(user.get("user_email") or user.get("sso_user_id") or metadata.get("email"))
+                names = [
+                    user.get("user_alias"),
+                    metadata.get("display_name"),
+                    metadata.get("owner_name"),
+                ]
+                for used_by in metadata.get("used_by") or []:
+                    if isinstance(used_by, dict):
+                        names.append(used_by.get("name"))
+                if self._is_backend_usage_account(backend, user_id):
+                    self._add_account_index_entry(index, user_id, "her_user_email" if email else "her_user_alias", email, names)
             total_pages = _as_int(payload.get("total_pages")) if isinstance(payload, dict) else 0
             if total_pages and page >= total_pages:
                 break
 
-        for user_id in await self.user_ids_from_key_alias(email_prefix):
-            add_user_id(user_id, "key_alias")
+        max_pages = max(1, _env_int("HER_KEY_LIST_MAX_PAGES", 20))
+        for page in range(1, max_pages + 1):
+            payload = await self.request_backend(
+                backend,
+                "GET",
+                "/key/list",
+                params={"return_full_object": "true", "page": page, "size": 100},
+            )
+            keys = _records(payload)
+            if not keys:
+                break
+            for key in keys:
+                metadata = _metadata_dict(key.get("metadata"))
+                email = _normal_email(metadata.get("email"))
+                names = [
+                    metadata.get("display_name"),
+                    metadata.get("owner_name"),
+                    key.get("user_alias"),
+                    key.get("key_alias"),
+                ]
+                for used_by in metadata.get("used_by") or []:
+                    if isinstance(used_by, dict):
+                        names.append(used_by.get("name"))
+                if self._is_backend_usage_account(backend, key.get("user_id")):
+                    self._add_account_index_entry(index, key.get("user_id"), "her_key_metadata_email" if email else "her_key_metadata_name", email, names)
+            total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=0)) if isinstance(payload, dict) else 0
+            if total_pages and page >= total_pages:
+                break
+
+        self._account_index_cache.set(cache_key, index, _env_int("HER_ACCOUNT_INDEX_CACHE_TTL_SECONDS", 1800))
+        return index
+
+    def _name_index_matches(self, index: dict[str, Any], name: str) -> dict[str, dict[str, set[str]]]:
+        if not name or not _has_cjk(name):
+            return {}
+        candidates = index["names"].get(name, {})
+        if not candidates:
+            return {}
+        user_ids = {user_id for user_id in candidates if user_id}
+        emails = {email for entry in candidates.values() for email in entry.get("emails", set()) if email}
+        if len(user_ids) == 1 and len(emails) <= 1:
+            return candidates
+        return {}
+
+    async def add_her_index_matches(
+        self,
+        backend: LiteLLMBackend,
+        email_lower: str,
+        name: str | None,
+        add_user_id: Any,
+    ) -> None:
+        index = await self.her_account_index(backend)
+        email_matches = index["emails"].get(email_lower, {})
+        for user_id, entry in email_matches.items():
+            for source in sorted(entry.get("sources", set())) or ["her_email"]:
+                add_user_id(backend, user_id, source)
+
+        if email_matches:
+            return
+
+        for user_id, entry in self._name_index_matches(index, _clean_text(name)).items():
+            for source in sorted(entry.get("sources", set())) or ["her_user_alias_unique"]:
+                add_user_id(backend, user_id, "her_user_alias_unique" if source.startswith("her_") else source)
+
+    async def resolve_user(self, email: str, name: str | None = None) -> dict[str, Any]:
+        email_lower = email.lower()
+        email_prefix = email_lower.split("@", 1)[0]
+        matched_users: list[dict[str, Any]] = []
+        matched_user_ids: list[str] = []
+        matched_accounts: list[dict[str, str]] = []
+        matched_account_map: dict[str, dict[str, Any]] = {}
+        matched_sources: dict[str, list[str]] = {}
+
+        def add_user_id(backend: LiteLLMBackend, user_id: Any, source: str) -> None:
+            text = str(user_id or "").strip()
+            if not text or not self._is_backend_usage_account(backend, text):
+                return
+            encoded = self._encode_account_id(backend, text)
+            if encoded not in matched_user_ids:
+                matched_user_ids.append(encoded)
+                account = {"backend": backend.id, "source": backend.source or "其他", "user_id": text, "account_id": encoded, "matchSources": []}
+                matched_accounts.append(account)
+                matched_account_map[encoded] = account
+            matched_sources.setdefault(encoded, [])
+            if source not in matched_sources[encoded]:
+                matched_sources[encoded].append(source)
+            account = matched_account_map.get(encoded)
+            if account is not None and source not in account["matchSources"]:
+                account["matchSources"].append(source)
+
+        for backend in self.backends:
+            for page in range(1, 51):
+                payload = await self.request_backend(backend, "GET", "/user/list", params={"page": page, "page_size": 100})
+                for user in _records(payload):
+                    user_id = user.get("user_id")
+                    email_candidates = [user.get("user_email"), user.get("sso_user_id")]
+                    legacy_candidates = [user.get("user_id"), user.get("user_alias")]
+                    if any(str(candidate or "").lower() == email_lower for candidate in email_candidates):
+                        matched_users.append(user)
+                        add_user_id(backend, user_id, "user_email")
+                    elif any(str(candidate or "").lower() == email_prefix for candidate in legacy_candidates):
+                        matched_users.append(user)
+                        add_user_id(backend, user_id, "legacy_user")
+                total_pages = _as_int(payload.get("total_pages")) if isinstance(payload, dict) else 0
+                if total_pages and page >= total_pages:
+                    break
+
+            if backend.source != "Her":
+                for user_id in await self.user_ids_from_key_alias(email_prefix, backend):
+                    add_user_id(backend, user_id, "key_alias")
+
+            if backend.source == "Her":
+                await self.add_her_index_matches(backend, email_lower, name, add_user_id)
 
         if matched_user_ids:
             primary = matched_users[0].copy() if matched_users else {}
             primary.setdefault("user_id", matched_user_ids[0])
             primary["matched_user_ids"] = sorted(matched_user_ids)
+            primary["matched_accounts"] = matched_accounts
             primary["matched_sources"] = matched_sources
             primary["user_email"] = email_lower
             primary.setdefault("user_alias", email_prefix)
@@ -283,11 +473,13 @@ class LiteLLMClient:
 
         raise HTTPException(status_code=404, detail="未找到当前员工对应的用量账号")
 
-    async def user_ids_from_key_alias(self, email_prefix: str) -> list[str]:
+    async def user_ids_from_key_alias(self, email_prefix: str, backend: LiteLLMBackend | None = None) -> list[str]:
+        backend = backend or self.backends[0]
         user_ids: list[str] = []
         seen: set[str] = set()
         for alias in (f"cursor-{email_prefix}", f"claude-code-{email_prefix}", email_prefix):
-            payload = await self.request(
+            payload = await self.request_backend(
+                backend,
                 "GET",
                 "/key/list",
                 params={"key_alias": alias, "return_full_object": "true", "page": 1, "size": 100},
@@ -300,8 +492,14 @@ class LiteLLMClient:
         return user_ids
 
     async def usage_rows(self, user_id: str, start_date: str, end_date: str, source: str | None) -> list[dict[str, Any]]:
+        backend, raw_user_id = self._decode_account_id(user_id)
+        if backend.source:
+            if _source_filter_applies(source) and source != backend.source:
+                return []
+            return await self._usage_from_daily_activity(raw_user_id, start_date, end_date, "all", backend=backend, source_override=backend.source)
+
         try:
-            rows = await self._usage_from_key_daily_activity(user_id, start_date, end_date, source)
+            rows = await self._usage_from_key_daily_activity(raw_user_id, start_date, end_date, source, backend)
         except HTTPException:
             rows = []
         if rows:
@@ -309,20 +507,21 @@ class LiteLLMClient:
 
         if _env_bool("PERSONAL_USAGE_LOG_FALLBACK_ENABLED", False):
             try:
-                rows = await self._usage_from_logs(user_id, start_date, end_date, source)
+                rows = await self._usage_from_logs(raw_user_id, start_date, end_date, source, backend)
             except HTTPException:
                 rows = []
             if rows:
                 return rows
-        return await self._usage_from_daily_activity(user_id, start_date, end_date, source)
+        return await self._usage_from_daily_activity(raw_user_id, start_date, end_date, source, backend=backend)
 
     async def usage_rows_for_user_ids(self, user_ids: list[str], start_date: str, end_date: str, source: str | None) -> list[dict[str, Any]]:
         batches = await asyncio.gather(*(self.usage_rows(user_id, start_date, end_date, source) for user_id in user_ids))
         rows = [row for batch in batches for row in batch]
         return sorted(rows, key=lambda item: (item["date"], item["source"], item["model"]))
 
-    async def _usage_from_key_daily_activity(self, user_id: str, start_date: str, end_date: str, source: str | None) -> list[dict[str, Any]]:
-        keys = await self.keys_for_user(user_id)
+    async def _usage_from_key_daily_activity(self, user_id: str, start_date: str, end_date: str, source: str | None, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
+        backend = backend or self.backends[0]
+        keys = await self.keys_for_user(user_id, backend)
         selected_keys: list[tuple[dict[str, Any], str]] = []
         for key in keys[:25]:
             key_source = detect_source_from_key(key)
@@ -338,6 +537,7 @@ class LiteLLMClient:
                     end_date=end_date,
                     source="all",
                     api_key=key["id"],
+                    backend=backend,
                     source_override=key_source,
                 )
                 for key, key_source in selected_keys
@@ -359,12 +559,14 @@ class LiteLLMClient:
             else:
                 os.environ["USAGE_LOG_MAX_PAGES"] = original
 
-    async def _usage_from_logs(self, user_id: str, start_date: str, end_date: str, source: str | None) -> list[dict[str, Any]]:
+    async def _usage_from_logs(self, user_id: str, start_date: str, end_date: str, source: str | None, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
+        backend = backend or self.backends[0]
         max_pages = max(1, int(os.getenv("USAGE_LOG_MAX_PAGES", "20")))
         utc_start, utc_end = _local_date_window_as_utc_text(start_date, end_date)
         grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
         for page in range(1, max_pages + 1):
-            payload = await self.request(
+            payload = await self.request_backend(
+                backend,
                 "GET",
                 "/spend/logs/v2",
                 params={
@@ -381,7 +583,7 @@ class LiteLLMClient:
             if not logs:
                 break
             for log in logs:
-                detected_source = detect_source(log)
+                detected_source = backend.source or detect_source(log)
                 if source and source != "all" and detected_source != source:
                     continue
                 model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
@@ -456,28 +658,32 @@ class LiteLLMClient:
         end_date: str,
         source: str | None,
         api_key: str | None = None,
+        backend: LiteLLMBackend | None = None,
         source_override: str | None = None,
     ) -> list[dict[str, Any]]:
         if _source_filter_applies(source):
             return []
+        backend = backend or self.backends[0]
         params = {"user_id": user_id, "start_date": start_date, "end_date": end_date, "page": 1, "page_size": 1000}
         if api_key:
             params["api_key"] = api_key
         try:
-            payload = await self.request("GET", "/user/daily/activity/aggregated", params=params)
+            payload = await self.request_backend(backend, "GET", "/user/daily/activity/aggregated", params=params)
         except HTTPException:
-            payload = await self.request("GET", "/user/daily/activity", params=params)
+            payload = await self.request_backend(backend, "GET", "/user/daily/activity", params=params)
         rows = []
         for item in _records(payload):
             rows.append(self._row_from_daily_activity_item(item, source_override or "其他"))
         return rows
 
-    async def keys_for_user(self, user_id: str) -> list[dict[str, Any]]:
-        cache_key = f"keys:{user_id}"
+    async def keys_for_user(self, user_id: str, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
+        backend = backend or self.backends[0]
+        cache_key = f"keys:{backend.id}:{user_id}"
         hit, value, _ = self._key_cache.get(cache_key)
         if hit:
             return value
-        payload = await self.request(
+        payload = await self.request_backend(
+            backend,
             "GET",
             "/key/list",
             params={"user_id": user_id, "return_full_object": "true", "page": 1, "size": 100},
@@ -505,7 +711,12 @@ class LiteLLMClient:
         return keys
 
     async def keys_for_user_ids(self, user_ids: list[str]) -> list[dict[str, Any]]:
-        batches = await asyncio.gather(*(self.keys_for_user(user_id) for user_id in user_ids))
+        batches = []
+        for user_id in user_ids:
+            backend, raw_user_id = self._decode_account_id(user_id)
+            if backend.source:
+                continue
+            batches.append(await self.keys_for_user(raw_user_id, backend))
         keys: list[dict[str, Any]] = []
         seen: set[str] = set()
         for batch in batches:
@@ -517,10 +728,14 @@ class LiteLLMClient:
         return keys
 
     async def regenerate_key(self, key_id: str, user_id: str, changed_by: str) -> str:
-        owned_keys = await self.keys_for_user(user_id)
+        backend, raw_user_id = self._decode_account_id(user_id)
+        if backend.source:
+            raise HTTPException(status_code=403, detail="Her 访问密钥暂不支持在这里更新")
+        owned_keys = await self.keys_for_user(raw_user_id, backend)
         if not any(key["id"] == key_id for key in owned_keys):
             raise HTTPException(status_code=403, detail="不能更新不属于自己的访问密钥")
-        payload = await self.request(
+        payload = await self.request_backend(
+            backend,
             "POST",
             "/key/regenerate",
             params={"key": key_id},
@@ -532,18 +747,21 @@ class LiteLLMClient:
             raise HTTPException(status_code=502, detail="上游未返回新的访问密钥")
         return str(new_key)
 
-    async def users(self) -> list[dict[str, Any]]:
+    async def users(self, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
+        backend = backend or self.backends[0]
         users: list[dict[str, Any]] = []
         for page in range(1, 101):
-            payload = await self.request("GET", "/user/list", params={"page": page, "page_size": 100})
+            payload = await self.request_backend(backend, "GET", "/user/list", params={"page": page, "page_size": 100})
             users.extend(_records(payload))
             total_pages = _as_int(payload.get("total_pages")) if isinstance(payload, dict) else 0
             if total_pages and page >= total_pages:
                 break
         return users
 
-    async def admin_daily_activity_rows(self, start_date: str, end_date: str) -> list[dict[str, Any]]:
-        payload = await self.request(
+    async def admin_daily_activity_rows(self, start_date: str, end_date: str, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
+        backend = backend or self.backends[0]
+        payload = await self.request_backend(
+            backend,
             "GET",
             "/user/daily/activity/aggregated",
             params={
@@ -552,12 +770,10 @@ class LiteLLMClient:
                 "timezone": usage_timezone_offset_minutes(),
             },
         )
-        rows = [self._row_from_daily_activity_item(item, "其他", "全量") for item in _records(payload)]
+        rows = [self._row_from_daily_activity_item(item, backend.source or "其他", "全量") for item in _records(payload)]
         return sorted(rows, key=lambda item: (item["date"], item["model"]))
 
     async def admin_usage_rows(self, start_date: str, end_date: str, source: str | None, employee: str | None = None) -> dict[str, Any]:
-        users = await self.users()
-        user_map = self._admin_user_map(users)
         employee_filter = (employee or "").strip().lower()
         grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         employees: dict[str, dict[str, Any]] = {}
@@ -568,53 +784,68 @@ class LiteLLMClient:
         total_pages = 0
         total_records = 0
 
-        for page in range(1, max_pages + 1):
-            payload = await self.request(
-                "GET",
-                "/spend/logs/v2",
-                params={
-                    "start_date": utc_start,
-                    "end_date": utc_end,
-                    "page": page,
-                    "page_size": page_size,
-                    "sort_by": "startTime",
-                    "sort_order": "desc",
-                },
-            )
-            pages_read = page
-            if isinstance(payload, dict):
-                total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=total_pages))
-                total_records = _as_int(_first(payload, "total", "total_count", "count", default=total_records))
-            logs = _records(payload)
-            if not logs:
-                break
-            for log in logs:
-                raw_user = str(_first(log, "user", "user_id", "end_user", default="未绑定账号") or "未绑定账号")
-                employee_info = self._admin_employee_info(raw_user, user_map)
-                if employee_filter and not self._admin_employee_matches(employee_info, employee_filter):
-                    continue
-                detected_source = detect_source(log)
-                if source and source != "all" and detected_source != source:
-                    continue
+        for backend in self.backends:
+            if backend.source and _source_filter_applies(source) and source != backend.source:
+                continue
+            users = await self.users(backend)
+            user_map = self._admin_user_map(users)
+            backend_pages_read = 0
+            backend_total_pages = 0
+            backend_total_records = 0
 
-                employee_key = employee_info["id"]
-                employees.setdefault(employee_key, employee_info)
-                model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
-                day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
-                key = (day, employee_key, detected_source, model)
-                row = grouped.setdefault(key, self._admin_empty_row(day, employee_info, detected_source, model))
-                self._add_log_to_row(row, log)
+            for page in range(1, max_pages + 1):
+                payload = await self.request_backend(
+                    backend,
+                    "GET",
+                    "/spend/logs/v2",
+                    params={
+                        "start_date": utc_start,
+                        "end_date": utc_end,
+                        "page": page,
+                        "page_size": page_size,
+                        "sort_by": "startTime",
+                        "sort_order": "desc",
+                    },
+                )
+                backend_pages_read = page
+                if isinstance(payload, dict):
+                    backend_total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=backend_total_pages))
+                    backend_total_records = _as_int(_first(payload, "total", "total_count", "count", default=backend_total_records))
+                logs = _records(payload)
+                if not logs:
+                    break
+                for log in logs:
+                    raw_user = str(_first(log, "user", "user_id", "end_user", default="未绑定账号") or "未绑定账号")
+                    employee_info = self._admin_employee_info(raw_user, user_map)
+                    if employee_filter and not self._admin_employee_matches(employee_info, employee_filter):
+                        continue
+                    detected_source = backend.source or detect_source(log)
+                    if source and source != "all" and detected_source != source:
+                        continue
 
-            if total_pages and page >= total_pages:
-                break
+                    employee_key = employee_info["id"]
+                    employees.setdefault(employee_key, employee_info)
+                    model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
+                    day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
+                    key = (day, employee_key, detected_source, model)
+                    row = grouped.setdefault(key, self._admin_empty_row(day, employee_info, detected_source, model))
+                    self._add_log_to_row(row, log)
+
+                if backend_total_pages and page >= backend_total_pages:
+                    break
+
+            pages_read = max(pages_read, backend_pages_read)
+            total_pages = max(total_pages, backend_total_pages)
+            total_records += backend_total_records
 
         rows = sorted(grouped.values(), key=lambda item: (item["date"], item["employeeName"], item["source"], item["model"]))
         summary_rows: list[dict[str, Any]] = []
         if (not employee_filter) and (not source or source == "all"):
-            try:
-                summary_rows = await self.admin_daily_activity_rows(start_date, end_date)
-            except HTTPException:
-                summary_rows = []
+            for backend in self.backends:
+                try:
+                    summary_rows.extend(await self.admin_daily_activity_rows(start_date, end_date, backend))
+                except HTTPException:
+                    continue
         truncated = bool(total_pages and pages_read < total_pages)
         return {
             "rows": rows,
@@ -654,29 +885,149 @@ class LiteLLMClient:
             "dataQuality": payload.get("dataQuality", {}),
         }
 
-    async def team_map(self) -> dict[str, dict[str, str]]:
+    async def team_map(self, backend: LiteLLMBackend | None = None) -> dict[str, dict[str, str]]:
+        backend = backend or self.backends[0]
         mapping: dict[str, dict[str, str]] = {}
+        for team in await self.teams(backend):
+            team_id = str(_first(team, "team_id", "id", default="") or "").strip()
+            if not team_id:
+                continue
+            team_alias = str(_first(team, "team_alias", "alias", "name", default="") or "").strip()
+            mapping[team_id.lower()] = {"id": team_id, "name": team_alias or team_id}
+        return mapping
+
+    async def teams(self, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
+        backend = backend or self.backends[0]
         for path in ("/v2/team/list", "/team/list"):
+            teams: list[dict[str, Any]] = []
             for page in range(1, 51):
                 try:
-                    payload = await self.request("GET", path, params={"page": page, "page_size": 100})
+                    payload = await self.request_backend(backend, "GET", path, params={"page": page, "page_size": 100})
                 except HTTPException:
                     break
-                for team in _records(payload):
-                    team_id = str(_first(team, "team_id", "id", default="") or "").strip()
-                    if not team_id:
-                        continue
-                    team_alias = str(_first(team, "team_alias", "alias", "name", default="") or "").strip()
-                    mapping[team_id.lower()] = {"id": team_id, "name": team_alias or team_id}
+                teams.extend(_records(payload))
                 total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=0)) if isinstance(payload, dict) else 0
                 has_more = bool(payload.get("has_more")) if isinstance(payload, dict) else False
                 if total_pages and page >= total_pages:
                     break
                 if not total_pages and not has_more:
                     break
-            if mapping:
-                break
-        return mapping
+            if teams:
+                return teams
+        return []
+
+    def _team_summary(self, team: dict[str, Any], backend: LiteLLMBackend) -> dict[str, Any]:
+        team_id = str(_first(team, "team_id", "id", default="") or "").strip()
+        team_alias = str(_first(team, "team_alias", "alias", "name", default="") or "").strip()
+        members = self._team_members(team)
+        return {
+            "id": team_id,
+            "name": team_alias or team_id,
+            "memberCount": len(members),
+            "backend": backend.id,
+        }
+
+    def _team_members(self, team: dict[str, Any]) -> list[dict[str, Any]]:
+        members = _first(team, "members_with_roles", "membersWithRoles", default=[])
+        if isinstance(members, str):
+            try:
+                members = json.loads(members)
+            except ValueError:
+                members = []
+        if not isinstance(members, list):
+            return []
+        return [member for member in members if isinstance(member, dict)]
+
+    def _team_member_user_id(self, member: dict[str, Any]) -> str:
+        return str(_first(member, "user_id", "userId", default="") or "").strip()
+
+    def _team_member_email(self, member: dict[str, Any]) -> str:
+        return _normal_email(_first(member, "user_email", "userEmail", "email", default=""))
+
+    def _team_member_role(self, member: dict[str, Any]) -> str:
+        return str(_first(member, "role", "user_role", "team_role", default="") or "").strip().lower()
+
+    def _is_team_admin_role(self, member: dict[str, Any]) -> bool:
+        return self._team_member_role(member) == "admin"
+
+    def _accounts_by_backend(self, upstream_user: dict[str, Any]) -> dict[str, set[str]]:
+        grouped: dict[str, set[str]] = defaultdict(set)
+        accounts = upstream_user.get("matched_accounts")
+        if isinstance(accounts, list):
+            for account in accounts:
+                if not isinstance(account, dict):
+                    continue
+                backend_id = str(account.get("backend") or "primary")
+                user_id = str(account.get("user_id") or "").strip().lower()
+                if user_id:
+                    grouped[backend_id].add(user_id)
+        if grouped:
+            return grouped
+        for account_id in upstream_user.get("matched_user_ids") or []:
+            backend, raw_user_id = self._decode_account_id(str(account_id))
+            if raw_user_id:
+                grouped[backend.id].add(raw_user_id.strip().lower())
+        return grouped
+
+    def _account_emails_by_backend(self, upstream_user: dict[str, Any]) -> dict[str, set[str]]:
+        grouped: dict[str, set[str]] = defaultdict(set)
+        accounts = upstream_user.get("matched_accounts")
+        if isinstance(accounts, list):
+            for account in accounts:
+                if not isinstance(account, dict):
+                    continue
+                email = _normal_email(_first(account, "user_email", "email", "sso_user_id", default=""))
+                if email:
+                    grouped[str(account.get("backend") or "primary")].add(email)
+        for email in (
+            _normal_email(_first(upstream_user, "user_email", "email", "sso_user_id", default="")),
+            *[_normal_email(item) for item in upstream_user.get("matched_emails") or []],
+        ):
+            if email:
+                for backend in self.backends:
+                    grouped[backend.id].add(email)
+        return grouped
+
+    async def team_leader_scope(self, upstream_user: dict[str, Any]) -> dict[str, Any]:
+        accounts_by_backend = self._accounts_by_backend(upstream_user)
+        emails_by_backend = self._account_emails_by_backend(upstream_user)
+        leader_teams: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for backend in self.backends:
+            user_ids = accounts_by_backend.get(backend.id, set())
+            emails = emails_by_backend.get(backend.id, set())
+            if not user_ids and not emails:
+                continue
+            for team in await self.teams(backend):
+                team_id = str(_first(team, "team_id", "id", default="") or "").strip()
+                if not team_id:
+                    continue
+                for member in self._team_members(team):
+                    member_id = self._team_member_user_id(member).lower()
+                    member_email = self._team_member_email(member)
+                    if self._is_team_admin_role(member) and ((member_id and member_id in user_ids) or (member_email and member_email in emails)):
+                        key = (backend.id, team_id)
+                        if key not in seen:
+                            seen.add(key)
+                            leader_teams.append({"backend": backend, "team": team, **self._team_summary(team, backend)})
+                        break
+
+        if not leader_teams:
+            return {"isTeamLeader": False, "teamBoardStatus": "none", "team": None, "leaderTeams": []}
+        if len(leader_teams) > 1:
+            return {
+                "isTeamLeader": True,
+                "teamBoardStatus": "multiple",
+                "team": None,
+                "leaderTeams": [{key: value for key, value in item.items() if key != "team"} for item in leader_teams],
+            }
+        only = leader_teams[0]
+        return {
+            "isTeamLeader": True,
+            "teamBoardStatus": "single",
+            "team": {key: value for key, value in only.items() if key != "team"},
+            "leaderTeams": [{key: value for key, value in only.items() if key != "team"}],
+        }
 
     def _department_info_from_log(self, log: dict[str, Any], team_map: dict[str, dict[str, str]]) -> dict[str, str]:
         metadata = _metadata_dict(_first(log, "metadata", "request_tags", "tags", default={}))
@@ -782,11 +1133,19 @@ class LiteLLMClient:
             summary["activeEmployees"] = len(employees.get(department_id, set()))
         return sorted(grouped.values(), key=self._department_sort_key)
 
-    async def _team_daily_activity_rows(self, start_date: str, end_date: str, department: str | None, team_map: dict[str, dict[str, str]]) -> list[dict[str, Any]]:
+    async def _team_daily_activity_rows(
+        self,
+        start_date: str,
+        end_date: str,
+        department: str | None,
+        team_map: dict[str, dict[str, str]],
+        backend: LiteLLMBackend | None = None,
+    ) -> list[dict[str, Any]]:
+        backend = backend or self.backends[0]
         params: dict[str, Any] = {"start_date": start_date, "end_date": end_date, "page": 1, "page_size": 100}
         if department and department != "unassigned":
             params["team_ids"] = department
-        payload = await self.request("GET", "/team/daily/activity", params=params)
+        payload = await self.request_backend(backend, "GET", "/team/daily/activity", params=params)
         rows: list[dict[str, Any]] = []
         for item in _records(payload):
             metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else item
@@ -799,7 +1158,7 @@ class LiteLLMClient:
                     rows.append(
                         {
                             "date": _date_text(_first(item, "date", "day")),
-                            "source": "其他",
+                            "source": backend.source or "其他",
                             "model": "全量",
                             "promptTokens": _as_int(_first(entity_metrics, "prompt_tokens", "promptTokens", "total_prompt_tokens")),
                             "completionTokens": _as_int(_first(entity_metrics, "completion_tokens", "completionTokens", "total_completion_tokens")),
@@ -815,6 +1174,7 @@ class LiteLLMClient:
                     )
             else:
                 row = self._row_from_daily_activity_item(item, "其他", "全量")
+                row["source"] = backend.source or row["source"]
                 team_id = str(_first(item, "team_id", "teamId", default=department or "") or department or "all")
                 known = team_map.get(team_id.lower(), {})
                 row.update({"departmentId": team_id, "departmentName": known.get("name") or team_id, "departmentBindStatus": "已绑定部门"})
@@ -822,9 +1182,6 @@ class LiteLLMClient:
         return rows
 
     async def admin_department_usage_rows(self, start_date: str, end_date: str, source: str | None, department: str | None = None) -> dict[str, Any]:
-        users = await self.users()
-        user_map = self._admin_user_map(users)
-        team_map = await self.team_map()
         department_filter = (department or "").strip().lower()
         grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
         departments: dict[str, dict[str, str]] = {}
@@ -836,8 +1193,177 @@ class LiteLLMClient:
         total_pages = 0
         total_records = 0
 
+        for backend in self.backends:
+            if backend.source and _source_filter_applies(source) and source != backend.source:
+                continue
+            users = await self.users(backend)
+            user_map = self._admin_user_map(users)
+            team_map = await self.team_map(backend)
+            backend_pages_read = 0
+            backend_total_pages = 0
+            backend_total_records = 0
+
+            for page in range(1, max_pages + 1):
+                payload = await self.request_backend(
+                    backend,
+                    "GET",
+                    "/spend/logs/v2",
+                    params={
+                        "start_date": utc_start,
+                        "end_date": utc_end,
+                        "page": page,
+                        "page_size": page_size,
+                        "sort_by": "startTime",
+                        "sort_order": "desc",
+                    },
+                )
+                backend_pages_read = page
+                if isinstance(payload, dict):
+                    backend_total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=backend_total_pages))
+                    backend_total_records = _as_int(_first(payload, "total", "total_count", "count", default=backend_total_records))
+                logs = _records(payload)
+                if not logs:
+                    break
+                for log in logs:
+                    department_info = self._department_info_from_log(log, team_map)
+                    if department_filter and department_filter not in {department_info["id"].lower(), department_info["name"].lower()}:
+                        continue
+                    detected_source = backend.source or detect_source(log)
+                    if source and source != "all" and detected_source != source:
+                        continue
+
+                    raw_user = str(_first(log, "user", "user_id", "end_user", default="未绑定账号") or "未绑定账号")
+                    employee_info = self._admin_employee_info(raw_user, user_map)
+                    department_id = department_info["id"]
+                    departments.setdefault(department_id, department_info)
+                    employees.setdefault(employee_info["id"], employee_info)
+                    model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
+                    day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
+                    key = (day, department_id, employee_info["id"], detected_source, model)
+                    row = grouped.setdefault(key, self._department_empty_row(day, department_info, detected_source, model, employee_info))
+                    self._add_log_to_row(row, log)
+
+                if backend_total_pages and page >= backend_total_pages:
+                    break
+
+            pages_read = max(pages_read, backend_pages_read)
+            total_pages = max(total_pages, backend_total_pages)
+            total_records += backend_total_records
+
+        rows = sorted(grouped.values(), key=lambda item: (item["date"], item["departmentName"], item["employeeName"], item["source"], item["model"]))
+        summary_rows: list[dict[str, Any]] = []
+        if not source or source == "all":
+            for backend in self.backends:
+                try:
+                    team_map = await self.team_map(backend)
+                    backend_summary_rows = await self._team_daily_activity_rows(start_date, end_date, department, team_map, backend)
+                    if department_filter:
+                        backend_summary_rows = [
+                            row
+                            for row in backend_summary_rows
+                            if department_filter in {str(row.get("departmentId", "")).lower(), str(row.get("departmentName", "")).lower()}
+                        ]
+                    summary_rows.extend(backend_summary_rows)
+                except HTTPException:
+                    continue
+
+        truncated = bool(total_pages and pages_read < total_pages)
+        return {
+            "rows": rows,
+            "summaryRows": summary_rows or rows,
+            "departments": self._department_summaries(rows, departments),
+            "employees": self._admin_employee_summaries(rows, employees),
+            "pageLimit": max_pages,
+            "pageSize": page_size,
+            "pagesRead": pages_read,
+            "totalPages": total_pages,
+            "totalRecords": total_records,
+            "truncated": truncated,
+            "dataQuality": {
+                "summarySource": "team_daily_activity" if summary_rows else "spend_logs",
+                "rankingSource": "spend_logs",
+                "timezoneOffsetMinutes": usage_timezone_offset_minutes(),
+            },
+        }
+
+    def _team_member_employee_info(self, member: dict[str, Any], user_map: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+        user_id = self._team_member_user_id(member)
+        email = str(_first(member, "user_email", "userEmail", default="") or "").strip().lower()
+        if user_id and user_id.lower() in user_map:
+            return user_map[user_id.lower()]
+        if email and email in user_map:
+            return user_map[email]
+        if not user_id and not email:
+            return None
+        name = str(_first(member, "user_alias", "userAlias", "name", default="") or "").strip()
+        return {
+            "id": email or user_id,
+            "name": name or (email.split("@", 1)[0] if email else user_id),
+            "email": email,
+            "bindStatus": "已绑定邮箱" if email else "未绑定邮箱",
+            "userIds": [user_id] if user_id else [],
+        }
+
+    def _admin_employee_summaries_with_zeroes(self, rows: list[dict[str, Any]], employees: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        summaries = {item["employeeId"]: item for item in self._admin_employee_summaries(rows, employees)}
+        for employee_id, employee in employees.items():
+            summaries.setdefault(
+                employee_id,
+                {
+                    "employeeId": employee_id,
+                    "employeeName": employee.get("name") or employee_id,
+                    "employeeEmail": employee.get("email") or "",
+                    "bindStatus": employee.get("bindStatus") or "未绑定邮箱",
+                    "promptTokens": 0,
+                    "completionTokens": 0,
+                    "totalTokens": 0,
+                    "requestCount": 0,
+                    "successCount": 0,
+                    "failureCount": 0,
+                    "spend": 0.0,
+                    "primarySource": "其他",
+                    "teamRole": employee.get("teamRole") or "user",
+                },
+            )
+        return sorted(summaries.values(), key=self._admin_employee_sort_key)
+
+    async def team_usage_rows(
+        self,
+        backend_id: str,
+        team_id: str,
+        start_date: str,
+        end_date: str,
+        source: str | None,
+    ) -> dict[str, Any]:
+        backend = self._backend_map.get(backend_id)
+        if backend is None:
+            raise HTTPException(status_code=403, detail="当前团队权限已失效，请重新登录")
+        teams = await self.teams(backend)
+        team = next((item for item in teams if str(_first(item, "team_id", "id", default="") or "") == team_id), None)
+        if team is None:
+            raise HTTPException(status_code=404, detail="未找到当前负责的团队")
+
+        user_map = self._admin_user_map(await self.users(backend))
+        team_info = self._team_summary(team, backend)
+        employees: dict[str, dict[str, Any]] = {}
+        for member in self._team_members(team):
+            employee_info = self._team_member_employee_info(member, user_map)
+            if employee_info:
+                employee_info = dict(employee_info)
+                employee_info["teamRole"] = self._team_member_role(member) or "user"
+                employees.setdefault(employee_info["id"], employee_info)
+
+        grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        max_pages = max(1, int(os.getenv("ADMIN_USAGE_LOG_MAX_PAGES", "30")))
+        page_size = max(1, min(100, int(os.getenv("ADMIN_USAGE_PAGE_SIZE", "100"))))
+        utc_start, utc_end = _local_date_window_as_utc_text(start_date, end_date)
+        pages_read = 0
+        total_pages = 0
+        total_records = 0
+
         for page in range(1, max_pages + 1):
-            payload = await self.request(
+            payload = await self.request_backend(
+                backend,
                 "GET",
                 "/spend/logs/v2",
                 params={
@@ -857,38 +1383,29 @@ class LiteLLMClient:
             if not logs:
                 break
             for log in logs:
-                department_info = self._department_info_from_log(log, team_map)
-                if department_filter and department_filter not in {department_info["id"].lower(), department_info["name"].lower()}:
+                log_team = self._department_info_from_log(log, {team_id.lower(): {"id": team_id, "name": team_info["name"]}})
+                if log_team["id"] != team_id:
                     continue
-                detected_source = detect_source(log)
+                detected_source = backend.source or detect_source(log)
                 if source and source != "all" and detected_source != source:
                     continue
-
                 raw_user = str(_first(log, "user", "user_id", "end_user", default="未绑定账号") or "未绑定账号")
                 employee_info = self._admin_employee_info(raw_user, user_map)
-                department_id = department_info["id"]
-                departments.setdefault(department_id, department_info)
-                employees.setdefault(employee_info["id"], employee_info)
+                employee_key = employee_info["id"]
+                employees.setdefault(employee_key, employee_info)
                 model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
                 day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
-                key = (day, department_id, employee_info["id"], detected_source, model)
-                row = grouped.setdefault(key, self._department_empty_row(day, department_info, detected_source, model, employee_info))
+                key = (day, employee_key, detected_source, model)
+                row = grouped.setdefault(key, self._admin_empty_row(day, employee_info, detected_source, model))
                 self._add_log_to_row(row, log)
-
             if total_pages and page >= total_pages:
                 break
 
-        rows = sorted(grouped.values(), key=lambda item: (item["date"], item["departmentName"], item["employeeName"], item["source"], item["model"]))
+        rows = sorted(grouped.values(), key=lambda item: (item["date"], item["employeeName"], item["source"], item["model"]))
         summary_rows: list[dict[str, Any]] = []
         if not source or source == "all":
             try:
-                summary_rows = await self._team_daily_activity_rows(start_date, end_date, department, team_map)
-                if department_filter:
-                    summary_rows = [
-                        row
-                        for row in summary_rows
-                        if department_filter in {str(row.get("departmentId", "")).lower(), str(row.get("departmentName", "")).lower()}
-                    ]
+                summary_rows = await self._team_daily_activity_rows(start_date, end_date, team_id, {team_id.lower(): {"id": team_id, "name": team_info["name"]}}, backend)
             except HTTPException:
                 summary_rows = []
 
@@ -896,8 +1413,8 @@ class LiteLLMClient:
         return {
             "rows": rows,
             "summaryRows": summary_rows or rows,
-            "departments": self._department_summaries(rows, departments),
-            "employees": self._admin_employee_summaries(rows, employees),
+            "employees": self._admin_employee_summaries_with_zeroes(rows, employees),
+            "team": team_info,
             "pageLimit": max_pages,
             "pageSize": page_size,
             "pagesRead": pages_read,

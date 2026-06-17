@@ -1,11 +1,13 @@
 const sourceColors = {
   Cursor: "#1f7a5b",
   "Claude Code": "#b88727",
+  Her: "#d45d42",
   "其他": "#2e6f9f",
 };
 
 const sourceLabels = {
   Cursor: "Codex",
+  Her: "Her",
 };
 
 let currentUser = null;
@@ -15,6 +17,7 @@ let usageSummary = null;
 let lastPersonalUsageCacheHit = false;
 let lastAdminUsageCacheHit = false;
 let lastDepartmentUsageCacheHit = false;
+let lastTeamUsageCacheHit = false;
 let adminUsageData = [];
 let adminSummaryData = [];
 let adminEmployees = [];
@@ -23,6 +26,12 @@ let departmentUsageData = [];
 let departmentSummaryData = [];
 let departmentRankings = [];
 let departmentEmployees = [];
+let teamUsageData = [];
+let teamSummaryData = [];
+let teamEmployees = [];
+let teamInfo = null;
+let leaderTeams = [];
+let selectedTeamRef = "";
 let selectedDepartment = "";
 let departmentPickerOpen = false;
 let departmentPickerOptions = [];
@@ -30,6 +39,7 @@ let modelCatalog = [];
 let isDashboardLoading = false;
 let isAdminLoading = false;
 let isDepartmentLoading = false;
+let isTeamLoading = false;
 let authConfig = { devLoginEnabled: false, oidcConfigured: false, providerName: "飞书扫码登录" };
 
 const el = (id) => document.getElementById(id);
@@ -272,6 +282,64 @@ function renderDepartmentMetrics(data) {
   el("departmentSplitTitle").textContent = `${scopeLabel} Prompt / Completion 拆分`;
   el("departmentSplitDesc").textContent = `观察${scopeLabel}输入输出 Token 比例。`;
   renderMetricGroups("departmentMetrics", data, "department");
+}
+
+function teamScopeLabel() {
+  const selected = leaderTeams.find((item) => item.teamRef === selectedTeamRef);
+  return teamInfo?.name || selected?.name || currentUser?.team?.name || "团队";
+}
+
+function normalizeLeaderTeams(user) {
+  const teams = Array.isArray(user?.leaderTeams) ? user.leaderTeams : [];
+  if (teams.length) return teams.filter((item) => item?.teamRef);
+  return user?.team?.teamRef ? [user.team] : [];
+}
+
+function ensureSelectedTeamRef() {
+  if (!selectedTeamRef || !leaderTeams.some((item) => item.teamRef === selectedTeamRef)) {
+    selectedTeamRef = currentUser?.team?.teamRef || leaderTeams[0]?.teamRef || "";
+  }
+  teamInfo = leaderTeams.find((item) => item.teamRef === selectedTeamRef) || currentUser?.team || null;
+}
+
+function renderTeamSelector() {
+  const selector = el("teamSelector");
+  if (!selector) return;
+  ensureSelectedTeamRef();
+  selector.classList.toggle("hidden", leaderTeams.length <= 1);
+  const select = el("teamSelect");
+  select.innerHTML = leaderTeams
+    .map((team) => `<option value="${team.teamRef}">${team.name || team.id || "团队"} · ${fmt.format(team.memberCount || 0)} 人</option>`)
+    .join("");
+  select.value = selectedTeamRef;
+}
+
+function renderTeamMetrics(data) {
+  const total = sum(data, "totalTokens");
+  const requests = sum(data, "requestCount");
+  const label = rangeLabel();
+  const source = sourceText();
+  const scopeLabel = teamScopeLabel();
+  const activeMembers = teamEmployees.filter((item) => Number(item.totalTokens || 0) > 0 || Number(item.requestCount || 0) > 0).length;
+  el("teamHeroTotal").textContent = formatTokens(total);
+  el("teamHeroTotalLabel").textContent = `${scopeLabel} Token`;
+  el("teamHeroRequests").textContent = fmt.format(requests);
+  el("teamActiveUsers").textContent = fmt.format(activeMembers);
+  el("teamTrendBadge").textContent = `${label} · ${source}`;
+  el("teamSpendBadge").textContent = `${label} · ${source}`;
+  el("teamWelcomeTitle").textContent = `${scopeLabel} AI 用量总览`;
+  el("teamWelcomeDesc").textContent = `当前展示团队成员在所选日期范围与来源筛选下的汇总数据。`;
+  el("teamTrendTitle").textContent = `${scopeLabel}每日 Token 趋势`;
+  el("teamTrendDesc").textContent = `按日期汇总${scopeLabel} Prompt 与 Completion Token。`;
+  el("teamSpendTitle").textContent = `${scopeLabel}每日金额消费趋势`;
+  el("teamSpendDesc").textContent = `按日期汇总${scopeLabel}预估消费金额。`;
+  el("teamSourceTitle").textContent = `${scopeLabel}来源占比`;
+  el("teamSourceDesc").textContent = `${scopeLabel} Codex、Claude Code 与其他来源占比。`;
+  el("teamModelTitle").textContent = `${scopeLabel}模型使用排行`;
+  el("teamModelDesc").textContent = `按${scopeLabel}总 Token 消耗排序。`;
+  el("teamSplitTitle").textContent = `${scopeLabel} Prompt / Completion 拆分`;
+  el("teamSplitDesc").textContent = `观察${scopeLabel}输入输出 Token 比例。`;
+  renderMetricGroups("teamMetrics", data, "team");
 }
 
 function showChartTooltip(event, html) {
@@ -632,7 +700,7 @@ function renderEmployeeRanking(tableId, countId, employees, emptyText) {
             <tr class="admin-employee-row" data-employee="${item.employeeEmail || item.employeeId}">
               <td><strong>${item.employeeName || item.employeeId}</strong></td>
               <td>${item.employeeEmail || "未绑定邮箱"}</td>
-              <td>${displaySource(item.primarySource)}</td>
+              <td>${tableId === "teamUserTable" ? (item.teamRole === "admin" ? "负责人" : "成员") : displaySource(item.primarySource)}</td>
               <td class="num">${fmt.format(requests)}</td>
               <td class="num"><strong>${formatTokens(item.totalTokens || 0)}</strong></td>
               <td class="num">${money.format(item.spend || 0)}</td>
@@ -686,6 +754,10 @@ function renderDepartmentUsers() {
     el("departmentRankingDesc").textContent = "当前展示全部部门汇总排行，点击部门行查看该部门员工排行。";
     renderDepartmentRanking("departmentUserTable", "departmentUserCount", departmentRankings, "当前筛选范围暂无部门用量");
   }
+}
+
+function renderTeamUsers() {
+  renderEmployeeRanking("teamUserTable", "teamUserCount", teamEmployees, "当前团队暂无成员用量");
 }
 
 function loadingLine(width = "100%") {
@@ -855,6 +927,26 @@ function renderDepartmentLoading() {
   renderTableSkeleton("departmentUserTable", "departmentUserCount", 8);
 }
 
+function renderTeamLoading() {
+  const label = rangeLabel();
+  const source = sourceText();
+  const scopeLabel = teamScopeLabel();
+  el("teamHeroTotal").textContent = "加载中";
+  el("teamHeroTotalLabel").textContent = `${scopeLabel} Token`;
+  el("teamHeroRequests").textContent = "--";
+  el("teamActiveUsers").textContent = "--";
+  el("teamTrendBadge").textContent = `${label} · ${source}`;
+  el("teamSpendBadge").textContent = `${label} · ${source}`;
+  el("teamLimitHint").textContent = "数据加载中";
+  renderMetricSkeleton("teamMetrics");
+  renderChartSkeleton("teamTrendChart");
+  renderChartSkeleton("teamSpendChart");
+  renderDonutSkeleton("teamDonutTotal", "teamSourceLegend");
+  renderBarsSkeleton("teamModelBars");
+  renderSplitSkeleton("teamSplitChart");
+  renderTableSkeleton("teamUserTable", "teamUserCount", 8);
+}
+
 function renderPersonal() {
   if (isDashboardLoading) {
     renderPersonalLoading();
@@ -916,10 +1008,37 @@ function renderDepartment() {
   }
 }
 
+function renderTeamBlocked() {
+  const status = currentUser?.teamBoardStatus || "none";
+  const allowed = currentUser?.isTeamLeader && leaderTeams.length > 0 && status !== "none";
+  el("teamDashboardContent").classList.toggle("hidden", !allowed);
+  el("teamBlockedState").classList.toggle("hidden", allowed);
+  if (!allowed) el("teamBlockedDesc").textContent = "当前账号还没有团队负责人权限。";
+}
+
+function renderTeam() {
+  renderTeamBlocked();
+  if (!currentUser?.isTeamLeader || !leaderTeams.length) return;
+  renderTeamSelector();
+  if (isTeamLoading) {
+    renderTeamLoading();
+    return;
+  }
+  const totalData = teamSummaryData.length ? teamSummaryData : teamUsageData;
+  renderTeamMetrics(totalData);
+  renderTrendTo("teamTrendChart", totalData);
+  renderSpendTrendTo("teamSpendChart", totalData);
+  renderDonutTo("teamSourceDonut", "teamDonutTotal", "teamSourceLegend", teamUsageData);
+  renderModelBarsTo("teamModelBars", teamUsageData);
+  renderSplitTo("teamSplitChart", teamUsageData);
+  renderTeamUsers();
+}
+
 function render() {
   renderPersonal();
   if (currentUser?.isAdmin) renderAdmin();
   if (currentUser?.isAdmin) renderDepartment();
+  if (currentUser?.isTeamLeader) renderTeam();
 }
 
 function uniqueValues(items, getter) {
@@ -997,9 +1116,11 @@ async function copyText(text, successMessage) {
 function switchView(view) {
   if (view === "admin" && !currentUser?.isAdmin) view = "dashboard";
   if (view === "department" && !currentUser?.isAdmin) view = "dashboard";
+  if (view === "team" && !currentUser?.isTeamLeader) view = "dashboard";
   currentView = view;
   el("dashboardView").classList.toggle("hidden", view !== "dashboard");
   el("adminView").classList.toggle("hidden", view !== "admin");
+  el("teamView").classList.toggle("hidden", view !== "team");
   el("departmentView").classList.toggle("hidden", view !== "department");
   el("modelsView").classList.toggle("hidden", view !== "models");
   el("dashboardFilters").classList.toggle("hidden", view === "models");
@@ -1010,12 +1131,14 @@ function switchView(view) {
   }
   if (view === "dashboard" && !usageData.length) loadDashboardData();
   if (view === "admin" && !adminUsageData.length) loadAdminData();
+  if (view === "team" && currentUser?.isTeamLeader && !teamUsageData.length) loadTeamData();
   if (view === "department" && !departmentUsageData.length) loadDepartmentData();
 }
 
 async function loadCurrentViewData(forceRefresh = false) {
   if (currentView === "models") return loadModels();
   if (currentView === "admin") return loadAdminData(forceRefresh);
+  if (currentView === "team") return loadTeamData(forceRefresh);
   if (currentView === "department") return loadDepartmentData(forceRefresh);
   return loadDashboardData(forceRefresh);
 }
@@ -1112,6 +1235,39 @@ async function loadDepartmentData(forceRefresh = false) {
   }
 }
 
+async function loadTeamData(forceRefresh = false) {
+  if (!currentUser?.isTeamLeader || !leaderTeams.length || isTeamLoading) return;
+  ensureSelectedTeamRef();
+  isTeamLoading = true;
+  renderTeam();
+  const { startDate, endDate } = selectedDateRange();
+  const source = el("sourceSelect").value;
+  const query = new URLSearchParams({ start_date: startDate, end_date: endDate, source });
+  if (selectedTeamRef) query.set("team_ref", selectedTeamRef);
+  if (forceRefresh) query.set("refresh", "1");
+  try {
+    const payload = await api(`/api/team/usage?${query.toString()}`);
+    teamUsageData = payload.rows || [];
+    teamSummaryData = payload.summaryRows || teamUsageData;
+    teamEmployees = payload.employees || [];
+    teamInfo = payload.team || currentUser.team || null;
+    lastTeamUsageCacheHit = Boolean(payload.cache?.hit);
+    if (payload.truncated) {
+      el("teamLimitHint").textContent = `成员排行默认按 Token 从高到低排序；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），排行可能不完整`;
+    } else {
+      el("teamLimitHint").textContent = `成员排行默认按 Token 从高到低排序；已读取 ${payload.pagesRead || 0} 页日志，并包含团队内零用量成员`;
+    }
+  } catch (error) {
+    showToast(error.message || "团队数据加载失败");
+    teamUsageData = [];
+    teamSummaryData = [];
+    teamEmployees = [];
+  } finally {
+    isTeamLoading = false;
+    renderTeam();
+  }
+}
+
 async function loadModels() {
   try {
     const payload = await api("/api/models");
@@ -1128,17 +1284,22 @@ async function loadModels() {
 
 async function showApp(user) {
   currentUser = user;
+  leaderTeams = normalizeLeaderTeams(user);
+  selectedTeamRef = user.team?.teamRef || leaderTeams[0]?.teamRef || "";
+  ensureSelectedTeamRef();
   el("loginView").classList.add("hidden");
   el("appView").classList.remove("hidden");
   el("adminTab").classList.toggle("hidden", !user.isAdmin);
+  el("teamTab").classList.toggle("hidden", !user.isTeamLeader);
   el("departmentTab").classList.toggle("hidden", !user.isAdmin);
   el("userEmail").textContent = user.email;
   el("userName").textContent = user.name;
   el("avatar").textContent = user.avatar || initials(user.email, user.name);
   el("welcomeTitle").textContent = `${user.name}您好，今天的 AI 工具消耗一眼看清`;
   el("adminWelcomeTitle").textContent = `${user.name}您好，全员 AI 用量一眼看清`;
+  el("teamWelcomeTitle").textContent = `${teamScopeLabel()} AI 用量总览`;
   el("departmentWelcomeTitle").textContent = `${user.name}您好，部门 AI 用量一眼看清`;
-  switchView("dashboard");
+  switchView(user.isAdmin ? "admin" : user.isTeamLeader ? "team" : "dashboard");
   render();
   await Promise.all([loadCurrentViewData(), loadModels()]);
 }
@@ -1157,6 +1318,12 @@ function showLogin() {
   departmentSummaryData = [];
   departmentRankings = [];
   departmentEmployees = [];
+  teamUsageData = [];
+  teamSummaryData = [];
+  teamEmployees = [];
+  teamInfo = null;
+  leaderTeams = [];
+  selectedTeamRef = "";
   departmentPickerOptions = [];
   el("departmentEmployeeSearch").value = "";
   closeDepartmentPicker();
@@ -1200,6 +1367,9 @@ document.querySelectorAll("[data-view]").forEach((button) => button.addEventList
 el("rangeSelect").addEventListener("change", async () => {
   selectedAdminEmployee = "";
   selectedDepartment = "";
+  teamUsageData = [];
+  teamSummaryData = [];
+  teamEmployees = [];
   el("departmentEmployeeSearch").value = "";
   departmentPickerOptions = [];
   closeDepartmentPicker();
@@ -1209,6 +1379,9 @@ el("rangeSelect").addEventListener("change", async () => {
 el("sourceSelect").addEventListener("change", async () => {
   selectedAdminEmployee = "";
   selectedDepartment = "";
+  teamUsageData = [];
+  teamSummaryData = [];
+  teamEmployees = [];
   el("departmentEmployeeSearch").value = "";
   departmentPickerOptions = [];
   closeDepartmentPicker();
@@ -1222,6 +1395,9 @@ el("refreshButton").addEventListener("click", async () => {
   } else if (currentView === "admin") {
     await loadAdminData(true);
     showToast(lastAdminUsageCacheHit ? "\u5df2\u52a0\u8f7d\u7f13\u5b58\u5168\u5458\u6570\u636e" : "\u5df2\u5237\u65b0\u5168\u5458\u7528\u91cf\u6570\u636e");
+  } else if (currentView === "team") {
+    await loadTeamData(true);
+    showToast(lastTeamUsageCacheHit ? "已加载缓存团队数据" : "已刷新团队用量数据");
   } else if (currentView === "department") {
     await loadDepartmentData(true);
     showToast(lastDepartmentUsageCacheHit ? "\u5df2\u52a0\u8f7d\u7f13\u5b58\u90e8\u95e8\u6570\u636e" : "\u5df2\u5237\u65b0\u90e8\u95e8\u7528\u91cf\u6570\u636e");
@@ -1306,6 +1482,15 @@ el("departmentBackButton").addEventListener("click", async () => {
   await loadDepartmentData();
 });
 
+el("teamSelect").addEventListener("change", async (event) => {
+  selectedTeamRef = event.target.value;
+  teamInfo = leaderTeams.find((item) => item.teamRef === selectedTeamRef) || null;
+  teamUsageData = [];
+  teamSummaryData = [];
+  teamEmployees = [];
+  await loadTeamData();
+});
+
 el("modelSearch").addEventListener("input", renderModels);
 el("providerFilter").addEventListener("change", renderModels);
 el("capabilityFilter").addEventListener("change", renderModels);
@@ -1337,4 +1522,3 @@ async function init() {
 }
 
 init();
-

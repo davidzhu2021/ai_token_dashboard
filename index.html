@@ -1114,6 +1114,24 @@
         min-width: 240px;
       }
 
+      .team-selector {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 10px;
+        margin: 0 0 16px;
+      }
+
+      .team-selector label {
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 800;
+      }
+
+      .team-selector .select {
+        min-width: min(100%, 280px);
+      }
+
       .department-picker {
         position: relative;
         flex: 1 1 auto;
@@ -1753,6 +1771,7 @@
                   <option value="all">全部来源</option>
                   <option value="Cursor">Codex</option>
                   <option value="Claude Code">Claude Code</option>
+                  <option value="Her">Her</option>
                   <option value="其他">其他</option>
                 </select>
               </div>
@@ -1762,6 +1781,10 @@
                 <button id="adminTab" class="view-tab hidden" type="button" data-view="admin">
                   <span class="nav-icon"><svg><use href="#icon-dashboard"></use></svg></span>
                   全员看板
+                </button>
+                <button id="teamTab" class="view-tab hidden" type="button" data-view="team">
+                  <span class="nav-icon"><svg><use href="#icon-dashboard"></use></svg></span>
+                  团队看板
                 </button>
                 <button id="departmentTab" class="view-tab" type="button" data-view="department">
                   <span class="nav-icon"><svg><use href="#icon-dashboard"></use></svg></span>
@@ -2083,6 +2106,149 @@
           </section>
         </section>
 
+        <section id="teamView" class="view-section hidden">
+          <section id="teamBlockedState" class="panel empty-state hidden">
+            <div class="empty-icon"><svg><use href="#icon-team"></use></svg></div>
+            <h2>团队看板暂不可用</h2>
+            <p id="teamBlockedDesc">当前账号还没有团队负责人权限。</p>
+          </section>
+
+          <div id="teamDashboardContent">
+            <div id="teamSelector" class="team-selector hidden">
+              <label for="teamSelect">团队</label>
+              <select id="teamSelect" class="select" aria-label="选择团队"></select>
+            </div>
+
+            <section class="hero-band">
+              <div class="hero-copy">
+                <span class="eyebrow">团队视图 · 成员用量</span>
+                <h2 id="teamWelcomeTitle">团队 AI 用量总览</h2>
+                <p id="teamWelcomeDesc">当前展示团队成员在所选日期范围与来源筛选下的汇总数据。</p>
+              </div>
+              <div class="status-card">
+                <div>
+                  <span id="teamHeroTotalLabel">团队 Token</span>
+                  <strong id="teamHeroTotal">0</strong>
+                </div>
+                <div class="status-grid">
+                  <div class="status-mini"><span>活跃成员</span><strong id="teamActiveUsers">0</strong></div>
+                  <div class="status-mini"><span>团队请求次数</span><strong id="teamHeroRequests">0</strong></div>
+                </div>
+              </div>
+            </section>
+
+            <section id="teamMetrics" class="metrics"></section>
+
+            <section class="trend-grid">
+              <div class="panel">
+                <div class="panel-header">
+                  <div class="panel-heading">
+                    <span class="panel-icon"><svg><use href="#icon-trend"></use></svg></span>
+                    <div>
+                      <h3 id="teamTrendTitle" class="panel-title">团队每日 Token 趋势</h3>
+                      <p id="teamTrendDesc" class="panel-desc">按日期汇总团队 Prompt 与 Completion Token。</p>
+                    </div>
+                  </div>
+                  <span id="teamTrendBadge" class="chip">近 30 天</span>
+                </div>
+                <svg id="teamTrendChart" class="chart" role="img" aria-label="团队每日 Token 趋势图"></svg>
+              </div>
+
+              <div class="panel">
+                <div class="panel-header">
+                  <div class="panel-heading">
+                    <span class="panel-icon"><svg><use href="#icon-spend"></use></svg></span>
+                    <div>
+                      <h3 id="teamSpendTitle" class="panel-title">团队每日金额消费趋势</h3>
+                      <p id="teamSpendDesc" class="panel-desc">按日期汇总团队预估消费金额。</p>
+                    </div>
+                  </div>
+                  <span id="teamSpendBadge" class="chip blue">近 30 天</span>
+                </div>
+                <svg id="teamSpendChart" class="chart" role="img" aria-label="团队每日金额消费趋势图"></svg>
+              </div>
+            </section>
+
+            <section class="analysis-grid">
+              <div class="panel">
+                <div class="panel-header">
+                  <div class="panel-heading">
+                    <span class="panel-icon"><svg><use href="#icon-source"></use></svg></span>
+                    <div>
+                      <h3 id="teamSourceTitle" class="panel-title">团队来源占比</h3>
+                      <p id="teamSourceDesc" class="panel-desc">Codex、Claude Code 与其他来源占比。</p>
+                    </div>
+                  </div>
+                </div>
+                <div class="donut-wrap">
+                  <svg id="teamSourceDonut" class="donut" role="img" aria-label="团队来源占比图"></svg>
+                  <div class="donut-center"><strong id="teamDonutTotal">0</strong><span>Token</span></div>
+                </div>
+                <div id="teamSourceLegend" class="legend"></div>
+              </div>
+
+              <div class="panel">
+                <div class="panel-header">
+                  <div class="panel-heading">
+                    <span class="panel-icon"><svg><use href="#icon-model"></use></svg></span>
+                    <div>
+                      <h3 id="teamModelTitle" class="panel-title">团队模型使用排行</h3>
+                      <p id="teamModelDesc" class="panel-desc">按团队总 Token 消耗排序。</p>
+                    </div>
+                  </div>
+                </div>
+                <div id="teamModelBars" class="bar-list"></div>
+              </div>
+
+              <div class="panel wide">
+                <div class="panel-header">
+                  <div class="panel-heading">
+                    <span class="panel-icon"><svg><use href="#icon-split"></use></svg></span>
+                    <div>
+                      <h3 id="teamSplitTitle" class="panel-title">团队 Prompt / Completion 拆分</h3>
+                      <p id="teamSplitDesc" class="panel-desc">观察团队输入输出 Token 比例。</p>
+                    </div>
+                  </div>
+                </div>
+                <svg id="teamSplitChart" class="split-chart" role="img" aria-label="团队 Prompt 和 Completion Token 拆分图"></svg>
+              </div>
+            </section>
+
+            <section class="panel table-panel">
+              <div class="panel-header">
+                <div class="panel-heading">
+                  <span class="panel-icon"><svg><use href="#icon-team"></use></svg></span>
+                  <div>
+                    <h3 class="panel-title">成员 Token 排行</h3>
+                    <p class="panel-desc">按当前日期范围与来源筛选统计团队成员用量，包含零用量成员。</p>
+                  </div>
+                </div>
+                <span id="teamUserCount" class="chip blue">0 人</span>
+              </div>
+              <div class="admin-toolbar">
+                <span id="teamLimitHint" class="hint">按当前筛选范围统计</span>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>成员</th>
+                      <th>邮箱</th>
+                      <th>团队角色</th>
+                      <th class="num">请求数</th>
+                      <th class="num">总 Token</th>
+                      <th class="num">金额</th>
+                      <th class="num">成功率</th>
+                      <th>状态</th>
+                    </tr>
+                  </thead>
+                  <tbody id="teamUserTable"></tbody>
+                </table>
+              </div>
+            </section>
+          </div>
+        </section>
+
         <section id="departmentView" class="view-section hidden">
           <section class="hero-band">
             <div class="hero-copy">
@@ -2270,4 +2436,3 @@
     <script src="/assets/app.js?v=20260616-lazy-cache"></script>
   </body>
 </html>
-

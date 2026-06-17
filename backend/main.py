@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import logging
 import os
 import re
@@ -52,6 +53,8 @@ user_mapping_cache = TTLCache()
 personal_usage_cache = TTLCache()
 admin_usage_cache = TTLCache()
 department_usage_cache = TTLCache()
+team_auth_cache = TTLCache()
+team_usage_cache = TTLCache()
 _litellm_client: LiteLLMClient | None = None
 
 
@@ -214,13 +217,14 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
-async def cached_resolve_user(email: str) -> tuple[dict[str, Any], dict[str, Any]]:
+async def cached_resolve_user(email: str, name: str | None = None, refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
     normalized_email = email.strip().lower()
-    cache_key = f"user-map:{normalized_email}"
+    normalized_name = str(name or "").strip()
+    cache_key = f"user-map:v2:{normalized_email}:{normalized_name}"
     hit, value, ttl_seconds = user_mapping_cache.get(cache_key)
-    if hit:
+    if hit and not refresh:
         return value, {"hit": True, "ttlSeconds": ttl_seconds}
-    upstream = await client().resolve_user(normalized_email)
+    upstream = await client().resolve_user(normalized_email, normalized_name)
     user_mapping_cache.set(cache_key, upstream, env_int("USER_MAPPING_CACHE_TTL_SECONDS", 1800))
     return upstream, {"hit": False, "ttlSeconds": 0}
 
@@ -235,6 +239,54 @@ def admin_usage_cache_key(email: str, start_date: str, end_date: str, source: st
 
 def department_usage_cache_key(email: str, start_date: str, end_date: str, source: str, department: str | None) -> str:
     return f"department-usage:v1:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(department or '').strip().lower()}"
+
+
+def team_auth_cache_key(email: str, name: str | None) -> str:
+    return f"team-auth:v1:{email.strip().lower()}:{str(name or '').strip()}"
+
+
+def team_usage_cache_key(email: str, team: dict[str, Any], start_date: str, end_date: str, source: str) -> str:
+    return f"team-usage:v1:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{start_date}:{end_date}:{source or 'all'}"
+
+
+def team_ref(team: dict[str, Any]) -> str:
+    raw = f"{team.get('backend')}:{team.get('id')}".encode("utf-8")
+    return base64.urlsafe_b64encode(hashlib.sha256(raw).digest()[:12]).decode("ascii").rstrip("=")
+
+
+def public_team(team: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(team, dict):
+        return None
+    return {
+        "teamRef": team_ref(team),
+        "id": team.get("id"),
+        "name": team.get("name"),
+        "memberCount": team.get("memberCount"),
+    }
+
+
+def public_team_from_payload(authorized_team: dict[str, Any], payload_team: dict[str, Any] | None = None) -> dict[str, Any]:
+    result = public_team(authorized_team) or {}
+    if isinstance(payload_team, dict):
+        for key in ("id", "name", "memberCount"):
+            if payload_team.get(key) is not None:
+                result[key] = payload_team[key]
+    return result
+
+
+def select_authorized_team(scope: dict[str, Any], team_ref_value: str | None = None) -> dict[str, Any]:
+    leader_teams = [team for team in scope.get("leaderTeams") or [] if isinstance(team, dict)]
+    if not leader_teams:
+        raise HTTPException(status_code=403, detail="当前账号还没有团队负责人权限")
+    if team_ref_value:
+        for team in leader_teams:
+            if team_ref(team) == team_ref_value:
+                return team
+        raise HTTPException(status_code=403, detail="当前账号无权查看该团队看板")
+    selected = scope.get("team") if isinstance(scope.get("team"), dict) else None
+    if selected:
+        return selected
+    return leader_teams[0]
 
 
 def empty_usage_totals() -> dict[str, Any]:
@@ -311,7 +363,7 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
         payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
         return payload
 
-    upstream_user, mapping_cache = await cached_resolve_user(app_user["email"])
+    upstream_user, mapping_cache = await cached_resolve_user(app_user["email"], app_user.get("name"), refresh)
     user_ids = upstream_user_ids(upstream_user)
     if not user_ids:
         raise HTTPException(status_code=502, detail="上游员工记录缺少 user_id")
@@ -361,9 +413,67 @@ async def department_usage_payload(admin: dict[str, Any], start_date: str, end_d
     return payload
 
 
-async def current_upstream_user(request: Request) -> tuple[dict[str, Any], dict[str, Any]]:
+async def team_scope_for_user(app_user: dict[str, Any], refresh: bool = False) -> dict[str, Any]:
+    cache_key = team_auth_cache_key(app_user["email"], app_user.get("name"))
+    if not refresh:
+        hit, value, ttl_seconds = team_auth_cache.get(cache_key)
+        if hit:
+            scope = dict(value)
+            scope["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+            return scope
+    try:
+        upstream_user, _ = await cached_resolve_user(app_user["email"], app_user.get("name"), refresh)
+        scope = await client().team_leader_scope(upstream_user)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            scope = {"isTeamLeader": False, "teamBoardStatus": "none", "team": None, "leaderTeams": []}
+        else:
+            raise
+    team_auth_cache.set(cache_key, scope, env_int("TEAM_AUTH_CACHE_TTL_SECONDS", 300))
+    scope = dict(scope)
+    scope["cache"] = {"hit": False, "ttlSeconds": 0}
+    return scope
+
+
+async def app_user_with_team_scope(app_user: dict[str, Any]) -> dict[str, Any]:
+    scope = await team_scope_for_user(app_user)
+    selected_team = public_team(scope.get("team"))
+    public_teams = [team for team in (public_team(item) for item in scope.get("leaderTeams") or []) if team]
+    enriched = dict(app_user)
+    enriched.update(
+        {
+            "isTeamLeader": bool(scope.get("isTeamLeader")),
+            "teamBoardStatus": scope.get("teamBoardStatus", "none"),
+            "team": selected_team,
+            "leaderTeams": public_teams,
+        }
+    )
+    return enriched
+
+
+async def team_usage_payload(app_user: dict[str, Any], start_date: str, end_date: str, source: str, refresh: bool = False, team_ref_value: str | None = None) -> dict[str, Any]:
+    scope = await team_scope_for_user(app_user, refresh)
+    if not scope.get("isTeamLeader"):
+        raise HTTPException(status_code=403, detail="当前账号还没有团队负责人权限")
+    team = select_authorized_team(scope, team_ref_value)
+    cache_key = team_usage_cache_key(app_user["email"], team, start_date, end_date, source)
+    if not refresh:
+        hit, value, ttl_seconds = team_usage_cache.get(cache_key)
+        if hit:
+            payload = dict(value)
+            payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+            return payload
+    payload = dict(await client().team_usage_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source))
+    payload["team"] = public_team_from_payload(team, payload.get("team"))
+    team_usage_cache.set(cache_key, payload, env_int("TEAM_USAGE_CACHE_TTL_SECONDS", 300))
+    payload = dict(payload)
+    payload["cache"] = {"hit": False, "ttlSeconds": 0}
+    return payload
+
+
+async def current_upstream_user(request: Request, refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
     app_user = require_user(request)
-    upstream, _ = await cached_resolve_user(app_user["email"])
+    upstream, _ = await cached_resolve_user(app_user["email"], app_user.get("name"), refresh)
     return app_user, upstream
 
 
@@ -378,15 +488,16 @@ def upstream_user_ids(upstream_user: dict[str, Any]) -> list[str]:
 
 
 @app.get("/api/debug/me-mapping")
-async def debug_me_mapping(request: Request) -> dict[str, Any]:
+async def debug_me_mapping(request: Request, refresh: bool = Query(False)) -> dict[str, Any]:
     if not env_bool("DEBUG_MAPPING_ENABLED", False):
         raise HTTPException(status_code=404, detail="接口不存在")
-    app_user, upstream_user = await current_upstream_user(request)
+    app_user, upstream_user = await current_upstream_user(request, refresh)
     return {
         "email": app_user["email"],
         "userIds": upstream_user_ids(upstream_user),
         "matchedBy": upstream_user.get("matched_by"),
         "matchedSources": upstream_user.get("matched_sources", {}),
+        "matchedAccounts": upstream_user.get("matched_accounts", []),
     }
 
 
@@ -402,7 +513,7 @@ async def debug_me_usage_compare(
     app_user = require_user(request)
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
-    upstream, mapping_cache = await cached_resolve_user(app_user["email"])
+    upstream, mapping_cache = await cached_resolve_user(app_user["email"], app_user.get("name"))
     user_ids = upstream_user_ids(upstream)
     litellm = client()
     current_rows = await litellm.usage_rows_for_user_ids(user_ids, start_date, end_date, "all")
@@ -456,7 +567,7 @@ async def auth_config() -> dict[str, Any]:
 
 @app.get("/api/auth/me")
 async def auth_me(request: Request) -> dict[str, Any]:
-    return require_user(request)
+    return await app_user_with_team_scope(require_user(request))
 
 
 @app.post("/api/auth/dev-login")
@@ -468,10 +579,9 @@ async def dev_login(request: Request) -> dict[str, Any]:
     if "@" not in email:
         raise HTTPException(status_code=400, detail="请输入有效的企业邮箱")
     email = validate_company_email(email)
-    await client().resolve_user(email)
     user = normalize_user(email)
     request.session[SESSION_USER_KEY] = user
-    return user
+    return await app_user_with_team_scope(user)
 
 
 @app.get("/api/auth/sso/start")
@@ -551,6 +661,29 @@ async def my_usage(
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
     return await personal_usage_payload(app_user, start_date, end_date, source, refresh)
+
+
+@app.get("/api/team/usage")
+async def team_usage(
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    source: str = Query("all"),
+    team_ref: str | None = None,
+    refresh: bool = Query(False),
+) -> dict[str, Any]:
+    app_user = require_user(request)
+    if not start_date or not end_date:
+        start_date, end_date = default_date_range()
+    payload = await team_usage_payload(app_user, start_date, end_date, source, refresh, team_ref)
+    return {
+        "leader": {"email": app_user["email"], "name": app_user["name"]},
+        "startDate": start_date,
+        "endDate": end_date,
+        "source": source,
+        "teamRef": payload.get("team", {}).get("teamRef", team_ref or ""),
+        **payload,
+    }
 
 
 @app.get("/api/me/usage/logs")
