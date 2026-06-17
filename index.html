@@ -1114,6 +1114,64 @@
         min-width: 240px;
       }
 
+      .department-picker {
+        position: relative;
+        flex: 1 1 auto;
+      }
+
+      .department-options {
+        position: absolute;
+        z-index: 30;
+        top: calc(100% + 8px);
+        left: 0;
+        right: 0;
+        max-height: 280px;
+        overflow-y: auto;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        background: #fff;
+        box-shadow: var(--shadow);
+        padding: 6px;
+      }
+
+      .department-option {
+        width: 100%;
+        border: 0;
+        border-radius: 8px;
+        background: transparent;
+        color: var(--ink);
+        cursor: pointer;
+        display: grid;
+        gap: 4px;
+        padding: 10px;
+        text-align: left;
+      }
+
+      .department-option:hover,
+      .department-option:focus,
+      .department-option:active {
+        background: rgba(31, 122, 91, 0.1);
+        outline: none;
+      }
+
+      .department-option strong,
+      .department-option span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .department-option span {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .department-option.all {
+        border-bottom: 1px solid var(--line);
+        border-radius: 8px 8px 0 0;
+        margin-bottom: 4px;
+      }
+
       .admin-detail-card {
         display: none;
         margin-bottom: 18px;
@@ -1536,6 +1594,10 @@
 
         .admin-search {
           min-width: 0;
+          width: 100%;
+        }
+
+        .department-picker {
           width: 100%;
         }
 
@@ -2149,7 +2211,10 @@
             </div>
             <div class="admin-toolbar">
               <div class="admin-search">
-                <input id="departmentEmployeeSearch" class="input" type="search" placeholder="搜索部门名称或部门 ID" aria-label="搜索部门" />
+                <div id="departmentDepartmentPicker" class="department-picker">
+                  <input id="departmentEmployeeSearch" class="input" type="search" placeholder="搜索部门名称或部门 ID" aria-label="搜索部门" autocomplete="off" aria-expanded="false" aria-controls="departmentDepartmentOptions" />
+                  <div id="departmentDepartmentOptions" class="department-options hidden" role="listbox" aria-label="部门选择"></div>
+                </div>
                 <button id="departmentSearchButton" class="ghost-btn" type="button">搜索</button>
               </div>
               <span id="departmentLimitHint" class="hint">默认按 Token 从高到低排序</span>

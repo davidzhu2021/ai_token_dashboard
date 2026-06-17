@@ -24,6 +24,8 @@ let departmentSummaryData = [];
 let departmentRankings = [];
 let departmentEmployees = [];
 let selectedDepartment = "";
+let departmentPickerOpen = false;
+let departmentPickerOptions = [];
 let modelCatalog = [];
 let isDashboardLoading = false;
 let isAdminLoading = false;
@@ -475,6 +477,111 @@ function sortedDepartments(items) {
   });
 }
 
+function departmentOptionKey(item) {
+  return item.departmentId || item.departmentName || "";
+}
+
+function departmentOptionName(item) {
+  return item.departmentName || item.departmentId || "未命名部门";
+}
+
+function departmentOptionList() {
+  return sortedDepartments(departmentPickerOptions.length ? departmentPickerOptions : departmentRankings);
+}
+
+function filteredDepartmentOptions() {
+  const keyword = el("departmentEmployeeSearch").value.trim().toLowerCase();
+  const options = departmentOptionList();
+  if (!keyword) return options;
+  return options.filter((item) => {
+    const name = String(item.departmentName || "").toLowerCase();
+    const id = String(item.departmentId || "").toLowerCase();
+    return name.includes(keyword) || id.includes(keyword);
+  });
+}
+
+function closeDepartmentPicker() {
+  departmentPickerOpen = false;
+  el("departmentEmployeeSearch").setAttribute("aria-expanded", "false");
+  el("departmentDepartmentOptions").classList.add("hidden");
+}
+
+function openDepartmentPicker() {
+  departmentPickerOpen = true;
+  el("departmentEmployeeSearch").setAttribute("aria-expanded", "true");
+  el("departmentDepartmentOptions").classList.remove("hidden");
+  renderDepartmentPickerOptions();
+}
+
+function renderDepartmentPickerOptions() {
+  const optionsEl = el("departmentDepartmentOptions");
+  optionsEl.innerHTML = "";
+  if (!departmentPickerOpen) return;
+
+  const allButton = document.createElement("button");
+  allButton.type = "button";
+  allButton.className = "department-option all";
+  allButton.setAttribute("role", "option");
+  allButton.innerHTML = "<strong>全部部门</strong><span>查看所有部门汇总排行</span>";
+  allButton.addEventListener("click", () => selectAllDepartments());
+  optionsEl.appendChild(allButton);
+
+  const options = filteredDepartmentOptions();
+  if (!options.length) {
+    const empty = document.createElement("div");
+    empty.className = "department-option";
+    empty.innerHTML = "<strong>暂无匹配部门</strong><span>可点击搜索继续按输入内容查询</span>";
+    optionsEl.appendChild(empty);
+    return;
+  }
+
+  options.forEach((item) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "department-option";
+    button.setAttribute("role", "option");
+
+    const title = document.createElement("strong");
+    title.textContent = departmentOptionName(item);
+    const meta = document.createElement("span");
+    meta.textContent = `ID：${item.departmentId || "未绑定部门"} · Token：${formatTokens(item.totalTokens || 0)} · 活跃员工：${fmt.format(item.activeEmployees || 0)}`;
+
+    button.append(title, meta);
+    button.addEventListener("click", () => selectDepartmentOption(item));
+    optionsEl.appendChild(button);
+  });
+}
+
+async function selectDepartmentOption(item) {
+  selectedDepartment = departmentOptionKey(item);
+  el("departmentEmployeeSearch").value = departmentOptionName(item);
+  closeDepartmentPicker();
+  await loadDepartmentData();
+}
+
+async function selectAllDepartments() {
+  selectedDepartment = "";
+  el("departmentEmployeeSearch").value = "";
+  closeDepartmentPicker();
+  await loadDepartmentData();
+}
+
+async function runDepartmentSearch() {
+  const search = el("departmentEmployeeSearch").value.trim();
+  if (!search) {
+    await selectAllDepartments();
+    return;
+  }
+  const match = filteredDepartmentOptions()[0];
+  if (match) {
+    await selectDepartmentOption(match);
+    return;
+  }
+  selectedDepartment = "";
+  closeDepartmentPicker();
+  await loadDepartmentData();
+}
+
 function employeeSummariesFromRows(rows) {
   const grouped = {};
   const sourceTotals = {};
@@ -798,6 +905,7 @@ function renderDepartment() {
   renderModelBarsTo("departmentModelBars", departmentUsageData);
   renderSplitTo("departmentSplitChart", departmentUsageData);
   renderDepartmentUsers();
+  renderDepartmentPickerOptions();
 
   const detailCard = el("departmentDetailCard");
   detailCard.classList.toggle("show", Boolean(selectedDepartment));
@@ -983,6 +1091,7 @@ async function loadDepartmentData(forceRefresh = false) {
     departmentSummaryData = payload.summaryRows || departmentUsageData;
     departmentRankings = payload.departments || [];
     departmentEmployees = payload.employees || [];
+    if (!department) departmentPickerOptions = departmentRankings;
     lastDepartmentUsageCacheHit = Boolean(payload.cache?.hit);
     const rankingSubject = selectedDepartment ? "员工排行" : "部门排行";
     if (payload.truncated) {
@@ -996,6 +1105,7 @@ async function loadDepartmentData(forceRefresh = false) {
     departmentSummaryData = [];
     departmentRankings = [];
     departmentEmployees = [];
+    if (!department) departmentPickerOptions = [];
   } finally {
     isDepartmentLoading = false;
     renderDepartment();
@@ -1037,6 +1147,7 @@ function showLogin() {
   currentUser = null;
   selectedAdminEmployee = "";
   selectedDepartment = "";
+  departmentPickerOpen = false;
   usageData = [];
   usageSummary = null;
   adminUsageData = [];
@@ -1046,6 +1157,9 @@ function showLogin() {
   departmentSummaryData = [];
   departmentRankings = [];
   departmentEmployees = [];
+  departmentPickerOptions = [];
+  el("departmentEmployeeSearch").value = "";
+  closeDepartmentPicker();
   el("appView").classList.add("hidden");
   el("loginView").classList.remove("hidden");
 }
@@ -1086,12 +1200,18 @@ document.querySelectorAll("[data-view]").forEach((button) => button.addEventList
 el("rangeSelect").addEventListener("change", async () => {
   selectedAdminEmployee = "";
   selectedDepartment = "";
+  el("departmentEmployeeSearch").value = "";
+  departmentPickerOptions = [];
+  closeDepartmentPicker();
   await loadCurrentViewData();
 });
 
 el("sourceSelect").addEventListener("change", async () => {
   selectedAdminEmployee = "";
   selectedDepartment = "";
+  el("departmentEmployeeSearch").value = "";
+  departmentPickerOptions = [];
+  closeDepartmentPicker();
   await loadCurrentViewData();
 });
 
@@ -1138,14 +1258,28 @@ el("adminClearEmployee").addEventListener("click", async () => {
 });
 
 el("departmentSearchButton").addEventListener("click", async () => {
-  selectedDepartment = "";
-  await loadDepartmentData();
+  await runDepartmentSearch();
 });
 
 el("departmentEmployeeSearch").addEventListener("keydown", async (event) => {
   if (event.key === "Enter") {
-    selectedDepartment = "";
-    await loadDepartmentData();
+    event.preventDefault();
+    await runDepartmentSearch();
+  } else if (event.key === "Escape") {
+    closeDepartmentPicker();
+  }
+});
+
+el("departmentEmployeeSearch").addEventListener("focus", openDepartmentPicker);
+el("departmentEmployeeSearch").addEventListener("click", openDepartmentPicker);
+el("departmentEmployeeSearch").addEventListener("input", () => {
+  selectedDepartment = "";
+  openDepartmentPicker();
+});
+
+document.addEventListener("click", (event) => {
+  if (!el("departmentDepartmentPicker").contains(event.target) && event.target !== el("departmentSearchButton")) {
+    closeDepartmentPicker();
   }
 });
 
@@ -1154,18 +1288,21 @@ el("departmentUserTable").addEventListener("click", async (event) => {
   if (!row) return;
   selectedDepartment = row.dataset.department;
   el("departmentEmployeeSearch").value = "";
+  closeDepartmentPicker();
   await loadDepartmentData();
 });
 
 el("departmentClearEmployee").addEventListener("click", async () => {
   selectedDepartment = "";
   el("departmentEmployeeSearch").value = "";
+  closeDepartmentPicker();
   await loadDepartmentData();
 });
 
 el("departmentBackButton").addEventListener("click", async () => {
   selectedDepartment = "";
   el("departmentEmployeeSearch").value = "";
+  closeDepartmentPicker();
   await loadDepartmentData();
 });
 
