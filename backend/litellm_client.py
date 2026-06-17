@@ -291,6 +291,7 @@ class LiteLLMClient:
         return {
             "emails": defaultdict(dict),
             "names": defaultdict(dict),
+            "profiles": {},
         }
 
     def _add_account_index_entry(
@@ -341,6 +342,9 @@ class LiteLLMClient:
                     if isinstance(used_by, dict):
                         names.append(used_by.get("name"))
                 if self._is_backend_usage_account(backend, user_id):
+                    user_id_text = _clean_text(user_id)
+                    alias_name = _clean_text(user.get("user_alias") or metadata.get("display_name") or metadata.get("owner_name"))
+                    index["profiles"][user_id_text] = {"email": email, "name": alias_name}
                     self._add_account_index_entry(index, user_id, "her_user_email" if email else "her_user_alias", email, names)
             total_pages = _as_int(payload.get("total_pages")) if isinstance(payload, dict) else 0
             if total_pages and page >= total_pages:
@@ -370,6 +374,12 @@ class LiteLLMClient:
                     if isinstance(used_by, dict):
                         names.append(used_by.get("name"))
                 if self._is_backend_usage_account(backend, key.get("user_id")):
+                    user_id_text = _clean_text(key.get("user_id"))
+                    if user_id_text:
+                        existing = index["profiles"].get(user_id_text, {})
+                        profile_email = email or _normal_email(existing.get("email"))
+                        profile_name = _clean_text(metadata.get("display_name") or metadata.get("owner_name") or existing.get("name"))
+                        index["profiles"][user_id_text] = {"email": profile_email, "name": profile_name}
                     self._add_account_index_entry(index, key.get("user_id"), "her_key_metadata_email" if email else "her_key_metadata_name", email, names)
             total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=0)) if isinstance(payload, dict) else 0
             if total_pages and page >= total_pages:
@@ -377,6 +387,87 @@ class LiteLLMClient:
 
         self._account_index_cache.set(cache_key, index, _env_int("HER_ACCOUNT_INDEX_CACHE_TTL_SECONDS", 1800))
         return index
+
+    def _log_raw_user(self, log: dict[str, Any]) -> str:
+        return str(_first(log, "user", "user_id", "end_user", default="") or "").strip()
+
+    def _log_identity_candidates(self, log: dict[str, Any]) -> tuple[str, set[str], list[str]]:
+        metadata = _metadata_dict(_first(log, "metadata", "request_tags", "tags", default={}))
+        raw_user = self._log_raw_user(log)
+        emails = {
+            _normal_email(raw_user),
+            _normal_email(_first(log, "user_email", "email", "sso_user_id", default="")),
+            _normal_email(metadata.get("email")),
+            _normal_email(metadata.get("user_email")),
+            _normal_email(metadata.get("sso_user_id")),
+            _normal_email(metadata.get("owner_email")),
+            _normal_email(metadata.get("end_user")),
+        }
+        names = [
+            _clean_text(_first(log, "user_alias", "name", default="")),
+            _clean_text(metadata.get("display_name")),
+            _clean_text(metadata.get("owner_name")),
+            _clean_text(metadata.get("user_alias")),
+            _clean_text(metadata.get("name")),
+        ]
+        return raw_user, {item for item in emails if item}, [item for item in names if item]
+
+    def _employee_info_from_raw_user(
+        self,
+        raw_user: str,
+        user_map: dict[str, dict[str, Any]],
+        backend: LiteLLMBackend | None = None,
+        account_index: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        employee = self._admin_employee_info(raw_user, user_map)
+        if raw_user or not backend or backend.source != "Her" or not account_index:
+            return employee
+
+        # No raw user ID found on log; try Her profile metadata fallback.
+        return {"id": "", "name": "", "email": "", "bindStatus": "未绑定邮箱"}
+
+    def _employee_info_from_log(
+        self,
+        log: dict[str, Any],
+        user_map: dict[str, dict[str, Any]],
+        backend: LiteLLMBackend,
+        account_index: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        raw_user, emails, names = self._log_identity_candidates(log)
+        if raw_user:
+            normalized = raw_user.lower()
+            if normalized in user_map:
+                return user_map[normalized]
+        for email in sorted(emails):
+            if email in user_map:
+                return user_map[email]
+
+        if backend.source == "Her" and account_index:
+            for email in sorted(emails):
+                matches = account_index.get("emails", {}).get(email, {})
+                if len(matches) == 1:
+                    user_id = next(iter(matches.keys()))
+                    if user_id and user_id.lower() in user_map:
+                        return user_map[user_id.lower()]
+                    profile = account_index.get("profiles", {}).get(user_id, {})
+                    if user_id:
+                        profile_email = _normal_email(profile.get("email"))
+                        profile_name = _clean_text(profile.get("name")) or (profile_email.split("@", 1)[0] if profile_email else user_id)
+                        return {"id": profile_email or user_id, "name": profile_name, "email": profile_email, "bindStatus": "已绑定邮箱" if profile_email else "未绑定邮箱"}
+            for name in names:
+                matches = self._name_index_matches(account_index, name)
+                if len(matches) == 1:
+                    user_id = next(iter(matches.keys()))
+                    if user_id and user_id.lower() in user_map:
+                        return user_map[user_id.lower()]
+                    profile = account_index.get("profiles", {}).get(user_id, {})
+                    profile_email = _normal_email(profile.get("email"))
+                    profile_name = _clean_text(profile.get("name")) or name or user_id
+                    return {"id": profile_email or user_id, "name": profile_name, "email": profile_email, "bindStatus": "已绑定邮箱" if profile_email else "未绑定邮箱"}
+
+        if raw_user:
+            return self._admin_employee_info(raw_user, user_map)
+        return {"id": "unbound-account", "name": "未绑定账号", "email": "", "bindStatus": "未绑定邮箱"}
 
     def _name_index_matches(self, index: dict[str, Any], name: str) -> dict[str, dict[str, set[str]]]:
         if not name or not _has_cjk(name):
@@ -789,6 +880,7 @@ class LiteLLMClient:
                 continue
             users = await self.users(backend)
             user_map = self._admin_user_map(users)
+            account_index = await self.her_account_index(backend) if backend.source == "Her" else None
             backend_pages_read = 0
             backend_total_pages = 0
             backend_total_records = 0
@@ -815,8 +907,7 @@ class LiteLLMClient:
                 if not logs:
                     break
                 for log in logs:
-                    raw_user = str(_first(log, "user", "user_id", "end_user", default="未绑定账号") or "未绑定账号")
-                    employee_info = self._admin_employee_info(raw_user, user_map)
+                    employee_info = self._employee_info_from_log(log, user_map, backend, account_index)
                     if employee_filter and not self._admin_employee_matches(employee_info, employee_filter):
                         continue
                     detected_source = backend.source or detect_source(log)
@@ -1229,6 +1320,7 @@ class LiteLLMClient:
             users = await self.users(backend)
             user_map = self._admin_user_map(users)
             team_map = await self.team_map(backend)
+            account_index = await self.her_account_index(backend) if backend.source == "Her" else None
             backend_pages_read = 0
             backend_total_pages = 0
             backend_total_records = 0
@@ -1262,8 +1354,7 @@ class LiteLLMClient:
                     if source and source != "all" and detected_source != source:
                         continue
 
-                    raw_user = str(_first(log, "user", "user_id", "end_user", default="未绑定账号") or "未绑定账号")
-                    employee_info = self._admin_employee_info(raw_user, user_map)
+                    employee_info = self._employee_info_from_log(log, user_map, backend, account_index)
                     department_id = department_info["id"]
                     departments.setdefault(department_id, department_info)
                     employees.setdefault(employee_info["id"], employee_info)
@@ -1374,6 +1465,7 @@ class LiteLLMClient:
             raise HTTPException(status_code=404, detail="未找到当前负责的团队")
 
         user_map = self._admin_user_map(await self.users(backend))
+        account_index = await self.her_account_index(backend) if backend.source == "Her" else None
         team_info = self._team_summary(team, backend)
         employees: dict[str, dict[str, Any]] = {}
         for member in self._team_members(team):
@@ -1419,8 +1511,7 @@ class LiteLLMClient:
                 detected_source = backend.source or detect_source(log)
                 if source and source != "all" and detected_source != source:
                     continue
-                raw_user = str(_first(log, "user", "user_id", "end_user", default="未绑定账号") or "未绑定账号")
-                employee_info = self._admin_employee_info(raw_user, user_map)
+                employee_info = self._employee_info_from_log(log, user_map, backend, account_index)
                 employee_key = employee_info["id"]
                 employees.setdefault(employee_key, employee_info)
                 model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
@@ -1587,31 +1678,40 @@ class LiteLLMClient:
         hit, value, _ = self._model_cache.get("models")
         if hit:
             return value
-        payload = await self.request("GET", "/models")
-        raw_models = _records(payload)
-        if not raw_models and isinstance(payload, dict):
-            values = payload.get("data") or payload.get("models") or []
-            if isinstance(values, list):
-                raw_models = [{"id": str(value), "model_name": str(value)} if isinstance(value, str) else value for value in values]
         models = []
-        for index, item in enumerate(raw_models):
-            model_name = str(_first(item, "model_name", "model", "id", "litellm_model_name", default=f"model-{index + 1}"))
-            provider = str(_first(item, "provider", "litellm_provider", default=provider_from_model(model_name)))
-            capabilities = ["代码"] if any(word in model_name.lower() for word in ("code", "coder", "claude", "gpt")) else ["通用"]
-            if any(word in model_name.lower() for word in ("vision", "gemini")):
-                capabilities.append("多模态")
-            models.append(
-                {
-                    "id": str(_first(item, "id", "model_info_id", default=model_name)),
-                    "modelName": model_name,
-                    "provider": provider,
-                    "capabilities": capabilities,
-                    "description": str(_first(item, "description", default="当前账号可用模型。")),
-                    "contextWindow": str(_first(item, "max_input_tokens", "context_window", "contextWindow", default="未标注")),
-                    "status": "可用",
-                    "recommendedFor": str(_first(item, "recommended_for", default="按任务需求复制模型名称后使用")),
-                }
-            )
+        seen_keys: set[tuple[str, str]] = set()
+        for backend in self.backends:
+            try:
+                payload = await self.request_backend(backend, "GET", "/models")
+            except HTTPException:
+                continue
+            raw_models = _records(payload)
+            if not raw_models and isinstance(payload, dict):
+                values = payload.get("data") or payload.get("models") or []
+                if isinstance(values, list):
+                    raw_models = [{"id": str(value), "model_name": str(value)} if isinstance(value, str) else value for value in values]
+            for index, item in enumerate(raw_models):
+                model_name = str(_first(item, "model_name", "model", "id", "litellm_model_name", default=f"model-{index + 1}"))
+                dedupe_key = (backend.id, model_name.lower())
+                if dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
+                provider = str(_first(item, "provider", "litellm_provider", default=provider_from_model(model_name)))
+                capabilities = ["代码"] if any(word in model_name.lower() for word in ("code", "coder", "claude", "gpt")) else ["通用"]
+                if any(word in model_name.lower() for word in ("vision", "gemini")):
+                    capabilities.append("多模态")
+                models.append(
+                    {
+                        "id": str(_first(item, "id", "model_info_id", default=model_name)),
+                        "modelName": model_name,
+                        "provider": provider,
+                        "capabilities": capabilities,
+                        "description": str(_first(item, "description", default="当前账号可用模型。")),
+                        "contextWindow": str(_first(item, "max_input_tokens", "context_window", "contextWindow", default="未标注")),
+                        "status": "可用",
+                        "recommendedFor": str(_first(item, "recommended_for", default="按任务需求复制模型名称后使用")),
+                    }
+                )
         self._model_cache.set("models", models, _env_int("MODEL_CACHE_TTL_SECONDS", 1800))
         return models
 
