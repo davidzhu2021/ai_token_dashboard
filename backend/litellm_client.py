@@ -1254,21 +1254,15 @@ class LiteLLMClient:
             summary["activeEmployees"] = len(employees.get(department_id, set()))
         return sorted(grouped.values(), key=self._department_sort_key)
 
-    async def _team_daily_activity_rows(
+    def _team_daily_activity_rows_from_items(
         self,
-        start_date: str,
-        end_date: str,
+        items: list[dict[str, Any]],
         department: str | None,
         team_map: dict[str, dict[str, str]],
-        backend: LiteLLMBackend | None = None,
+        backend: LiteLLMBackend,
     ) -> list[dict[str, Any]]:
-        backend = backend or self.backends[0]
-        params: dict[str, Any] = {"start_date": start_date, "end_date": end_date, "page": 1, "page_size": 100}
-        if department and department != "unassigned":
-            params["team_ids"] = department
-        payload = await self.request_backend(backend, "GET", "/team/daily/activity", params=params)
         rows: list[dict[str, Any]] = []
-        for item in _records(payload):
+        for item in items:
             metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else item
             breakdown = item.get("breakdown") if isinstance(item.get("breakdown"), dict) else {}
             entities = breakdown.get("entities") if isinstance(breakdown.get("entities"), dict) else {}
@@ -1279,8 +1273,8 @@ class LiteLLMClient:
                     rows.append(
                         {
                             "date": _date_text(_first(item, "date", "day")),
-                            "source": backend.source or "其他",
-                            "model": "全量",
+                            "source": backend.source or "\u5176\u4ed6",
+                            "model": "\u5168\u91cf",
                             "promptTokens": _as_int(_first(entity_metrics, "prompt_tokens", "promptTokens", "total_prompt_tokens")),
                             "completionTokens": _as_int(_first(entity_metrics, "completion_tokens", "completionTokens", "total_completion_tokens")),
                             "totalTokens": _as_int(_first(entity_metrics, "total_tokens", "totalTokens")),
@@ -1290,16 +1284,56 @@ class LiteLLMClient:
                             "spend": _as_number(_first(entity_metrics, "spend", "total_spend")),
                             "departmentId": str(team_id),
                             "departmentName": known.get("name") or str(team_id),
-                            "departmentBindStatus": "已绑定部门",
+                            "departmentBindStatus": "\u5df2\u7ed1\u5b9a\u90e8\u95e8",
                         }
                     )
             else:
-                row = self._row_from_daily_activity_item(item, "其他", "全量")
+                row = self._row_from_daily_activity_item(item, "\u5176\u4ed6", "\u5168\u91cf")
                 row["source"] = backend.source or row["source"]
                 team_id = str(_first(item, "team_id", "teamId", default=department or "") or department or "all")
                 known = team_map.get(team_id.lower(), {})
-                row.update({"departmentId": team_id, "departmentName": known.get("name") or team_id, "departmentBindStatus": "已绑定部门"})
+                row.update({"departmentId": team_id, "departmentName": known.get("name") or team_id, "departmentBindStatus": "\u5df2\u7ed1\u5b9a\u90e8\u95e8"})
                 rows.append(row)
+        return rows
+
+    async def _team_daily_activity_rows(
+        self,
+        start_date: str,
+        end_date: str,
+        department: str | None,
+        team_map: dict[str, dict[str, str]],
+        backend: LiteLLMBackend | None = None,
+    ) -> list[dict[str, Any]]:
+        backend = backend or self.backends[0]
+        rows: list[dict[str, Any]] = []
+        max_pages = max(1, _env_int("TEAM_DAILY_ACTIVITY_MAX_PAGES", 50))
+        page_size = 100
+
+        for page in range(1, max_pages + 1):
+            params: dict[str, Any] = {"start_date": start_date, "end_date": end_date, "page": page, "page_size": page_size}
+            if department and department != "unassigned":
+                params["team_ids"] = department
+            payload = await self.request_backend(backend, "GET", "/team/daily/activity", params=params)
+            items = _records(payload)
+            if not items:
+                break
+
+            rows.extend(self._team_daily_activity_rows_from_items(items, department, team_map, backend))
+
+            metadata = _metadata_dict(payload.get("metadata")) if isinstance(payload, dict) else {}
+            total_pages = _as_int(_first(metadata, "total_pages", "totalPages", default=_first(payload, "total_pages", "totalPages", default=0)))
+            has_more_raw = _first(metadata, "has_more", "hasMore", default=_first(payload, "has_more", "hasMore", default=None))
+            has_more = bool(has_more_raw)
+            if isinstance(has_more_raw, str):
+                has_more = has_more_raw.strip().lower() in {"1", "true", "yes", "on"}
+
+            if total_pages and page >= total_pages:
+                break
+            if not total_pages:
+                if has_more_raw is not None and not has_more:
+                    break
+                if has_more_raw is None and len(items) < page_size:
+                    break
         return rows
 
     async def admin_department_usage_rows(self, start_date: str, end_date: str, source: str | None, department: str | None = None) -> dict[str, Any]:
