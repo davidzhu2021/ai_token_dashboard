@@ -1138,7 +1138,7 @@ async function showApp(user) {
   el("welcomeTitle").textContent = `${user.name}您好，今天的 AI 工具消耗一眼看清`;
   el("adminWelcomeTitle").textContent = `${user.name}您好，全员 AI 用量一眼看清`;
   el("departmentWelcomeTitle").textContent = `${user.name}您好，部门 AI 用量一眼看清`;
-  switchView(user.isAdmin ? "admin" : "dashboard");
+  switchView("dashboard");
   render();
   await Promise.all([loadCurrentViewData(), loadModels()]);
 }
