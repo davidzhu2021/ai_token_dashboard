@@ -160,6 +160,83 @@ def test_team_leader_scope_rejects_noncanonical_team_admin_role(monkeypatch) -> 
     assert scope["teamBoardStatus"] == "none"
 
 
+def test_teams_hydrates_v2_list_with_team_info(monkeypatch) -> None:
+    client = object.__new__(LiteLLMClient)
+    backend = LiteLLMBackend(
+        id="primary",
+        label="Primary",
+        base_url="https://example.test",
+        admin_key="test-key",
+    )
+    client.backends = [backend]
+    client._backend_map = {"primary": backend}
+    calls: list[tuple[str, str]] = []
+
+    async def fake_request_backend(backend_arg: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append((method, path))
+        if path == "/v2/team/list":
+            return {
+                "teams": [
+                    {"team_id": "team-a", "team_alias": "Team A", "members_with_roles": []},
+                ],
+                "total_pages": 1,
+            }
+        if path == "/team/info":
+            return {
+                "team_id": "team-a",
+                "team_info": {
+                    "team_id": "team-a",
+                    "team_alias": "Team A",
+                    "members_with_roles": [
+                        {"user_id": "leader-user", "role": "admin"},
+                    ],
+                },
+            }
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    teams = asyncio.run(client.teams(backend))
+    scope = asyncio.run(client.team_leader_scope({"matched_accounts": [{"backend": "primary", "user_id": "leader-user"}]}))
+
+    assert teams[0]["members_with_roles"][0]["user_id"] == "leader-user"
+    assert calls == [("GET", "/v2/team/list"), ("GET", "/team/info"), ("GET", "/v2/team/list"), ("GET", "/team/info")]
+    assert scope["isTeamLeader"] is True
+    assert scope["team"]["id"] == "team-a"
+
+
+def test_teams_falls_back_to_team_list_when_v2_unavailable(monkeypatch) -> None:
+    client = object.__new__(LiteLLMClient)
+    backend = LiteLLMBackend(
+        id="primary",
+        label="Primary",
+        base_url="https://example.test",
+        admin_key="test-key",
+    )
+    client.backends = [backend]
+    client._backend_map = {"primary": backend}
+
+    async def fake_request_backend(backend_arg: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        if path == "/v2/team/list":
+            raise main.HTTPException(status_code=404, detail="not found")
+        if path == "/team/list":
+            return [
+                {
+                    "team_id": "team-a",
+                    "team_alias": "Team A",
+                    "members_with_roles": [{"user_id": "leader-user", "role": "admin"}],
+                }
+            ]
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    scope = asyncio.run(client.team_leader_scope({"matched_accounts": [{"backend": "primary", "user_id": "leader-user"}]}))
+
+    assert scope["isTeamLeader"] is True
+    assert scope["team"]["id"] == "team-a"
+
+
 def test_auth_me_marks_single_team_admin(monkeypatch) -> None:
     reset_caches()
     patch_user(monkeypatch)

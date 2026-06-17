@@ -888,7 +888,7 @@ class LiteLLMClient:
     async def team_map(self, backend: LiteLLMBackend | None = None) -> dict[str, dict[str, str]]:
         backend = backend or self.backends[0]
         mapping: dict[str, dict[str, str]] = {}
-        for team in await self.teams(backend):
+        for team in await self.teams(backend, include_details=False):
             team_id = str(_first(team, "team_id", "id", default="") or "").strip()
             if not team_id:
                 continue
@@ -896,7 +896,37 @@ class LiteLLMClient:
             mapping[team_id.lower()] = {"id": team_id, "name": team_alias or team_id}
         return mapping
 
-    async def teams(self, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
+    async def team_info(self, backend: LiteLLMBackend, team_id: str) -> dict[str, Any] | None:
+        payload = await self.request_backend(backend, "GET", "/team/info", params={"team_id": team_id})
+        if not isinstance(payload, dict):
+            return None
+        team_info = payload.get("team_info")
+        if isinstance(team_info, dict):
+            team_info.setdefault("team_id", payload.get("team_id") or team_id)
+            return team_info
+        if payload.get("team_id") or payload.get("members_with_roles") is not None:
+            payload.setdefault("team_id", team_id)
+            return payload
+        return None
+
+    async def _teams_with_details(self, backend: LiteLLMBackend, teams: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        detailed: list[dict[str, Any]] = []
+        for team in teams:
+            team_id = str(_first(team, "team_id", "id", default="") or "").strip()
+            if not team_id:
+                detailed.append(team)
+                continue
+            if self._team_members(team):
+                detailed.append(team)
+                continue
+            try:
+                full_team = await self.team_info(backend, team_id)
+            except HTTPException:
+                full_team = None
+            detailed.append(full_team or team)
+        return detailed
+
+    async def teams(self, backend: LiteLLMBackend | None = None, include_details: bool = True) -> list[dict[str, Any]]:
         backend = backend or self.backends[0]
         for path in ("/v2/team/list", "/team/list"):
             teams: list[dict[str, Any]] = []
@@ -913,7 +943,7 @@ class LiteLLMClient:
                 if not total_pages and not has_more:
                     break
             if teams:
-                return teams
+                return await self._teams_with_details(backend, teams) if include_details else teams
         return []
 
     def _team_summary(self, team: dict[str, Any], backend: LiteLLMBackend) -> dict[str, Any]:
