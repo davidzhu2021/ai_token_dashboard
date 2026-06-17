@@ -284,6 +284,17 @@ function renderDepartmentMetrics(data) {
   renderMetricGroups("departmentMetrics", data, "department");
 }
 
+function setDepartmentOverviewVisible(visible) {
+  [
+    "departmentOverviewHero",
+    "departmentMetrics",
+    "departmentDetailCard",
+    "departmentTrendGrid",
+    "departmentSourceGrid",
+    "departmentBreakdownGrid",
+  ].forEach((id) => el(id).classList.toggle("hidden", !visible));
+}
+
 function teamScopeLabel() {
   const selected = leaderTeams.find((item) => item.teamRef === selectedTeamRef);
   return teamInfo?.name || selected?.name || currentUser?.team?.name || "团队";
@@ -751,7 +762,7 @@ function renderDepartmentUsers() {
     renderEmployeeRanking("departmentUserTable", "departmentUserCount", departmentEmployees, "当前筛选范围暂无部门员工用量");
   } else {
     el("departmentRankingTitle").textContent = "部门用量排行";
-    el("departmentRankingDesc").textContent = "当前展示全部部门汇总排行，点击部门行查看该部门员工排行。";
+    el("departmentRankingDesc").textContent = "点击部门查看该部门用量看板和员工排行。";
     renderDepartmentRanking("departmentUserTable", "departmentUserCount", departmentRankings, "当前筛选范围暂无部门用量");
   }
 }
@@ -906,6 +917,7 @@ function renderAdminLoading() {
 }
 
 function renderDepartmentLoading() {
+  setDepartmentOverviewVisible(Boolean(selectedDepartment));
   const label = rangeLabel();
   const source = sourceText();
   const scopeLabel = departmentScopeLabel();
@@ -989,13 +1001,16 @@ function renderDepartment() {
     renderDepartmentLoading();
     return;
   }
+  setDepartmentOverviewVisible(Boolean(selectedDepartment));
   const totalData = departmentSummaryData.length ? departmentSummaryData : departmentUsageData;
-  renderDepartmentMetrics(totalData);
-  renderTrendTo("departmentTrendChart", totalData);
-  renderSpendTrendTo("departmentSpendChart", totalData);
-  renderDonutTo("departmentSourceDonut", "departmentDonutTotal", "departmentSourceLegend", departmentUsageData);
-  renderModelBarsTo("departmentModelBars", departmentUsageData);
-  renderSplitTo("departmentSplitChart", departmentUsageData);
+  if (selectedDepartment) {
+    renderDepartmentMetrics(totalData);
+    renderTrendTo("departmentTrendChart", totalData);
+    renderSpendTrendTo("departmentSpendChart", totalData);
+    renderDonutTo("departmentSourceDonut", "departmentDonutTotal", "departmentSourceLegend", departmentUsageData);
+    renderModelBarsTo("departmentModelBars", departmentUsageData);
+    renderSplitTo("departmentSplitChart", departmentUsageData);
+  }
   renderDepartmentUsers();
   renderDepartmentPickerOptions();
 

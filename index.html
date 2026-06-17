@@ -2175,7 +2175,7 @@
               </div>
             </section>
 
-            <section class="analysis-grid">
+            <section class="full-width-grid">
               <div class="panel">
                 <div class="panel-header">
                   <div class="panel-heading">
@@ -2186,13 +2186,17 @@
                     </div>
                   </div>
                 </div>
-                <div class="donut-wrap">
-                  <svg id="teamSourceDonut" class="donut" role="img" aria-label="团队来源占比图"></svg>
-                  <div class="donut-center"><strong id="teamDonutTotal">0</strong><span>Token</span></div>
+                <div class="source-grid">
+                  <div class="donut-wrap">
+                    <svg id="teamSourceDonut" width="180" height="180" viewBox="0 0 180 180" class="donut" role="img" aria-label="团队来源占比图"></svg>
+                    <div class="donut-center"><strong id="teamDonutTotal">0</strong><span>Token</span></div>
+                  </div>
+                  <div id="teamSourceLegend" class="legend"></div>
                 </div>
-                <div id="teamSourceLegend" class="legend"></div>
               </div>
+            </section>
 
+            <section class="dashboard-grid">
               <div class="panel">
                 <div class="panel-header">
                   <div class="panel-heading">
@@ -2203,10 +2207,10 @@
                     </div>
                   </div>
                 </div>
-                <div id="teamModelBars" class="bar-list"></div>
+                <div id="teamModelBars" class="bars"></div>
               </div>
 
-              <div class="panel wide">
+              <div class="panel">
                 <div class="panel-header">
                   <div class="panel-heading">
                     <span class="panel-icon"><svg><use href="#icon-split"></use></svg></span>
@@ -2256,7 +2260,7 @@
         </section>
 
         <section id="departmentView" class="view-section hidden">
-          <section class="hero-band">
+          <section id="departmentOverviewHero" class="hero-band">
             <div class="hero-copy">
               <span class="eyebrow">部门视图 · 真实数据</span>
               <h2 id="departmentWelcomeTitle">全部部门 AI 用量总览</h2>
@@ -2286,7 +2290,7 @@
             </div>
           </section>
 
-          <section class="trend-grid">
+          <section id="departmentTrendGrid" class="trend-grid">
             <div class="panel">
               <div class="panel-header">
                 <div class="panel-heading">
@@ -2316,7 +2320,7 @@
             </div>
           </section>
 
-          <section class="full-width-grid">
+          <section id="departmentSourceGrid" class="full-width-grid">
             <div class="panel">
               <div class="panel-header">
                 <div class="panel-heading">
@@ -2339,7 +2343,7 @@
             </div>
           </section>
 
-          <section class="dashboard-grid">
+          <section id="departmentBreakdownGrid" class="dashboard-grid">
             <div class="panel">
               <div class="panel-header">
                 <div class="panel-heading">
@@ -2373,7 +2377,7 @@
                 <span class="panel-icon"><svg><use href="#icon-table"></use></svg></span>
                 <div>
                   <h3 id="departmentRankingTitle" class="panel-title">部门用量排行</h3>
-                  <p id="departmentRankingDesc" class="panel-desc">点击部门行查看该部门员工排行和明细。</p>
+                  <p id="departmentRankingDesc" class="panel-desc">点击部门查看该部门用量看板和员工排行。</p>
                 </div>
               </div>
               <div class="panel-actions">
