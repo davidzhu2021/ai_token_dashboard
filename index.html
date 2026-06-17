@@ -470,9 +470,8 @@
 
       .top-controls {
         display: grid;
-        grid-template-columns: minmax(320px, 420px) auto auto;
+        grid-template-columns: minmax(260px, 320px) minmax(0, 1fr) auto;
         align-items: center;
-        justify-content: end;
         gap: 8px;
         min-width: 0;
         flex: 1 1 auto;
@@ -486,10 +485,13 @@
 
       .nav-zone {
         display: flex;
+        min-width: 0;
         justify-content: flex-end;
       }
 
       .filter-zone {
+        display: flex;
+        justify-content: flex-start;
         width: 100%;
       }
 
@@ -507,9 +509,12 @@
 
       .view-tabs {
         display: inline-flex;
-        flex: 0 0 auto;
+        flex: 0 1 auto;
+        flex-wrap: wrap;
+        justify-content: flex-end;
         gap: 4px;
         padding: 4px;
+        max-width: 100%;
         background: rgba(255, 255, 255, 0.72);
         border: 1px solid var(--line);
         border-radius: 999px;
@@ -537,8 +542,9 @@
 
       .dashboard-filters {
         display: grid;
-        grid-template-columns: repeat(2, minmax(132px, 1fr));
+        grid-template-columns: repeat(2, minmax(126px, 1fr));
         gap: 8px;
+        max-width: 320px;
         width: 100%;
       }
 
