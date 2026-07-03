@@ -391,7 +391,7 @@ async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: 
             payload = dict(value)
             payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
             return payload
-    payload = await client().admin_usage_rows(start_date, end_date, source, employee)
+    payload = await client().admin_usage_rows(start_date, end_date, source, employee, refresh)
     admin_usage_cache.set(cache_key, payload, env_int("ADMIN_USAGE_CACHE_TTL_SECONDS", 300))
     payload = dict(payload)
     payload["cache"] = {"hit": False, "ttlSeconds": 0}
@@ -406,7 +406,7 @@ async def department_usage_payload(admin: dict[str, Any], start_date: str, end_d
             payload = dict(value)
             payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
             return payload
-    payload = await client().admin_department_usage_rows(start_date, end_date, source, department)
+    payload = await client().admin_department_usage_rows(start_date, end_date, source, department, refresh)
     department_usage_cache.set(cache_key, payload, env_int("DEPARTMENT_USAGE_CACHE_TTL_SECONDS", 300))
     payload = dict(payload)
     payload["cache"] = {"hit": False, "ttlSeconds": 0}
@@ -463,7 +463,7 @@ async def team_usage_payload(app_user: dict[str, Any], start_date: str, end_date
             payload = dict(value)
             payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
             return payload
-    payload = dict(await client().team_usage_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source))
+    payload = dict(await client().team_usage_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source, refresh))
     payload["team"] = public_team_from_payload(team, payload.get("team"))
     team_usage_cache.set(cache_key, payload, env_int("TEAM_USAGE_CACHE_TTL_SECONDS", 300))
     payload = dict(payload)

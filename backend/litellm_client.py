@@ -224,6 +224,7 @@ class LiteLLMClient:
         self._users_cache = TTLCache()
         self._teams_cache = TTLCache()
         self._team_map_cache = TTLCache()
+        self._spend_log_scan_cache = TTLCache()
 
     def _cache(self, attribute: str) -> TTLCache:
         cache = getattr(self, attribute, None)
@@ -879,10 +880,20 @@ class LiteLLMClient:
         rows = [self._row_from_daily_activity_item(item, backend.source or "其他", "全量") for item in _records(payload)]
         return sorted(rows, key=lambda item: (item["date"], item["model"]))
 
-    async def admin_usage_rows(self, start_date: str, end_date: str, source: str | None, employee: str | None = None) -> dict[str, Any]:
-        employee_filter = (employee or "").strip().lower()
-        grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-        employees: dict[str, dict[str, Any]] = {}
+    def _spend_log_scan_cache_key(self, start_date: str, end_date: str, source: str | None) -> str:
+        return f"spend-log-scan:v1:{start_date}:{end_date}:{source or 'all'}"
+
+    async def _spend_log_scan_rows(self, start_date: str, end_date: str, source: str | None, refresh: bool = False) -> dict[str, Any]:
+        cache_key = self._spend_log_scan_cache_key(start_date, end_date, source)
+        if not refresh:
+            hit, value, ttl_seconds = self._cache("_spend_log_scan_cache").get(cache_key)
+            if hit:
+                payload = dict(value)
+                payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+                return payload
+
+        started = time.perf_counter()
+        entries: list[dict[str, Any]] = []
         max_pages = max(1, int(os.getenv("ADMIN_USAGE_LOG_MAX_PAGES", "30")))
         page_size = max(1, min(100, int(os.getenv("ADMIN_USAGE_PAGE_SIZE", "100"))))
         utc_start, utc_end = _local_date_window_as_utc_text(start_date, end_date)
@@ -893,9 +904,6 @@ class LiteLLMClient:
         for backend in self.backends:
             if backend.source and _source_filter_applies(source) and source != backend.source:
                 continue
-            users = await self.users(backend)
-            user_map = self._admin_user_map(users)
-            account_index = await self.her_account_index(backend) if backend.source == "Her" else None
             backend_pages_read = 0
             backend_total_pages = 0
             backend_total_records = 0
@@ -922,20 +930,10 @@ class LiteLLMClient:
                 if not logs:
                     break
                 for log in logs:
-                    employee_info = self._employee_info_from_log(log, user_map, backend, account_index)
-                    if employee_filter and not self._admin_employee_matches(employee_info, employee_filter):
-                        continue
                     detected_source = backend.source or detect_source(log)
                     if source and source != "all" and detected_source != source:
                         continue
-
-                    employee_key = employee_info["id"]
-                    employees.setdefault(employee_key, employee_info)
-                    model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
-                    day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
-                    key = (day, employee_key, detected_source, model)
-                    row = grouped.setdefault(key, self._admin_empty_row(day, employee_info, detected_source, model))
-                    self._add_log_to_row(row, log)
+                    entries.append({"backend": backend, "log": log, "source": detected_source})
 
                 if backend_total_pages and page >= backend_total_pages:
                     break
@@ -943,6 +941,59 @@ class LiteLLMClient:
             pages_read = max(pages_read, backend_pages_read)
             total_pages = max(total_pages, backend_total_pages)
             total_records += backend_total_records
+
+        payload = {
+            "entries": entries,
+            "pageLimit": max_pages,
+            "pageSize": page_size,
+            "pagesRead": pages_read,
+            "totalPages": total_pages,
+            "totalRecords": total_records,
+            "truncated": bool(total_pages and pages_read < total_pages),
+        }
+        self._cache("_spend_log_scan_cache").set(cache_key, payload, _env_int("USAGE_LOG_SCAN_CACHE_TTL_SECONDS", 60))
+        payload = dict(payload)
+        payload["cache"] = {"hit": False, "ttlSeconds": 0}
+        duration_ms = round((time.perf_counter() - started) * 1000)
+        logger.info(
+            "usage log scan source=%s cache_hit=%s pages=%s/%s entries=%s took=%sms",
+            source or "all",
+            False,
+            pages_read,
+            total_pages or "?",
+            len(entries),
+            duration_ms,
+        )
+        return payload
+
+    async def admin_usage_rows(self, start_date: str, end_date: str, source: str | None, employee: str | None = None, refresh: bool = False) -> dict[str, Any]:
+        started = time.perf_counter()
+        employee_filter = (employee or "").strip().lower()
+        grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        employees: dict[str, dict[str, Any]] = {}
+        scan = await self._spend_log_scan_rows(start_date, end_date, source, refresh)
+
+        for backend in self.backends:
+            if backend.source and _source_filter_applies(source) and source != backend.source:
+                continue
+            users = await self.users(backend)
+            user_map = self._admin_user_map(users)
+            account_index = await self.her_account_index(backend) if backend.source == "Her" else None
+            for entry in scan["entries"]:
+                if entry["backend"].id != backend.id:
+                    continue
+                log = entry["log"]
+                employee_info = self._employee_info_from_log(log, user_map, backend, account_index)
+                if employee_filter and not self._admin_employee_matches(employee_info, employee_filter):
+                    continue
+                detected_source = entry["source"]
+                employee_key = employee_info["id"]
+                employees.setdefault(employee_key, employee_info)
+                model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
+                day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
+                key = (day, employee_key, detected_source, model)
+                row = grouped.setdefault(key, self._admin_empty_row(day, employee_info, detected_source, model))
+                self._add_log_to_row(row, log)
 
         rows = sorted(grouped.values(), key=lambda item: (item["date"], item["employeeName"], item["source"], item["model"]))
         summary_rows: list[dict[str, Any]] = []
@@ -952,23 +1003,33 @@ class LiteLLMClient:
                     summary_rows.extend(await self.admin_daily_activity_rows(start_date, end_date, backend))
                 except HTTPException:
                     continue
-        truncated = bool(total_pages and pages_read < total_pages)
-        return {
+        result = {
             "rows": rows,
             "summaryRows": summary_rows or rows,
             "employees": self._admin_employee_summaries(rows, employees),
-            "pageLimit": max_pages,
-            "pageSize": page_size,
-            "pagesRead": pages_read,
-            "totalPages": total_pages,
-            "totalRecords": total_records,
-            "truncated": truncated,
+            "pageLimit": scan["pageLimit"],
+            "pageSize": scan["pageSize"],
+            "pagesRead": scan["pagesRead"],
+            "totalPages": scan["totalPages"],
+            "totalRecords": scan["totalRecords"],
+            "truncated": scan["truncated"],
             "dataQuality": {
                 "summarySource": "official_daily_activity" if summary_rows else "spend_logs",
                 "rankingSource": "spend_logs",
                 "timezoneOffsetMinutes": usage_timezone_offset_minutes(),
             },
         }
+        duration_ms = round((time.perf_counter() - started) * 1000)
+        logger.info(
+            "usage board=admin cache_hit=%s pages=%s/%s rows=%s employees=%s took=%sms",
+            bool(scan.get("cache", {}).get("hit")),
+            scan["pagesRead"],
+            scan["totalPages"] or "?",
+            len(rows),
+            len(result["employees"]),
+            duration_ms,
+        )
+        return result
 
     async def admin_usage_compare(self, start_date: str, end_date: str, source: str | None) -> dict[str, Any]:
         payload = await self.admin_usage_rows(start_date, end_date, source, None)
@@ -1363,17 +1424,14 @@ class LiteLLMClient:
                     break
         return rows
 
-    async def admin_department_usage_rows(self, start_date: str, end_date: str, source: str | None, department: str | None = None) -> dict[str, Any]:
+    async def admin_department_usage_rows(self, start_date: str, end_date: str, source: str | None, department: str | None = None, refresh: bool = False) -> dict[str, Any]:
+        started = time.perf_counter()
         department_filter = (department or "").strip().lower()
         grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
         departments: dict[str, dict[str, str]] = {}
         employees: dict[str, dict[str, Any]] = {}
-        max_pages = max(1, int(os.getenv("ADMIN_USAGE_LOG_MAX_PAGES", "30")))
-        page_size = max(1, min(100, int(os.getenv("ADMIN_USAGE_PAGE_SIZE", "100"))))
-        utc_start, utc_end = _local_date_window_as_utc_text(start_date, end_date)
-        pages_read = 0
-        total_pages = 0
-        total_records = 0
+        scan = await self._spend_log_scan_rows(start_date, end_date, source, refresh)
+        team_maps: dict[str, dict[str, dict[str, str]]] = {}
 
         for backend in self.backends:
             if backend.source and _source_filter_applies(source) and source != backend.source:
@@ -1381,63 +1439,32 @@ class LiteLLMClient:
             users = await self.users(backend)
             user_map = self._admin_user_map(users)
             team_map = await self.team_map(backend)
+            team_maps[backend.id] = team_map
             account_index = await self.her_account_index(backend) if backend.source == "Her" else None
-            backend_pages_read = 0
-            backend_total_pages = 0
-            backend_total_records = 0
-
-            for page in range(1, max_pages + 1):
-                payload = await self.request_backend(
-                    backend,
-                    "GET",
-                    "/spend/logs/v2",
-                    params={
-                        "start_date": utc_start,
-                        "end_date": utc_end,
-                        "page": page,
-                        "page_size": page_size,
-                        "sort_by": "startTime",
-                        "sort_order": "desc",
-                    },
-                )
-                backend_pages_read = page
-                if isinstance(payload, dict):
-                    backend_total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=backend_total_pages))
-                    backend_total_records = _as_int(_first(payload, "total", "total_count", "count", default=backend_total_records))
-                logs = _records(payload)
-                if not logs:
-                    break
-                for log in logs:
-                    department_info = self._department_info_from_log(log, team_map)
-                    if department_filter and department_filter not in {department_info["id"].lower(), department_info["name"].lower()}:
-                        continue
-                    detected_source = backend.source or detect_source(log)
-                    if source and source != "all" and detected_source != source:
-                        continue
-
-                    employee_info = self._employee_info_from_log(log, user_map, backend, account_index)
-                    department_id = department_info["id"]
-                    departments.setdefault(department_id, department_info)
-                    employees.setdefault(employee_info["id"], employee_info)
-                    model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
-                    day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
-                    key = (day, department_id, employee_info["id"], detected_source, model)
-                    row = grouped.setdefault(key, self._department_empty_row(day, department_info, detected_source, model, employee_info))
-                    self._add_log_to_row(row, log)
-
-                if backend_total_pages and page >= backend_total_pages:
-                    break
-
-            pages_read = max(pages_read, backend_pages_read)
-            total_pages = max(total_pages, backend_total_pages)
-            total_records += backend_total_records
+            for entry in scan["entries"]:
+                if entry["backend"].id != backend.id:
+                    continue
+                log = entry["log"]
+                department_info = self._department_info_from_log(log, team_map)
+                if department_filter and department_filter not in {department_info["id"].lower(), department_info["name"].lower()}:
+                    continue
+                detected_source = entry["source"]
+                employee_info = self._employee_info_from_log(log, user_map, backend, account_index)
+                department_id = department_info["id"]
+                departments.setdefault(department_id, department_info)
+                employees.setdefault(employee_info["id"], employee_info)
+                model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
+                day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
+                key = (day, department_id, employee_info["id"], detected_source, model)
+                row = grouped.setdefault(key, self._department_empty_row(day, department_info, detected_source, model, employee_info))
+                self._add_log_to_row(row, log)
 
         rows = sorted(grouped.values(), key=lambda item: (item["date"], item["departmentName"], item["employeeName"], item["source"], item["model"]))
         summary_rows: list[dict[str, Any]] = []
         if not source or source == "all":
             for backend in self.backends:
                 try:
-                    team_map = await self.team_map(backend)
+                    team_map = team_maps.get(backend.id) or await self.team_map(backend)
                     backend_summary_rows = await self._team_daily_activity_rows(start_date, end_date, department, team_map, backend)
                     if department_filter:
                         backend_summary_rows = [
@@ -1449,24 +1476,34 @@ class LiteLLMClient:
                 except HTTPException:
                     continue
 
-        truncated = bool(total_pages and pages_read < total_pages)
-        return {
+        result = {
             "rows": rows,
             "summaryRows": summary_rows or rows,
             "departments": self._department_summaries(rows, departments),
             "employees": self._admin_employee_summaries(rows, employees),
-            "pageLimit": max_pages,
-            "pageSize": page_size,
-            "pagesRead": pages_read,
-            "totalPages": total_pages,
-            "totalRecords": total_records,
-            "truncated": truncated,
+            "pageLimit": scan["pageLimit"],
+            "pageSize": scan["pageSize"],
+            "pagesRead": scan["pagesRead"],
+            "totalPages": scan["totalPages"],
+            "totalRecords": scan["totalRecords"],
+            "truncated": scan["truncated"],
             "dataQuality": {
                 "summarySource": "team_daily_activity" if summary_rows else "spend_logs",
                 "rankingSource": "spend_logs",
                 "timezoneOffsetMinutes": usage_timezone_offset_minutes(),
             },
         }
+        duration_ms = round((time.perf_counter() - started) * 1000)
+        logger.info(
+            "usage board=department cache_hit=%s pages=%s/%s rows=%s departments=%s took=%sms",
+            bool(scan.get("cache", {}).get("hit")),
+            scan["pagesRead"],
+            scan["totalPages"] or "?",
+            len(rows),
+            len(result["departments"]),
+            duration_ms,
+        )
+        return result
 
     def _team_member_employee_info(self, member: dict[str, Any], user_map: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
         user_id = self._team_member_user_id(member)
@@ -1516,7 +1553,9 @@ class LiteLLMClient:
         start_date: str,
         end_date: str,
         source: str | None,
+        refresh: bool = False,
     ) -> dict[str, Any]:
+        started = time.perf_counter()
         backend = self._backend_map.get(backend_id)
         if backend is None:
             raise HTTPException(status_code=403, detail="当前团队权限已失效，请重新登录")
@@ -1537,51 +1576,23 @@ class LiteLLMClient:
                 employees.setdefault(employee_info["id"], employee_info)
 
         grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-        max_pages = max(1, int(os.getenv("ADMIN_USAGE_LOG_MAX_PAGES", "30")))
-        page_size = max(1, min(100, int(os.getenv("ADMIN_USAGE_PAGE_SIZE", "100"))))
-        utc_start, utc_end = _local_date_window_as_utc_text(start_date, end_date)
-        pages_read = 0
-        total_pages = 0
-        total_records = 0
-
-        for page in range(1, max_pages + 1):
-            payload = await self.request_backend(
-                backend,
-                "GET",
-                "/spend/logs/v2",
-                params={
-                    "start_date": utc_start,
-                    "end_date": utc_end,
-                    "page": page,
-                    "page_size": page_size,
-                    "sort_by": "startTime",
-                    "sort_order": "desc",
-                },
-            )
-            pages_read = page
-            if isinstance(payload, dict):
-                total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=total_pages))
-                total_records = _as_int(_first(payload, "total", "total_count", "count", default=total_records))
-            logs = _records(payload)
-            if not logs:
-                break
-            for log in logs:
-                log_team = self._department_info_from_log(log, {team_id.lower(): {"id": team_id, "name": team_info["name"]}})
-                if log_team["id"] != team_id:
-                    continue
-                detected_source = backend.source or detect_source(log)
-                if source and source != "all" and detected_source != source:
-                    continue
-                employee_info = self._employee_info_from_log(log, user_map, backend, account_index)
-                employee_key = employee_info["id"]
-                employees.setdefault(employee_key, employee_info)
-                model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
-                day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
-                key = (day, employee_key, detected_source, model)
-                row = grouped.setdefault(key, self._admin_empty_row(day, employee_info, detected_source, model))
-                self._add_log_to_row(row, log)
-            if total_pages and page >= total_pages:
-                break
+        scan = await self._spend_log_scan_rows(start_date, end_date, source, refresh)
+        for entry in scan["entries"]:
+            if entry["backend"].id != backend.id:
+                continue
+            log = entry["log"]
+            log_team = self._department_info_from_log(log, {team_id.lower(): {"id": team_id, "name": team_info["name"]}})
+            if log_team["id"] != team_id:
+                continue
+            detected_source = entry["source"]
+            employee_info = self._employee_info_from_log(log, user_map, backend, account_index)
+            employee_key = employee_info["id"]
+            employees.setdefault(employee_key, employee_info)
+            model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
+            day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
+            key = (day, employee_key, detected_source, model)
+            row = grouped.setdefault(key, self._admin_empty_row(day, employee_info, detected_source, model))
+            self._add_log_to_row(row, log)
 
         rows = sorted(grouped.values(), key=lambda item: (item["date"], item["employeeName"], item["source"], item["model"]))
         summary_rows: list[dict[str, Any]] = []
@@ -1591,24 +1602,34 @@ class LiteLLMClient:
             except HTTPException:
                 summary_rows = []
 
-        truncated = bool(total_pages and pages_read < total_pages)
-        return {
+        result = {
             "rows": rows,
             "summaryRows": summary_rows or rows,
             "employees": self._admin_employee_summaries_with_zeroes(rows, employees),
             "team": team_info,
-            "pageLimit": max_pages,
-            "pageSize": page_size,
-            "pagesRead": pages_read,
-            "totalPages": total_pages,
-            "totalRecords": total_records,
-            "truncated": truncated,
+            "pageLimit": scan["pageLimit"],
+            "pageSize": scan["pageSize"],
+            "pagesRead": scan["pagesRead"],
+            "totalPages": scan["totalPages"],
+            "totalRecords": scan["totalRecords"],
+            "truncated": scan["truncated"],
             "dataQuality": {
                 "summarySource": "team_daily_activity" if summary_rows else "spend_logs",
                 "rankingSource": "spend_logs",
                 "timezoneOffsetMinutes": usage_timezone_offset_minutes(),
             },
         }
+        duration_ms = round((time.perf_counter() - started) * 1000)
+        logger.info(
+            "usage board=team cache_hit=%s pages=%s/%s rows=%s employees=%s took=%sms",
+            bool(scan.get("cache", {}).get("hit")),
+            scan["pagesRead"],
+            scan["totalPages"] or "?",
+            len(rows),
+            len(result["employees"]),
+            duration_ms,
+        )
+        return result
 
     def _usage_totals(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
         totals = {

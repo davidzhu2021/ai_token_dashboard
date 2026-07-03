@@ -19,7 +19,7 @@ class FakeLiteLLMClient:
     async def team_leader_scope(self, upstream_user: dict[str, Any]) -> dict[str, Any]:
         return self.scope
 
-    async def team_usage_rows(self, backend: str, team_id: str, start_date: str, end_date: str, source: str | None) -> dict[str, Any]:
+    async def team_usage_rows(self, backend: str, team_id: str, start_date: str, end_date: str, source: str | None, refresh: bool = False) -> dict[str, Any]:
         self.calls.append((backend, team_id, start_date, end_date, source))
         return self.payload
 

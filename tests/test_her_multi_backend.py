@@ -144,6 +144,8 @@ def test_team_usage_with_her_team_ref_only_reads_authorized_team() -> None:
         return {"emails": {}, "names": {}, "profiles": {"carher-003": {"email": "", "name": "Carol"}}}
 
     async def fake_request_backend(backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> Any:
+        if backend.id == "primary" and path == "/spend/logs/v2":
+            return {"logs": [], "total_pages": 1, "total": 0}
         if backend.id == "her" and path == "/spend/logs/v2":
             return {
                 "logs": [
