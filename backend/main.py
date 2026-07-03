@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import asyncio
 import logging
 import os
 import re
@@ -60,6 +61,7 @@ department_usage_ranking_cache = TTLCache()
 team_auth_cache = TTLCache()
 team_usage_cache = TTLCache()
 _litellm_client: LiteLLMClient | None = None
+_usage_scan_prewarm_task: asyncio.Task | None = None
 
 
 def allowed_provider_login_url(url: str) -> str | None:
@@ -195,9 +197,49 @@ def client() -> LiteLLMClient:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+async def prewarm_usage_scan() -> None:
+    if not env_bool("USAGE_SCAN_PREWARM_ENABLED", True):
+        return
+    delay_seconds = max(0, env_int("USAGE_SCAN_PREWARM_DELAY_SECONDS", 5))
+    if delay_seconds:
+        await asyncio.sleep(delay_seconds)
+    sources = [item.strip() for item in os.getenv("USAGE_SCAN_PREWARM_SOURCES", "all").split(",") if item.strip()]
+    if not sources:
+        sources = ["all"]
+    start_date, end_date = default_date_range()
+    for source in sources:
+        try:
+            payload = await client()._spend_log_scan_rows(start_date, end_date, source)
+            logger.info(
+                "usage scan prewarm source=%s pages=%s/%s entries=%s cache_hit=%s",
+                source,
+                payload.get("pagesRead", 0),
+                payload.get("totalPages") or "?",
+                len(payload.get("entries") or []),
+                bool(payload.get("cache", {}).get("hit")),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("usage scan prewarm source=%s failed: %s", source, exc.__class__.__name__)
+
+
+@app.on_event("startup")
+async def start_usage_scan_prewarm() -> None:
+    global _usage_scan_prewarm_task
+    _usage_scan_prewarm_task = asyncio.create_task(prewarm_usage_scan())
+
+
 @app.on_event("shutdown")
 async def close_litellm_client() -> None:
-    global _litellm_client
+    global _litellm_client, _usage_scan_prewarm_task
+    if _usage_scan_prewarm_task is not None:
+        _usage_scan_prewarm_task.cancel()
+        try:
+            await _usage_scan_prewarm_task
+        except asyncio.CancelledError:
+            pass
+        _usage_scan_prewarm_task = None
     if _litellm_client is not None:
         await _litellm_client.close()
         _litellm_client = None

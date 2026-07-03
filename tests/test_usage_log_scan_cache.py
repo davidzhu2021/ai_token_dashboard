@@ -1,6 +1,7 @@
 import asyncio
 from typing import Any
 
+import backend.main as main
 from backend.cache import TTLCache
 from backend.litellm_client import LiteLLMBackend, LiteLLMClient
 
@@ -11,6 +12,7 @@ def make_client() -> tuple[LiteLLMClient, LiteLLMBackend]:
     client.backends = [backend]
     client._backend_map = {backend.id: backend}
     client._spend_log_scan_cache = TTLCache()
+    client._spend_log_scan_tasks = {}
     return client, backend
 
 
@@ -91,6 +93,126 @@ def test_usage_log_scan_refresh_bypasses_cache(monkeypatch) -> None:
     assert calls == 2
 
 
+def test_usage_log_scan_reads_pages_concurrently_after_first_page(monkeypatch) -> None:
+    client, backend = make_client()
+    captured_pages: list[int] = []
+
+    async def fake_request_backend(_backend: LiteLLMBackend, _method: str, path: str, **kwargs: Any) -> Any:
+        assert _backend == backend
+        assert path == "/spend/logs/v2"
+        page = int(kwargs.get("params", {}).get("page", 1))
+        captured_pages.append(page)
+        return {
+            "logs": [
+                {
+                    "user": f"user-{page}",
+                    "startTime": f"2026-06-{page:02d}T10:00:00Z",
+                    "model": "gpt-4o",
+                    "total_tokens": page,
+                }
+            ],
+            "total_pages": 3,
+            "total": 3,
+        }
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+    monkeypatch.setenv("ADMIN_USAGE_LOG_MAX_PAGES", "30")
+    monkeypatch.setenv("SPEND_LOG_SCAN_PAGE_CONCURRENCY", "2")
+
+    payload = asyncio.run(client._spend_log_scan_rows("2026-06-01", "2026-06-30", "all"))
+
+    assert captured_pages == [1, 2, 3]
+    assert [entry["log"]["user"] for entry in payload["entries"]] == ["user-1", "user-2", "user-3"]
+    assert payload["pagesRead"] == 3
+    assert payload["totalPages"] == 3
+    assert payload["truncated"] is False
+
+
+def test_usage_log_scan_respects_page_limit(monkeypatch) -> None:
+    client, backend = make_client()
+    captured_pages: list[int] = []
+
+    async def fake_request_backend(_backend: LiteLLMBackend, _method: str, path: str, **kwargs: Any) -> Any:
+        assert _backend == backend
+        assert path == "/spend/logs/v2"
+        page = int(kwargs.get("params", {}).get("page", 1))
+        captured_pages.append(page)
+        return {
+            "logs": [{"user": f"user-{page}", "startTime": "2026-06-15T10:00:00Z", "model": "gpt-4o", "total_tokens": 1}],
+            "total_pages": 5,
+            "total": 5,
+        }
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+    monkeypatch.setenv("ADMIN_USAGE_LOG_MAX_PAGES", "2")
+
+    payload = asyncio.run(client._spend_log_scan_rows("2026-06-01", "2026-06-30", "all"))
+
+    assert captured_pages == [1, 2]
+    assert payload["pagesRead"] == 2
+    assert payload["totalPages"] == 5
+    assert payload["truncated"] is True
+
+
+def test_usage_log_scan_merges_in_flight_requests(monkeypatch) -> None:
+    client, backend = make_client()
+    calls = 0
+
+    async def fake_request_backend(_backend: LiteLLMBackend, _method: str, path: str, **_kwargs: Any) -> Any:
+        nonlocal calls
+        assert _backend == backend
+        assert path == "/spend/logs/v2"
+        calls += 1
+        await asyncio.sleep(0.01)
+        return {
+            "logs": [{"user": "user-a", "startTime": "2026-06-15T10:00:00Z", "model": "gpt-4o", "total_tokens": 1}],
+            "total_pages": 1,
+            "total": 1,
+        }
+
+    async def run_scan_pair() -> tuple[dict[str, Any], dict[str, Any]]:
+        return await asyncio.gather(
+            client._spend_log_scan_rows("2026-06-01", "2026-06-30", "all"),
+            client._spend_log_scan_rows("2026-06-01", "2026-06-30", "all"),
+        )
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    first, second = asyncio.run(run_scan_pair())
+
+    assert calls == 1
+    assert first["entries"] == second["entries"]
+    assert client._spend_log_scan_tasks == {}
+
+
+def test_usage_log_scan_refresh_writes_new_cache(monkeypatch) -> None:
+    client, backend = make_client()
+    calls = 0
+
+    async def fake_request_backend(_backend: LiteLLMBackend, _method: str, path: str, **_kwargs: Any) -> Any:
+        nonlocal calls
+        assert _backend == backend
+        assert path == "/spend/logs/v2"
+        calls += 1
+        return {
+            "logs": [{"user": f"user-{calls}", "startTime": "2026-06-15T10:00:00Z", "model": "gpt-4o", "total_tokens": calls}],
+            "total_pages": 1,
+            "total": 1,
+        }
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    first = asyncio.run(client._spend_log_scan_rows("2026-06-01", "2026-06-30", "all"))
+    refreshed = asyncio.run(client._spend_log_scan_rows("2026-06-01", "2026-06-30", "all", refresh=True))
+    cached = asyncio.run(client._spend_log_scan_rows("2026-06-01", "2026-06-30", "all"))
+
+    assert calls == 2
+    assert first["entries"][0]["log"]["user"] == "user-1"
+    assert refreshed["entries"][0]["log"]["user"] == "user-2"
+    assert cached["entries"][0]["log"]["user"] == "user-2"
+    assert cached["cache"]["hit"] is True
+
+
 def test_admin_usage_summary_does_not_read_spend_logs(monkeypatch) -> None:
     client, backend = make_client()
 
@@ -159,3 +281,36 @@ def test_department_usage_summary_does_not_read_spend_logs(monkeypatch) -> None:
     assert payload["summaryRows"][0]["totalTokens"] == 150
     assert payload["departments"][0]["departmentId"] == "team-a"
     assert payload["dataQuality"]["summarySource"] == "team_daily_activity"
+
+
+def test_usage_scan_prewarm_reads_default_sources(monkeypatch) -> None:
+    calls: list[tuple[str, str, str]] = []
+
+    class FakeClient:
+        async def _spend_log_scan_rows(self, start_date: str, end_date: str, source: str) -> dict[str, Any]:
+            calls.append((start_date, end_date, source))
+            return {"entries": [], "pagesRead": 0, "totalPages": 0, "cache": {"hit": False}}
+
+    monkeypatch.setenv("USAGE_SCAN_PREWARM_ENABLED", "true")
+    monkeypatch.setenv("USAGE_SCAN_PREWARM_DELAY_SECONDS", "0")
+    monkeypatch.setenv("USAGE_SCAN_PREWARM_SOURCES", "all,Claude Code")
+    monkeypatch.setattr(main, "client", lambda: FakeClient())
+    monkeypatch.setattr(main, "default_date_range", lambda: ("2026-06-01", "2026-06-30"))
+
+    asyncio.run(main.prewarm_usage_scan())
+
+    assert calls == [("2026-06-01", "2026-06-30", "all"), ("2026-06-01", "2026-06-30", "Claude Code")]
+
+
+def test_usage_scan_prewarm_swallows_failures(monkeypatch) -> None:
+    class FakeClient:
+        async def _spend_log_scan_rows(self, _start_date: str, _end_date: str, _source: str) -> dict[str, Any]:
+            raise RuntimeError("upstream unavailable")
+
+    monkeypatch.setenv("USAGE_SCAN_PREWARM_ENABLED", "true")
+    monkeypatch.setenv("USAGE_SCAN_PREWARM_DELAY_SECONDS", "0")
+    monkeypatch.setenv("USAGE_SCAN_PREWARM_SOURCES", "all")
+    monkeypatch.setattr(main, "client", lambda: FakeClient())
+    monkeypatch.setattr(main, "default_date_range", lambda: ("2026-06-01", "2026-06-30"))
+
+    asyncio.run(main.prewarm_usage_scan())

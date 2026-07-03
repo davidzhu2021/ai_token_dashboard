@@ -159,14 +159,18 @@ ADMIN_USAGE_CACHE_TTL_SECONDS=300
 DEPARTMENT_USAGE_CACHE_TTL_SECONDS=300
 TEAM_AUTH_CACHE_TTL_SECONDS=300
 TEAM_USAGE_CACHE_TTL_SECONDS=300
-USAGE_LOG_SCAN_CACHE_TTL_SECONDS=60
+USAGE_LOG_SCAN_CACHE_TTL_SECONDS=300
 KEY_LIST_CACHE_TTL_SECONDS=300
 MODEL_CACHE_TTL_SECONDS=1800
 LITELLM_MAX_CONCURRENCY=4
+SPEND_LOG_SCAN_PAGE_CONCURRENCY=4
 LITELLM_SLOW_REQUEST_MS=800
 PERSONAL_USAGE_LOG_FALLBACK_ENABLED=false
 ADMIN_USAGE_LOG_MAX_PAGES=30
 ADMIN_USAGE_PAGE_SIZE=100
+USAGE_SCAN_PREWARM_ENABLED=true
+USAGE_SCAN_PREWARM_DELAY_SECONDS=5
+USAGE_SCAN_PREWARM_SOURCES=all
 USAGE_TIMEZONE_OFFSET_MINUTES=-480
 ```
 
@@ -457,3 +461,10 @@ DEBUG_MAPPING_ENABLED=true
 ```
 
 排查完成后应关闭调试开关并重启服务。
+
+
+### Usage Ranking Cold-Load Optimization
+
+- `SPEND_LOG_SCAN_PAGE_CONCURRENCY` controls concurrent `/spend/logs/v2` page reads for admin, department, and team rankings. Default is `4`, and requests are still constrained by `LITELLM_MAX_CONCURRENCY`.
+- `USAGE_SCAN_PREWARM_ENABLED=true` starts a background prewarm after service startup. By default it waits `USAGE_SCAN_PREWARM_DELAY_SECONDS=5` seconds and warms the default 30-day `USAGE_SCAN_PREWARM_SOURCES=all` scan. Prewarm failures are logged and do not block startup.
+- `USAGE_LOG_SCAN_CACHE_TTL_SECONDS=300` keeps the shared scan result long enough for admin, department, and team views to reuse it when switching dashboards.

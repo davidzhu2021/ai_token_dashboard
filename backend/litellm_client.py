@@ -225,6 +225,7 @@ class LiteLLMClient:
         self._teams_cache = TTLCache()
         self._team_map_cache = TTLCache()
         self._spend_log_scan_cache = TTLCache()
+        self._spend_log_scan_tasks: dict[str, asyncio.Task] = {}
 
     def _cache(self, attribute: str) -> TTLCache:
         cache = getattr(self, attribute, None)
@@ -892,6 +893,104 @@ class LiteLLMClient:
                 payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
                 return payload
 
+        tasks = getattr(self, "_spend_log_scan_tasks", None)
+        if tasks is None:
+            tasks = {}
+            self._spend_log_scan_tasks = tasks
+
+        task = tasks.get(cache_key)
+        if task and not task.done():
+            payload = dict(await task)
+            payload["cache"] = {"hit": False, "ttlSeconds": 0}
+            return payload
+
+        task = asyncio.create_task(self._spend_log_scan_rows_uncached(start_date, end_date, source))
+        tasks[cache_key] = task
+        try:
+            payload = dict(await task)
+            payload["cache"] = {"hit": False, "ttlSeconds": 0}
+            return payload
+        finally:
+            if tasks.get(cache_key) is task:
+                tasks.pop(cache_key, None)
+
+    def _spend_log_page_concurrency(self) -> int:
+        return max(1, _env_int("SPEND_LOG_SCAN_PAGE_CONCURRENCY", _env_int("LITELLM_MAX_CONCURRENCY", 4)))
+
+    async def _fetch_spend_log_page(
+        self,
+        backend: LiteLLMBackend,
+        utc_start: str,
+        utc_end: str,
+        page: int,
+        page_size: int,
+    ) -> dict[str, Any]:
+        payload = await self.request_backend(
+            backend,
+            "GET",
+            "/spend/logs/v2",
+            params={
+                "start_date": utc_start,
+                "end_date": utc_end,
+                "page": page,
+                "page_size": page_size,
+                "sort_by": "startTime",
+                "sort_order": "desc",
+            },
+        )
+        return {
+            "page": page,
+            "logs": _records(payload),
+            "totalPages": _as_int(_first(payload, "total_pages", "totalPages", default=0)) if isinstance(payload, dict) else 0,
+            "totalRecords": _as_int(_first(payload, "total", "total_count", "count", default=0)) if isinstance(payload, dict) else 0,
+        }
+
+    async def _spend_log_pages_for_backend(
+        self,
+        backend: LiteLLMBackend,
+        utc_start: str,
+        utc_end: str,
+        page_size: int,
+        max_pages: int,
+    ) -> dict[str, Any]:
+        first_page = await self._fetch_spend_log_page(backend, utc_start, utc_end, 1, page_size)
+        pages = [first_page]
+        if not first_page["logs"]:
+            return {
+                "pages": pages,
+                "pagesRead": 1,
+                "totalPages": first_page["totalPages"],
+                "totalRecords": first_page["totalRecords"],
+            }
+
+        total_pages = first_page["totalPages"]
+        target_pages = min(max_pages, total_pages or max_pages)
+        if target_pages > 1:
+            page_numbers = list(range(2, target_pages + 1))
+            concurrency = min(self._spend_log_page_concurrency(), len(page_numbers))
+            for index in range(0, len(page_numbers), concurrency):
+                batch = page_numbers[index : index + concurrency]
+                page_results = await asyncio.gather(
+                    *(self._fetch_spend_log_page(backend, utc_start, utc_end, page, page_size) for page in batch)
+                )
+                pages.extend(page_results)
+                if not total_pages:
+                    empty_page = next((item["page"] for item in page_results if not item["logs"]), None)
+                    if empty_page is not None:
+                        pages = [item for item in pages if item["page"] <= empty_page]
+                        break
+
+        pages.sort(key=lambda item: item["page"])
+        return {
+            "pages": pages,
+            "pagesRead": max((item["page"] for item in pages), default=0),
+            "totalPages": total_pages,
+            "totalRecords": first_page["totalRecords"],
+        }
+
+    async def _spend_log_scan_rows_uncached(self, start_date: str, end_date: str, source: str | None) -> dict[str, Any]:
+        cache_key = self._spend_log_scan_cache_key(start_date, end_date, source)
+
         started = time.perf_counter()
         entries: list[dict[str, Any]] = []
         max_pages = max(1, int(os.getenv("ADMIN_USAGE_LOG_MAX_PAGES", "30")))
@@ -908,35 +1007,19 @@ class LiteLLMClient:
             backend_total_pages = 0
             backend_total_records = 0
 
-            for page in range(1, max_pages + 1):
-                payload = await self.request_backend(
-                    backend,
-                    "GET",
-                    "/spend/logs/v2",
-                    params={
-                        "start_date": utc_start,
-                        "end_date": utc_end,
-                        "page": page,
-                        "page_size": page_size,
-                        "sort_by": "startTime",
-                        "sort_order": "desc",
-                    },
-                )
-                backend_pages_read = page
-                if isinstance(payload, dict):
-                    backend_total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=backend_total_pages))
-                    backend_total_records = _as_int(_first(payload, "total", "total_count", "count", default=backend_total_records))
-                logs = _records(payload)
+            scan = await self._spend_log_pages_for_backend(backend, utc_start, utc_end, page_size, max_pages)
+            backend_pages_read = scan["pagesRead"]
+            backend_total_pages = scan["totalPages"]
+            backend_total_records = scan["totalRecords"]
+            for page_payload in scan["pages"]:
+                logs = page_payload["logs"]
                 if not logs:
-                    break
+                    continue
                 for log in logs:
                     detected_source = backend.source or detect_source(log)
                     if source and source != "all" and detected_source != source:
                         continue
                     entries.append({"backend": backend, "log": log, "source": detected_source})
-
-                if backend_total_pages and page >= backend_total_pages:
-                    break
 
             pages_read = max(pages_read, backend_pages_read)
             total_pages = max(total_pages, backend_total_pages)
@@ -951,7 +1034,7 @@ class LiteLLMClient:
             "totalRecords": total_records,
             "truncated": bool(total_pages and pages_read < total_pages),
         }
-        self._cache("_spend_log_scan_cache").set(cache_key, payload, _env_int("USAGE_LOG_SCAN_CACHE_TTL_SECONDS", 60))
+        self._cache("_spend_log_scan_cache").set(cache_key, payload, _env_int("USAGE_LOG_SCAN_CACHE_TTL_SECONDS", 300))
         payload = dict(payload)
         payload["cache"] = {"hit": False, "ttlSeconds": 0}
         duration_ms = round((time.perf_counter() - started) * 1000)
