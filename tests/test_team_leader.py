@@ -23,11 +23,27 @@ class FakeLiteLLMClient:
         self.calls.append((backend, team_id, start_date, end_date, source))
         return self.payload
 
+    async def admin_usage_summary_rows(self, start_date: str, end_date: str, source: str | None) -> dict[str, Any]:
+        return self.payload
+
+    async def admin_usage_ranking_rows(self, start_date: str, end_date: str, source: str | None, employee: str | None = None, refresh: bool = False) -> dict[str, Any]:
+        return self.payload
+
+    async def admin_department_usage_summary_rows(self, start_date: str, end_date: str, source: str | None, department: str | None = None) -> dict[str, Any]:
+        return self.payload
+
+    async def admin_department_usage_ranking_rows(self, start_date: str, end_date: str, source: str | None, department: str | None = None, refresh: bool = False) -> dict[str, Any]:
+        return self.payload
+
 
 def reset_caches() -> None:
     main.user_mapping_cache.clear()
     main.team_auth_cache.clear()
     main.team_usage_cache.clear()
+    main.admin_usage_summary_cache.clear()
+    main.admin_usage_ranking_cache.clear()
+    main.department_usage_summary_cache.clear()
+    main.department_usage_ranking_cache.clear()
 
 
 def app_client(email: str = "leader@auto-link.com.cn") -> TestClient:
@@ -385,3 +401,39 @@ def test_team_usage_ignores_client_team_override(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert fake.calls[0][1] == "authorized-team"
+
+
+def test_admin_split_usage_routes_return_payload(monkeypatch) -> None:
+    reset_caches()
+    patch_user(monkeypatch)
+    fake = FakeLiteLLMClient(
+        {"isTeamLeader": False, "teamBoardStatus": "none", "team": None, "leaderTeams": []},
+        {"summaryRows": [{"date": "2026-06-15", "totalTokens": 100}], "rows": [], "employees": []},
+    )
+    monkeypatch.setattr(main, "client", lambda: fake)
+
+    summary = app_client().get("/api/admin/usage/summary?start_date=2026-06-01&end_date=2026-06-30")
+    ranking = app_client().get("/api/admin/usage/ranking?start_date=2026-06-01&end_date=2026-06-30")
+
+    assert summary.status_code == 200
+    assert summary.json()["summaryRows"][0]["totalTokens"] == 100
+    assert ranking.status_code == 200
+    assert ranking.json()["employees"] == []
+
+
+def test_department_split_usage_routes_return_payload(monkeypatch) -> None:
+    reset_caches()
+    patch_user(monkeypatch)
+    fake = FakeLiteLLMClient(
+        {"isTeamLeader": False, "teamBoardStatus": "none", "team": None, "leaderTeams": []},
+        {"summaryRows": [], "departments": [{"departmentId": "team-a"}], "rows": [], "employees": []},
+    )
+    monkeypatch.setattr(main, "client", lambda: fake)
+
+    summary = app_client().get("/api/admin/departments/usage/summary?start_date=2026-06-01&end_date=2026-06-30")
+    ranking = app_client().get("/api/admin/departments/usage/ranking?start_date=2026-06-01&end_date=2026-06-30")
+
+    assert summary.status_code == 200
+    assert summary.json()["departments"][0]["departmentId"] == "team-a"
+    assert ranking.status_code == 200
+    assert ranking.json()["rows"] == []

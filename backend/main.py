@@ -53,6 +53,10 @@ user_mapping_cache = TTLCache()
 personal_usage_cache = TTLCache()
 admin_usage_cache = TTLCache()
 department_usage_cache = TTLCache()
+admin_usage_summary_cache = TTLCache()
+admin_usage_ranking_cache = TTLCache()
+department_usage_summary_cache = TTLCache()
+department_usage_ranking_cache = TTLCache()
 team_auth_cache = TTLCache()
 team_usage_cache = TTLCache()
 _litellm_client: LiteLLMClient | None = None
@@ -237,8 +241,16 @@ def admin_usage_cache_key(email: str, start_date: str, end_date: str, source: st
     return f"admin-usage:v2:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(employee or '').strip().lower()}"
 
 
+def admin_usage_part_cache_key(part: str, email: str, start_date: str, end_date: str, source: str, employee: str | None = None) -> str:
+    return f"admin-usage:{part}:v1:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(employee or '').strip().lower()}"
+
+
 def department_usage_cache_key(email: str, start_date: str, end_date: str, source: str, department: str | None) -> str:
     return f"department-usage:v2:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(department or '').strip().lower()}"
+
+
+def department_usage_part_cache_key(part: str, email: str, start_date: str, end_date: str, source: str, department: str | None = None) -> str:
+    return f"department-usage:{part}:v1:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(department or '').strip().lower()}"
 
 
 def team_auth_cache_key(email: str, name: str | None) -> str:
@@ -398,6 +410,36 @@ async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: 
     return payload
 
 
+async def admin_usage_summary_payload(admin: dict[str, Any], start_date: str, end_date: str, source: str, refresh: bool = False) -> dict[str, Any]:
+    cache_key = admin_usage_part_cache_key("summary", admin["email"], start_date, end_date, source)
+    if not refresh:
+        hit, value, ttl_seconds = admin_usage_summary_cache.get(cache_key)
+        if hit:
+            payload = dict(value)
+            payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+            return payload
+    payload = await client().admin_usage_summary_rows(start_date, end_date, source)
+    admin_usage_summary_cache.set(cache_key, payload, env_int("ADMIN_USAGE_CACHE_TTL_SECONDS", 300))
+    payload = dict(payload)
+    payload["cache"] = {"hit": False, "ttlSeconds": 0}
+    return payload
+
+
+async def admin_usage_ranking_payload(admin: dict[str, Any], start_date: str, end_date: str, source: str, employee: str | None, refresh: bool = False) -> dict[str, Any]:
+    cache_key = admin_usage_part_cache_key("ranking", admin["email"], start_date, end_date, source, employee)
+    if not refresh:
+        hit, value, ttl_seconds = admin_usage_ranking_cache.get(cache_key)
+        if hit:
+            payload = dict(value)
+            payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+            return payload
+    payload = await client().admin_usage_ranking_rows(start_date, end_date, source, employee, refresh)
+    admin_usage_ranking_cache.set(cache_key, payload, env_int("ADMIN_USAGE_CACHE_TTL_SECONDS", 300))
+    payload = dict(payload)
+    payload["cache"] = {"hit": False, "ttlSeconds": 0}
+    return payload
+
+
 async def department_usage_payload(admin: dict[str, Any], start_date: str, end_date: str, source: str, department: str | None, refresh: bool = False) -> dict[str, Any]:
     cache_key = department_usage_cache_key(admin["email"], start_date, end_date, source, department)
     if not refresh:
@@ -408,6 +450,36 @@ async def department_usage_payload(admin: dict[str, Any], start_date: str, end_d
             return payload
     payload = await client().admin_department_usage_rows(start_date, end_date, source, department, refresh)
     department_usage_cache.set(cache_key, payload, env_int("DEPARTMENT_USAGE_CACHE_TTL_SECONDS", 300))
+    payload = dict(payload)
+    payload["cache"] = {"hit": False, "ttlSeconds": 0}
+    return payload
+
+
+async def department_usage_summary_payload(admin: dict[str, Any], start_date: str, end_date: str, source: str, department: str | None, refresh: bool = False) -> dict[str, Any]:
+    cache_key = department_usage_part_cache_key("summary", admin["email"], start_date, end_date, source, department)
+    if not refresh:
+        hit, value, ttl_seconds = department_usage_summary_cache.get(cache_key)
+        if hit:
+            payload = dict(value)
+            payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+            return payload
+    payload = await client().admin_department_usage_summary_rows(start_date, end_date, source, department)
+    department_usage_summary_cache.set(cache_key, payload, env_int("DEPARTMENT_USAGE_CACHE_TTL_SECONDS", 300))
+    payload = dict(payload)
+    payload["cache"] = {"hit": False, "ttlSeconds": 0}
+    return payload
+
+
+async def department_usage_ranking_payload(admin: dict[str, Any], start_date: str, end_date: str, source: str, department: str | None, refresh: bool = False) -> dict[str, Any]:
+    cache_key = department_usage_part_cache_key("ranking", admin["email"], start_date, end_date, source, department)
+    if not refresh:
+        hit, value, ttl_seconds = department_usage_ranking_cache.get(cache_key)
+        if hit:
+            payload = dict(value)
+            payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+            return payload
+    payload = await client().admin_department_usage_ranking_rows(start_date, end_date, source, department, refresh)
+    department_usage_ranking_cache.set(cache_key, payload, env_int("DEPARTMENT_USAGE_CACHE_TTL_SECONDS", 300))
     payload = dict(payload)
     payload["cache"] = {"hit": False, "ttlSeconds": 0}
     return payload
@@ -735,6 +807,50 @@ async def admin_usage(
     }
 
 
+@app.get("/api/admin/usage/summary")
+async def admin_usage_summary(
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    source: str = Query("all"),
+    refresh: bool = Query(False),
+) -> dict[str, Any]:
+    admin = require_admin(request)
+    if not start_date or not end_date:
+        start_date, end_date = default_date_range()
+    payload = await admin_usage_summary_payload(admin, start_date, end_date, source, refresh)
+    return {
+        "admin": {"email": admin["email"], "name": admin["name"]},
+        "startDate": start_date,
+        "endDate": end_date,
+        "source": source,
+        **payload,
+    }
+
+
+@app.get("/api/admin/usage/ranking")
+async def admin_usage_ranking(
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    source: str = Query("all"),
+    employee: str | None = None,
+    refresh: bool = Query(False),
+) -> dict[str, Any]:
+    admin = require_admin(request)
+    if not start_date or not end_date:
+        start_date, end_date = default_date_range()
+    payload = await admin_usage_ranking_payload(admin, start_date, end_date, source, employee, refresh)
+    return {
+        "admin": {"email": admin["email"], "name": admin["name"]},
+        "startDate": start_date,
+        "endDate": end_date,
+        "source": source,
+        "employee": employee or "",
+        **payload,
+    }
+
+
 @app.get("/api/admin/users")
 async def admin_users(
     request: Request,
@@ -764,6 +880,52 @@ async def admin_departments_usage(
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
     payload = await department_usage_payload(admin, start_date, end_date, source, department, refresh)
+    return {
+        "admin": {"email": admin["email"], "name": admin["name"]},
+        "startDate": start_date,
+        "endDate": end_date,
+        "source": source,
+        "department": department or "",
+        **payload,
+    }
+
+
+@app.get("/api/admin/departments/usage/summary")
+async def admin_departments_usage_summary(
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    source: str = Query("all"),
+    department: str | None = None,
+    refresh: bool = Query(False),
+) -> dict[str, Any]:
+    admin = require_admin(request)
+    if not start_date or not end_date:
+        start_date, end_date = default_date_range()
+    payload = await department_usage_summary_payload(admin, start_date, end_date, source, department, refresh)
+    return {
+        "admin": {"email": admin["email"], "name": admin["name"]},
+        "startDate": start_date,
+        "endDate": end_date,
+        "source": source,
+        "department": department or "",
+        **payload,
+    }
+
+
+@app.get("/api/admin/departments/usage/ranking")
+async def admin_departments_usage_ranking(
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    source: str = Query("all"),
+    department: str | None = None,
+    refresh: bool = Query(False),
+) -> dict[str, Any]:
+    admin = require_admin(request)
+    if not start_date or not end_date:
+        start_date, end_date = default_date_range()
+    payload = await department_usage_ranking_payload(admin, start_date, end_date, source, department, refresh)
     return {
         "admin": {"email": admin["email"], "name": admin["name"]},
         "startDate": start_date,

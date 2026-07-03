@@ -1031,6 +1031,37 @@ class LiteLLMClient:
         )
         return result
 
+    async def admin_usage_summary_rows(self, start_date: str, end_date: str, source: str | None) -> dict[str, Any]:
+        summary_rows: list[dict[str, Any]] = []
+        if not source or source == "all":
+            for backend in self.backends:
+                try:
+                    summary_rows.extend(await self.admin_daily_activity_rows(start_date, end_date, backend))
+                except HTTPException:
+                    continue
+        return {
+            "summaryRows": summary_rows,
+            "dataQuality": {
+                "summarySource": "official_daily_activity" if summary_rows else "spend_logs_required",
+                "rankingSource": "spend_logs_required",
+                "timezoneOffsetMinutes": usage_timezone_offset_minutes(),
+            },
+        }
+
+    async def admin_usage_ranking_rows(self, start_date: str, end_date: str, source: str | None, employee: str | None = None, refresh: bool = False) -> dict[str, Any]:
+        payload = await self.admin_usage_rows(start_date, end_date, source, employee, refresh)
+        return {
+            "rows": payload.get("rows", []),
+            "employees": payload.get("employees", []),
+            "pageLimit": payload.get("pageLimit", 0),
+            "pageSize": payload.get("pageSize", 0),
+            "pagesRead": payload.get("pagesRead", 0),
+            "totalPages": payload.get("totalPages", 0),
+            "totalRecords": payload.get("totalRecords", 0),
+            "truncated": payload.get("truncated", False),
+            "dataQuality": payload.get("dataQuality", {}),
+        }
+
     async def admin_usage_compare(self, start_date: str, end_date: str, source: str | None) -> dict[str, Any]:
         payload = await self.admin_usage_rows(start_date, end_date, source, None)
         rows = payload.get("rows", [])
@@ -1504,6 +1535,59 @@ class LiteLLMClient:
             duration_ms,
         )
         return result
+
+    async def admin_department_usage_summary_rows(self, start_date: str, end_date: str, source: str | None, department: str | None = None) -> dict[str, Any]:
+        department_filter = (department or "").strip().lower()
+        summary_rows: list[dict[str, Any]] = []
+        if not source or source == "all":
+            for backend in self.backends:
+                try:
+                    team_map = await self.team_map(backend)
+                    backend_summary_rows = await self._team_daily_activity_rows(start_date, end_date, department, team_map, backend)
+                    if department_filter:
+                        backend_summary_rows = [
+                            row
+                            for row in backend_summary_rows
+                            if department_filter in {str(row.get("departmentId", "")).lower(), str(row.get("departmentName", "")).lower()}
+                        ]
+                    summary_rows.extend(backend_summary_rows)
+                except HTTPException:
+                    continue
+        departments: dict[str, dict[str, str]] = {}
+        for row in summary_rows:
+            department_id = str(row.get("departmentId") or "unassigned")
+            departments.setdefault(
+                department_id,
+                {
+                    "id": department_id,
+                    "name": str(row.get("departmentName") or department_id),
+                    "bindStatus": str(row.get("departmentBindStatus") or ""),
+                },
+            )
+        return {
+            "summaryRows": summary_rows,
+            "departments": self._department_summaries(summary_rows, departments),
+            "dataQuality": {
+                "summarySource": "team_daily_activity" if summary_rows else "spend_logs_required",
+                "rankingSource": "spend_logs_required",
+                "timezoneOffsetMinutes": usage_timezone_offset_minutes(),
+            },
+        }
+
+    async def admin_department_usage_ranking_rows(self, start_date: str, end_date: str, source: str | None, department: str | None = None, refresh: bool = False) -> dict[str, Any]:
+        payload = await self.admin_department_usage_rows(start_date, end_date, source, department, refresh)
+        return {
+            "rows": payload.get("rows", []),
+            "departments": payload.get("departments", []),
+            "employees": payload.get("employees", []),
+            "pageLimit": payload.get("pageLimit", 0),
+            "pageSize": payload.get("pageSize", 0),
+            "pagesRead": payload.get("pagesRead", 0),
+            "totalPages": payload.get("totalPages", 0),
+            "totalRecords": payload.get("totalRecords", 0),
+            "truncated": payload.get("truncated", False),
+            "dataQuality": payload.get("dataQuality", {}),
+        }
 
     def _team_member_employee_info(self, member: dict[str, Any], user_map: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
         user_id = self._team_member_user_id(member)

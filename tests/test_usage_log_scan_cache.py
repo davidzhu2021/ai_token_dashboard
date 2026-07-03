@@ -89,3 +89,73 @@ def test_usage_log_scan_refresh_bypasses_cache(monkeypatch) -> None:
     asyncio.run(client._spend_log_scan_rows("2026-06-01", "2026-06-30", "all", refresh=True))
 
     assert calls == 2
+
+
+def test_admin_usage_summary_does_not_read_spend_logs(monkeypatch) -> None:
+    client, backend = make_client()
+
+    async def fake_request_backend(_backend: LiteLLMBackend, _method: str, path: str, **_kwargs: Any) -> Any:
+        assert _backend == backend
+        assert path == "/user/daily/activity/aggregated"
+        return {
+            "data": [
+                {
+                    "date": "2026-06-15",
+                    "total_tokens": 200,
+                    "prompt_tokens": 120,
+                    "completion_tokens": 80,
+                    "request_count": 2,
+                }
+            ]
+        }
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    payload = asyncio.run(client.admin_usage_summary_rows("2026-06-01", "2026-06-30", "all"))
+
+    assert payload["summaryRows"][0]["totalTokens"] == 200
+    assert payload["dataQuality"]["summarySource"] == "official_daily_activity"
+
+
+def test_department_usage_summary_does_not_read_spend_logs(monkeypatch) -> None:
+    client, backend = make_client()
+
+    async def fake_team_map(_backend: LiteLLMBackend | None = None) -> dict[str, dict[str, str]]:
+        return {"team-a": {"id": "team-a", "name": "Team A"}}
+
+    async def fake_team_daily_activity_rows(
+        start_date: str,
+        end_date: str,
+        department: str | None,
+        team_map: dict[str, dict[str, str]],
+        backend_arg: LiteLLMBackend | None = None,
+    ) -> list[dict[str, Any]]:
+        assert backend_arg == backend
+        assert department is None
+        assert team_map["team-a"]["name"] == "Team A"
+        return [
+            {
+                "date": "2026-06-15",
+                "departmentId": "team-a",
+                "departmentName": "Team A",
+                "departmentBindStatus": "bound",
+                "source": "其他",
+                "model": "全量",
+                "promptTokens": 100,
+                "completionTokens": 50,
+                "totalTokens": 150,
+                "requestCount": 3,
+                "successCount": 3,
+                "failureCount": 0,
+                "spend": 0.1,
+            }
+        ]
+
+    monkeypatch.setattr(client, "team_map", fake_team_map)
+    monkeypatch.setattr(client, "_team_daily_activity_rows", fake_team_daily_activity_rows)
+
+    payload = asyncio.run(client.admin_department_usage_summary_rows("2026-06-01", "2026-06-30", "all"))
+
+    assert payload["summaryRows"][0]["totalTokens"] == 150
+    assert payload["departments"][0]["departmentId"] == "team-a"
+    assert payload["dataQuality"]["summarySource"] == "team_daily_activity"

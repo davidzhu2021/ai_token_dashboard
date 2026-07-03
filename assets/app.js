@@ -40,6 +40,8 @@ let isDashboardLoading = false;
 let isAdminLoading = false;
 let isDepartmentLoading = false;
 let isTeamLoading = false;
+let isAdminRankingLoading = false;
+let isDepartmentRankingLoading = false;
 let authConfig = { devLoginEnabled: false, oidcConfigured: false, providerName: "飞书扫码登录" };
 
 const el = (id) => document.getElementById(id);
@@ -974,7 +976,7 @@ function renderPersonal() {
 }
 
 function renderAdmin() {
-  if (isAdminLoading) {
+  if (isAdminLoading && !adminSummaryData.length && !adminUsageData.length) {
     renderAdminLoading();
     return;
   }
@@ -982,10 +984,14 @@ function renderAdmin() {
   renderAdminMetrics(adminUsageData);
   renderTrendTo("adminTrendChart", totalData);
   renderSpendTrendTo("adminSpendChart", totalData);
-  renderDonutTo("adminSourceDonut", "adminDonutTotal", "adminSourceLegend", adminUsageData);
-  renderModelBarsTo("adminModelBars", adminUsageData);
-  renderSplitTo("adminSplitChart", adminUsageData);
-  renderAdminUsers();
+  renderDonutTo("adminSourceDonut", "adminDonutTotal", "adminSourceLegend", adminUsageData.length ? adminUsageData : totalData);
+  renderModelBarsTo("adminModelBars", adminUsageData.length ? adminUsageData : totalData);
+  renderSplitTo("adminSplitChart", adminUsageData.length ? adminUsageData : totalData);
+  if (isAdminRankingLoading) {
+    renderTableSkeleton("adminUserTable", "adminUserCount", 8);
+  } else {
+    renderAdminUsers();
+  }
 
   const detailCard = el("adminDetailCard");
   detailCard.classList.toggle("show", Boolean(selectedAdminEmployee));
@@ -997,7 +1003,7 @@ function renderAdmin() {
 }
 
 function renderDepartment() {
-  if (isDepartmentLoading) {
+  if (isDepartmentLoading && !departmentSummaryData.length && !departmentUsageData.length) {
     renderDepartmentLoading();
     return;
   }
@@ -1007,11 +1013,15 @@ function renderDepartment() {
     renderDepartmentMetrics(totalData);
     renderTrendTo("departmentTrendChart", totalData);
     renderSpendTrendTo("departmentSpendChart", totalData);
-    renderDonutTo("departmentSourceDonut", "departmentDonutTotal", "departmentSourceLegend", departmentUsageData);
-    renderModelBarsTo("departmentModelBars", departmentUsageData);
-    renderSplitTo("departmentSplitChart", departmentUsageData);
+    renderDonutTo("departmentSourceDonut", "departmentDonutTotal", "departmentSourceLegend", departmentUsageData.length ? departmentUsageData : totalData);
+    renderModelBarsTo("departmentModelBars", departmentUsageData.length ? departmentUsageData : totalData);
+    renderSplitTo("departmentSplitChart", departmentUsageData.length ? departmentUsageData : totalData);
   }
-  renderDepartmentUsers();
+  if (isDepartmentRankingLoading) {
+    renderTableSkeleton("departmentUserTable", "departmentUserCount", 8);
+  } else {
+    renderDepartmentUsers();
+  }
   renderDepartmentPickerOptions();
 
   const detailCard = el("departmentDetailCard");
@@ -1182,6 +1192,7 @@ async function loadDashboardData(forceRefresh = false) {
 async function loadAdminData(forceRefresh = false) {
   if (!currentUser?.isAdmin || isAdminLoading) return;
   isAdminLoading = true;
+  isAdminRankingLoading = false;
   renderAdmin();
   const { startDate, endDate } = selectedDateRange();
   const source = el("sourceSelect").value;
@@ -1190,31 +1201,59 @@ async function loadAdminData(forceRefresh = false) {
   const query = new URLSearchParams({ start_date: startDate, end_date: endDate, source });
   if (employee) query.set("employee", employee);
   if (forceRefresh) query.set("refresh", "1");
+  const canSplitLoad = source === "all" && !employee;
   try {
-    const payload = await api(`/api/admin/usage?${query.toString()}`);
-    adminUsageData = payload.rows || [];
-    adminSummaryData = payload.summaryRows || adminUsageData;
-    adminEmployees = payload.employees || [];
-    lastAdminUsageCacheHit = Boolean(payload.cache?.hit);
-    if (payload.truncated) {
-      el("adminLimitHint").textContent = `默认按 Token 从高到低排序；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），员工排行可能不完整`;
-    } else {
-      el("adminLimitHint").textContent = `默认按 Token 从高到低排序；已读取 ${payload.pagesRead || 0} 页日志，按当前筛选范围统计`;
+    if (!canSplitLoad) {
+      const payload = await api(`/api/admin/usage?${query.toString()}`);
+      adminUsageData = payload.rows || [];
+      adminSummaryData = payload.summaryRows || adminUsageData;
+      adminEmployees = payload.employees || [];
+      lastAdminUsageCacheHit = Boolean(payload.cache?.hit);
+      updateAdminLimitHint(payload);
+      return;
     }
+
+    adminUsageData = [];
+    adminEmployees = [];
+    isAdminRankingLoading = true;
+    renderAdmin();
+
+    const summaryPayload = await api(`/api/admin/usage/summary?${query.toString()}`);
+    adminSummaryData = summaryPayload.summaryRows || [];
+    lastAdminUsageCacheHit = Boolean(summaryPayload.cache?.hit);
+    isAdminLoading = false;
+    renderAdmin();
+
+    const rankingPayload = await api(`/api/admin/usage/ranking?${query.toString()}`);
+    adminUsageData = rankingPayload.rows || [];
+    adminEmployees = rankingPayload.employees || [];
+    if (!adminSummaryData.length) adminSummaryData = rankingPayload.summaryRows || adminUsageData;
+    lastAdminUsageCacheHit = Boolean(rankingPayload.cache?.hit);
+    updateAdminLimitHint(rankingPayload);
   } catch (error) {
-    showToast(error.message || "全员数据加载失败");
+    showToast(error.message || "Admin data load failed");
     adminUsageData = [];
     adminSummaryData = [];
     adminEmployees = [];
   } finally {
     isAdminLoading = false;
+    isAdminRankingLoading = false;
     renderAdmin();
+  }
+}
+
+function updateAdminLimitHint(payload) {
+  if (payload.truncated) {
+    el("adminLimitHint").textContent = `Ranking by Token; log read limit reached (${payload.pagesRead || 0}/${payload.totalPages || "?"} pages), ranking may be incomplete`;
+  } else {
+    el("adminLimitHint").textContent = `Ranking by Token; read ${payload.pagesRead || 0} log pages for current filters`;
   }
 }
 
 async function loadDepartmentData(forceRefresh = false) {
   if (!currentUser?.isAdmin || isDepartmentLoading) return;
   isDepartmentLoading = true;
+  isDepartmentRankingLoading = false;
   renderDepartment();
   const { startDate, endDate } = selectedDateRange();
   const source = el("sourceSelect").value;
@@ -1223,22 +1262,36 @@ async function loadDepartmentData(forceRefresh = false) {
   const query = new URLSearchParams({ start_date: startDate, end_date: endDate, source });
   if (department) query.set("department", department);
   if (forceRefresh) query.set("refresh", "1");
+  const canSplitLoad = source === "all";
   try {
-    const payload = await api(`/api/admin/departments/usage?${query.toString()}`);
-    departmentUsageData = payload.rows || [];
-    departmentSummaryData = payload.summaryRows || departmentUsageData;
-    departmentRankings = payload.departments || [];
-    departmentEmployees = payload.employees || [];
-    if (!department) departmentPickerOptions = departmentRankings;
-    lastDepartmentUsageCacheHit = Boolean(payload.cache?.hit);
-    const rankingSubject = selectedDepartment ? "员工排行" : "部门排行";
-    if (payload.truncated) {
-      el("departmentLimitHint").textContent = `${rankingSubject}默认按 Token 从高到低排序；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），排行可能不完整`;
-    } else {
-      el("departmentLimitHint").textContent = `${rankingSubject}默认按 Token 从高到低排序；已读取 ${payload.pagesRead || 0} 页日志，按当前筛选范围统计`;
+    if (!canSplitLoad) {
+      const payload = await api(`/api/admin/departments/usage?${query.toString()}`);
+      applyDepartmentPayload(payload, department);
+      updateDepartmentLimitHint(payload);
+      return;
     }
+
+    departmentUsageData = [];
+    departmentEmployees = [];
+    if (!department) departmentRankings = [];
+    isDepartmentRankingLoading = true;
+    renderDepartment();
+
+    const summaryPayload = await api(`/api/admin/departments/usage/summary?${query.toString()}`);
+    departmentSummaryData = summaryPayload.summaryRows || [];
+    if (!department) {
+      departmentRankings = summaryPayload.departments || [];
+      departmentPickerOptions = departmentRankings;
+    }
+    lastDepartmentUsageCacheHit = Boolean(summaryPayload.cache?.hit);
+    isDepartmentLoading = false;
+    renderDepartment();
+
+    const rankingPayload = await api(`/api/admin/departments/usage/ranking?${query.toString()}`);
+    applyDepartmentPayload(rankingPayload, department, true);
+    updateDepartmentLimitHint(rankingPayload);
   } catch (error) {
-    showToast(error.message || "部门数据加载失败");
+    showToast(error.message || "Department data load failed");
     departmentUsageData = [];
     departmentSummaryData = [];
     departmentRankings = [];
@@ -1246,7 +1299,26 @@ async function loadDepartmentData(forceRefresh = false) {
     if (!department) departmentPickerOptions = [];
   } finally {
     isDepartmentLoading = false;
+    isDepartmentRankingLoading = false;
     renderDepartment();
+  }
+}
+
+function applyDepartmentPayload(payload, department, keepSummary = false) {
+  departmentUsageData = payload.rows || [];
+  departmentSummaryData = keepSummary && departmentSummaryData.length ? departmentSummaryData : payload.summaryRows || departmentUsageData;
+  departmentRankings = payload.departments || [];
+  departmentEmployees = payload.employees || [];
+  if (!department) departmentPickerOptions = departmentRankings;
+  lastDepartmentUsageCacheHit = Boolean(payload.cache?.hit);
+}
+
+function updateDepartmentLimitHint(payload) {
+  const rankingSubject = selectedDepartment ? "Employee ranking" : "Department ranking";
+  if (payload.truncated) {
+    el("departmentLimitHint").textContent = `${rankingSubject} by Token; log read limit reached (${payload.pagesRead || 0}/${payload.totalPages || "?"} pages), ranking may be incomplete`;
+  } else {
+    el("departmentLimitHint").textContent = `${rankingSubject} by Token; read ${payload.pagesRead || 0} log pages for current filters`;
   }
 }
 
