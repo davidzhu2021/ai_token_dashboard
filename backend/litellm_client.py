@@ -221,6 +221,16 @@ class LiteLLMClient:
         self._key_cache = TTLCache()
         self._model_cache = TTLCache()
         self._account_index_cache = TTLCache()
+        self._users_cache = TTLCache()
+        self._teams_cache = TTLCache()
+        self._team_map_cache = TTLCache()
+
+    def _cache(self, attribute: str) -> TTLCache:
+        cache = getattr(self, attribute, None)
+        if cache is None:
+            cache = TTLCache()
+            setattr(self, attribute, cache)
+        return cache
 
     async def close(self) -> None:
         await self.http_client.aclose()
@@ -840,6 +850,10 @@ class LiteLLMClient:
 
     async def users(self, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
         backend = backend or self.backends[0]
+        cache_key = f"users:{backend.id}"
+        hit, value, _ = self._cache("_users_cache").get(cache_key)
+        if hit:
+            return value
         users: list[dict[str, Any]] = []
         for page in range(1, 101):
             payload = await self.request_backend(backend, "GET", "/user/list", params={"page": page, "page_size": 100})
@@ -847,6 +861,7 @@ class LiteLLMClient:
             total_pages = _as_int(payload.get("total_pages")) if isinstance(payload, dict) else 0
             if total_pages and page >= total_pages:
                 break
+        self._cache("_users_cache").set(cache_key, users, _env_int("USERS_CACHE_TTL_SECONDS", 1800))
         return users
 
     async def admin_daily_activity_rows(self, start_date: str, end_date: str, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
@@ -978,6 +993,10 @@ class LiteLLMClient:
 
     async def team_map(self, backend: LiteLLMBackend | None = None) -> dict[str, dict[str, str]]:
         backend = backend or self.backends[0]
+        cache_key = f"team-map:{backend.id}"
+        hit, value, _ = self._cache("_team_map_cache").get(cache_key)
+        if hit:
+            return value
         mapping: dict[str, dict[str, str]] = {}
         for team in await self.teams(backend, include_details=False):
             team_id = str(_first(team, "team_id", "id", default="") or "").strip()
@@ -985,6 +1004,7 @@ class LiteLLMClient:
                 continue
             team_alias = str(_first(team, "team_alias", "alias", "name", default="") or "").strip()
             mapping[team_id.lower()] = {"id": team_id, "name": team_alias or team_id}
+        self._cache("_team_map_cache").set(cache_key, mapping, _env_int("TEAM_MAP_CACHE_TTL_SECONDS", 600))
         return mapping
 
     async def team_info(self, backend: LiteLLMBackend, team_id: str) -> dict[str, Any] | None:
@@ -1019,6 +1039,10 @@ class LiteLLMClient:
 
     async def teams(self, backend: LiteLLMBackend | None = None, include_details: bool = True) -> list[dict[str, Any]]:
         backend = backend or self.backends[0]
+        cache_key = f"teams:{backend.id}:{'details' if include_details else 'list'}"
+        hit, value, _ = self._cache("_teams_cache").get(cache_key)
+        if hit:
+            return value
         for path in ("/v2/team/list", "/team/list"):
             teams: list[dict[str, Any]] = []
             for page in range(1, 51):
@@ -1034,7 +1058,10 @@ class LiteLLMClient:
                 if not total_pages and not has_more:
                     break
             if teams:
-                return await self._teams_with_details(backend, teams) if include_details else teams
+                result = await self._teams_with_details(backend, teams) if include_details else teams
+                self._cache("_teams_cache").set(cache_key, result, _env_int("TEAMS_CACHE_TTL_SECONDS", 600))
+                return result
+        self._cache("_teams_cache").set(cache_key, [], _env_int("TEAMS_CACHE_TTL_SECONDS", 600))
         return []
 
     def _team_summary(self, team: dict[str, Any], backend: LiteLLMBackend) -> dict[str, Any]:

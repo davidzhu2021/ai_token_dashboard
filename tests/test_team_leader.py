@@ -200,7 +200,7 @@ def test_teams_hydrates_v2_list_with_team_info(monkeypatch) -> None:
     scope = asyncio.run(client.team_leader_scope({"matched_accounts": [{"backend": "primary", "user_id": "leader-user"}]}))
 
     assert teams[0]["members_with_roles"][0]["user_id"] == "leader-user"
-    assert calls == [("GET", "/v2/team/list"), ("GET", "/team/info"), ("GET", "/v2/team/list"), ("GET", "/team/info")]
+    assert calls == [("GET", "/v2/team/list"), ("GET", "/team/info")]
     assert scope["isTeamLeader"] is True
     assert scope["team"]["id"] == "team-a"
 
