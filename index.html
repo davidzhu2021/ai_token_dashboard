@@ -607,14 +607,6 @@
         padding: 30px 28px 36px;
       }
 
-      .hero-band {
-        display: grid;
-        grid-template-columns: minmax(0, 1fr) 340px;
-        gap: 18px;
-        align-items: stretch;
-        margin-bottom: 18px;
-      }
-
       .hero-copy {
         padding: 32px;
         border: 1px solid var(--line);
@@ -658,39 +650,144 @@
         margin: 0;
       }
 
-      .status-card {
-        padding: 22px;
+      .daily-overview {
+        display: grid;
+        grid-template-columns: minmax(340px, 1.35fr) minmax(260px, 0.8fr) minmax(260px, 0.8fr);
+        gap: 14px;
+        margin-bottom: 18px;
+      }
+
+      .daily-main-card,
+      .daily-stat-card {
+        border: 1px solid var(--line);
         border-radius: var(--radius);
+        box-shadow: var(--shadow-soft);
+        backdrop-filter: blur(18px);
+      }
+
+      .daily-main-card {
+        min-width: 0;
+        padding: 22px 24px;
         background:
-          linear-gradient(145deg, rgba(23, 33, 31, 0.98), rgba(33, 77, 66, 0.94)),
-          var(--ink);
-        color: white;
+          linear-gradient(130deg, rgba(255, 255, 255, 0.97), rgba(232, 247, 241, 0.82)),
+          var(--panel);
         display: grid;
         align-content: space-between;
-        gap: 26px;
-        box-shadow: 0 24px 52px rgba(23, 33, 31, 0.16);
+        gap: 20px;
+        overflow: hidden;
+        position: relative;
       }
 
-      .status-card span {
-        color: rgba(255, 255, 255, 0.7);
+      .daily-main-card::after {
+        content: "";
+        position: absolute;
+        inset: auto 18px 16px auto;
+        width: 126px;
+        height: 42px;
+        background:
+          linear-gradient(90deg, var(--leaf) 0 24%, transparent 24% 34%, var(--gold) 34% 52%, transparent 52% 62%, var(--blue) 62% 84%, transparent 84%);
+        opacity: 0.1;
+      }
+
+      .daily-eyebrow,
+      .daily-label {
+        color: var(--muted);
         font-size: 13px;
+        font-weight: 800;
       }
 
-      .status-card strong {
-        font-size: 34px;
+      .daily-main-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: flex-start;
+        position: relative;
+        z-index: 1;
       }
 
-      .status-grid {
+      .daily-context {
+        color: var(--muted);
+        font-size: 13px;
+        text-align: right;
+        line-height: 1.6;
+      }
+
+      .daily-main-values {
         display: grid;
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: minmax(0, 1fr) minmax(160px, 0.42fr);
+        gap: 18px;
+        align-items: end;
+        position: relative;
+        z-index: 1;
+      }
+
+      .daily-value {
+        display: block;
+        margin-top: 6px;
+        font-size: clamp(34px, 5vw, 58px);
+        line-height: 0.95;
+        letter-spacing: 0;
+        font-weight: 900;
+      }
+
+      .daily-money {
+        display: block;
+        margin-top: 6px;
+        font-size: clamp(24px, 2.4vw, 34px);
+        line-height: 1;
+        letter-spacing: 0;
+        font-weight: 900;
+        color: var(--gold);
+      }
+
+      .daily-stat-card {
+        min-width: 0;
+        padding: 18px;
+        background: rgba(255, 255, 255, 0.72);
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 10px;
       }
 
-      .status-mini {
-        padding: 12px;
-        border: 1px solid rgba(255, 255, 255, 0.16);
-        background: rgba(255, 255, 255, 0.08);
-        border-radius: 14px;
+      .daily-mini {
+        min-width: 0;
+        min-height: 104px;
+        padding: 14px;
+        border: 1px solid rgba(23, 33, 31, 0.08);
+        border-radius: var(--radius-sm);
+        background: rgba(255, 255, 255, 0.68);
+        display: grid;
+        align-content: space-between;
+        gap: 12px;
+      }
+
+      .daily-mini.accent {
+        background:
+          linear-gradient(145deg, rgba(23, 33, 31, 0.96), rgba(33, 77, 66, 0.92)),
+          var(--ink);
+        color: white;
+      }
+
+      .daily-mini.accent .daily-label {
+        color: rgba(255, 255, 255, 0.68);
+      }
+
+      .daily-mini strong {
+        display: block;
+        overflow-wrap: anywhere;
+        font-size: 30px;
+        line-height: 1;
+        font-weight: 900;
+      }
+
+      .daily-mini .daily-sub {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .daily-mini.accent .daily-sub {
+        color: rgba(255, 255, 255, 0.62);
       }
 
       .metrics {
@@ -1559,7 +1656,7 @@
           grid-template-columns: repeat(2, minmax(0, 1fr));
         }
 
-        .hero-band,
+        .daily-overview,
         .trend-grid,
         .dashboard-grid,
         .full-width-grid,
@@ -1675,9 +1772,21 @@
           grid-template-columns: 90px 1fr 72px;
         }
 
-        .status-grid,
+        .daily-main-values,
         .key-meta {
           grid-template-columns: 1fr;
+        }
+
+        .daily-main-head {
+          display: grid;
+        }
+
+        .daily-context {
+          text-align: left;
+        }
+
+        .daily-stat-card {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
         }
 
         .user-pill {
@@ -1829,20 +1938,45 @@
 
       <main class="main">
         <section id="dashboardView" class="view-section">
-        <section class="hero-band">
-          <div class="hero-copy">
-            <span class="eyebrow">个人用量概览</span>
-            <h2 id="welcomeTitle">今天的 AI 工具消耗一眼看清</h2>
-            <p>按日期和工具来源聚合你的个人使用记录，快速了解 Token、请求次数、成功率和预估成本。</p>
-          </div>
-          <div class="status-card">
-            <div>
-              <span id="heroTotalLabel">筛选范围 Token</span>
-              <strong id="heroTotal">0</strong>
+        <section class="daily-overview" aria-label="最近一天用量摘要">
+          <div class="daily-main-card">
+            <div class="daily-main-head">
+              <span class="daily-eyebrow">最近一天 · 个人用量</span>
+              <span id="heroContext" class="daily-context">近 7 天 · 全部来源 · 最新数据日 暂无日期</span>
             </div>
-            <div class="status-grid">
-              <div class="status-mini"><span>成功率</span><strong id="heroSuccess">0%</strong></div>
-              <div class="status-mini"><span>请求次数</span><strong id="heroRequests">0</strong></div>
+            <div class="daily-main-values">
+              <div>
+                <span id="heroTotalLabel" class="daily-label">最近一天 Token</span>
+                <strong id="heroTotal" class="daily-value">0</strong>
+              </div>
+              <div>
+                <span class="daily-label">预估金额</span>
+                <strong id="heroSpend" class="daily-money">$0.00</strong>
+              </div>
+            </div>
+          </div>
+          <div class="daily-stat-card">
+            <div class="daily-mini">
+              <span class="daily-label">请求次数</span>
+              <strong id="heroRequests">0</strong>
+              <span id="heroRequestsSub" class="daily-sub">最近一天累计</span>
+            </div>
+            <div class="daily-mini">
+              <span class="daily-label">成功率</span>
+              <strong id="heroSuccess">0%</strong>
+              <span id="heroSuccessSub" class="daily-sub">0 / 0 次成功</span>
+            </div>
+          </div>
+          <div class="daily-stat-card">
+            <div class="daily-mini accent">
+              <span class="daily-label">范围占比</span>
+              <strong id="heroShare">0%</strong>
+              <span id="heroShareSub" class="daily-sub">占所选范围 Token</span>
+            </div>
+            <div class="daily-mini">
+              <span class="daily-label">数据日期</span>
+              <strong id="heroDate">暂无</strong>
+              <span class="daily-sub">当前筛选下最新日期</span>
             </div>
           </div>
         </section>
@@ -1963,20 +2097,45 @@
         </section>
 
         <section id="adminView" class="view-section hidden">
-          <section class="hero-band">
-            <div class="hero-copy">
-              <span class="eyebrow">管理员视图</span>
-              <h2 id="adminWelcomeTitle">全员 AI 用量总览</h2>
-              <p>按当前日期范围和工具来源聚合全员使用记录，快速定位 Token、金额、请求质量和高消耗员工。</p>
-            </div>
-            <div class="status-card">
-              <div>
-                <span id="adminHeroTotalLabel">全员 Token</span>
-                <strong id="adminHeroTotal">0</strong>
+          <section class="daily-overview" aria-label="最近一天全员用量摘要">
+            <div class="daily-main-card">
+              <div class="daily-main-head">
+                <span id="adminHeroTitle" class="daily-eyebrow">最近一天 · 管理员视图</span>
+                <span id="adminHeroContext" class="daily-context">近 7 天 · 全部来源 · 最新数据日 暂无日期</span>
               </div>
-              <div class="status-grid">
-                <div class="status-mini"><span>活跃员工</span><strong id="adminActiveUsers">0</strong></div>
-                <div class="status-mini"><span>请求次数</span><strong id="adminHeroRequests">0</strong></div>
+              <div class="daily-main-values">
+                <div>
+                  <span id="adminHeroTotalLabel" class="daily-label">最近一天 Token</span>
+                  <strong id="adminHeroTotal" class="daily-value">0</strong>
+                </div>
+                <div>
+                  <span class="daily-label">预估金额</span>
+                  <strong id="adminHeroSpend" class="daily-money">$0.00</strong>
+                </div>
+              </div>
+            </div>
+            <div class="daily-stat-card">
+              <div class="daily-mini">
+                <span class="daily-label">请求次数</span>
+                <strong id="adminHeroRequests">0</strong>
+                <span id="adminHeroRequestsSub" class="daily-sub">最近一天累计</span>
+              </div>
+              <div class="daily-mini">
+                <span class="daily-label">成功率</span>
+                <strong id="adminHeroSuccess">0%</strong>
+                <span id="adminHeroSuccessSub" class="daily-sub">0 / 0 次成功</span>
+              </div>
+            </div>
+            <div class="daily-stat-card">
+              <div class="daily-mini accent">
+                <span class="daily-label">活跃员工</span>
+                <strong id="adminActiveUsers">0</strong>
+                <span id="adminActiveUsersSub" class="daily-sub">当前筛选范围</span>
+              </div>
+              <div class="daily-mini">
+                <span class="daily-label">数据日期</span>
+                <strong id="adminHeroDate">暂无</strong>
+                <span class="daily-sub">当前筛选下最新日期</span>
               </div>
             </div>
           </section>
@@ -2125,20 +2284,45 @@
               <select id="teamSelect" class="select" aria-label="选择团队"></select>
             </div>
 
-            <section class="hero-band">
-              <div class="hero-copy">
-                <span class="eyebrow">团队视图 · 成员用量</span>
-                <h2 id="teamWelcomeTitle">团队 AI 用量总览</h2>
-                <p id="teamWelcomeDesc">当前展示团队成员在所选日期范围与来源筛选下的汇总数据。</p>
-              </div>
-              <div class="status-card">
-                <div>
-                  <span id="teamHeroTotalLabel">团队 Token</span>
-                  <strong id="teamHeroTotal">0</strong>
+            <section class="daily-overview" aria-label="最近一天团队用量摘要">
+              <div class="daily-main-card">
+                <div class="daily-main-head">
+                  <span id="teamWelcomeTitle" class="daily-eyebrow">最近一天 · 团队视图</span>
+                  <span id="teamHeroContext" class="daily-context">近 7 天 · 全部来源 · 最新数据日 暂无日期</span>
                 </div>
-                <div class="status-grid">
-                  <div class="status-mini"><span>活跃成员</span><strong id="teamActiveUsers">0</strong></div>
-                  <div class="status-mini"><span>团队请求次数</span><strong id="teamHeroRequests">0</strong></div>
+                <div class="daily-main-values">
+                  <div>
+                    <span id="teamHeroTotalLabel" class="daily-label">最近一天 Token</span>
+                    <strong id="teamHeroTotal" class="daily-value">0</strong>
+                  </div>
+                  <div>
+                    <span class="daily-label">预估金额</span>
+                    <strong id="teamHeroSpend" class="daily-money">$0.00</strong>
+                  </div>
+                </div>
+              </div>
+              <div class="daily-stat-card">
+                <div class="daily-mini">
+                  <span class="daily-label">请求次数</span>
+                  <strong id="teamHeroRequests">0</strong>
+                  <span id="teamHeroRequestsSub" class="daily-sub">最近一天累计</span>
+                </div>
+                <div class="daily-mini">
+                  <span class="daily-label">成功率</span>
+                  <strong id="teamHeroSuccess">0%</strong>
+                  <span id="teamHeroSuccessSub" class="daily-sub">0 / 0 次成功</span>
+                </div>
+              </div>
+              <div class="daily-stat-card">
+                <div class="daily-mini accent">
+                  <span class="daily-label">活跃成员</span>
+                  <strong id="teamActiveUsers">0</strong>
+                  <span id="teamActiveUsersSub" class="daily-sub">当前筛选范围</span>
+                </div>
+                <div class="daily-mini">
+                  <span class="daily-label">数据日期</span>
+                  <strong id="teamHeroDate">暂无</strong>
+                  <span class="daily-sub">当前筛选下最新日期</span>
                 </div>
               </div>
             </section>
@@ -2260,20 +2444,45 @@
         </section>
 
         <section id="departmentView" class="view-section hidden">
-          <section id="departmentOverviewHero" class="hero-band">
-            <div class="hero-copy">
-              <span class="eyebrow">部门视图 · 真实数据</span>
-              <h2 id="departmentWelcomeTitle">全部部门 AI 用量总览</h2>
-              <p id="departmentWelcomeDesc">当前展示所有部门在所选日期范围与来源筛选下的汇总数据。</p>
-            </div>
-            <div class="status-card">
-              <div>
-                <span id="departmentHeroTotalLabel">部门 Token</span>
-                <strong id="departmentHeroTotal">0</strong>
+          <section id="departmentOverviewHero" class="daily-overview" aria-label="最近一天部门用量摘要">
+            <div class="daily-main-card">
+              <div class="daily-main-head">
+                <span id="departmentWelcomeTitle" class="daily-eyebrow">最近一天 · 部门视图</span>
+                <span id="departmentHeroContext" class="daily-context">近 7 天 · 全部来源 · 最新数据日 暂无日期</span>
               </div>
-              <div class="status-grid">
-                <div class="status-mini"><span id="departmentActiveLabel">活跃部门</span><strong id="departmentActiveUsers">0</strong></div>
-                <div class="status-mini"><span id="departmentRequestLabel">全部部门请求次数</span><strong id="departmentHeroRequests">0</strong></div>
+              <div class="daily-main-values">
+                <div>
+                  <span id="departmentHeroTotalLabel" class="daily-label">最近一天 Token</span>
+                  <strong id="departmentHeroTotal" class="daily-value">0</strong>
+                </div>
+                <div>
+                  <span class="daily-label">预估金额</span>
+                  <strong id="departmentHeroSpend" class="daily-money">$0.00</strong>
+                </div>
+              </div>
+            </div>
+            <div class="daily-stat-card">
+              <div class="daily-mini">
+                <span class="daily-label">请求次数</span>
+                <strong id="departmentHeroRequests">0</strong>
+                <span id="departmentHeroRequestsSub" class="daily-sub">最近一天累计</span>
+              </div>
+              <div class="daily-mini">
+                <span class="daily-label">成功率</span>
+                <strong id="departmentHeroSuccess">0%</strong>
+                <span id="departmentHeroSuccessSub" class="daily-sub">0 / 0 次成功</span>
+              </div>
+            </div>
+            <div class="daily-stat-card">
+              <div class="daily-mini accent">
+                <span id="departmentActiveLabel" class="daily-label">活跃部门</span>
+                <strong id="departmentActiveUsers">0</strong>
+                <span id="departmentActiveUsersSub" class="daily-sub">当前筛选范围</span>
+              </div>
+              <div class="daily-mini">
+                <span class="daily-label">数据日期</span>
+                <strong id="departmentHeroDate">暂无</strong>
+                <span class="daily-sub">当前筛选下最新日期</span>
               </div>
             </div>
           </section>

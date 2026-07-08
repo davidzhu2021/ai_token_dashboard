@@ -120,8 +120,79 @@ function aggregateByDate(data) {
       promptTokens: sum(grouped[date], "promptTokens"),
       completionTokens: sum(grouped[date], "completionTokens"),
       totalTokens: sum(grouped[date], "totalTokens"),
+      requestCount: sum(grouped[date], "requestCount"),
+      successCount: sum(grouped[date], "successCount"),
+      failureCount: sum(grouped[date], "failureCount"),
       spend: sum(grouped[date], "spend"),
     }));
+}
+
+function successRateText(requests, successes) {
+  return requests ? `${Math.round((successes / requests) * 1000) / 10}%` : "0%";
+}
+
+function latestUsageDay(data, summary = null) {
+  return summary?.latestDay || aggregateByDate(data).slice(-1)[0] || {};
+}
+
+function overviewContext(latestDate) {
+  const dateText = latestDate || "暂无日期";
+  return `${rangeLabel()} · ${sourceText()} · 最新数据日 ${dateText}`;
+}
+
+function tokenShareText(latestTokens, totalTokens) {
+  if (!totalTokens) return "0%";
+  return `${Math.round((latestTokens / totalTokens) * 1000) / 10}%`;
+}
+
+function setText(id, value) {
+  const node = el(id);
+  if (node) node.textContent = value;
+}
+
+function renderDailyOverview(config) {
+  const {
+    prefix,
+    data,
+    summary = null,
+    title,
+    totalLabel = "最近一天 Token",
+    sideLabel,
+    sideValue,
+    sideSub = "当前筛选范围",
+    showShare = false,
+  } = config;
+  const latest = latestUsageDay(data, summary);
+  const latestDate = latest.date || "";
+  const latestTokens = Number(latest.totalTokens || 0);
+  const latestSpend = Number(latest.spend || 0);
+  const latestRequests = Number(latest.requestCount || 0);
+  const latestSuccesses = Number(latest.successCount || 0);
+  const totalTokens = sum(data, "totalTokens");
+  const baseId = prefix ? `${prefix}Hero` : "hero";
+
+  setText(`${baseId}TotalLabel`, totalLabel);
+  setText(`${baseId}Total`, formatTokens(latestTokens));
+  setText(`${baseId}Spend`, money.format(latestSpend));
+  setText(`${baseId}Requests`, fmt.format(latestRequests));
+  setText(`${baseId}RequestsSub`, latestDate ? `${latestDate} 累计` : "暂无最新日期");
+  setText(`${baseId}Success`, successRateText(latestRequests, latestSuccesses));
+  setText(`${baseId}SuccessSub`, `${fmt.format(latestSuccesses)} / ${fmt.format(latestRequests)} 次成功`);
+  setText(`${baseId}Context`, overviewContext(latestDate));
+  setText(`${baseId}Date`, latestDate || "暂无");
+
+  if (prefix === "admin") setText("adminHeroTitle", title);
+  if (prefix === "team" || prefix === "department") setText(`${prefix}WelcomeTitle`, title);
+
+  if (showShare) {
+    const share = tokenShareText(latestTokens, totalTokens);
+    setText("heroShare", share);
+    setText("heroShareSub", "占所选范围 Token");
+  } else {
+    setText(`${prefix}ActiveUsers`, fmt.format(sideValue || 0));
+    setText(`${prefix}ActiveUsersSub`, sideSub);
+    if (sideLabel) setText(`${prefix}ActiveLabel`, sideLabel);
+  }
 }
 
 function icon(name) {
@@ -223,16 +294,14 @@ function renderMetricGroups(containerId, data, mode = "personal", summary = null
 }
 
 function renderPersonalMetrics(data) {
-  const total = sum(data, "totalTokens");
-  const requests = sum(data, "requestCount");
-  const successes = sum(data, "successCount");
-  const successRate = requests ? Math.round((successes / requests) * 1000) / 10 : 0;
   const label = rangeLabel();
   const source = sourceText();
-  el("heroTotal").textContent = formatTokens(total);
-  el("heroSuccess").textContent = `${successRate}%`;
-  el("heroRequests").textContent = fmt.format(requests);
-  el("heroTotalLabel").textContent = `${label} Token`;
+  renderDailyOverview({
+    prefix: "",
+    data,
+    summary: usageSummary,
+    showShare: true,
+  });
   el("trendBadge").textContent = `${label} · ${source}`;
   el("spendBadge").textContent = `${label} · ${source}`;
   renderMetricGroups("metrics", data, "personal", usageSummary);
@@ -240,37 +309,36 @@ function renderPersonalMetrics(data) {
 
 function renderAdminMetrics(data) {
   const totalData = adminSummaryData.length ? adminSummaryData : data;
-  const total = sum(totalData, "totalTokens");
-  const requests = sum(totalData, "requestCount");
   const label = rangeLabel();
   const source = sourceText();
-  el("adminHeroTotal").textContent = formatTokens(total);
-  el("adminHeroTotalLabel").textContent = selectedAdminEmployee ? "员工 Token" : "全员 Token";
-  el("adminHeroRequests").textContent = fmt.format(requests);
-  el("adminActiveUsers").textContent = fmt.format(adminEmployees.length);
+  renderDailyOverview({
+    prefix: "admin",
+    data: totalData,
+    title: selectedAdminEmployee ? "最近一天 · 员工视图" : "最近一天 · 管理员视图",
+    totalLabel: selectedAdminEmployee ? "最近一天员工 Token" : "最近一天全员 Token",
+    sideValue: adminEmployees.length,
+    sideSub: selectedAdminEmployee ? "当前员工" : "当前筛选范围",
+  });
   el("adminTrendBadge").textContent = `${label} · ${source}`;
   el("adminSpendBadge").textContent = `${label} · ${source}`;
   renderMetricGroups("adminMetrics", totalData, "admin", null, data);
 }
 
 function renderDepartmentMetrics(data) {
-  const total = sum(data, "totalTokens");
-  const requests = sum(data, "requestCount");
   const label = rangeLabel();
   const source = sourceText();
   const scopeLabel = departmentScopeLabel();
-  el("departmentHeroTotal").textContent = formatTokens(total);
-  el("departmentHeroTotalLabel").textContent = `${scopeLabel} Token`;
-  el("departmentHeroRequests").textContent = fmt.format(requests);
-  el("departmentActiveUsers").textContent = fmt.format(selectedDepartment ? departmentEmployees.length : departmentRankings.length);
-  el("departmentRequestLabel").textContent = `${scopeLabel}请求次数`;
+  renderDailyOverview({
+    prefix: "department",
+    data,
+    title: `最近一天 · ${scopeLabel}`,
+    totalLabel: "最近一天 Token",
+    sideLabel: selectedDepartment ? "活跃员工" : "活跃部门",
+    sideValue: selectedDepartment ? departmentEmployees.length : departmentRankings.length,
+    sideSub: selectedDepartment ? "当前部门" : "当前筛选范围",
+  });
   el("departmentTrendBadge").textContent = `${label} · ${source}`;
   el("departmentSpendBadge").textContent = `${label} · ${source}`;
-  el("departmentWelcomeTitle").textContent = `${scopeLabel} AI 用量总览`;
-  el("departmentWelcomeDesc").textContent = selectedDepartment
-    ? `当前展示 ${scopeLabel} 在所选日期范围与来源筛选下的员工用量明细。`
-    : "当前展示所有部门在所选日期范围与来源筛选下的汇总数据。";
-  el("departmentActiveLabel").textContent = selectedDepartment ? "活跃员工" : "活跃部门";
   el("departmentTrendTitle").textContent = `${scopeLabel}每日 Token 趋势`;
   el("departmentTrendDesc").textContent = `按日期汇总${scopeLabel} Prompt 与 Completion Token。`;
   el("departmentSpendTitle").textContent = `${scopeLabel}每日金额消费趋势`;
@@ -288,7 +356,6 @@ function setDepartmentOverviewVisible(visible) {
   [
     "departmentOverviewHero",
     "departmentMetrics",
-    "departmentDetailCard",
     "departmentTrendGrid",
     "departmentSourceGrid",
     "departmentBreakdownGrid",
@@ -326,20 +393,20 @@ function renderTeamSelector() {
 }
 
 function renderTeamMetrics(data) {
-  const total = sum(data, "totalTokens");
-  const requests = sum(data, "requestCount");
   const label = rangeLabel();
   const source = sourceText();
   const scopeLabel = teamScopeLabel();
   const activeMembers = teamEmployees.filter((item) => Number(item.totalTokens || 0) > 0 || Number(item.requestCount || 0) > 0).length;
-  el("teamHeroTotal").textContent = formatTokens(total);
-  el("teamHeroTotalLabel").textContent = `${scopeLabel} Token`;
-  el("teamHeroRequests").textContent = fmt.format(requests);
-  el("teamActiveUsers").textContent = fmt.format(activeMembers);
+  renderDailyOverview({
+    prefix: "team",
+    data,
+    title: `最近一天 · ${scopeLabel}`,
+    totalLabel: "最近一天 Token",
+    sideValue: activeMembers,
+    sideSub: "当前筛选范围",
+  });
   el("teamTrendBadge").textContent = `${label} · ${source}`;
   el("teamSpendBadge").textContent = `${label} · ${source}`;
-  el("teamWelcomeTitle").textContent = `${scopeLabel} AI 用量总览`;
-  el("teamWelcomeDesc").textContent = `当前展示团队成员在所选日期范围与来源筛选下的汇总数据。`;
   el("teamTrendTitle").textContent = `${scopeLabel}每日 Token 趋势`;
   el("teamTrendDesc").textContent = `按日期汇总${scopeLabel} Prompt 与 Completion Token。`;
   el("teamSpendTitle").textContent = `${scopeLabel}每日金额消费趋势`;
@@ -883,9 +950,16 @@ function renderPersonalLoading() {
   const label = rangeLabel();
   const source = sourceText();
   el("heroTotal").textContent = "加载中";
+  el("heroSpend").textContent = "--";
   el("heroSuccess").textContent = "--";
+  el("heroSuccessSub").textContent = "-- / -- 次成功";
   el("heroRequests").textContent = "--";
-  el("heroTotalLabel").textContent = `${label} Token`;
+  el("heroRequestsSub").textContent = "数据加载中";
+  el("heroShare").textContent = "--";
+  el("heroShareSub").textContent = "占所选范围 Token";
+  el("heroDate").textContent = "加载中";
+  el("heroContext").textContent = `${label} · ${source} · 数据加载中`;
+  el("heroTotalLabel").textContent = "最近一天 Token";
   el("trendBadge").textContent = `${label} · ${source}`;
   el("spendBadge").textContent = `${label} · ${source}`;
   renderMetricSkeleton("metrics");
@@ -901,9 +975,17 @@ function renderAdminLoading() {
   const label = rangeLabel();
   const source = sourceText();
   el("adminHeroTotal").textContent = "加载中";
-  el("adminHeroTotalLabel").textContent = selectedAdminEmployee ? "员工 Token" : "全员 Token";
+  el("adminHeroSpend").textContent = "--";
+  el("adminHeroTotalLabel").textContent = selectedAdminEmployee ? "最近一天员工 Token" : "最近一天全员 Token";
+  el("adminHeroTitle").textContent = selectedAdminEmployee ? "最近一天 · 员工视图" : "最近一天 · 管理员视图";
   el("adminHeroRequests").textContent = "--";
+  el("adminHeroRequestsSub").textContent = "数据加载中";
+  el("adminHeroSuccess").textContent = "--";
+  el("adminHeroSuccessSub").textContent = "-- / -- 次成功";
+  el("adminHeroDate").textContent = "加载中";
+  el("adminHeroContext").textContent = `${label} · ${source} · 数据加载中`;
   el("adminActiveUsers").textContent = "--";
+  el("adminActiveUsersSub").textContent = selectedAdminEmployee ? "当前员工" : "当前筛选范围";
   el("adminTrendBadge").textContent = `${label} · ${source}`;
   el("adminSpendBadge").textContent = `${label} · ${source}`;
   el("adminLimitHint").textContent = "数据加载中";
@@ -917,19 +999,27 @@ function renderAdminLoading() {
 }
 
 function renderDepartmentLoading() {
-  setDepartmentOverviewVisible(Boolean(selectedDepartment));
+  setDepartmentOverviewVisible(true);
   const label = rangeLabel();
   const source = sourceText();
   const scopeLabel = departmentScopeLabel();
   el("departmentHeroTotal").textContent = "加载中";
-  el("departmentHeroTotalLabel").textContent = `${scopeLabel} Token`;
+  el("departmentHeroSpend").textContent = "--";
+  el("departmentHeroTotalLabel").textContent = "最近一天 Token";
+  el("departmentWelcomeTitle").textContent = `最近一天 · ${scopeLabel}`;
   el("departmentHeroRequests").textContent = "--";
-  el("departmentRequestLabel").textContent = `${scopeLabel}请求次数`;
+  el("departmentHeroRequestsSub").textContent = "数据加载中";
+  el("departmentHeroSuccess").textContent = "--";
+  el("departmentHeroSuccessSub").textContent = "-- / -- 次成功";
+  el("departmentHeroDate").textContent = "加载中";
+  el("departmentHeroContext").textContent = `${label} · ${source} · 数据加载中`;
   el("departmentActiveUsers").textContent = "--";
   el("departmentActiveLabel").textContent = selectedDepartment ? "活跃员工" : "活跃部门";
+  el("departmentActiveUsersSub").textContent = selectedDepartment ? "当前部门" : "当前筛选范围";
   el("departmentTrendBadge").textContent = `${label} · ${source}`;
   el("departmentSpendBadge").textContent = `${label} · ${source}`;
   el("departmentLimitHint").textContent = "数据加载中";
+  el("departmentDetailCard").classList.toggle("show", Boolean(selectedDepartment));
   renderMetricSkeleton("departmentMetrics");
   renderChartSkeleton("departmentTrendChart");
   renderChartSkeleton("departmentSpendChart");
@@ -944,9 +1034,17 @@ function renderTeamLoading() {
   const source = sourceText();
   const scopeLabel = teamScopeLabel();
   el("teamHeroTotal").textContent = "加载中";
-  el("teamHeroTotalLabel").textContent = `${scopeLabel} Token`;
+  el("teamHeroSpend").textContent = "--";
+  el("teamHeroTotalLabel").textContent = "最近一天 Token";
   el("teamHeroRequests").textContent = "--";
+  el("teamHeroRequestsSub").textContent = "数据加载中";
+  el("teamHeroSuccess").textContent = "--";
+  el("teamHeroSuccessSub").textContent = "-- / -- 次成功";
+  el("teamHeroDate").textContent = "加载中";
+  el("teamHeroContext").textContent = `${label} · ${source} · 数据加载中`;
   el("teamActiveUsers").textContent = "--";
+  el("teamActiveUsersSub").textContent = "当前筛选范围";
+  el("teamWelcomeTitle").textContent = `最近一天 · ${scopeLabel}`;
   el("teamTrendBadge").textContent = `${label} · ${source}`;
   el("teamSpendBadge").textContent = `${label} · ${source}`;
   el("teamLimitHint").textContent = "数据加载中";
@@ -1001,16 +1099,14 @@ function renderDepartment() {
     renderDepartmentLoading();
     return;
   }
-  setDepartmentOverviewVisible(Boolean(selectedDepartment));
+  setDepartmentOverviewVisible(true);
   const totalData = departmentSummaryData.length ? departmentSummaryData : departmentUsageData;
-  if (selectedDepartment) {
-    renderDepartmentMetrics(totalData);
-    renderTrendTo("departmentTrendChart", totalData);
-    renderSpendTrendTo("departmentSpendChart", totalData);
-    renderDonutTo("departmentSourceDonut", "departmentDonutTotal", "departmentSourceLegend", departmentUsageData);
-    renderModelBarsTo("departmentModelBars", departmentUsageData);
-    renderSplitTo("departmentSplitChart", departmentUsageData);
-  }
+  renderDepartmentMetrics(totalData);
+  renderTrendTo("departmentTrendChart", totalData);
+  renderSpendTrendTo("departmentSpendChart", totalData);
+  renderDonutTo("departmentSourceDonut", "departmentDonutTotal", "departmentSourceLegend", departmentUsageData);
+  renderModelBarsTo("departmentModelBars", departmentUsageData);
+  renderSplitTo("departmentSplitChart", departmentUsageData);
   renderDepartmentUsers();
   renderDepartmentPickerOptions();
 
@@ -1310,10 +1406,8 @@ async function showApp(user) {
   el("userEmail").textContent = user.email;
   el("userName").textContent = user.name;
   el("avatar").textContent = user.avatar || initials(user.email, user.name);
-  el("welcomeTitle").textContent = `${user.name}您好，今天的 AI 工具消耗一眼看清`;
-  el("adminWelcomeTitle").textContent = `${user.name}您好，全员 AI 用量一眼看清`;
-  el("teamWelcomeTitle").textContent = `${teamScopeLabel()} AI 用量总览`;
-  el("departmentWelcomeTitle").textContent = `${user.name}您好，部门 AI 用量一眼看清`;
+  el("teamWelcomeTitle").textContent = `最近一天 · ${teamScopeLabel()}`;
+  el("departmentWelcomeTitle").textContent = "最近一天 · 全部部门";
   switchView("dashboard");
   render();
   await Promise.all([loadCurrentViewData(), loadModels()]);
