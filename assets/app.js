@@ -1,8 +1,8 @@
 const sourceColors = {
-  Cursor: "#1f7a5b",
-  "Claude Code": "#b88727",
+  Cursor: "#0170c1",
+  "Claude Code": "#17b7d6",
   Her: "#d45d42",
-  "其他": "#2e6f9f",
+  "其他": "#6b7f93",
 };
 
 const sourceLabels = {
@@ -381,7 +381,7 @@ function tooltipMarkup(date, rows) {
 
 function renderEmptyChart(svg, label) {
   svg.setAttribute("viewBox", "0 0 900 280");
-  svg.innerHTML = `<rect width="900" height="280" rx="8" fill="#fffdf6"/><text x="450" y="140" fill="#65736f" font-size="16" text-anchor="middle">${label}</text>`;
+  svg.innerHTML = `<rect width="900" height="280" rx="8" fill="#f7fbff"/><text x="450" y="140" fill="#607181" font-size="16" text-anchor="middle">${label}</text>`;
 }
 
 function renderLineChart({ svg, points, valueField, color, fill, axisFormatter, tooltipRows }) {
@@ -402,7 +402,7 @@ function renderLineChart({ svg, points, valueField, color, fill, axisFormatter, 
   const grid = [0, 0.25, 0.5, 0.75, 1]
     .map((ratio) => {
       const yy = y(max * ratio);
-      return `<line x1="${pad.left}" y1="${yy}" x2="${width - pad.right}" y2="${yy}" stroke="#dbe2d5" stroke-dasharray="4 7"/><text x="12" y="${yy + 4}" fill="#65736f" font-size="12">${axisFormatter(max * ratio)}</text>`;
+      return `<line x1="${pad.left}" y1="${yy}" x2="${width - pad.right}" y2="${yy}" stroke="#d8e7f4" stroke-dasharray="4 7"/><text x="12" y="${yy + 4}" fill="#607181" font-size="12">${axisFormatter(max * ratio)}</text>`;
     })
     .join("");
   const dots = points
@@ -417,11 +417,11 @@ function renderLineChart({ svg, points, valueField, color, fill, axisFormatter, 
     .filter((_, index) => index === 0 || index === points.length - 1 || index % labelEvery === 0)
     .map((p, index, arr) => {
       const originalIndex = points.findIndex((item) => item.date === p.date);
-      return `<text x="${x(originalIndex)}" y="${height - 16}" fill="#65736f" font-size="12" text-anchor="${index === arr.length - 1 ? "end" : "middle"}">${p.date.slice(5)}</text>`;
+      return `<text x="${x(originalIndex)}" y="${height - 16}" fill="#607181" font-size="12" text-anchor="${index === arr.length - 1 ? "end" : "middle"}">${p.date.slice(5)}</text>`;
     })
     .join("");
 
-  svg.innerHTML = `<rect width="${width}" height="${height}" rx="8" fill="#fffdf6"/>${grid}<path d="${area}" fill="${fill}"/><path d="${path}" fill="none" stroke="${color}" stroke-width="4"/>${dots}${labels}`;
+  svg.innerHTML = `<rect width="${width}" height="${height}" rx="8" fill="#f7fbff"/>${grid}<path d="${area}" fill="${fill}"/><path d="${path}" fill="none" stroke="${color}" stroke-width="4"/>${dots}${labels}`;
   svg.querySelectorAll(".chart-hit").forEach((node) => {
     node.addEventListener("pointermove", (event) => showChartTooltip(event, decodeURIComponent(node.dataset.tooltip)));
     node.addEventListener("pointerleave", hideChartTooltip);
@@ -435,8 +435,8 @@ function renderTrendTo(svgId, data) {
     svg: el(svgId),
     points,
     valueField: "totalTokens",
-    color: "#1f7a5b",
-    fill: "rgba(31,122,91,.13)",
+    color: "#0170c1",
+    fill: "rgba(1,112,193,.13)",
     axisFormatter: formatTokens,
     tooltipRows: (p) => [
       { label: "总 Token", value: fmt.format(p.totalTokens) },
@@ -452,8 +452,8 @@ function renderSpendTrendTo(svgId, data) {
     svg: el(svgId),
     points,
     valueField: "spend",
-    color: "#b17916",
-    fill: "rgba(177,121,22,.13)",
+    color: "#a97812",
+    fill: "rgba(169,120,18,.13)",
     axisFormatter: (value) => money.format(value),
     tooltipRows: (p) => [{ label: "预估金额", value: money.format(p.spend) }],
   });
@@ -475,7 +475,7 @@ function renderDonutTo(svgId, totalId, legendId, data) {
       return circle;
     })
     .join("");
-  el(svgId).innerHTML = `<circle cx="90" cy="90" r="${radius}" fill="none" stroke="#edf0e8" stroke-width="18"/>${circles}`;
+  el(svgId).innerHTML = `<circle cx="90" cy="90" r="${radius}" fill="none" stroke="#e5f1fb" stroke-width="18"/>${circles}`;
   el(totalId).textContent = formatTokens(total);
   el(legendId).innerHTML = totals
     .map((item) => {
@@ -510,14 +510,14 @@ function renderSplitTo(svgId, data) {
   const promptWidth = (prompt / total) * 760;
   svg.setAttribute("viewBox", "0 0 820 236");
   svg.innerHTML = `
-    <rect width="820" height="236" rx="8" fill="#fffdf6"/>
-    <text x="30" y="42" fill="#65736f" font-size="14">Prompt Token</text>
-    <rect x="30" y="62" width="760" height="42" rx="6" fill="#edf0e8"/>
-    <rect x="30" y="62" width="${promptWidth}" height="42" rx="6" fill="#1f7a5b"/>
-    <text x="30" y="134" fill="#14201d" font-size="28" font-weight="800">${formatTokens(prompt)}</text>
-    <text x="30" y="176" fill="#65736f" font-size="14">Completion Token</text>
-    <rect x="30" y="196" width="760" height="18" rx="6" fill="#b88727"/>
-    <text x="660" y="176" fill="#14201d" font-size="28" font-weight="800">${formatTokens(completion)}</text>
+    <rect width="820" height="236" rx="8" fill="#f7fbff"/>
+    <text x="30" y="42" fill="#607181" font-size="14">Prompt Token</text>
+    <rect x="30" y="62" width="760" height="42" rx="6" fill="#e5f1fb"/>
+    <rect x="30" y="62" width="${promptWidth}" height="42" rx="6" fill="#0170c1"/>
+    <text x="30" y="134" fill="#102333" font-size="28" font-weight="800">${formatTokens(prompt)}</text>
+    <text x="30" y="176" fill="#607181" font-size="14">Completion Token</text>
+    <rect x="30" y="196" width="760" height="18" rx="6" fill="#17b7d6"/>
+    <text x="660" y="176" fill="#102333" font-size="28" font-weight="800">${formatTokens(completion)}</text>
   `;
 }
 
@@ -831,11 +831,11 @@ function renderChartSkeleton(svgId) {
   const svg = el(svgId);
   svg.setAttribute("viewBox", "0 0 900 280");
   svg.innerHTML = `
-    <rect width="900" height="280" rx="8" fill="#fffdf6"/>
-    <text x="450" y="126" fill="#65736f" font-size="16" font-weight="800" text-anchor="middle">正在汇总</text>
-    <text x="450" y="154" fill="#8a938f" font-size="13" text-anchor="middle">当前筛选范围</text>
-    <rect x="64" y="196" width="772" height="14" rx="7" fill="#e5ebe3"/>
-    <rect x="64" y="224" width="512" height="10" rx="5" fill="#edf1ea"/>
+    <rect width="900" height="280" rx="8" fill="#f7fbff"/>
+    <text x="450" y="126" fill="#607181" font-size="16" font-weight="800" text-anchor="middle">正在汇总</text>
+    <text x="450" y="154" fill="#8a96a3" font-size="13" text-anchor="middle">当前筛选范围</text>
+    <rect x="64" y="196" width="772" height="14" rx="7" fill="#dcecf8"/>
+    <rect x="64" y="224" width="512" height="10" rx="5" fill="#eaf4fc"/>
   `;
 }
 
@@ -855,7 +855,7 @@ function renderBarsSkeleton(containerId) {
       (_, index) => `
         <div class="bar-row">
           <strong><span class="loading-line" style="display:block;width:${70 - index * 6}px"></span></strong>
-          <div class="bar-track"><div class="bar-fill" style="width:${78 - index * 10}%;background:#dfe6de"></div></div>
+          <div class="bar-track"><div class="bar-fill" style="width:${78 - index * 10}%;background:#dcecf8"></div></div>
           <span class="num">--</span>
         </div>
       `,
@@ -867,10 +867,10 @@ function renderSplitSkeleton(svgId) {
   const svg = el(svgId);
   svg.setAttribute("viewBox", "0 0 820 236");
   svg.innerHTML = `
-    <rect width="820" height="236" rx="8" fill="#fffdf6"/>
-    <text x="410" y="102" fill="#65736f" font-size="16" font-weight="800" text-anchor="middle">正在汇总</text>
-    <rect x="30" y="132" width="760" height="24" rx="8" fill="#e5ebe3"/>
-    <rect x="30" y="176" width="520" height="16" rx="8" fill="#edf1ea"/>
+    <rect width="820" height="236" rx="8" fill="#f7fbff"/>
+    <text x="410" y="102" fill="#607181" font-size="16" font-weight="800" text-anchor="middle">正在汇总</text>
+    <rect x="30" y="132" width="760" height="24" rx="8" fill="#dcecf8"/>
+    <rect x="30" y="176" width="520" height="16" rx="8" fill="#eaf4fc"/>
   `;
 }
 
