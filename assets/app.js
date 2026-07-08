@@ -128,6 +128,10 @@ function icon(name) {
   return `<svg><use href="#icon-${name}"></use></svg>`;
 }
 
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
+}
+
 function metric(label, value, sub, chip, tone = "", iconName = "token") {
   return `
     <article class="metric-card">
@@ -207,15 +211,15 @@ function renderMetricGroups(containerId, data, mode = "personal", summary = null
       metric("最近一天 Token", formatTokens(latest.totalTokens || 0), latest.date ? `${latest.date} 的整日汇总` : `最新日期${scope}消耗`, "最近", "", "token"),
       metric("最近一天消耗金额", money.format(latest.spend || 0), latest.date ? `${latest.date} 的整日预估金额` : "最新日期预估金额", "最近", "gold", "cost"),
     ]),
-    metricGroup("所选范围消耗", `${label} · ${source}${scopeSuffix}`, [
+    metricGroup("范围消耗", `${label} · ${source}${scopeSuffix}`, [
       metric(`${label} Token`, formatTokens(total), "按当前日期与来源筛选累计", source, "gold", "trend"),
       metric(`${label} 消耗金额`, money.format(spend), "按上游记录汇总", "估算", "gold", "cost"),
     ]),
-    metricGroup("所选范围请求", `${label} · ${source}${scopeSuffix}`, [
+    metricGroup("请求质量", `${label} · ${source}${scopeSuffix}`, [
       metric(`${label} 请求次数`, fmt.format(requests), "按当前筛选累计", "请求", "blue", "request"),
       metric(`${label} 请求成功率`, `${successRate}%`, `${fmt.format(successes)} / ${fmt.format(requests)} 次成功`, "稳定", "", "success"),
     ]),
-    metricGroup("工具消耗拆分", `${label} · ${source}${scopeSuffix}`, [
+    metricGroup("工具拆分", `${label} · ${source}${scopeSuffix}`, [
       metric(`${label} Codex Token`, formatTokens(cursor), "Codex 相关消耗", "Codex", "", "cursor"),
       metric(`${label} Claude Code Token`, formatTokens(cc), "终端工具相关消耗", "Claude Code", "blue", "terminal"),
     ]),
@@ -490,7 +494,10 @@ function renderModelBarsTo(containerId, data) {
   const max = Math.max(1, ...rows.map((row) => row.value));
   el(containerId).innerHTML = rows.length
     ? rows
-        .map((row) => `<div class="bar-row"><strong>${row.model}</strong><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3, (row.value / max) * 100)}%"></div></div><span class="num">${formatTokens(row.value)}</span></div>`)
+        .map((row) => {
+          const modelName = escapeHtml(row.model);
+          return `<div class="bar-row"><strong title="${modelName}">${modelName}</strong><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3, (row.value / max) * 100)}%"></div></div><span class="num">${formatTokens(row.value)}</span></div>`;
+        })
         .join("")
     : `<div class="model-empty">当前筛选范围暂无模型用量</div>`;
 }
@@ -522,7 +529,8 @@ function renderTable(data) {
         .reverse()
         .map((item) => {
           const status = item.failureCount > 0 ? `<span class="chip rose">${item.failureCount} 次失败</span>` : `<span class="chip">正常</span>`;
-          return `<tr><td>${item.date}</td><td>${displaySource(item.source)}</td><td>${item.model}</td><td class="num">${fmt.format(item.requestCount || 0)}</td><td class="num">${fmt.format(item.promptTokens || 0)}</td><td class="num">${fmt.format(item.completionTokens || 0)}</td><td class="num"><strong>${fmt.format(item.totalTokens || 0)}</strong></td><td>${status}</td></tr>`;
+          const modelName = escapeHtml(item.model);
+          return `<tr><td>${item.date}</td><td>${displaySource(item.source)}</td><td><span class="table-clip" title="${modelName}">${modelName}</span></td><td class="num">${fmt.format(item.requestCount || 0)}</td><td class="num">${fmt.format(item.promptTokens || 0)}</td><td class="num">${fmt.format(item.completionTokens || 0)}</td><td class="num"><strong>${fmt.format(item.totalTokens || 0)}</strong></td><td>${status}</td></tr>`;
         })
         .join("")
     : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">当前筛选范围暂无用量记录</td></tr>`;
@@ -701,16 +709,21 @@ function employeeSummariesFromRows(rows) {
 
 function renderEmployeeRanking(tableId, countId, employees, emptyText) {
   const sorted = sortedAdminEmployees(employees);
+  const interactive = tableId === "adminUserTable";
   el(countId).textContent = `${sorted.length} 人`;
   el(tableId).innerHTML = sorted.length
     ? sorted
         .map((item) => {
           const requests = Number(item.requestCount || 0);
           const successRate = requests ? Math.round((Number(item.successCount || 0) / requests) * 1000) / 10 : 0;
+          const employeeKey = escapeHtml(item.employeeEmail || item.employeeId);
+          const employeeName = escapeHtml(item.employeeName || item.employeeId);
+          const email = escapeHtml(item.employeeEmail || "未绑定邮箱");
+          const rowAttrs = interactive ? `data-employee="${employeeKey}" tabindex="0" aria-label="查看 ${employeeName} 的用量详情"` : "";
           return `
-            <tr class="admin-employee-row" data-employee="${item.employeeEmail || item.employeeId}">
-              <td><strong>${item.employeeName || item.employeeId}</strong></td>
-              <td>${item.employeeEmail || "未绑定邮箱"}</td>
+            <tr class="${interactive ? "admin-employee-row" : ""}" ${rowAttrs}>
+              <td><strong class="cell-primary" title="${employeeName}">${employeeName}</strong></td>
+              <td><span class="cell-secondary" title="${email}">${email}</span></td>
               <td>${tableId === "teamUserTable" ? (item.teamRole === "admin" ? "负责人" : "成员") : displaySource(item.primarySource)}</td>
               <td class="num">${fmt.format(requests)}</td>
               <td class="num"><strong>${formatTokens(item.totalTokens || 0)}</strong></td>
@@ -732,10 +745,13 @@ function renderDepartmentRanking(tableId, countId, departments, emptyText) {
         .map((item) => {
           const requests = Number(item.requestCount || 0);
           const successRate = requests ? Math.round((Number(item.successCount || 0) / requests) * 1000) / 10 : 0;
+          const departmentKey = escapeHtml(item.departmentId || item.departmentName);
+          const departmentName = escapeHtml(item.departmentName || item.departmentId);
+          const departmentId = escapeHtml(item.departmentId || "未绑定部门");
           return `
-            <tr class="admin-employee-row" data-department="${item.departmentId}">
-              <td><strong>${item.departmentName || item.departmentId}</strong></td>
-              <td>${item.departmentId || "未绑定部门"}</td>
+            <tr class="admin-employee-row" data-department="${departmentKey}" tabindex="0" aria-label="查看 ${departmentName} 的部门详情">
+              <td><strong class="cell-primary" title="${departmentName}">${departmentName}</strong></td>
+              <td><span class="cell-secondary" title="${departmentId}">${departmentId}</span></td>
               <td>${displaySource(item.primarySource)}</td>
               <td class="num">${fmt.format(requests)}</td>
               <td class="num"><strong>${formatTokens(item.totalTokens || 0)}</strong></td>
@@ -816,8 +832,8 @@ function renderChartSkeleton(svgId) {
   svg.setAttribute("viewBox", "0 0 900 280");
   svg.innerHTML = `
     <rect width="900" height="280" rx="8" fill="#fffdf6"/>
-    <text x="450" y="126" fill="#65736f" font-size="16" font-weight="800" text-anchor="middle">数据加载中</text>
-    <text x="450" y="154" fill="#8a938f" font-size="13" text-anchor="middle">正在从后端汇总当前筛选范围</text>
+    <text x="450" y="126" fill="#65736f" font-size="16" font-weight="800" text-anchor="middle">正在汇总</text>
+    <text x="450" y="154" fill="#8a938f" font-size="13" text-anchor="middle">当前筛选范围</text>
     <rect x="64" y="196" width="772" height="14" rx="7" fill="#e5ebe3"/>
     <rect x="64" y="224" width="512" height="10" rx="5" fill="#edf1ea"/>
   `;
@@ -826,7 +842,7 @@ function renderChartSkeleton(svgId) {
 function renderDonutSkeleton(totalId, legendId) {
   el(totalId).textContent = "--";
   el(legendId).innerHTML = `
-    <div class="loading-status"><span class="loading-pill"></span><span>数据加载中</span></div>
+    <div class="loading-status"><span class="loading-pill"></span><span>正在汇总</span></div>
     <div style="margin-top:18px">${loadingLine("86%")}</div>
     <div style="margin-top:14px">${loadingLine("72%")}</div>
     <div style="margin-top:14px">${loadingLine("64%")}</div>
@@ -852,7 +868,7 @@ function renderSplitSkeleton(svgId) {
   svg.setAttribute("viewBox", "0 0 820 236");
   svg.innerHTML = `
     <rect width="820" height="236" rx="8" fill="#fffdf6"/>
-    <text x="410" y="102" fill="#65736f" font-size="16" font-weight="800" text-anchor="middle">数据加载中</text>
+    <text x="410" y="102" fill="#65736f" font-size="16" font-weight="800" text-anchor="middle">正在汇总</text>
     <rect x="30" y="132" width="760" height="24" rx="8" fill="#e5ebe3"/>
     <rect x="30" y="176" width="520" height="16" rx="8" fill="#edf1ea"/>
   `;
@@ -1087,25 +1103,32 @@ function renderModels() {
   const models = filteredModels();
   el("modelCount").textContent = fmt.format(models.length);
   if (!models.length) {
-    el("modelGrid").innerHTML = `<article class="panel model-empty">没有找到匹配的模型，请调整筛选条件。</article>`;
+    el("modelGrid").innerHTML = `<article class="panel model-empty">没有找到匹配模型。清空搜索词或切换筛选条件后重试。</article>`;
     return;
   }
   el("modelGrid").innerHTML = models
     .map(
-      (model) => `
-        <article class="model-card">
-          <div class="model-card-head">
-            <div class="key-title">
-              <span class="key-icon">${icon("model")}</span>
-              <div><h3 class="model-name">${model.modelName}</h3><div class="provider">${model.provider}</div></div>
+      (model) => {
+        const modelName = escapeHtml(model.modelName);
+        const provider = escapeHtml(model.provider);
+        const status = escapeHtml(model.status || "可用");
+        const description = escapeHtml(model.description || "当前账号可用模型。");
+        const capabilities = (model.capabilities || ["通用"]).map((capability) => `<span class="chip blue">${escapeHtml(capability)}</span>`).join("");
+        return `
+          <article class="model-card">
+            <div class="model-card-head">
+              <div class="key-title">
+                <span class="key-icon">${icon("model")}</span>
+                <div><h3 class="model-name" title="${modelName}">${modelName}</h3><div class="provider">${provider}</div></div>
+              </div>
+              <span class="chip ${model.status === "推荐" || model.status === "默认" ? "" : "blue"}">${status}</span>
             </div>
-            <span class="chip ${model.status === "推荐" || model.status === "默认" ? "" : "blue"}">${model.status || "可用"}</span>
-          </div>
-          <p class="model-desc">${model.description || "当前账号可用模型。"}</p>
-          <div class="tag-row">${(model.capabilities || ["通用"]).map((capability) => `<span class="chip blue">${capability}</span>`).join("")}</div>
-          <button class="copy-btn" type="button" data-copy-model="${model.modelName}"><span class="app-icon">${icon("copy")}</span>复制模型名称</button>
-        </article>
-      `,
+            <p class="model-desc">${description}</p>
+            <div class="tag-row">${capabilities}</div>
+            <button class="copy-btn" type="button" data-copy-model="${modelName}" aria-label="复制模型名称 ${modelName}"><span class="app-icon">${icon("copy")}</span>复制名称</button>
+          </article>
+        `;
+      },
     )
     .join("");
 }
@@ -1442,6 +1465,16 @@ el("adminUserTable").addEventListener("click", async (event) => {
   await loadAdminData();
 });
 
+el("adminUserTable").addEventListener("keydown", async (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  const row = event.target.closest("[data-employee]");
+  if (!row) return;
+  event.preventDefault();
+  selectedAdminEmployee = row.dataset.employee;
+  el("adminEmployeeSearch").value = "";
+  await loadAdminData();
+});
+
 el("adminClearEmployee").addEventListener("click", async () => {
   selectedAdminEmployee = "";
   el("adminEmployeeSearch").value = "";
@@ -1477,6 +1510,17 @@ document.addEventListener("click", (event) => {
 el("departmentUserTable").addEventListener("click", async (event) => {
   const row = event.target.closest("[data-department]");
   if (!row) return;
+  selectedDepartment = row.dataset.department;
+  el("departmentEmployeeSearch").value = "";
+  closeDepartmentPicker();
+  await loadDepartmentData();
+});
+
+el("departmentUserTable").addEventListener("keydown", async (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  const row = event.target.closest("[data-department]");
+  if (!row) return;
+  event.preventDefault();
   selectedDepartment = row.dataset.department;
   el("departmentEmployeeSearch").value = "";
   closeDepartmentPicker();
