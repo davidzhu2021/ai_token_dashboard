@@ -423,21 +423,21 @@
       }
 
       .topbar-inner {
-        max-width: 1680px;
+        max-width: none;
         margin: 0 auto;
-        min-height: 72px;
+        min-height: 64px;
         display: flex;
         align-items: center;
         justify-content: space-between;
-        gap: 16px;
-        padding: 0 22px;
+        gap: 14px;
+        padding: 8px 24px;
       }
 
       .brand-dark {
         display: flex;
         align-items: center;
-        gap: 12px;
-        min-width: 250px;
+        gap: 10px;
+        min-width: 220px;
         flex: 0 0 auto;
       }
 
@@ -470,7 +470,7 @@
 
       .top-controls {
         display: grid;
-        grid-template-columns: minmax(260px, 320px) minmax(0, 1fr) auto;
+        grid-template-columns: minmax(220px, 280px) minmax(0, 1fr) auto;
         align-items: center;
         gap: 8px;
         min-width: 0;
@@ -504,7 +504,7 @@
       }
 
       .action-zone > .ghost-btn {
-        min-width: 92px;
+        min-width: 82px;
       }
 
       .view-tabs {
@@ -532,6 +532,8 @@
         align-items: center;
         gap: 7px;
         font-weight: 800;
+        white-space: nowrap;
+        flex-shrink: 0;
       }
 
       .view-tab.active {
@@ -542,9 +544,9 @@
 
       .dashboard-filters {
         display: grid;
-        grid-template-columns: repeat(2, minmax(126px, 1fr));
+        grid-template-columns: repeat(2, minmax(100px, 1fr));
         gap: 8px;
-        max-width: 320px;
+        max-width: 280px;
         width: 100%;
       }
 
@@ -1636,45 +1638,274 @@
 
       @media (max-width: 1600px) {
         .topbar-inner {
-          display: grid;
-          grid-template-columns: minmax(220px, 250px) minmax(260px, 320px) minmax(0, 1fr);
-          grid-template-areas:
-            "brand filters actions"
-            "nav nav nav";
-          align-items: center;
-          gap: 10px 16px;
-          padding: 10px 22px 12px;
+          min-height: 60px;
+          gap: 12px;
+          padding: 6px 16px;
         }
 
         .brand-dark {
-          grid-area: brand;
-          min-width: 0;
+          min-width: 185px;
+          gap: 9px;
+        }
+
+        .brand-dark .brand-icon {
+          width: 38px;
+          height: 38px;
+          border-radius: 12px;
+        }
+
+        .brand-dark strong {
+          font-size: 16px;
+        }
+
+        .brand-dark > div span {
+          font-size: 11px;
         }
 
         .top-controls {
-          display: contents;
+          grid-template-columns: minmax(190px, 220px) minmax(0, 1fr) auto;
         }
 
-        .filter-zone {
-          grid-area: filters;
+        .dashboard-filters {
+          grid-template-columns: repeat(2, minmax(84px, 1fr));
+          max-width: 220px;
+          gap: 6px;
         }
 
-        .nav-zone {
-          grid-area: nav;
-          justify-content: center;
+        .dashboard-filters .select {
+          min-height: 40px;
+          padding: 0 10px;
+          font-size: 14px;
+        }
+
+        .view-tab {
+          min-height: 34px;
+          gap: 5px;
+          padding: 0 9px;
+          font-size: 14px;
         }
 
         .action-zone {
-          grid-area: actions;
+          gap: 6px;
+        }
+
+        .action-zone > .ghost-btn {
+          min-width: 72px;
+          min-height: 40px;
+          gap: 6px;
+          padding: 0 12px;
+          font-size: 14px;
+        }
+
+        .user-pill {
+          gap: 8px;
+          padding: 5px 10px 5px 6px;
+        }
+
+        .avatar {
+          width: 32px;
+          height: 32px;
+          flex-basis: 32px;
+        }
+
+        .user-pill > div span {
+          max-width: 145px;
+        }
+      }
+
+      @media (max-width: 1366px) {
+        .topbar-inner {
+          min-height: 56px;
+          gap: 10px;
+          padding: 6px 10px;
+        }
+
+        .brand-dark {
+          min-width: 160px;
+          gap: 8px;
+        }
+
+        .brand-dark .brand-icon {
+          width: 36px;
+          height: 36px;
+          border-radius: 11px;
+        }
+
+        .brand-dark strong {
+          font-size: 15px;
+        }
+
+        .brand-dark > div span {
+          font-size: 10px;
+        }
+
+        .top-controls {
+          grid-template-columns: minmax(160px, 180px) minmax(0, 1fr) auto;
+          gap: 6px;
+        }
+
+        .dashboard-filters {
+          grid-template-columns: repeat(2, minmax(76px, 1fr));
+          max-width: 180px;
+          gap: 5px;
+        }
+
+        .dashboard-filters .select {
+          min-height: 38px;
+          padding: 0 8px;
+          font-size: 13px;
         }
 
         .view-tabs {
-          width: max-content;
-          max-width: none;
+          gap: 2px;
+          padding: 3px;
+        }
+
+        .view-tab {
+          min-height: 32px;
+          gap: 4px;
+          padding: 0 6px;
+          font-size: 13px;
+        }
+
+        .view-tab .nav-icon {
+          width: 16px;
+          height: 16px;
+        }
+
+        .action-zone {
+          gap: 5px;
+        }
+
+        .action-zone > .ghost-btn {
+          min-width: 64px;
+          min-height: 38px;
+          gap: 5px;
+          padding: 0 8px;
+          font-size: 13px;
+        }
+
+        .user-pill {
+          gap: 6px;
+          min-width: 0;
+          padding: 4px 7px 4px 5px;
+        }
+
+        .avatar {
+          width: 30px;
+          height: 30px;
+          flex-basis: 30px;
+          font-size: 12px;
+        }
+
+        .user-pill strong {
+          font-size: 12px;
+        }
+
+        .user-pill > div span {
+          max-width: 130px;
+          font-size: 10px;
         }
       }
 
       @media (max-width: 1180px) {
+        .topbar-inner {
+          min-height: 52px;
+          gap: 8px;
+          padding: 5px 8px;
+        }
+
+        .brand-dark {
+          min-width: 140px;
+          gap: 6px;
+        }
+
+        .brand-dark .brand-icon {
+          width: 32px;
+          height: 32px;
+          border-radius: 10px;
+        }
+
+        .brand-dark strong {
+          font-size: 14px;
+        }
+
+        .brand-dark > div span {
+          font-size: 9px;
+        }
+
+        .top-controls {
+          grid-template-columns: minmax(145px, 160px) minmax(0, 1fr) auto;
+          gap: 5px;
+        }
+
+        .dashboard-filters {
+          grid-template-columns: repeat(2, minmax(68px, 1fr));
+          max-width: 160px;
+          gap: 4px;
+        }
+
+        .dashboard-filters .select {
+          min-height: 36px;
+          padding: 0 6px;
+          font-size: 12px;
+        }
+
+        .view-tabs {
+          gap: 1px;
+          padding: 2px;
+        }
+
+        .view-tab {
+          min-height: 30px;
+          gap: 3px;
+          padding: 0 4px;
+          font-size: 12px;
+        }
+
+        .view-tab .nav-icon {
+          width: 14px;
+          height: 14px;
+        }
+
+        .action-zone {
+          gap: 4px;
+        }
+
+        .action-zone > .ghost-btn {
+          min-width: 54px;
+          min-height: 36px;
+          gap: 4px;
+          padding: 0 6px;
+          font-size: 12px;
+        }
+
+        .action-zone .app-icon {
+          width: 17px;
+          height: 17px;
+        }
+
+        .user-pill {
+          gap: 5px;
+          padding: 3px 6px 3px 4px;
+        }
+
+        .avatar {
+          width: 28px;
+          height: 28px;
+          flex-basis: 28px;
+          font-size: 11px;
+        }
+
+        .user-pill strong {
+          font-size: 11px;
+        }
+
+        .user-pill > div span {
+          max-width: 110px;
+          font-size: 9px;
+        }
+
         .metrics {
           grid-template-columns: repeat(2, minmax(0, 1fr));
         }
@@ -1693,18 +1924,114 @@
         }
       }
 
-      @media (max-width: 1100px) {
+      @media (min-width: 821px) and (max-width: 1000px) {
         .topbar-inner {
-          grid-template-columns: minmax(210px, 1fr) auto;
-          grid-template-areas:
-            "brand actions"
-            "filters filters"
-            "nav nav";
+          gap: 6px;
+          padding: 4px;
         }
 
-        .filter-zone,
+        .brand-dark {
+          min-width: 126px;
+          gap: 5px;
+        }
+
+        .brand-dark .brand-icon {
+          width: 30px;
+          height: 30px;
+          border-radius: 9px;
+        }
+
+        .brand-dark strong {
+          font-size: 13px;
+        }
+
+        .brand-dark > div span {
+          font-size: 9px;
+        }
+
+        .top-controls {
+          grid-template-columns: 138px minmax(0, 1fr) auto;
+          gap: 4px;
+        }
+
+        .dashboard-filters {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          max-width: 138px;
+          gap: 3px;
+        }
+
+        .dashboard-filters .select {
+          min-height: 34px;
+          padding: 0 4px;
+          font-size: 11px;
+        }
+
         .nav-zone {
-          justify-content: center;
+          overflow-x: auto;
+          overscroll-behavior-inline: contain;
+          scrollbar-width: none;
+        }
+
+        .nav-zone::-webkit-scrollbar {
+          display: none;
+        }
+
+        .view-tabs {
+          flex: 0 0 auto;
+          width: max-content;
+          min-width: max-content;
+          max-width: none;
+          gap: 0;
+          padding: 2px;
+        }
+
+        .view-tab {
+          min-height: 28px;
+          gap: 2px;
+          padding: 0 2px;
+          font-size: 10.5px;
+        }
+
+        .view-tab .nav-icon {
+          width: 12px;
+          height: 12px;
+        }
+
+        .action-zone {
+          gap: 4px;
+        }
+
+        .action-zone > .ghost-btn {
+          min-width: 48px;
+          min-height: 34px;
+          padding: 0 5px;
+          font-size: 11px;
+        }
+
+        .action-zone .app-icon {
+          width: 15px;
+          height: 15px;
+        }
+
+        .user-pill {
+          gap: 4px;
+          padding: 3px 5px 3px 4px;
+        }
+
+        .avatar {
+          width: 26px;
+          height: 26px;
+          flex-basis: 26px;
+          font-size: 10px;
+        }
+
+        .user-pill strong {
+          font-size: 10.5px;
+        }
+
+        .user-pill > div span {
+          max-width: 115px;
+          font-size: 8.5px;
         }
       }
 
@@ -1735,6 +2062,7 @@
         }
 
         .topbar-inner {
+          display: grid;
           grid-template-columns: minmax(0, 1fr);
           grid-template-areas:
             "brand"
@@ -1745,15 +2073,61 @@
           padding: 16px;
         }
 
+        .brand-dark {
+          grid-area: brand;
+        }
+
+        .top-controls {
+          display: contents;
+        }
+
+        .filter-zone {
+          grid-area: filters;
+        }
+
+        .nav-zone {
+          grid-area: nav;
+        }
+
+        .action-zone {
+          grid-area: actions;
+        }
+
         .brand-dark,
         .dashboard-filters {
           width: 100%;
+        }
+
+        .brand-dark {
+          min-width: 0;
+          gap: 12px;
+        }
+
+        .brand-dark .brand-icon {
+          width: 42px;
+          height: 42px;
+          border-radius: 13px;
+        }
+
+        .brand-dark strong {
+          font-size: 18px;
+        }
+
+        .brand-dark > div span {
+          font-size: 12px;
         }
 
         .dashboard-filters {
           display: grid;
           grid-template-columns: 1fr;
           gap: 10px;
+          max-width: none;
+        }
+
+        .dashboard-filters .select {
+          min-height: 44px;
+          padding: 0 14px;
+          font-size: inherit;
         }
 
         .admin-toolbar,
@@ -1793,6 +2167,8 @@
           width: max-content;
           min-width: max-content;
           max-width: none;
+          gap: 4px;
+          padding: 4px;
         }
 
         .action-zone {
@@ -1804,11 +2180,29 @@
 
         .view-tab {
           flex: 0 0 auto;
+          min-height: 36px;
+          gap: 7px;
+          padding: 0 12px;
+          font-size: inherit;
+        }
+
+        .view-tab .nav-icon {
+          width: 18px;
+          height: 18px;
         }
 
         .action-zone > .ghost-btn {
           width: 100%;
           min-width: 0;
+          min-height: 42px;
+          gap: 8px;
+          padding: 0 16px;
+          font-size: inherit;
+        }
+
+        .action-zone .app-icon {
+          width: 22px;
+          height: 22px;
         }
 
         .user-pill {
@@ -1872,7 +2266,25 @@
 
         .user-pill {
           width: 100%;
+          gap: 10px;
+          padding: 7px 12px 7px 8px;
           border-radius: 6px;
+        }
+
+        .avatar {
+          width: 36px;
+          height: 36px;
+          flex-basis: 36px;
+          font-size: 14px;
+        }
+
+        .user-pill strong {
+          font-size: 13px;
+        }
+
+        .user-pill > div span {
+          max-width: 170px;
+          font-size: 11px;
         }
       }
     </style>
