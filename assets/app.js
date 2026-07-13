@@ -999,10 +999,15 @@ function renderAdminLoading() {
 }
 
 function renderDepartmentLoading() {
-  setDepartmentOverviewVisible(true);
+  setDepartmentOverviewVisible(Boolean(selectedDepartment));
   const label = rangeLabel();
   const source = sourceText();
   const scopeLabel = departmentScopeLabel();
+  el("departmentBackButton").classList.toggle("hidden", !selectedDepartment);
+  el("departmentRankingTitle").textContent = selectedDepartment ? `${scopeLabel}员工排行` : "部门用量排行";
+  el("departmentRankingDesc").textContent = selectedDepartment
+    ? `当前展示 ${scopeLabel} 内员工用量，默认按 Token 从高到低排序。`
+    : "点击部门查看该部门用量看板和员工排行。";
   el("departmentHeroTotal").textContent = "加载中";
   el("departmentHeroSpend").textContent = "--";
   el("departmentHeroTotalLabel").textContent = "最近一天 Token";
@@ -1099,14 +1104,16 @@ function renderDepartment() {
     renderDepartmentLoading();
     return;
   }
-  setDepartmentOverviewVisible(true);
+  setDepartmentOverviewVisible(Boolean(selectedDepartment));
   const totalData = departmentSummaryData.length ? departmentSummaryData : departmentUsageData;
-  renderDepartmentMetrics(totalData);
-  renderTrendTo("departmentTrendChart", totalData);
-  renderSpendTrendTo("departmentSpendChart", totalData);
-  renderDonutTo("departmentSourceDonut", "departmentDonutTotal", "departmentSourceLegend", departmentUsageData);
-  renderModelBarsTo("departmentModelBars", departmentUsageData);
-  renderSplitTo("departmentSplitChart", departmentUsageData);
+  if (selectedDepartment) {
+    renderDepartmentMetrics(totalData);
+    renderTrendTo("departmentTrendChart", totalData);
+    renderSpendTrendTo("departmentSpendChart", totalData);
+    renderDonutTo("departmentSourceDonut", "departmentDonutTotal", "departmentSourceLegend", departmentUsageData);
+    renderModelBarsTo("departmentModelBars", departmentUsageData);
+    renderSplitTo("departmentSplitChart", departmentUsageData);
+  }
   renderDepartmentUsers();
   renderDepartmentPickerOptions();
 
