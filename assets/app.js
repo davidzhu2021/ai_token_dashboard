@@ -45,9 +45,11 @@ let pendingRegenerateKeyId = "";
 let pendingDeleteKeyId = "";
 let pendingDeleteKeyName = "";
 let currentPlainKey = "";
+let currentPlainKeyCleanup = null;
 let revealedKeys = new Map();
 let revealTimers = new Map();
 let revealingKeyIds = new Set();
+let disablingOldKeyIds = new Set();
 let isCreatingKey = false;
 let isRegeneratingKey = false;
 let isDeletingKey = false;
@@ -1361,9 +1363,19 @@ function renderKeys() {
       const name = escapeHtml(key.name || "个人访问密钥");
       const purpose = escapeHtml(key.purpose || "用于个人 AI 工具访问。");
       const status = escapeHtml(key.status || "正常");
+      const cleanupRequired = Boolean(key.cleanupRequired);
+      const oldKeyId = escapeHtml(key.oldKeyId || key.id || "");
+      const replacementKeyId = escapeHtml(key.replacementKeyId || "");
+      const isDisabling = disablingOldKeyIds.has(String(key.oldKeyId || key.id || ""));
+      const cleanupState = cleanupRequired
+        ? `<span class="key-cleanup-state">旧密钥仍有效，请完成停用</span>`
+        : "";
+      const rotationAction = cleanupRequired
+        ? `<button class="ghost-btn retry-disable-key-btn" type="button" data-disable-old-key="${oldKeyId}" data-replacement-key="${replacementKeyId}" ${isDisabling ? "disabled" : ""}>${isDisabling ? "停用中..." : "重试停用旧密钥"}</button>`
+        : "";
       return `
         <tr>
-          <td><div class="key-name-cell"><strong>${name}</strong><span>${purpose}</span></div></td>
+          <td><div class="key-name-cell"><strong>${name}</strong><span>${purpose}</span>${cleanupState}</div></td>
           <td><span class="chip ${keyStatusClass(key.status)}">${status}</span></td>
           <td>${keySecretMarkup(key)}</td>
           <td><span class="key-model-summary">${escapeHtml(keyModelText(key))}</span></td>
@@ -1372,7 +1384,8 @@ function renderKeys() {
           <td>${escapeHtml(key.expiresAt || "永不过期")}</td>
           <td>
             <div class="key-row-actions">
-              <button class="ghost-btn key-regenerate-btn" type="button" data-regenerate-key="${id}">更新</button>
+              <button class="ghost-btn key-regenerate-btn" type="button" data-regenerate-key="${id}" ${cleanupRequired ? "disabled title=\"请先停用旧密钥\"" : ""}>更新</button>
+              ${rotationAction}
               <button class="danger-outline-btn" type="button" data-delete-key="${id}">删除</button>
             </div>
           </td>
@@ -1382,12 +1395,19 @@ function renderKeys() {
     .join("");
 
   cardList.innerHTML = personalKeys
-    .map((key) => `
+    .map((key) => {
+      const cleanupRequired = Boolean(key.cleanupRequired);
+      const keyId = escapeHtml(key.id);
+      const oldKeyId = escapeHtml(key.oldKeyId || key.id || "");
+      const replacementKeyId = escapeHtml(key.replacementKeyId || "");
+      const isDisabling = disablingOldKeyIds.has(String(key.oldKeyId || key.id || ""));
+      return `
       <article class="panel key-mobile-card">
         <div class="key-mobile-head">
           <div class="key-name-cell">
             <strong>${escapeHtml(key.name || "个人访问密钥")}</strong>
             <span>${escapeHtml(key.purpose || "用于个人 AI 工具访问。")}</span>
+            ${cleanupRequired ? `<span class="key-cleanup-state">旧密钥仍有效，请完成停用</span>` : ""}
           </div>
           <span class="chip ${keyStatusClass(key.status)}">${escapeHtml(key.status || "正常")}</span>
         </div>
@@ -1397,11 +1417,13 @@ function renderKeys() {
         <div class="key-mobile-row"><span>最近使用</span><strong>${escapeHtml(key.lastUsed || "-")}</strong></div>
         <div class="key-mobile-row"><span>过期时间</span><strong>${escapeHtml(key.expiresAt || "永不过期")}</strong></div>
         <div class="key-mobile-actions">
-          <button class="ghost-btn" type="button" data-regenerate-key="${escapeHtml(key.id)}">更新</button>
-          <button class="danger-outline-btn" type="button" data-delete-key="${escapeHtml(key.id)}">删除</button>
+          <button class="ghost-btn" type="button" data-regenerate-key="${keyId}" ${cleanupRequired ? "disabled title=\"请先停用旧密钥\"" : ""}>更新</button>
+          ${cleanupRequired ? `<button class="ghost-btn retry-disable-key-btn" type="button" data-disable-old-key="${oldKeyId}" data-replacement-key="${replacementKeyId}" ${isDisabling ? "disabled" : ""}>${isDisabling ? "停用中..." : "重试停用旧密钥"}</button>` : ""}
+          <button class="danger-outline-btn" type="button" data-delete-key="${keyId}">删除</button>
         </div>
       </article>
-    `)
+    `;
+    })
     .join("");
 }
 
@@ -1476,23 +1498,45 @@ function closeDeleteKeyModal() {
 
 function showPlainKey(key, expiry = "", options = {}) {
   currentPlainKey = String(key || "");
+  const cleanupRequired = Boolean(options.cleanupRequired && options.oldKeyDisabled !== true);
+  currentPlainKeyCleanup = cleanupRequired
+    ? {
+        oldKeyId: String(options.oldKeyId || ""),
+        replacementKeyId: String(options.replacementKeyId || options.id || ""),
+      }
+    : null;
   setText("newKeyValue", currentPlainKey);
   setText("newKeyExpiry", expiry ? `过期时间：${expiry}` : "");
   const warning = String(options.warning || "");
+  const isRotation = Boolean(options.rotationMode);
+  setText("newKeyTitle", isRotation ? "新密钥已创建" : "请立即保存新密钥");
   setText(
     "newKeyNotice",
-    warning || (options.revealable === false
-      ? "完整密钥只显示这一次。关闭窗口后无法再次查看，请立即复制并安全保存。"
-      : "密钥已加密保管，关闭窗口后仍可在列表中通过眼睛按钮查看。"),
+    warning || (cleanupRequired
+      ? "新密钥已经创建并可以立即配置使用，但旧密钥尚未停用。"
+      : options.revealable === false
+        ? "完整密钥只显示这一次。关闭窗口后无法再次查看，请立即复制并安全保存。"
+        : isRotation
+          ? "新密钥已加密保管，旧密钥已停用。请将使用旧密钥的工具更新为新密钥。"
+          : "密钥已加密保管，关闭窗口后仍可在列表中通过眼睛按钮查看。"),
   );
-  el("newKeyNotice").closest(".warning-box").classList.toggle("success", !warning && options.revealable !== false);
+  el("newKeyNoticeBox").classList.toggle("success", !warning && !cleanupRequired && options.revealable !== false);
+  el("rotationCleanupPanel").classList.toggle("hidden", !cleanupRequired);
+  setText(
+    "rotationCleanupMessage",
+    warning || "新密钥已经可以使用，但旧密钥目前仍然有效。请先替换工具中的配置，然后重试停用旧密钥。",
+  );
+  el("retryDisableOldKey").disabled = false;
+  el("retryDisableOldKey").textContent = "重试停用旧密钥";
   el("newKeyModal").classList.remove("hidden");
 }
 
 function clearPlainKey() {
   currentPlainKey = "";
+  currentPlainKeyCleanup = null;
   setText("newKeyValue", "");
   setText("newKeyExpiry", "");
+  el("rotationCleanupPanel").classList.add("hidden");
   el("newKeyModal").classList.add("hidden");
 }
 
@@ -2011,8 +2055,57 @@ el("createKeyForm").addEventListener("submit", async (event) => {
 });
 
 function requestRegenerateKey(keyId) {
+  const key = personalKeys.find((item) => String(item.id || "") === String(keyId || ""));
+  if (key?.cleanupRequired) {
+    showToast("请先停用上次更新留下的旧密钥");
+    return;
+  }
   pendingRegenerateKeyId = keyId;
   el("regenerateKeyModal").classList.remove("hidden");
+}
+
+async function disableOldKey(oldKeyId, replacementKeyId, options = {}) {
+  const normalizedOldKeyId = String(oldKeyId || "");
+  const normalizedReplacementKeyId = String(replacementKeyId || "");
+  if (!normalizedOldKeyId || !normalizedReplacementKeyId) {
+    showToast("缺少密钥更新信息，请刷新后重试");
+    return;
+  }
+  if (disablingOldKeyIds.has(normalizedOldKeyId)) return;
+  disablingOldKeyIds.add(normalizedOldKeyId);
+  renderKeys();
+  if (options.fromModal) {
+    el("retryDisableOldKey").disabled = true;
+    el("retryDisableOldKey").textContent = "停用中...";
+  }
+  try {
+    const payload = await api(`/api/me/keys/${encodeURIComponent(normalizedOldKeyId)}/disable-old`, {
+      method: "POST",
+      body: JSON.stringify({ replacementKeyId: normalizedReplacementKeyId }),
+    });
+    personalKeys = personalKeys.map((key) => (
+      String(key.oldKeyId || key.id || "") === normalizedOldKeyId
+        ? { ...key, cleanupRequired: false, oldKeyDisabled: true }
+        : key
+    ));
+    if (currentPlainKeyCleanup?.oldKeyId === normalizedOldKeyId) {
+      currentPlainKeyCleanup = null;
+      el("rotationCleanupPanel").classList.add("hidden");
+      el("newKeyNoticeBox").classList.add("success");
+      setText("newKeyNotice", "新密钥已加密保管，旧密钥现已停用。请将使用旧密钥的工具更新为新密钥。");
+    }
+    await loadKeys(true);
+    showToast(payload.warning || "旧密钥已停用");
+  } catch (error) {
+    showToast(error.message || "旧密钥停用失败，请稍后重试");
+  } finally {
+    disablingOldKeyIds.delete(normalizedOldKeyId);
+    if (options.fromModal && currentPlainKeyCleanup?.oldKeyId === normalizedOldKeyId) {
+      el("retryDisableOldKey").disabled = false;
+      el("retryDisableOldKey").textContent = "重试停用旧密钥";
+    }
+    renderKeys();
+  }
 }
 
 function requestDeleteKey(keyId) {
@@ -2042,6 +2135,11 @@ el("keysView").addEventListener("click", (event) => {
   const deleteButton = event.target.closest("[data-delete-key]");
   if (deleteButton) {
     requestDeleteKey(deleteButton.dataset.deleteKey);
+    return;
+  }
+  const disableButton = event.target.closest("[data-disable-old-key]");
+  if (disableButton) {
+    disableOldKey(disableButton.dataset.disableOldKey, disableButton.dataset.replacementKey);
     return;
   }
   const button = event.target.closest("[data-regenerate-key]");
@@ -2083,11 +2181,12 @@ el("deleteKeyForm").addEventListener("submit", async (event) => {
 el("cancelRegenerateKey").addEventListener("click", closeRegenerateKeyModal);
 el("confirmRegenerateKey").addEventListener("click", async () => {
   if (!pendingRegenerateKeyId || isRegeneratingKey) return;
+  const oldKeyId = pendingRegenerateKeyId;
   isRegeneratingKey = true;
   el("confirmRegenerateKey").disabled = true;
   el("confirmRegenerateKey").textContent = "更新中...";
   try {
-    const payload = await api(`/api/me/keys/${encodeURIComponent(pendingRegenerateKeyId)}/regenerate`, {
+    const payload = await api(`/api/me/keys/${encodeURIComponent(oldKeyId)}/regenerate`, {
       method: "POST",
       body: JSON.stringify({}),
     });
@@ -2095,7 +2194,11 @@ el("confirmRegenerateKey").addEventListener("click", async () => {
     el("regenerateKeyModal").classList.add("hidden");
     personalKeys = [];
     await loadKeys(true);
-    showPlainKey(payload.key, "", payload);
+    showPlainKey(payload.key, payload.expiresAt || "", {
+      ...payload,
+      oldKeyId: payload.oldKeyId || oldKeyId,
+      replacementKeyId: payload.replacementKeyId || payload.id || "",
+    });
   } catch (error) {
     showToast(error.message || "更新密钥失败");
   } finally {
@@ -2107,6 +2210,13 @@ el("confirmRegenerateKey").addEventListener("click", async () => {
 
 el("copyNewKey").addEventListener("click", () => {
   if (currentPlainKey) copyText(currentPlainKey, "完整密钥已复制");
+});
+el("retryDisableOldKey").addEventListener("click", () => {
+  if (!currentPlainKeyCleanup) {
+    showToast("未找到需要停用的旧密钥，请刷新列表后重试");
+    return;
+  }
+  disableOldKey(currentPlainKeyCleanup.oldKeyId, currentPlainKeyCleanup.replacementKeyId, { fromModal: true });
 });
 el("closeNewKey").addEventListener("click", clearPlainKey);
 

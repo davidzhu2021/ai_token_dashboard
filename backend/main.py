@@ -529,6 +529,10 @@ class CreatePersonalKeyRequest(BaseModel):
         return value
 
 
+class DisableOldKeyRequest(BaseModel):
+    replacementKeyId: str = Field(min_length=1, max_length=128)
+
+
 def write_key_audit(event: str, email: str, key_id: str, request: Request, result: str) -> None:
     audit_key_id = hashlib.sha256(key_id.encode("utf-8")).hexdigest() if key_id.startswith("sk-") else key_id
     safe_id = re.sub(r"[^A-Za-z0-9_-]", "", audit_key_id)[:64] or "-"
@@ -548,11 +552,58 @@ def public_key(key: dict[str, Any], revealable: bool) -> dict[str, Any]:
 def add_revealability(keys: list[dict[str, Any]]) -> list[dict[str, Any]]:
     try:
         vault = key_vault()
-        return [
-            public_key(
-                key,
-                vault.has(str(key.get("_backendId") or "primary"), str(key.get("_userId") or ""), str(key.get("id") or "")),
+        key_scopes = {
+            (
+                str(key.get("_backendId") or "primary"),
+                str(key.get("_userId") or ""),
+                str(key.get("id") or ""),
             )
+            for key in keys
+        }
+        pending_by_scope: dict[tuple[str, str, str], dict[str, Any]] = {}
+        scopes = {
+            (str(key.get("_backendId") or "primary"), str(key.get("_userId") or ""))
+            for key in keys
+        }
+        for backend_id, user_id in scopes:
+            for pending in vault.pending_rotations(backend_id, user_id):
+                old_scope = (backend_id, user_id, str(pending["oldKeyId"]))
+                replacement_scope = (backend_id, user_id, str(pending["replacementKeyId"]))
+                display_scope = old_scope if old_scope in key_scopes else replacement_scope
+                if display_scope in key_scopes:
+                    pending_by_scope[display_scope] = pending
+        return [
+            {
+                **public_key(
+                    key,
+                    vault.has(str(key.get("_backendId") or "primary"), str(key.get("_userId") or ""), str(key.get("id") or "")),
+                ),
+                **(
+                    {
+                        "cleanupRequired": pending_by_scope[
+                            (str(key.get("_backendId") or "primary"), str(key.get("_userId") or ""), str(key.get("id") or ""))
+                        ]["cleanupTarget"]
+                        == "old",
+                        "recoveryRequired": pending_by_scope[
+                            (str(key.get("_backendId") or "primary"), str(key.get("_userId") or ""), str(key.get("id") or ""))
+                        ]["cleanupTarget"]
+                        == "replacement",
+                        "oldKeyId": pending_by_scope[
+                            (str(key.get("_backendId") or "primary"), str(key.get("_userId") or ""), str(key.get("id") or ""))
+                        ]["oldKeyId"],
+                        "replacementKeyId": pending_by_scope[
+                            (str(key.get("_backendId") or "primary"), str(key.get("_userId") or ""), str(key.get("id") or ""))
+                        ]["replacementKeyId"],
+                    }
+                    if (
+                        str(key.get("_backendId") or "primary"),
+                        str(key.get("_userId") or ""),
+                        str(key.get("id") or ""),
+                    )
+                    in pending_by_scope
+                    else {}
+                ),
+            }
             for key in keys
         ]
     except KeyVaultError:
@@ -910,10 +961,24 @@ async def regenerate_my_key(key_id: str, request: Request) -> JSONResponse:
     last_error: HTTPException | None = None
     for user_id in user_ids:
         try:
-            regenerated = await client().regenerate_key(key_id, user_id, app_user["email"])
             backend, raw_user_id = client()._decode_account_id(user_id)
             regenerated_backend_id = backend.id
             regenerated_user_id = raw_user_id
+            pending = key_vault().pending_rotation(regenerated_backend_id, regenerated_user_id, key_id)
+            if pending is not None:
+                raise HTTPException(status_code=409, detail="该密钥已有待完成的更新，请先停用旧密钥")
+            if await client().supports_atomic_key_regeneration(user_id):
+                try:
+                    regenerated = await client().regenerate_key(key_id, user_id, app_user["email"])
+                    rotation_mode = "atomic"
+                except HTTPException as exc:
+                    if exc.status_code != 501:
+                        raise
+                    regenerated = await client().create_replacement_key(key_id, user_id, app_user["email"])
+                    rotation_mode = "replacement"
+            else:
+                regenerated = await client().create_replacement_key(key_id, user_id, app_user["email"])
+                rotation_mode = "replacement"
             break
         except HTTPException as exc:
             last_error = exc
@@ -922,23 +987,121 @@ async def regenerate_my_key(key_id: str, request: Request) -> JSONResponse:
     if regenerated is None:
         write_key_audit("regenerate", app_user["email"], key_id, request, "failed")
         raise last_error or HTTPException(status_code=403, detail="不能更新不属于自己的访问密钥")
-    try:
-        key_vault().replace(regenerated_backend_id, regenerated_user_id, key_id, regenerated["id"], regenerated["key"])
-        warning = ""
-    except KeyVaultError:
-        logger.exception("failed to store regenerated key in vault")
-        warning = "密钥已再生成，但加密保管失败；关闭后将无法再次查看，请立即复制并安全保存。"
-    write_key_audit("regenerate", app_user["email"], key_id, request, "success_vault_failed" if warning else "success")
+    warning = ""
+    cleanup_required = False
+    recovery_required = False
+    old_key_disabled = rotation_mode == "atomic"
+    revealable = False
+    if rotation_mode == "atomic":
+        try:
+            key_vault().replace(regenerated_backend_id, regenerated_user_id, key_id, regenerated["id"], regenerated["key"])
+            revealable = True
+        except KeyVaultError:
+            logger.exception("failed to store atomically regenerated key in vault")
+            warning = "密钥已更新，但加密保管失败；关闭后将无法再次查看，请立即复制并安全保存。"
+    else:
+        try:
+            key_vault().store(regenerated_backend_id, regenerated_user_id, regenerated["id"], regenerated["key"])
+            revealable = True
+        except KeyVaultError:
+            logger.exception("failed to store replacement key in vault")
+            try:
+                await client().delete_key(regenerated["id"], user_id, app_user["email"])
+            except HTTPException:
+                logger.exception("failed to compensate replacement key after vault failure")
+                recovery_required = True
+                warning = "高风险：新密钥未能加密保管，且自动撤销失败。旧密钥仍然有效，请立即复制本次新密钥并联系管理员清理新密钥。"
+            else:
+                write_key_audit("regenerate_replacement", app_user["email"], key_id, request, "vault_failed_compensated")
+                raise HTTPException(status_code=503, detail="新密钥保管失败，系统已撤销本次新密钥，旧密钥仍可继续使用，请稍后重试")
+        if revealable:
+            try:
+                await client().delete_key(key_id, user_id, app_user["email"])
+                old_key_disabled = True
+            except HTTPException as exc:
+                cleanup_required = True
+                warning = "新密钥已创建并保管，但旧密钥暂未停用；当前两把密钥均可使用，请重试停用旧密钥。"
+                try:
+                    key_vault().record_pending_rotation(
+                        regenerated_backend_id,
+                        regenerated_user_id,
+                        key_id,
+                        regenerated["id"],
+                        "old",
+                        str(exc.detail),
+                    )
+                except KeyVaultError:
+                    logger.exception("failed to persist pending old-key cleanup")
+                    cleanup_required = False
+                    recovery_required = True
+                    warning = "高风险：新密钥已创建并保管，但旧密钥未停用，且待处理状态保存失败。当前两把密钥均可使用，请联系管理员处理。"
+            else:
+                try:
+                    key_vault().delete(regenerated_backend_id, regenerated_user_id, key_id)
+                except KeyVaultError:
+                    logger.exception("failed to remove disabled old key from vault")
+                    warning = "新密钥已更新并可使用，但旧密钥的本地保管记录清理失败，请联系管理员处理。"
+    audit_result = "success"
+    if recovery_required:
+        audit_result = "replacement_cleanup_failed"
+    elif cleanup_required:
+        audit_result = "old_key_disable_failed"
+    elif warning:
+        audit_result = "success_vault_failed"
+    write_key_audit("regenerate", app_user["email"], key_id, request, audit_result)
     return JSONResponse(
         {
             "key": regenerated["key"],
             "id": regenerated["id"],
             "masked": mask_key(regenerated["key"]),
-            "revealable": not warning,
+            "revealable": revealable,
             "warning": warning,
+            "rotationMode": rotation_mode,
+            "oldKeyDisabled": old_key_disabled,
+            "cleanupRequired": cleanup_required,
+            "recoveryRequired": recovery_required,
+            "oldKeyId": key_id,
+            "replacementKeyId": regenerated["id"],
+            "expiresAt": regenerated.get("expiresAt", "永不过期"),
         },
         headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
     )
+
+
+@app.post("/api/me/keys/{old_key_id:path}/disable-old")
+async def disable_old_key(old_key_id: str, data: DisableOldKeyRequest, request: Request) -> JSONResponse:
+    app_user, upstream_user = await current_upstream_user(request)
+    last_error: HTTPException | None = None
+    for user_id in upstream_user_ids(upstream_user):
+        backend, raw_user_id = client()._decode_account_id(user_id)
+        try:
+            pending = key_vault().pending_rotation(backend.id, raw_user_id, old_key_id)
+        except KeyVaultError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if pending is None or pending.get("cleanupTarget") != "old":
+            continue
+        replacement_key_id = str(pending["replacementKeyId"])
+        if data.replacementKeyId != replacement_key_id:
+            raise HTTPException(status_code=409, detail="替代密钥与待处理记录不一致，请刷新页面后重试")
+        try:
+            await client().disable_pending_old_key(old_key_id, replacement_key_id, user_id, app_user["email"])
+        except HTTPException as exc:
+            last_error = exc
+            break
+        key_vault().complete_pending_rotation(backend.id, raw_user_id, old_key_id)
+        write_key_audit("disable_old_key", app_user["email"], old_key_id, request, "success")
+        return JSONResponse(
+            {
+                "oldKeyDisabled": True,
+                "cleanupRequired": False,
+                "oldKeyId": old_key_id,
+                "replacementKeyId": replacement_key_id,
+                "warning": "",
+            },
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+    write_key_audit("disable_old_key", app_user["email"], old_key_id, request, "failed")
+    raise last_error or HTTPException(status_code=404, detail="未找到待完成的密钥更新记录")
 
 
 @app.delete("/api/me/keys/{key_id:path}")

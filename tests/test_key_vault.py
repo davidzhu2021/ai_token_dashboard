@@ -74,3 +74,28 @@ def test_vault_delete_only_removes_matching_scope(tmp_path) -> None:
     assert vault.reveal("primary", "user-1", "hash-2") == "sk-user-one-EFGH"
     assert vault.reveal("primary", "user-2", "hash-1") == "sk-user-two-IJKL"
     assert vault.reveal("history", "user-1", "hash-1") == "sk-history-MNOP"
+
+
+def test_vault_persists_and_completes_pending_old_key_cleanup(tmp_path) -> None:
+    database = tmp_path / "vault.sqlite3"
+    key = master_key()
+    vault = KeyVault(database, key)
+    vault.store("primary", "user-1", "old-hash", "sk-old-secret-ABCD")
+    vault.store("primary", "user-1", "new-hash", "sk-new-secret-EFGH")
+    vault.record_pending_rotation("primary", "user-1", "old-hash", "new-hash", "old", "delete failed")
+
+    reopened = KeyVault(database, key)
+    assert reopened.pending_rotation("primary", "user-1", "old-hash") == {
+        "oldKeyId": "old-hash",
+        "replacementKeyId": "new-hash",
+        "cleanupTarget": "old",
+        "lastError": "delete failed",
+        "createdAt": reopened.pending_rotation("primary", "user-1", "old-hash")["createdAt"],
+        "updatedAt": reopened.pending_rotation("primary", "user-1", "old-hash")["updatedAt"],
+    }
+
+    reopened.complete_pending_rotation("primary", "user-1", "old-hash")
+
+    assert reopened.pending_rotation("primary", "user-1", "old-hash") is None
+    assert reopened.reveal("primary", "user-1", "old-hash") is None
+    assert reopened.reveal("primary", "user-1", "new-hash") == "sk-new-secret-EFGH"

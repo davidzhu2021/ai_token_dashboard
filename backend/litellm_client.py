@@ -10,6 +10,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from fastapi import HTTPException
@@ -823,6 +824,46 @@ class LiteLLMClient:
             last_used = _first(item, "last_used_at", default=None)
             created_at = _first(item, "created_at", default=None)
             models = item.get("models") if isinstance(item.get("models"), list) else []
+            rotation_fields = {
+                name: item.get(name)
+                for name in (
+                    "max_budget",
+                    "spend",
+                    "budget_duration",
+                    "budget_limits",
+                    "budget_id",
+                    "max_parallel_requests",
+                    "tpm_limit",
+                    "rpm_limit",
+                    "allowed_cache_controls",
+                    "allowed_routes",
+                    "config",
+                    "permissions",
+                    "model_max_budget",
+                    "budget_fallbacks",
+                    "model_rpm_limit",
+                    "model_tpm_limit",
+                    "guardrails",
+                    "policies",
+                    "prompts",
+                    "aliases",
+                    "object_permission",
+                    "tags",
+                    "disable_global_guardrails",
+                    "enforced_params",
+                    "allowed_passthrough_routes",
+                    "allowed_vector_store_indexes",
+                    "rpm_limit_type",
+                    "tpm_limit_type",
+                    "router_settings",
+                    "access_group_ids",
+                    "team_id",
+                    "agent_id",
+                    "project_id",
+                    "org_id",
+                )
+                if item.get(name) is not None
+            }
             keys.append(
                 {
                     "_backendId": backend.id,
@@ -838,6 +879,12 @@ class LiteLLMClient:
                     "monthTokens": _as_int(_first(item, "total_tokens", "token_usage", default=0)),
                     "spend": _as_number(_first(item, "spend", "total_spend")),
                     "status": status,
+                    "_rotation": {
+                        "metadata": metadata,
+                        "models": [str(model) for model in models if model],
+                        "expires": expires,
+                        **rotation_fields,
+                    },
                 }
             )
         self._key_cache.set(cache_key, keys, _env_int("KEY_LIST_CACHE_TTL_SECONDS", 300))
@@ -956,8 +1003,7 @@ class LiteLLMClient:
             payload = await self.request_backend(
                 backend,
                 "POST",
-                "/key/regenerate",
-                params={"key": key_id},
+                f"/key/{quote(key_id, safe='')}/regenerate",
                 headers={"litellm-changed-by": changed_by},
                 json={"grace_period": "0s"},
             )
@@ -975,6 +1021,157 @@ class LiteLLMClient:
         self.invalidate_key_cache(raw_user_id, backend)
         return {"key": str(new_key), "id": new_key_id}
 
+    async def supports_atomic_key_regeneration(self, user_id: str) -> bool:
+        backend, _ = self._decode_account_id(user_id)
+        if backend.source:
+            return False
+        try:
+            payload = await self.request_backend(backend, "GET", "/health/license")
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                return False
+            raise
+        return isinstance(payload, dict) and str(payload.get("license_type") or "").lower() == "enterprise"
+
+    @staticmethod
+    def _remaining_key_duration(expires: Any) -> str | None:
+        if not expires:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(expires).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail="旧密钥的过期时间无法安全继承，请新建密钥") from exc
+        seconds = int((parsed - datetime.now(timezone.utc)).total_seconds())
+        if seconds <= 0:
+            raise HTTPException(status_code=409, detail="已过期的访问密钥不能更新，请新建密钥")
+        return f"{seconds}s"
+
+    async def create_replacement_key(self, key_id: str, user_id: str, changed_by: str) -> dict[str, str]:
+        backend, raw_user_id = self._decode_account_id(user_id)
+        if backend.source:
+            raise HTTPException(status_code=403, detail="该来源访问密钥暂不支持在这里更新")
+        owned_keys = await self.keys_for_user(raw_user_id, backend, refresh=True)
+        owned = next((key for key in owned_keys if key.get("id") == key_id), None)
+        if owned is None:
+            raise HTTPException(status_code=403, detail="不能更新不属于自己的访问密钥")
+
+        rotation = owned.get("_rotation") if isinstance(owned.get("_rotation"), dict) else {}
+        if owned.get("status") != "正常":
+            raise HTTPException(status_code=409, detail="只有正常状态的访问密钥可以更新")
+        if rotation.get("budget_duration") or rotation.get("budget_limits"):
+            raise HTTPException(status_code=409, detail="旧密钥包含复杂预算规则，无法安全更新，请新建密钥")
+        allowed_routes = rotation.get("allowed_routes") or []
+        if allowed_routes and set(map(str, allowed_routes)) != {"llm_api_routes"}:
+            raise HTTPException(status_code=409, detail="旧密钥包含自定义访问范围，无法安全更新，请新建密钥")
+        if rotation.get("allowed_passthrough_routes"):
+            raise HTTPException(status_code=409, detail="旧密钥包含自定义访问范围，无法安全更新，请新建密钥")
+        available_models, unrestricted = await self.available_key_models(raw_user_id, backend)
+        available_set = set(available_models)
+        old_models = {str(model) for model in rotation.get("models") or [] if model}
+        if unrestricted:
+            effective_models = [] if not old_models or "all-proxy-models" in old_models else sorted(old_models)
+        elif not old_models or "all-proxy-models" in old_models:
+            effective_models = available_models
+        else:
+            effective_models = sorted(old_models & available_set)
+            if not effective_models:
+                raise HTTPException(status_code=409, detail="旧密钥的模型权限已与当前员工权限不一致，请新建密钥")
+
+        metadata = dict(rotation.get("metadata") or {})
+        metadata["display_name"] = str(owned.get("name") or metadata.get("display_name") or "个人访问密钥")
+        metadata["purpose"] = str(owned.get("purpose") or metadata.get("purpose") or "")
+        metadata["created_via"] = "ai-usage-center"
+        metadata["replaces_key_id"] = key_id
+        body: dict[str, Any] = {
+            "key_alias": f"ai-usage-{secrets.token_hex(8)}",
+            "key_type": "llm_api",
+            "user_id": raw_user_id,
+            "models": effective_models,
+            "metadata": metadata,
+        }
+        duration = self._remaining_key_duration(rotation.get("expires"))
+        if duration:
+            body["duration"] = duration
+
+        inherited_fields = (
+            "max_budget",
+            "spend",
+            "budget_duration",
+            "budget_limits",
+            "budget_id",
+            "max_parallel_requests",
+            "tpm_limit",
+            "rpm_limit",
+            "allowed_cache_controls",
+            "config",
+            "permissions",
+            "model_max_budget",
+            "budget_fallbacks",
+            "model_rpm_limit",
+            "model_tpm_limit",
+            "guardrails",
+            "policies",
+            "prompts",
+            "aliases",
+            "object_permission",
+            "tags",
+            "disable_global_guardrails",
+            "enforced_params",
+            "allowed_passthrough_routes",
+            "allowed_vector_store_indexes",
+            "rpm_limit_type",
+            "tpm_limit_type",
+            "router_settings",
+            "access_group_ids",
+            "team_id",
+            "agent_id",
+            "project_id",
+        )
+        for name in inherited_fields:
+            if name in rotation:
+                body[name] = rotation[name]
+        if rotation.get("org_id"):
+            body["organization_id"] = rotation["org_id"]
+
+        payload = await self.request_backend(
+            backend,
+            "POST",
+            "/key/generate",
+            headers={"litellm-changed-by": changed_by},
+            json=body,
+        )
+        new_key = _clean_text(_first(payload, "key", default=""))
+        new_key_id = _clean_text(_first(payload, "token_id", "token", default=""))
+        if not new_key.startswith("sk-"):
+            raise HTTPException(status_code=502, detail="上游未返回新的访问密钥")
+        if not new_key_id or new_key_id.startswith("sk-"):
+            new_key_id = safe_key_id(new_key)
+        self.invalidate_key_cache(raw_user_id, backend)
+        expires = _first(payload, "expires", default=None)
+        return {
+            "key": new_key,
+            "id": new_key_id,
+            "expiresAt": _date_text(expires) if expires else "永不过期",
+        }
+
+    async def disable_pending_old_key(
+        self,
+        old_key_id: str,
+        replacement_key_id: str,
+        user_id: str,
+        changed_by: str,
+    ) -> dict[str, str]:
+        backend, raw_user_id = self._decode_account_id(user_id)
+        owned_keys = await self.keys_for_user(raw_user_id, backend, refresh=True)
+        owned_ids = {str(key.get("id") or "") for key in owned_keys}
+        if replacement_key_id not in owned_ids:
+            raise HTTPException(status_code=403, detail="替代密钥不属于当前员工，不能继续停用旧密钥")
+        if old_key_id not in owned_ids:
+            return {"id": old_key_id}
+        return await self.delete_key(old_key_id, user_id, changed_by)
+
     async def delete_key(self, key_id: str, user_id: str, changed_by: str) -> dict[str, str]:
         backend, raw_user_id = self._decode_account_id(user_id)
         if backend.source:
@@ -991,10 +1188,20 @@ class LiteLLMClient:
             json={"keys": [key_id]},
         )
         deleted_keys = payload.get("deleted_keys") if isinstance(payload, dict) else None
-        if not isinstance(deleted_keys, list) or key_id not in {str(item) for item in deleted_keys}:
+        if not self._delete_confirmed(deleted_keys, key_id):
             raise HTTPException(status_code=502, detail="上游未确认访问密钥已删除")
         self.invalidate_key_cache(raw_user_id, backend)
         return {"id": key_id}
+
+    @staticmethod
+    def _delete_confirmed(deleted_keys: Any, key_id: str) -> bool:
+        if isinstance(deleted_keys, list):
+            return key_id in {str(item) for item in deleted_keys}
+        if isinstance(deleted_keys, dict):
+            return LiteLLMClient._delete_confirmed(deleted_keys.get("deleted_keys"), key_id)
+        if isinstance(deleted_keys, int):
+            return deleted_keys > 0
+        return False
 
     async def users(self, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
         backend = backend or self.backends[0]

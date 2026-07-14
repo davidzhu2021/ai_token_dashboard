@@ -379,6 +379,7 @@
       }
 
       .primary-btn:disabled,
+      .ghost-btn:disabled,
       .danger-btn:disabled,
       .danger-outline-btn:disabled {
         opacity: 0.45;
@@ -391,7 +392,7 @@
         border-color: var(--line);
       }
 
-      .ghost-btn:hover {
+      .ghost-btn:hover:not(:disabled) {
         border-color: rgba(26, 127, 100, 0.28);
         box-shadow: var(--shadow-soft);
       }
@@ -1523,6 +1524,21 @@
         line-height: 1.5;
       }
 
+      .key-cleanup-state {
+        display: inline-flex;
+        align-items: center;
+        width: fit-content;
+        margin-top: 3px;
+        padding: 4px 7px;
+        color: #8b3437;
+        background: rgba(255, 235, 233, 0.9);
+        border: 1px solid rgba(191, 74, 79, 0.22);
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 800;
+        line-height: 1.35;
+      }
+
       .key-masked-value {
         display: block;
         min-width: 0;
@@ -1613,6 +1629,11 @@
       .key-row-actions button {
         min-height: 36px;
         padding: 0 12px;
+      }
+
+      .key-row-actions .retry-disable-key-btn {
+        color: #8b3437;
+        border-color: rgba(191, 74, 79, 0.3);
       }
 
       .key-empty,
@@ -1838,6 +1859,39 @@
         display: flex;
         align-items: flex-start;
         gap: 10px;
+      }
+
+      .warning-box.success {
+        color: #17634f;
+        background: rgba(224, 245, 235, 0.9);
+        border-color: rgba(31, 122, 91, 0.22);
+      }
+
+      .rotation-cleanup-panel {
+        display: grid;
+        gap: 12px;
+        margin-top: 14px;
+        padding: 15px;
+        color: #762d31;
+        background: linear-gradient(135deg, rgba(255, 238, 235, 0.98), rgba(255, 248, 239, 0.94));
+        border: 1px solid rgba(191, 74, 79, 0.34);
+        border-radius: 8px;
+        box-shadow: 0 10px 24px rgba(191, 74, 79, 0.09);
+      }
+
+      .rotation-cleanup-panel strong {
+        display: block;
+        margin-bottom: 4px;
+        font-size: 14px;
+      }
+
+      .rotation-cleanup-panel span {
+        font-size: 12px;
+        line-height: 1.65;
+      }
+
+      .rotation-cleanup-panel button {
+        justify-self: start;
       }
 
       .delete-key-summary {
@@ -3688,7 +3742,7 @@
         <h3 id="regenerateKeyTitle">更新访问密钥</h3>
         <div class="warning-box">
           <span class="app-icon"><svg><use href="#icon-warning"></use></svg></span>
-          <span>更新后旧密钥会立即失效，使用旧密钥的工具需要更新配置。</span>
+          <span>系统将先创建并加密保管新密钥，再停用旧密钥。处理期间新旧密钥可能短暂同时有效；完成后，请将使用旧密钥的工具更新为新密钥。</span>
         </div>
         <div class="modal-actions">
           <button id="cancelRegenerateKey" class="ghost-btn" type="button">取消</button>
@@ -3723,9 +3777,16 @@
     <div id="newKeyModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="newKeyTitle">
       <div class="modal">
         <h3 id="newKeyTitle">请立即保存新密钥</h3>
-        <div class="warning-box">
+        <div id="newKeyNoticeBox" class="warning-box">
           <span class="app-icon"><svg><use href="#icon-warning"></use></svg></span>
           <span id="newKeyNotice">密钥已加密保管，关闭窗口后仍可在列表中通过眼睛按钮查看。</span>
+        </div>
+        <div id="rotationCleanupPanel" class="rotation-cleanup-panel hidden" role="alert">
+          <div>
+            <strong>旧密钥尚未停用</strong>
+            <span id="rotationCleanupMessage">新密钥已经可以使用，但旧密钥目前仍然有效。请重试停用旧密钥。</span>
+          </div>
+          <button id="retryDisableOldKey" class="danger-outline-btn" type="button">重试停用旧密钥</button>
         </div>
         <div class="new-key-box">
           <span class="hint">完整访问密钥</span>
@@ -3742,6 +3803,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260713-key-delete"></script>
+    <script src="/assets/app.js?v=20260714-key-rotation"></script>
   </body>
 </html>

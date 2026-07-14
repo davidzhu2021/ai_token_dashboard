@@ -177,10 +177,31 @@ def test_regenerate_checks_fresh_ownership_immediately_revokes_and_clears_cache(
     regenerated = asyncio.run(client.regenerate_key("owned-hash", "user-primary", "employee@example.com"))
 
     assert regenerated == {"key": "sk-regenerated-EFGH", "id": hashlib.sha256(b"sk-regenerated-EFGH").hexdigest()}
-    assert captured["path"] == "/key/regenerate"
-    assert captured["params"] == {"key": "owned-hash"}
+    assert captured["path"] == "/key/owned-hash/regenerate"
+    assert "params" not in captured
     assert captured["json"] == {"grace_period": "0s"}
     assert client._key_cache.get("keys:primary:user-primary")[0] is False
+
+
+def test_regenerate_uses_encoded_official_path(monkeypatch) -> None:
+    client, backend = make_client()
+    captured: dict[str, Any] = {}
+
+    async def fake_keys_for_user(_user_id: str, _backend: LiteLLMBackend | None = None, refresh: bool = False):
+        assert refresh is True
+        return [{"id": "hash/with space"}]
+
+    async def fake_request_backend(_backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        captured.update({"method": method, "path": path, **kwargs})
+        return {"key": "sk-regenerated-EFGH"}
+
+    monkeypatch.setattr(client, "keys_for_user", fake_keys_for_user)
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    asyncio.run(client.regenerate_key("hash/with space", "user-primary", "employee@example.com"))
+
+    assert captured["path"] == "/key/hash%2Fwith%20space/regenerate"
+    assert captured["json"] == {"grace_period": "0s"}
 
 
 def test_regenerate_rejects_unowned_key(monkeypatch) -> None:
@@ -205,6 +226,38 @@ def test_regenerate_rejects_unowned_key(monkeypatch) -> None:
 
     assert exc.value.status_code == 403
     assert requested is False
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"has_license": True, "license_type": "enterprise"}, True),
+        ({"has_license": False, "license_type": "community"}, False),
+    ],
+)
+def test_atomic_regeneration_capability_uses_license_type(monkeypatch, payload, expected) -> None:
+    client, _ = make_client()
+
+    async def fake_request_backend(*_args, **_kwargs):
+        return payload
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    assert asyncio.run(client.supports_atomic_key_regeneration("user-1")) is expected
+
+
+def test_atomic_regeneration_capability_does_not_hide_server_failure(monkeypatch) -> None:
+    client, _ = make_client()
+
+    async def fake_request_backend(*_args, **_kwargs):
+        raise HTTPException(status_code=503, detail="unavailable")
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(client.supports_atomic_key_regeneration("user-1"))
+
+    assert exc.value.status_code == 503
 
 
 def test_delete_checks_fresh_ownership_calls_upstream_and_clears_cache(monkeypatch) -> None:
@@ -232,6 +285,28 @@ def test_delete_checks_fresh_ownership_calls_upstream_and_clears_cache(monkeypat
     assert captured["json"] == {"keys": ["owned-hash"]}
     assert captured["headers"] == {"litellm-changed-by": "employee@example.com"}
     assert client._key_cache.get("keys:primary:user-primary")[0] is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"deleted_keys": {"deleted_keys": ["owned-hash"]}},
+        {"deleted_keys": 1},
+    ],
+)
+def test_delete_accepts_compatible_upstream_confirmation_shapes(monkeypatch, payload) -> None:
+    client, _ = make_client()
+
+    async def fake_keys_for_user(*_args: Any, **_kwargs: Any):
+        return [{"id": "owned-hash"}]
+
+    async def fake_request_backend(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return payload
+
+    monkeypatch.setattr(client, "keys_for_user", fake_keys_for_user)
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    assert asyncio.run(client.delete_key("owned-hash", "user-primary", "employee@example.com")) == {"id": "owned-hash"}
 
 
 def test_delete_rejects_unowned_key_without_upstream_request(monkeypatch) -> None:
@@ -284,6 +359,63 @@ def test_primary_account_selection_ignores_history_backends() -> None:
         ],
     }
     assert main.primary_upstream_user_id(upstream_user) == "user-primary"
+
+
+def test_keys_endpoint_merges_pending_rotation_state(monkeypatch) -> None:
+    class FakeClient:
+        async def available_key_models(self, user_id):
+            assert user_id == "user-1"
+            return ["gpt-5"], False
+
+        async def keys_for_user_ids(self, user_ids, refresh=False):
+            assert user_ids == ["user-1"]
+            assert refresh is False
+            return [
+                {
+                    "_backendId": "primary",
+                    "_userId": "user-1",
+                    "id": "new-hash",
+                    "name": "工作密钥",
+                    "purpose": "Codex",
+                    "status": "正常",
+                }
+            ]
+
+    class FakeVault:
+        def has(self, backend_id, user_id, key_id):
+            return (backend_id, user_id, key_id) == ("primary", "user-1", "new-hash")
+
+        def pending_rotations(self, backend_id, user_id):
+            assert (backend_id, user_id) == ("primary", "user-1")
+            return [
+                {
+                    "oldKeyId": "old-hash",
+                    "replacementKeyId": "new-hash",
+                    "cleanupTarget": "old",
+                    "lastError": "delete failed",
+                    "createdAt": "2026-07-14T00:00:00+00:00",
+                    "updatedAt": "2026-07-14T00:00:00+00:00",
+                }
+            ]
+
+    async def fake_current_upstream_user(_request):
+        return {"email": "employee@example.com"}, {"matched_user_ids": ["user-1"]}
+
+    monkeypatch.setattr(main, "client", lambda: FakeClient())
+    monkeypatch.setattr(main, "key_vault", lambda: FakeVault())
+    monkeypatch.setattr(main, "current_upstream_user", fake_current_upstream_user)
+
+    with TestClient(main.app) as app_client:
+        response = app_client.get("/api/me/keys")
+
+    assert response.status_code == 200
+    key = response.json()["keys"][0]
+    assert key["id"] == "new-hash"
+    assert key["revealable"] is True
+    assert key["cleanupRequired"] is True
+    assert key["recoveryRequired"] is False
+    assert key["oldKeyId"] == "old-hash"
+    assert key["replacementKeyId"] == "new-hash"
 
 
 def test_key_audit_never_writes_plain_key(monkeypatch, tmp_path) -> None:
@@ -474,12 +606,18 @@ def test_regenerate_endpoint_replaces_old_vault_record(monkeypatch) -> None:
             assert (key_id, user_id) == ("old-hash", "user-1")
             return {"key": "sk-regenerated-EFGH", "id": "new-hash"}
 
+        async def supports_atomic_key_regeneration(self, _user_id):
+            return True
+
     class FakeVault:
         def __init__(self) -> None:
             self.replaced = None
 
         def replace(self, backend_id, user_id, old_key_id, new_key_id, plaintext):
             self.replaced = (backend_id, user_id, old_key_id, new_key_id, plaintext)
+
+        def pending_rotation(self, *_args):
+            return None
 
     vault = FakeVault()
 
@@ -499,9 +637,230 @@ def test_regenerate_endpoint_replaces_old_vault_record(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json()["revealable"] is True
+    assert response.json()["rotationMode"] == "atomic"
+    assert response.json()["oldKeyDisabled"] is True
+    assert response.json()["cleanupRequired"] is False
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["pragma"] == "no-cache"
     assert vault.replaced == ("primary", "user-1", "old-hash", "new-hash", "sk-regenerated-EFGH")
+
+
+def test_replacement_key_intersects_models_inherits_limits_and_forces_llm_type(monkeypatch) -> None:
+    client, backend = make_client()
+    captured: dict[str, Any] = {}
+
+    async def fake_keys_for_user(*_args, **_kwargs):
+        return [{
+            "id": "old-hash",
+            "status": "正常",
+            "name": "工作密钥",
+            "purpose": "Codex",
+            "_rotation": {
+                "models": ["gpt-5", "removed-model"],
+                "metadata": {"owner": "me"},
+                "max_budget": 10,
+                "rpm_limit": 20,
+                "allowed_routes": ["llm_api_routes"],
+            },
+        }]
+
+    async def fake_available_models(*_args, **_kwargs):
+        return ["gpt-5", "claude-sonnet"], False
+
+    async def fake_request_backend(_backend, method, path, **kwargs):
+        captured.update({"backend": _backend, "method": method, "path": path, **kwargs})
+        return {"key": "sk-replacement-EFGH", "token_id": "new-hash"}
+
+    monkeypatch.setattr(client, "keys_for_user", fake_keys_for_user)
+    monkeypatch.setattr(client, "available_key_models", fake_available_models)
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    result = asyncio.run(client.create_replacement_key("old-hash", "user-1", "employee@example.com"))
+
+    assert result == {"key": "sk-replacement-EFGH", "id": "new-hash", "expiresAt": "永不过期"}
+    body = captured["json"]
+    assert captured["path"] == "/key/generate"
+    assert body["key_type"] == "llm_api"
+    assert body["models"] == ["gpt-5"]
+    assert body["max_budget"] == 10
+    assert body["rpm_limit"] == 20
+    assert body["metadata"]["display_name"] == "工作密钥"
+    assert body["metadata"]["purpose"] == "Codex"
+
+
+def test_replacement_key_rejects_custom_routes(monkeypatch) -> None:
+    client, _ = make_client()
+
+    async def fake_keys_for_user(*_args, **_kwargs):
+        return [{"id": "old-hash", "status": "正常", "_rotation": {"models": ["gpt-5"], "allowed_routes": ["/key/info"]}}]
+
+    monkeypatch.setattr(client, "keys_for_user", fake_keys_for_user)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(client.create_replacement_key("old-hash", "user-1", "employee@example.com"))
+
+    assert exc.value.status_code == 409
+
+
+def test_replacement_endpoint_persists_cleanup_when_old_delete_fails(monkeypatch) -> None:
+    class FakeClient:
+        def _decode_account_id(self, user_id):
+            return LiteLLMBackend(id="primary", label="Primary", base_url="", admin_key=""), user_id
+
+        async def supports_atomic_key_regeneration(self, _user_id):
+            return False
+
+        async def create_replacement_key(self, *_args):
+            return {"key": "sk-replacement-EFGH", "id": "new-hash"}
+
+        async def delete_key(self, key_id, *_args):
+            assert key_id == "old-hash"
+            raise HTTPException(status_code=502, detail="delete failed")
+
+    class FakeVault:
+        def __init__(self):
+            self.pending = None
+
+        def pending_rotation(self, *_args):
+            return None
+
+        def store(self, *_args):
+            return None
+
+        def record_pending_rotation(self, *args):
+            self.pending = args
+
+    vault = FakeVault()
+
+    async def fake_current_upstream_user(_request):
+        return {"email": "employee@example.com"}, {"matched_user_ids": ["user-1"]}
+
+    monkeypatch.setattr(main, "client", lambda: FakeClient())
+    monkeypatch.setattr(main, "key_vault", lambda: vault)
+    monkeypatch.setattr(main, "current_upstream_user", fake_current_upstream_user)
+    monkeypatch.setattr(main, "write_key_audit", lambda *_args: None)
+
+    with TestClient(main.app) as app_client:
+        response = app_client.post("/api/me/keys/old-hash/regenerate")
+
+    assert response.status_code == 200
+    assert response.json()["cleanupRequired"] is True
+    assert response.json()["oldKeyDisabled"] is False
+    assert response.json()["replacementKeyId"] == "new-hash"
+    assert vault.pending[:5] == ("primary", "user-1", "old-hash", "new-hash", "old")
+
+
+def test_replacement_endpoint_compensates_new_key_when_vault_fails(monkeypatch) -> None:
+    deleted = []
+
+    class FakeClient:
+        def _decode_account_id(self, user_id):
+            return LiteLLMBackend(id="primary", label="Primary", base_url="", admin_key=""), user_id
+
+        async def supports_atomic_key_regeneration(self, _user_id):
+            return False
+
+        async def create_replacement_key(self, *_args):
+            return {"key": "sk-replacement-EFGH", "id": "new-hash", "expiresAt": "永不过期"}
+
+        async def delete_key(self, key_id, *_args):
+            deleted.append(key_id)
+            return {"id": key_id}
+
+    class BrokenVault:
+        def pending_rotation(self, *_args):
+            return None
+
+        def store(self, *_args):
+            raise main.KeyVaultError("write failed")
+
+    async def fake_current_upstream_user(_request):
+        return {"email": "employee@example.com"}, {"matched_user_ids": ["user-1"]}
+
+    monkeypatch.setattr(main, "client", lambda: FakeClient())
+    monkeypatch.setattr(main, "key_vault", lambda: BrokenVault())
+    monkeypatch.setattr(main, "current_upstream_user", fake_current_upstream_user)
+    monkeypatch.setattr(main, "write_key_audit", lambda *_args: None)
+
+    with TestClient(main.app) as app_client:
+        response = app_client.post("/api/me/keys/old-hash/regenerate")
+
+    assert response.status_code == 503
+    assert deleted == ["new-hash"]
+
+
+def test_replacement_endpoint_returns_plaintext_if_vault_and_compensation_fail(monkeypatch) -> None:
+    class FakeClient:
+        def _decode_account_id(self, user_id):
+            return LiteLLMBackend(id="primary", label="Primary", base_url="", admin_key=""), user_id
+
+        async def supports_atomic_key_regeneration(self, _user_id):
+            return False
+
+        async def create_replacement_key(self, *_args):
+            return {"key": "sk-replacement-EFGH", "id": "new-hash", "expiresAt": "永不过期"}
+
+        async def delete_key(self, *_args):
+            raise HTTPException(status_code=502, detail="delete failed")
+
+    class BrokenVault:
+        def pending_rotation(self, *_args):
+            return None
+
+        def store(self, *_args):
+            raise main.KeyVaultError("write failed")
+
+    async def fake_current_upstream_user(_request):
+        return {"email": "employee@example.com"}, {"matched_user_ids": ["user-1"]}
+
+    monkeypatch.setattr(main, "client", lambda: FakeClient())
+    monkeypatch.setattr(main, "key_vault", lambda: BrokenVault())
+    monkeypatch.setattr(main, "current_upstream_user", fake_current_upstream_user)
+    monkeypatch.setattr(main, "write_key_audit", lambda *_args: None)
+
+    with TestClient(main.app) as app_client:
+        response = app_client.post("/api/me/keys/old-hash/regenerate")
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["key"] == "sk-replacement-EFGH"
+    assert payload["oldKeyDisabled"] is False
+    assert payload["cleanupRequired"] is False
+    assert payload["recoveryRequired"] is True
+    assert payload["revealable"] is False
+
+
+def test_disable_old_endpoint_uses_persisted_replacement(monkeypatch) -> None:
+    calls = []
+
+    class FakeClient:
+        def _decode_account_id(self, user_id):
+            return LiteLLMBackend(id="primary", label="Primary", base_url="", admin_key=""), user_id
+
+        async def disable_pending_old_key(self, old_id, replacement_id, user_id, changed_by):
+            calls.append((old_id, replacement_id, user_id, changed_by))
+
+    class FakeVault:
+        def pending_rotation(self, *_args):
+            return {"cleanupTarget": "old", "replacementKeyId": "new-hash"}
+
+        def complete_pending_rotation(self, *args):
+            calls.append(args)
+
+    async def fake_current_upstream_user(_request):
+        return {"email": "employee@example.com"}, {"matched_user_ids": ["user-1"]}
+
+    monkeypatch.setattr(main, "client", lambda: FakeClient())
+    monkeypatch.setattr(main, "key_vault", lambda: FakeVault())
+    monkeypatch.setattr(main, "current_upstream_user", fake_current_upstream_user)
+    monkeypatch.setattr(main, "write_key_audit", lambda *_args: None)
+
+    with TestClient(main.app) as app_client:
+        response = app_client.post("/api/me/keys/old-hash/disable-old", json={"replacementKeyId": "new-hash"})
+
+    assert response.status_code == 200
+    assert response.json()["cleanupRequired"] is False
+    assert calls[0] == ("old-hash", "new-hash", "user-1", "employee@example.com")
 
 
 def test_delete_endpoint_finds_owner_cleans_vault_and_audits(monkeypatch) -> None:
