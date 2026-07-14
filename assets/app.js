@@ -36,6 +36,21 @@ let selectedDepartment = "";
 let departmentPickerOpen = false;
 let departmentPickerOptions = [];
 let modelCatalog = [];
+let personalKeys = [];
+let availableKeyModels = [];
+let unrestrictedKeyModels = false;
+let isKeysLoading = false;
+let keyLoadError = "";
+let pendingRegenerateKeyId = "";
+let pendingDeleteKeyId = "";
+let pendingDeleteKeyName = "";
+let currentPlainKey = "";
+let revealedKeys = new Map();
+let revealTimers = new Map();
+let revealingKeyIds = new Set();
+let isCreatingKey = false;
+let isRegeneratingKey = false;
+let isDeletingKey = false;
 let isDashboardLoading = false;
 let isAdminLoading = false;
 let isDepartmentLoading = false;
@@ -148,6 +163,15 @@ function tokenShareText(latestTokens, totalTokens) {
 function setText(id, value) {
   const node = el(id);
   if (node) node.textContent = value;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 function renderDailyOverview(config) {
@@ -280,7 +304,7 @@ function renderMetricGroups(containerId, data, mode = "personal", summary = null
     ]),
     metricGroup("所选范围消耗", `${label} · ${source}${scopeSuffix}`, [
       metric(`${label} Token`, formatTokens(total), "按当前日期与来源筛选累计", source, "gold", "trend"),
-      metric(`${label} 消耗金额`, money.format(spend), "按上游记录汇总", "估算", "gold", "cost"),
+      metric(`${label} 消耗金额`, money.format(spend), "按用量记录汇总", "估算", "gold", "cost"),
     ]),
     metricGroup("所选范围请求", `${label} · ${source}${scopeSuffix}`, [
       metric(`${label} 请求次数`, fmt.format(requests), "按当前筛选累计", "请求", "blue", "request"),
@@ -1213,6 +1237,288 @@ function renderModels() {
     .join("");
 }
 
+function keyStatusClass(status) {
+  if (status === "正常") return "";
+  if (status === "已过期") return "gold";
+  return "rose";
+}
+
+function keyModelText(key) {
+  const models = Array.isArray(key.models) ? key.models.filter(Boolean) : [];
+  if (!models.length) return "全部可用模型";
+  if (models.length <= 2) return models.join("、");
+  return `${models.slice(0, 2).join("、")} 等 ${models.length} 个模型`;
+}
+
+function keySecretMarkup(key) {
+  const keyId = String(key.id || "");
+  const revealedValue = revealedKeys.get(keyId) || "";
+  const isRevealed = Boolean(revealedValue);
+  const isLoading = revealingKeyIds.has(keyId);
+  const canReveal = Boolean(key.revealable);
+  const title = canReveal
+    ? isRevealed
+      ? "隐藏完整密钥"
+      : isLoading
+        ? "正在读取完整密钥"
+        : "查看完整密钥"
+    : "该密钥创建时未保管完整值，请更新后查看";
+  const help = canReveal ? "" : `<span class="key-reveal-help">更新后可查看完整密钥</span>`;
+  return `
+    <span class="key-secret-wrap">
+      <span class="key-secret-control ${isRevealed ? "revealed" : ""}">
+        <code class="key-masked-value">${escapeHtml(isRevealed ? revealedValue : key.masked || "sk-...----")}</code>
+        <button
+          class="key-reveal-button"
+          type="button"
+          data-reveal-key="${escapeHtml(keyId)}"
+          aria-label="${escapeHtml(title)}"
+          title="${escapeHtml(title)}"
+          ${canReveal && !isLoading ? "" : "disabled"}
+        ><svg aria-hidden="true"><use href="#icon-${isRevealed ? "eye-off" : "eye"}"></use></svg></button>
+      </span>
+      ${help}
+    </span>
+  `;
+}
+
+function hideRevealedKey(keyId) {
+  const timer = revealTimers.get(keyId);
+  if (timer) window.clearTimeout(timer);
+  revealTimers.delete(keyId);
+  revealedKeys.delete(keyId);
+  revealingKeyIds.delete(keyId);
+  if (currentView === "keys") renderKeys();
+}
+
+function clearRevealedKeys() {
+  revealTimers.forEach((timer) => window.clearTimeout(timer));
+  revealTimers = new Map();
+  revealedKeys = new Map();
+  revealingKeyIds = new Set();
+  if (currentView === "keys" && el("keysView") && !el("keysView").classList.contains("hidden")) renderKeys();
+}
+
+async function toggleKeyReveal(keyId) {
+  if (revealedKeys.has(keyId)) {
+    hideRevealedKey(keyId);
+    return;
+  }
+  const key = personalKeys.find((item) => String(item.id || "") === keyId);
+  if (!key?.revealable) {
+    showToast("该密钥创建时未保管完整值，请更新后查看");
+    return;
+  }
+  if (revealingKeyIds.has(keyId)) return;
+  revealingKeyIds.add(keyId);
+  renderKeys();
+  try {
+    const payload = await api(`/api/me/keys/${encodeURIComponent(keyId)}/reveal`, {
+      method: "POST",
+      body: JSON.stringify({}),
+      cache: "no-store",
+    });
+    if (!String(payload.key || "").startsWith("sk-")) throw new Error("服务未返回有效的完整密钥");
+    revealedKeys.set(keyId, String(payload.key));
+    const previousTimer = revealTimers.get(keyId);
+    if (previousTimer) window.clearTimeout(previousTimer);
+    revealTimers.set(keyId, window.setTimeout(() => hideRevealedKey(keyId), 30000));
+  } catch (error) {
+    showToast(error.message || "完整密钥读取失败");
+  } finally {
+    revealingKeyIds.delete(keyId);
+    renderKeys();
+  }
+}
+
+function renderKeys() {
+  const countText = `${fmt.format(personalKeys.length)} 个密钥`;
+  setText("keyCount", isKeysLoading ? "加载中" : countText);
+  const tableBody = el("keyTableBody");
+  const cardList = el("keyCardList");
+
+  if (isKeysLoading) {
+    tableBody.innerHTML = `<tr><td colspan="8" class="key-loading">正在加载个人密钥...</td></tr>`;
+    cardList.innerHTML = `<article class="panel key-loading">正在加载个人密钥...</article>`;
+    return;
+  }
+  if (keyLoadError) {
+    const message = escapeHtml(keyLoadError);
+    tableBody.innerHTML = `<tr><td colspan="8" class="key-empty">${message}</td></tr>`;
+    cardList.innerHTML = `<article class="panel key-empty">${message}</article>`;
+    return;
+  }
+  if (!personalKeys.length) {
+    const emptyMessage = "还没有个人密钥，点击“添加密钥”创建第一个。";
+    tableBody.innerHTML = `<tr><td colspan="8" class="key-empty">${emptyMessage}</td></tr>`;
+    cardList.innerHTML = `<article class="panel key-empty">${emptyMessage}</article>`;
+    return;
+  }
+
+  tableBody.innerHTML = personalKeys
+    .map((key) => {
+      const id = escapeHtml(key.id);
+      const name = escapeHtml(key.name || "个人访问密钥");
+      const purpose = escapeHtml(key.purpose || "用于个人 AI 工具访问。");
+      const status = escapeHtml(key.status || "正常");
+      return `
+        <tr>
+          <td><div class="key-name-cell"><strong>${name}</strong><span>${purpose}</span></div></td>
+          <td><span class="chip ${keyStatusClass(key.status)}">${status}</span></td>
+          <td>${keySecretMarkup(key)}</td>
+          <td><span class="key-model-summary">${escapeHtml(keyModelText(key))}</span></td>
+          <td>${escapeHtml(key.createdAt || "-")}</td>
+          <td>${escapeHtml(key.lastUsed || "-")}</td>
+          <td>${escapeHtml(key.expiresAt || "永不过期")}</td>
+          <td>
+            <div class="key-row-actions">
+              <button class="ghost-btn key-regenerate-btn" type="button" data-regenerate-key="${id}">更新</button>
+              <button class="danger-outline-btn" type="button" data-delete-key="${id}">删除</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  cardList.innerHTML = personalKeys
+    .map((key) => `
+      <article class="panel key-mobile-card">
+        <div class="key-mobile-head">
+          <div class="key-name-cell">
+            <strong>${escapeHtml(key.name || "个人访问密钥")}</strong>
+            <span>${escapeHtml(key.purpose || "用于个人 AI 工具访问。")}</span>
+          </div>
+          <span class="chip ${keyStatusClass(key.status)}">${escapeHtml(key.status || "正常")}</span>
+        </div>
+        <div class="key-mobile-row"><span>密钥</span>${keySecretMarkup(key)}</div>
+        <div class="key-mobile-row"><span>可用模型</span><strong>${escapeHtml(keyModelText(key))}</strong></div>
+        <div class="key-mobile-row"><span>创建时间</span><strong>${escapeHtml(key.createdAt || "-")}</strong></div>
+        <div class="key-mobile-row"><span>最近使用</span><strong>${escapeHtml(key.lastUsed || "-")}</strong></div>
+        <div class="key-mobile-row"><span>过期时间</span><strong>${escapeHtml(key.expiresAt || "永不过期")}</strong></div>
+        <div class="key-mobile-actions">
+          <button class="ghost-btn" type="button" data-regenerate-key="${escapeHtml(key.id)}">更新</button>
+          <button class="danger-outline-btn" type="button" data-delete-key="${escapeHtml(key.id)}">删除</button>
+        </div>
+      </article>
+    `)
+    .join("");
+}
+
+function renderKeyModelChoices() {
+  const choices = el("keyModelChoices");
+  if (!availableKeyModels.length) {
+    choices.innerHTML = `<div class="key-model-empty">当前账号没有可选的指定模型。</div>`;
+    return;
+  }
+  choices.innerHTML = availableKeyModels
+    .map((model) => `
+      <label class="model-choice">
+        <input type="checkbox" name="keyModel" value="${escapeHtml(model)}" />
+        <span>${escapeHtml(model)}</span>
+      </label>
+    `)
+    .join("");
+}
+
+function updateKeyModelMode() {
+  const custom = el("keyModelMode").value === "custom";
+  el("keyModelChoices").classList.toggle("hidden", !custom);
+  if (!custom) {
+    el("keyModelChoices").querySelectorAll("input").forEach((input) => {
+      input.checked = false;
+    });
+  }
+}
+
+function openCreateKeyModal() {
+  el("createKeyForm").reset();
+  el("keyModelMode").value = "all";
+  renderKeyModelChoices();
+  updateKeyModelMode();
+  const scopeText = unrestrictedKeyModels
+    ? "全部可用模型会跟随当前账号的全模型权限。"
+    : "全部可用模型会限制在你当前账号已授权的模型范围内。";
+  setText("keyModelHint", scopeText);
+  el("createKeyModal").classList.remove("hidden");
+  window.setTimeout(() => el("keyNameInput").focus(), 0);
+}
+
+function closeCreateKeyModal() {
+  if (isCreatingKey) return;
+  el("createKeyModal").classList.add("hidden");
+  el("createKeyForm").reset();
+  updateKeyModelMode();
+}
+
+function closeRegenerateKeyModal() {
+  if (isRegeneratingKey) return;
+  pendingRegenerateKeyId = "";
+  el("regenerateKeyModal").classList.add("hidden");
+}
+
+function updateDeleteKeyConfirmation() {
+  const matches = el("deleteKeyConfirmInput").value.trim() === pendingDeleteKeyName;
+  el("confirmDeleteKey").disabled = isDeletingKey || !pendingDeleteKeyName || !matches;
+}
+
+function closeDeleteKeyModal() {
+  if (isDeletingKey) return;
+  pendingDeleteKeyId = "";
+  pendingDeleteKeyName = "";
+  el("deleteKeyConfirmInput").value = "";
+  setText("deleteKeyName", "-");
+  setText("deleteKeyMasked", "sk-...----");
+  setText("deleteKeyExpectedName", "-");
+  el("confirmDeleteKey").disabled = true;
+  el("deleteKeyModal").classList.add("hidden");
+}
+
+function showPlainKey(key, expiry = "", options = {}) {
+  currentPlainKey = String(key || "");
+  setText("newKeyValue", currentPlainKey);
+  setText("newKeyExpiry", expiry ? `过期时间：${expiry}` : "");
+  const warning = String(options.warning || "");
+  setText(
+    "newKeyNotice",
+    warning || (options.revealable === false
+      ? "完整密钥只显示这一次。关闭窗口后无法再次查看，请立即复制并安全保存。"
+      : "密钥已加密保管，关闭窗口后仍可在列表中通过眼睛按钮查看。"),
+  );
+  el("newKeyNotice").closest(".warning-box").classList.toggle("success", !warning && options.revealable !== false);
+  el("newKeyModal").classList.remove("hidden");
+}
+
+function clearPlainKey() {
+  currentPlainKey = "";
+  setText("newKeyValue", "");
+  setText("newKeyExpiry", "");
+  el("newKeyModal").classList.add("hidden");
+}
+
+async function loadKeys(forceRefresh = false) {
+  if (!currentUser || isKeysLoading) return;
+  if (revealedKeys.size || revealTimers.size || revealingKeyIds.size) clearRevealedKeys();
+  isKeysLoading = true;
+  keyLoadError = "";
+  renderKeys();
+  try {
+    const payload = await api(`/api/me/keys${forceRefresh ? "?refresh=1" : ""}`);
+    personalKeys = Array.isArray(payload.keys) ? payload.keys : [];
+    availableKeyModels = Array.isArray(payload.availableModels) ? payload.availableModels : [];
+    unrestrictedKeyModels = Boolean(payload.unrestrictedModels);
+  } catch (error) {
+    personalKeys = [];
+    availableKeyModels = [];
+    unrestrictedKeyModels = false;
+    keyLoadError = error.message || "个人密钥加载失败，请稍后重试。";
+    showToast(keyLoadError);
+  } finally {
+    isKeysLoading = false;
+    renderKeys();
+  }
+}
+
 async function copyText(text, successMessage) {
   try {
     await navigator.clipboard.writeText(text);
@@ -1235,17 +1541,39 @@ function switchView(view) {
   if (view === "admin" && !currentUser?.isAdmin) view = "dashboard";
   if (view === "department" && !currentUser?.isAdmin) view = "dashboard";
   if (view === "team" && !currentUser?.isTeamLeader) view = "dashboard";
+  if (currentView === "keys" && view !== "keys") clearRevealedKeys();
   currentView = view;
   el("dashboardView").classList.toggle("hidden", view !== "dashboard");
   el("adminView").classList.toggle("hidden", view !== "admin");
   el("teamView").classList.toggle("hidden", view !== "team");
   el("departmentView").classList.toggle("hidden", view !== "department");
+  el("keysView").classList.toggle("hidden", view !== "keys");
   el("modelsView").classList.toggle("hidden", view !== "models");
-  el("dashboardFilters").classList.toggle("hidden", view === "models");
-  document.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
+  el("dashboardFilters").classList.toggle("hidden", view === "models" || view === "keys");
+  let activeButton = null;
+  document.querySelectorAll("[data-view]").forEach((button) => {
+    const isActive = button.dataset.view === view;
+    button.classList.toggle("active", isActive);
+    if (isActive) {
+      activeButton = button;
+      button.setAttribute("aria-current", "page");
+    } else button.removeAttribute("aria-current");
+  });
+  if (activeButton && window.innerWidth <= 820) {
+    requestAnimationFrame(() => {
+      const navZone = activeButton.closest(".nav-zone");
+      if (!navZone) return;
+      const targetLeft = activeButton.offsetLeft - (navZone.clientWidth - activeButton.offsetWidth) / 2;
+      navZone.scrollLeft = Math.max(0, Math.min(targetLeft, navZone.scrollWidth - navZone.clientWidth));
+    });
+  }
   if (view === "models") {
     renderModels();
     if (!modelCatalog.length) loadModels();
+  }
+  if (view === "keys") {
+    renderKeys();
+    if (!personalKeys.length && !isKeysLoading) loadKeys();
   }
   if (view === "dashboard" && !usageData.length) loadDashboardData();
   if (view === "admin" && !adminUsageData.length) loadAdminData();
@@ -1254,6 +1582,7 @@ function switchView(view) {
 }
 
 async function loadCurrentViewData(forceRefresh = false) {
+  if (currentView === "keys") return loadKeys();
   if (currentView === "models") return loadModels();
   if (currentView === "admin") return loadAdminData(forceRefresh);
   if (currentView === "team") return loadTeamData(forceRefresh);
@@ -1441,6 +1770,21 @@ function showLogin() {
   leaderTeams = [];
   selectedTeamRef = "";
   departmentPickerOptions = [];
+  personalKeys = [];
+  availableKeyModels = [];
+  unrestrictedKeyModels = false;
+  keyLoadError = "";
+  pendingRegenerateKeyId = "";
+  pendingDeleteKeyId = "";
+  pendingDeleteKeyName = "";
+  isDeletingKey = false;
+  el("deleteKeyModal").classList.add("hidden");
+  el("deleteKeyConfirmInput").value = "";
+  el("confirmDeleteKey").disabled = true;
+  el("confirmDeleteKey").textContent = "确认删除";
+  el("cancelDeleteKey").disabled = false;
+  clearRevealedKeys();
+  clearPlainKey();
   el("departmentEmployeeSearch").value = "";
   closeDepartmentPicker();
   el("appView").classList.add("hidden");
@@ -1505,7 +1849,10 @@ el("sourceSelect").addEventListener("change", async () => {
 });
 
 el("refreshButton").addEventListener("click", async () => {
-  if (currentView === "models") {
+  if (currentView === "keys") {
+    await loadKeys(true);
+    showToast(keyLoadError ? "密钥列表刷新失败" : "已刷新密钥列表");
+  } else if (currentView === "models") {
     await loadModels();
     showToast("\u5df2\u5237\u65b0\u6a21\u578b\u5217\u8868");
   } else if (currentView === "admin") {
@@ -1615,6 +1962,178 @@ el("modelGrid").addEventListener("click", (event) => {
   if (button) copyText(button.dataset.copyModel, "模型名称已复制");
 });
 
+el("addKeyButton").addEventListener("click", openCreateKeyModal);
+el("cancelCreateKey").addEventListener("click", closeCreateKeyModal);
+el("keyModelMode").addEventListener("change", updateKeyModelMode);
+
+el("createKeyForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (isCreatingKey) return;
+  const name = el("keyNameInput").value.trim();
+  const purpose = el("keyPurposeInput").value.trim();
+  const duration = el("keyDurationSelect").value;
+  const customModels = [...el("keyModelChoices").querySelectorAll('input[name="keyModel"]:checked')].map((input) => input.value);
+  if (name.length < 2) {
+    showToast("密钥名称至少需要 2 个字符");
+    el("keyNameInput").focus();
+    return;
+  }
+  if (el("keyModelMode").value === "custom" && !customModels.length) {
+    showToast("请至少选择一个模型");
+    return;
+  }
+  isCreatingKey = true;
+  el("submitCreateKey").disabled = true;
+  el("submitCreateKey").textContent = "创建中...";
+  try {
+    const payload = await api("/api/me/keys", {
+      method: "POST",
+      body: JSON.stringify({
+        name,
+        purpose,
+        duration,
+        models: el("keyModelMode").value === "custom" ? customModels : [],
+      }),
+    });
+    el("createKeyModal").classList.add("hidden");
+    el("createKeyForm").reset();
+    updateKeyModelMode();
+    personalKeys = [];
+    await loadKeys(true);
+    showPlainKey(payload.key, payload.expiresAt || "", payload);
+  } catch (error) {
+    showToast(error.message || "创建密钥失败");
+  } finally {
+    isCreatingKey = false;
+    el("submitCreateKey").disabled = false;
+    el("submitCreateKey").textContent = "创建密钥";
+  }
+});
+
+function requestRegenerateKey(keyId) {
+  pendingRegenerateKeyId = keyId;
+  el("regenerateKeyModal").classList.remove("hidden");
+}
+
+function requestDeleteKey(keyId) {
+  const key = personalKeys.find((item) => String(item.id || "") === String(keyId || ""));
+  if (!key) {
+    showToast("未找到要删除的密钥，请刷新后重试");
+    return;
+  }
+  hideRevealedKey(String(keyId));
+  pendingDeleteKeyId = String(keyId);
+  pendingDeleteKeyName = String(key.name || "个人访问密钥");
+  el("deleteKeyConfirmInput").value = "";
+  setText("deleteKeyName", pendingDeleteKeyName);
+  setText("deleteKeyMasked", key.masked || "sk-...----");
+  setText("deleteKeyExpectedName", pendingDeleteKeyName);
+  updateDeleteKeyConfirmation();
+  el("deleteKeyModal").classList.remove("hidden");
+  window.setTimeout(() => el("deleteKeyConfirmInput").focus(), 0);
+}
+
+el("keysView").addEventListener("click", (event) => {
+  const revealButton = event.target.closest("[data-reveal-key]");
+  if (revealButton) {
+    toggleKeyReveal(revealButton.dataset.revealKey);
+    return;
+  }
+  const deleteButton = event.target.closest("[data-delete-key]");
+  if (deleteButton) {
+    requestDeleteKey(deleteButton.dataset.deleteKey);
+    return;
+  }
+  const button = event.target.closest("[data-regenerate-key]");
+  if (button) requestRegenerateKey(button.dataset.regenerateKey);
+});
+
+el("deleteKeyConfirmInput").addEventListener("input", updateDeleteKeyConfirmation);
+el("cancelDeleteKey").addEventListener("click", closeDeleteKeyModal);
+el("deleteKeyForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!pendingDeleteKeyId || isDeletingKey || el("deleteKeyConfirmInput").value.trim() !== pendingDeleteKeyName) return;
+  const keyId = pendingDeleteKeyId;
+  isDeletingKey = true;
+  el("deleteKeyConfirmInput").disabled = true;
+  el("cancelDeleteKey").disabled = true;
+  el("confirmDeleteKey").disabled = true;
+  el("confirmDeleteKey").textContent = "删除中...";
+  try {
+    const payload = await api(`/api/me/keys/${encodeURIComponent(keyId)}`, { method: "DELETE" });
+    hideRevealedKey(keyId);
+    pendingDeleteKeyId = "";
+    pendingDeleteKeyName = "";
+    el("deleteKeyModal").classList.add("hidden");
+    el("deleteKeyConfirmInput").value = "";
+    personalKeys = [];
+    await loadKeys(true);
+    showToast(payload.warning || "密钥已删除并立即失效");
+  } catch (error) {
+    showToast(error.message || "删除密钥失败");
+  } finally {
+    isDeletingKey = false;
+    el("deleteKeyConfirmInput").disabled = false;
+    el("cancelDeleteKey").disabled = false;
+    el("confirmDeleteKey").textContent = "确认删除";
+    updateDeleteKeyConfirmation();
+  }
+});
+
+el("cancelRegenerateKey").addEventListener("click", closeRegenerateKeyModal);
+el("confirmRegenerateKey").addEventListener("click", async () => {
+  if (!pendingRegenerateKeyId || isRegeneratingKey) return;
+  isRegeneratingKey = true;
+  el("confirmRegenerateKey").disabled = true;
+  el("confirmRegenerateKey").textContent = "更新中...";
+  try {
+    const payload = await api(`/api/me/keys/${encodeURIComponent(pendingRegenerateKeyId)}/regenerate`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    pendingRegenerateKeyId = "";
+    el("regenerateKeyModal").classList.add("hidden");
+    personalKeys = [];
+    await loadKeys(true);
+    showPlainKey(payload.key, "", payload);
+  } catch (error) {
+    showToast(error.message || "更新密钥失败");
+  } finally {
+    isRegeneratingKey = false;
+    el("confirmRegenerateKey").disabled = false;
+    el("confirmRegenerateKey").textContent = "确认更新";
+  }
+});
+
+el("copyNewKey").addEventListener("click", () => {
+  if (currentPlainKey) copyText(currentPlainKey, "完整密钥已复制");
+});
+el("closeNewKey").addEventListener("click", clearPlainKey);
+
+document.querySelectorAll(".modal-backdrop").forEach((backdrop) => {
+  backdrop.addEventListener("click", (event) => {
+    if (event.target !== backdrop) return;
+    if (backdrop.id === "createKeyModal") closeCreateKeyModal();
+    if (backdrop.id === "regenerateKeyModal") closeRegenerateKeyModal();
+    if (backdrop.id === "deleteKeyModal") closeDeleteKeyModal();
+    if (backdrop.id === "newKeyModal") clearPlainKey();
+  });
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  if (!el("newKeyModal").classList.contains("hidden")) clearPlainKey();
+  else if (!el("deleteKeyModal").classList.contains("hidden")) closeDeleteKeyModal();
+  else if (!el("regenerateKeyModal").classList.contains("hidden")) closeRegenerateKeyModal();
+  else if (!el("createKeyModal").classList.contains("hidden")) closeCreateKeyModal();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) clearRevealedKeys();
+});
+
+window.addEventListener("beforeunload", clearRevealedKeys);
+
 async function init() {
   try {
     authConfig = await api("/api/auth/config");
@@ -1627,7 +2146,7 @@ async function init() {
   el("emailInput").required = Boolean(authConfig.devLoginEnabled);
   el("loginHint").textContent = authConfig.devLoginEnabled
     ? `开发登录已启用，仅允许 ${authConfig.allowedEmailDomain || "公司邮箱"} 账号；生产环境请关闭。`
-    : "使用公司飞书账号扫码登录；本页面不会保存真实密码、认证令牌或管理员密钥。";
+    : "使用公司飞书账号扫码登录；本页面不会保存真实密码或登录凭据。";
   setupModelFilters();
   try {
     const user = await api("/api/auth/me");

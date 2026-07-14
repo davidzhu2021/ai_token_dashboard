@@ -3,18 +3,20 @@ import hashlib
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from base64 import urlsafe_b64encode
 from html import unescape
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, unquote, urljoin, urlparse, urlunparse
 
 import httpx
 from authlib.integrations.base_client import OAuthError
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, field_validator
 from starlette.middleware.sessions import SessionMiddleware
 
 from .cache import TTLCache
@@ -31,6 +33,7 @@ from .auth import (
     validate_company_email,
 )
 from .litellm_client import LiteLLMClient, default_date_range, mask_key
+from .key_vault import KeyVault, KeyVaultError
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -56,6 +59,7 @@ department_usage_cache = TTLCache()
 team_auth_cache = TTLCache()
 team_usage_cache = TTLCache()
 _litellm_client: LiteLLMClient | None = None
+_key_vault: KeyVault | None = None
 
 
 def allowed_provider_login_url(url: str) -> str | None:
@@ -189,6 +193,13 @@ def client() -> LiteLLMClient:
         return _litellm_client
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def key_vault() -> KeyVault:
+    global _key_vault
+    if _key_vault is None:
+        _key_vault = KeyVault.from_environment(ROOT_DIR)
+    return _key_vault
 
 
 @app.on_event("shutdown")
@@ -487,6 +498,79 @@ def upstream_user_ids(upstream_user: dict[str, Any]) -> list[str]:
     return [str(user_id)] if user_id else []
 
 
+def primary_upstream_user_id(upstream_user: dict[str, Any]) -> str:
+    accounts = upstream_user.get("matched_accounts")
+    if isinstance(accounts, list):
+        for account in accounts:
+            if isinstance(account, dict) and account.get("backend") == "primary" and account.get("user_id"):
+                return str(account["user_id"])
+    for user_id in upstream_user_ids(upstream_user):
+        if ":" not in user_id:
+            return user_id
+    raise HTTPException(status_code=502, detail="未找到当前员工的主访问账号")
+
+
+class CreatePersonalKeyRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=50)
+    purpose: str = Field(default="", max_length=200)
+    duration: Literal["never", "30d", "90d"] = "never"
+    models: list[str] = Field(default_factory=list)
+
+    @field_validator("name", "purpose")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("name")
+    @classmethod
+    def validate_name_not_blank(cls, value: str) -> str:
+        if len(value) < 2:
+            raise ValueError("名称至少需要 2 个字符")
+        return value
+
+
+def write_key_audit(event: str, email: str, key_id: str, request: Request, result: str) -> None:
+    audit_key_id = hashlib.sha256(key_id.encode("utf-8")).hexdigest() if key_id.startswith("sk-") else key_id
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "", audit_key_id)[:64] or "-"
+    client_host = request.client.host if request.client else "-"
+    audit_line = f"{datetime.now(timezone.utc).isoformat()}\t{event}\t{email}\t{safe_id}\t{client_host}\t{result}\n"
+    try:
+        with (ROOT_DIR / "audit.log").open("a", encoding="utf-8") as audit:
+            audit.write(audit_line)
+    except OSError:
+        logger.exception("failed to write audit log")
+
+
+def public_key(key: dict[str, Any], revealable: bool) -> dict[str, Any]:
+    return {**{name: value for name, value in key.items() if not name.startswith("_")}, "revealable": revealable}
+
+
+def add_revealability(keys: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    try:
+        vault = key_vault()
+        return [
+            public_key(
+                key,
+                vault.has(str(key.get("_backendId") or "primary"), str(key.get("_userId") or ""), str(key.get("id") or "")),
+            )
+            for key in keys
+        ]
+    except KeyVaultError:
+        logger.exception("failed to read key vault state")
+        return [public_key(key, False) for key in keys]
+
+
+def store_created_key(user_id: str, created: dict[str, str]) -> str:
+    key_id = str(created.get("id") or "")
+    plaintext = str(created.get("key") or "")
+    try:
+        key_vault().store("primary", user_id, key_id, plaintext)
+        return ""
+    except KeyVaultError:
+        logger.exception("failed to store created key in vault")
+        return "密钥已创建，但加密保管失败；关闭后将无法再次查看，请立即复制并安全保存。"
+
+
 @app.get("/api/debug/me-mapping")
 async def debug_me_mapping(request: Request, refresh: bool = Query(False)) -> dict[str, Any]:
     if not env_bool("DEBUG_MAPPING_ENABLED", False):
@@ -775,37 +859,143 @@ async def admin_departments_usage(
 
 
 @app.get("/api/me/keys")
-async def my_keys(request: Request) -> dict[str, Any]:
+async def my_keys(request: Request, refresh: bool = Query(False)) -> dict[str, Any]:
     _, upstream_user = await current_upstream_user(request)
     user_ids = upstream_user_ids(upstream_user)
     if not user_ids:
         raise HTTPException(status_code=502, detail="上游员工记录缺少 user_id")
-    return {"keys": await client().keys_for_user_ids(user_ids)}
+    primary_user_id = primary_upstream_user_id(upstream_user)
+    available_models, unrestricted = await client().available_key_models(primary_user_id)
+    keys = await client().keys_for_user_ids(user_ids, refresh)
+    return {
+        "keys": add_revealability(keys),
+        "availableModels": [model for model in available_models if model not in {"no-default-models", "all-proxy-models"}],
+        "unrestrictedModels": unrestricted,
+    }
+
+
+@app.post("/api/me/keys")
+async def create_my_key(data: CreatePersonalKeyRequest, request: Request) -> JSONResponse:
+    app_user, upstream_user = await current_upstream_user(request)
+    primary_user_id = primary_upstream_user_id(upstream_user)
+    try:
+        created = await client().create_key(
+            primary_user_id,
+            data.name,
+            data.purpose,
+            data.duration,
+            data.models,
+            app_user["email"],
+        )
+    except HTTPException:
+        write_key_audit("create", app_user["email"], "-", request, "failed")
+        raise
+    warning = store_created_key(primary_user_id, created)
+    write_key_audit("create", app_user["email"], created.get("id", "-"), request, "success_vault_failed" if warning else "success")
+    return JSONResponse(
+        {**created, "revealable": not warning, "warning": warning},
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
 
 
 @app.post("/api/me/keys/{key_id:path}/regenerate")
-async def regenerate_my_key(key_id: str, request: Request) -> dict[str, str]:
+async def regenerate_my_key(key_id: str, request: Request) -> JSONResponse:
     app_user, upstream_user = await current_upstream_user(request)
     user_ids = upstream_user_ids(upstream_user)
     if not user_ids:
         raise HTTPException(status_code=502, detail="上游员工记录缺少 user_id")
-    new_key = None
+    regenerated = None
+    regenerated_user_id = ""
+    regenerated_backend_id = "primary"
     last_error: HTTPException | None = None
     for user_id in user_ids:
         try:
-            new_key = await client().regenerate_key(key_id, user_id, app_user["email"])
+            regenerated = await client().regenerate_key(key_id, user_id, app_user["email"])
+            backend, raw_user_id = client()._decode_account_id(user_id)
+            regenerated_backend_id = backend.id
+            regenerated_user_id = raw_user_id
             break
         except HTTPException as exc:
             last_error = exc
-    if new_key is None:
+            if exc.status_code not in {403, 404}:
+                break
+    if regenerated is None:
+        write_key_audit("regenerate", app_user["email"], key_id, request, "failed")
         raise last_error or HTTPException(status_code=403, detail="不能更新不属于自己的访问密钥")
-    audit_line = f'{app_user["email"]}\t{key_id}\t{request.client.host if request.client else "-"}\tsuccess\n'
     try:
-        with (ROOT_DIR / "audit.log").open("a", encoding="utf-8") as audit:
-            audit.write(audit_line)
-    except OSError:
-        logger.exception("failed to write audit log")
-    return {"key": new_key, "masked": mask_key(new_key)}
+        key_vault().replace(regenerated_backend_id, regenerated_user_id, key_id, regenerated["id"], regenerated["key"])
+        warning = ""
+    except KeyVaultError:
+        logger.exception("failed to store regenerated key in vault")
+        warning = "密钥已再生成，但加密保管失败；关闭后将无法再次查看，请立即复制并安全保存。"
+    write_key_audit("regenerate", app_user["email"], key_id, request, "success_vault_failed" if warning else "success")
+    return JSONResponse(
+        {
+            "key": regenerated["key"],
+            "id": regenerated["id"],
+            "masked": mask_key(regenerated["key"]),
+            "revealable": not warning,
+            "warning": warning,
+        },
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
+
+
+@app.delete("/api/me/keys/{key_id:path}")
+async def delete_my_key(key_id: str, request: Request) -> dict[str, Any]:
+    app_user, upstream_user = await current_upstream_user(request)
+    user_ids = upstream_user_ids(upstream_user)
+    if not user_ids:
+        raise HTTPException(status_code=502, detail="上游员工记录缺少 user_id")
+    deleted_user_id = ""
+    deleted_backend_id = "primary"
+    last_error: HTTPException | None = None
+    for user_id in user_ids:
+        try:
+            await client().delete_key(key_id, user_id, app_user["email"])
+            backend, raw_user_id = client()._decode_account_id(user_id)
+            deleted_backend_id = backend.id
+            deleted_user_id = raw_user_id
+            break
+        except HTTPException as exc:
+            last_error = exc
+            if exc.status_code != 403:
+                break
+    if not deleted_user_id:
+        write_key_audit("delete", app_user["email"], key_id, request, "failed")
+        raise last_error or HTTPException(status_code=403, detail="不能删除不属于自己的访问密钥")
+    try:
+        key_vault().delete(deleted_backend_id, deleted_user_id, key_id)
+        warning = ""
+    except KeyVaultError:
+        logger.exception("failed to delete key from vault")
+        warning = "密钥已删除并立即失效，但本地加密保管记录清理失败，请联系管理员处理。"
+    write_key_audit("delete", app_user["email"], key_id, request, "success_vault_failed" if warning else "success")
+    return {"deleted": True, "warning": warning}
+
+
+@app.post("/api/me/keys/{key_id:path}/reveal")
+async def reveal_my_key(key_id: str, request: Request) -> JSONResponse:
+    app_user, upstream_user = await current_upstream_user(request)
+    keys = await client().keys_for_user_ids(upstream_user_ids(upstream_user), refresh=True)
+    owned = next((key for key in keys if str(key.get("id") or "") == key_id), None)
+    if owned is None:
+        write_key_audit("reveal", app_user["email"], key_id, request, "forbidden")
+        raise HTTPException(status_code=403, detail="不能查看不属于自己的访问密钥")
+    try:
+        plaintext = key_vault().reveal(
+            str(owned.get("_backendId") or "primary"),
+            str(owned.get("_userId") or ""),
+            key_id,
+        )
+    except KeyVaultError as exc:
+        write_key_audit("reveal", app_user["email"], key_id, request, "failed")
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if plaintext is None:
+        write_key_audit("reveal", app_user["email"], key_id, request, "not_stored")
+        raise HTTPException(status_code=404, detail="该密钥创建时未保管完整值，请再生成后查看")
+    write_key_audit("reveal", app_user["email"], key_id, request, "success")
+    return JSONResponse({"key": plaintext}, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 
 
 @app.get("/api/models")

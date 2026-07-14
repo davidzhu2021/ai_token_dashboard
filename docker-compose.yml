@@ -6,6 +6,11 @@ services:
     container_name: ai-token-dashboard
     env_file:
       - .env
+    volumes:
+      - key-vault-data:/app/.data
     ports:
       - "8010:8000"
     restart: unless-stopped
+
+volumes:
+  key-vault-data:

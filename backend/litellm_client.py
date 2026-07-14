@@ -1,7 +1,10 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
+import secrets
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -175,9 +178,32 @@ def detect_source_from_key(key: dict[str, Any]) -> str:
 def mask_key(value: str) -> str:
     if not value:
         return "未返回"
-    if len(value) <= 12:
-        return value[:3] + "..." + value[-3:]
-    return value[:10] + "..." + value[-4:]
+    if not value.startswith("sk-"):
+        return "sk-...----"
+    suffix = value[-4:] if len(value) >= 7 else "----"
+    return f"sk-...{suffix}"
+
+
+def safe_key_name(value: Any) -> str:
+    text = _clean_text(value)
+    return text if re.fullmatch(r"sk-\.\.\..{4}", text) else "sk-...----"
+
+
+def safe_key_id(value: Any) -> str:
+    text = _clean_text(value)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest() if text.startswith("sk-") else text
+
+
+def _is_expired(value: Any) -> bool:
+    if not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed <= datetime.now(timezone.utc)
+    except ValueError:
+        return False
 
 
 def provider_from_model(model_name: str) -> str:
@@ -767,12 +793,13 @@ class LiteLLMClient:
             rows.append(self._row_from_daily_activity_item(item, source_override or "其他"))
         return rows
 
-    async def keys_for_user(self, user_id: str, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
+    async def keys_for_user(self, user_id: str, backend: LiteLLMBackend | None = None, refresh: bool = False) -> list[dict[str, Any]]:
         backend = backend or self.backends[0]
         cache_key = f"keys:{backend.id}:{user_id}"
-        hit, value, _ = self._key_cache.get(cache_key)
-        if hit:
-            return value
+        if not refresh:
+            hit, value, _ = self._key_cache.get(cache_key)
+            if hit:
+                return value
         payload = await self.request_backend(
             backend,
             "GET",
@@ -781,18 +808,33 @@ class LiteLLMClient:
         )
         keys = []
         for item in _records(payload):
-            token = str(_first(item, "token", "key", "api_key", default=""))
-            alias = str(_first(item, "key_alias", "key_name", default="个人访问密钥") or "个人访问密钥")
-            metadata = _first(item, "metadata", default={})
-            status = "已禁用" if _first(item, "blocked", "deleted", default=False) else "正常"
-            last_used = _first(item, "last_used_at", "updated_at", "created_at", default="-")
+            token_hash = safe_key_id(_first(item, "token", default=""))
+            if not token_hash:
+                continue
+            metadata = _metadata_dict(_first(item, "metadata", default={}))
+            alias = _clean_text(metadata.get("display_name") or item.get("key_alias")) or "个人访问密钥"
+            expires = _first(item, "expires", default=None)
+            if _first(item, "blocked", "deleted", default=False):
+                status = "已禁用"
+            elif _is_expired(expires):
+                status = "已过期"
+            else:
+                status = "正常"
+            last_used = _first(item, "last_used_at", default=None)
+            created_at = _first(item, "created_at", default=None)
+            models = item.get("models") if isinstance(item.get("models"), list) else []
             keys.append(
                 {
-                    "id": token,
+                    "_backendId": backend.id,
+                    "_userId": user_id,
+                    "id": token_hash,
                     "name": alias,
-                    "purpose": str(metadata.get("purpose") if isinstance(metadata, dict) else "") or "用于个人 AI 工具访问。",
-                    "masked": mask_key(token),
-                    "lastUsed": _date_text(last_used) if last_used != "-" else "-",
+                    "purpose": _clean_text(metadata.get("purpose")) or "用于个人 AI 工具访问。",
+                    "masked": safe_key_name(item.get("key_name")),
+                    "models": [str(model) for model in models if model],
+                    "createdAt": _date_text(created_at) if created_at else "-",
+                    "lastUsed": _date_text(last_used) if last_used else "-",
+                    "expiresAt": _date_text(expires) if expires else "永不过期",
                     "monthTokens": _as_int(_first(item, "total_tokens", "token_usage", default=0)),
                     "spend": _as_number(_first(item, "spend", "total_spend")),
                     "status": status,
@@ -801,13 +843,98 @@ class LiteLLMClient:
         self._key_cache.set(cache_key, keys, _env_int("KEY_LIST_CACHE_TTL_SECONDS", 300))
         return keys
 
-    async def keys_for_user_ids(self, user_ids: list[str]) -> list[dict[str, Any]]:
+    def invalidate_key_cache(self, user_id: str, backend: LiteLLMBackend | None = None) -> None:
+        backend = backend or self.backends[0]
+        self._key_cache.delete(f"keys:{backend.id}:{user_id}")
+
+    async def key_user_models(self, user_id: str, backend: LiteLLMBackend | None = None) -> list[str]:
+        backend = backend or self.backends[0]
+        try:
+            payload = await self.request_backend(backend, "GET", "/v2/user/info", params={"user_id": user_id})
+            models = payload.get("models") if isinstance(payload, dict) else []
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            payload = await self.request_backend(backend, "GET", "/user/info", params={"user_id": user_id})
+            user_info = payload.get("user_info") if isinstance(payload, dict) else {}
+            models = user_info.get("models") if isinstance(user_info, dict) else []
+        return sorted({str(model) for model in models or [] if model})
+
+    async def available_key_models(self, user_id: str, backend: LiteLLMBackend | None = None) -> tuple[list[str], bool]:
+        backend = backend or self.backends[0]
+        user_models = await self.key_user_models(user_id, backend)
+        if user_models and "all-proxy-models" not in user_models:
+            return user_models, False
+        payload = await self.request_backend(backend, "GET", "/models")
+        model_names = {
+            _clean_text(_first(item, "id", "model_name", "model", default=""))
+            for item in _records(payload)
+        }
+        return sorted(model for model in model_names if model), not user_models or "all-proxy-models" in user_models
+
+    async def create_key(
+        self,
+        user_id: str,
+        name: str,
+        purpose: str,
+        duration: str,
+        models: list[str],
+        changed_by: str,
+    ) -> dict[str, str]:
+        backend, raw_user_id = self._decode_account_id(user_id)
+        if backend.source:
+            raise HTTPException(status_code=403, detail="该来源暂不支持在这里创建访问密钥")
+
+        available_models, unrestricted = await self.available_key_models(raw_user_id, backend)
+        selected_models = sorted({str(model).strip() for model in models if str(model).strip()})
+        invalid_models = sorted(set(selected_models) - set(available_models))
+        if invalid_models:
+            raise HTTPException(status_code=400, detail=f"包含无权使用的模型：{', '.join(invalid_models)}")
+        effective_models = selected_models or ([] if unrestricted else available_models)
+
+        body: dict[str, Any] = {
+            "key_alias": f"ai-usage-{secrets.token_hex(8)}",
+            "key_type": "llm_api",
+            "user_id": raw_user_id,
+            "models": effective_models,
+            "metadata": {
+                "display_name": name,
+                "purpose": purpose,
+                "created_via": "ai-usage-center",
+            },
+        }
+        if duration != "never":
+            body["duration"] = duration
+
+        payload = await self.request_backend(
+            backend,
+            "POST",
+            "/key/generate",
+            headers={"litellm-changed-by": changed_by},
+            json=body,
+        )
+        new_key = _clean_text(_first(payload, "key", default=""))
+        token_id = _clean_text(_first(payload, "token_id", "token", default=""))
+        if not new_key.startswith("sk-"):
+            raise HTTPException(status_code=502, detail="上游未返回新的访问密钥")
+        if not token_id or token_id.startswith("sk-"):
+            token_id = safe_key_id(new_key)
+        self.invalidate_key_cache(raw_user_id, backend)
+        expires = _first(payload, "expires", default=None)
+        return {
+            "key": new_key,
+            "id": token_id,
+            "masked": mask_key(new_key),
+            "expiresAt": _date_text(expires) if expires else "永不过期",
+        }
+
+    async def keys_for_user_ids(self, user_ids: list[str], refresh: bool = False) -> list[dict[str, Any]]:
         batches = []
         for user_id in user_ids:
             backend, raw_user_id = self._decode_account_id(user_id)
             if backend.source:
                 continue
-            batches.append(await self.keys_for_user(raw_user_id, backend))
+            batches.append(await self.keys_for_user(raw_user_id, backend, refresh))
         keys: list[dict[str, Any]] = []
         seen: set[str] = set()
         for batch in batches:
@@ -818,25 +945,56 @@ class LiteLLMClient:
                     keys.append(key)
         return keys
 
-    async def regenerate_key(self, key_id: str, user_id: str, changed_by: str) -> str:
+    async def regenerate_key(self, key_id: str, user_id: str, changed_by: str) -> dict[str, str]:
         backend, raw_user_id = self._decode_account_id(user_id)
         if backend.source:
-            raise HTTPException(status_code=403, detail="Her 访问密钥暂不支持在这里更新")
-        owned_keys = await self.keys_for_user(raw_user_id, backend)
+            raise HTTPException(status_code=403, detail="该来源访问密钥暂不支持在这里更新")
+        owned_keys = await self.keys_for_user(raw_user_id, backend, refresh=True)
         if not any(key["id"] == key_id for key in owned_keys):
             raise HTTPException(status_code=403, detail="不能更新不属于自己的访问密钥")
+        try:
+            payload = await self.request_backend(
+                backend,
+                "POST",
+                "/key/regenerate",
+                params={"key": key_id},
+                headers={"litellm-changed-by": changed_by},
+                json={"grace_period": "0s"},
+            )
+        except HTTPException as exc:
+            detail = str(exc.detail).lower()
+            if exc.status_code == 404 or "enterprise feature" in detail or "not_premium" in detail:
+                raise HTTPException(status_code=501, detail="当前服务暂不支持再生成访问密钥，请联系管理员") from exc
+            raise
+        new_key = _first(payload, "key", "token", "api_key", default="")
+        if not str(new_key).startswith("sk-"):
+            raise HTTPException(status_code=502, detail="上游未返回新的访问密钥")
+        new_key_id = _clean_text(_first(payload, "token_id", "token", default=""))
+        if not new_key_id or new_key_id.startswith("sk-"):
+            new_key_id = safe_key_id(new_key)
+        self.invalidate_key_cache(raw_user_id, backend)
+        return {"key": str(new_key), "id": new_key_id}
+
+    async def delete_key(self, key_id: str, user_id: str, changed_by: str) -> dict[str, str]:
+        backend, raw_user_id = self._decode_account_id(user_id)
+        if backend.source:
+            raise HTTPException(status_code=403, detail="该来源访问密钥暂不支持在这里删除")
+        owned_keys = await self.keys_for_user(raw_user_id, backend, refresh=True)
+        if not any(key["id"] == key_id for key in owned_keys):
+            raise HTTPException(status_code=403, detail="不能删除不属于自己的访问密钥")
+
         payload = await self.request_backend(
             backend,
             "POST",
-            "/key/regenerate",
-            params={"key": key_id},
+            "/key/delete",
             headers={"litellm-changed-by": changed_by},
-            json={},
+            json={"keys": [key_id]},
         )
-        new_key = _first(payload, "key", "token", "api_key", default="")
-        if not new_key:
-            raise HTTPException(status_code=502, detail="上游未返回新的访问密钥")
-        return str(new_key)
+        deleted_keys = payload.get("deleted_keys") if isinstance(payload, dict) else None
+        if not isinstance(deleted_keys, list) or key_id not in {str(item) for item in deleted_keys}:
+            raise HTTPException(status_code=502, detail="上游未确认访问密钥已删除")
+        self.invalidate_key_cache(raw_user_id, backend)
+        return {"id": key_id}
 
     async def users(self, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
         backend = backend or self.backends[0]
