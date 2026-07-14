@@ -65,12 +65,12 @@ After a successful GitHub push, update the production server from the pushed `ma
 - Server: `JSZX-AI-03 / 188`
 - Deploy directory: `/home/cltx/apps/ai-token-dashboard/current`
 - Docker Compose service/container: `ai-token-dashboard`
-- Port mapping: host `8010` -> container `8000`
+- Port mapping: host `8000` -> container `8000`
 
 Standard sync command from Windows PowerShell:
 
 ```powershell
-wsl bash -lc "cd /home/zhuyida/codes/carher-admin/scripts && ./jms ssh JSZX-AI-03 'cd /home/cltx/apps/ai-token-dashboard/current && git pull origin master && docker compose up -d --build && sleep 5 && curl -fsS http://127.0.0.1:8010/api/health'"
+wsl bash -lc "cd /home/zhuyida/codes/carher-admin/scripts && ./jms ssh JSZX-AI-03 'cd /home/cltx/apps/ai-token-dashboard/current && git pull origin master && docker compose up -d --build && sleep 5 && curl -fsS http://127.0.0.1:8000/api/health'"
 ```
 
 Post-deploy verification:
