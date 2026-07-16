@@ -176,6 +176,11 @@ def detect_source_from_key(key: dict[str, Any]) -> str:
     return "其他"
 
 
+def tool_account_aliases(email_prefix: str) -> list[str]:
+    aliases = [email_prefix, f"cursor-{email_prefix}", f"claude-code-{email_prefix}"]
+    return [alias for alias in aliases if alias]
+
+
 def mask_key(value: str) -> str:
     if not value:
         return "未返回"
@@ -531,6 +536,7 @@ class LiteLLMClient:
     async def resolve_user(self, email: str, name: str | None = None) -> dict[str, Any]:
         email_lower = email.lower()
         email_prefix = email_lower.split("@", 1)[0]
+        legacy_aliases = set(tool_account_aliases(email_prefix))
         matched_users: list[dict[str, Any]] = []
         matched_user_ids: list[str] = []
         matched_accounts: list[dict[str, str]] = []
@@ -564,9 +570,9 @@ class LiteLLMClient:
                     if any(str(candidate or "").lower() == email_lower for candidate in email_candidates):
                         matched_users.append(user)
                         add_user_id(backend, user_id, "user_email")
-                    elif any(str(candidate or "").lower() == email_prefix for candidate in legacy_candidates):
+                    elif any(str(candidate or "").lower() in legacy_aliases for candidate in legacy_candidates):
                         matched_users.append(user)
-                        add_user_id(backend, user_id, "legacy_user")
+                        add_user_id(backend, user_id, "tool_account_alias")
                 total_pages = _as_int(payload.get("total_pages")) if isinstance(payload, dict) else 0
                 if total_pages and page >= total_pages:
                     break
@@ -574,6 +580,9 @@ class LiteLLMClient:
             if backend.source != "Her":
                 for user_id in await self.user_ids_from_key_alias(email_prefix, backend):
                     add_user_id(backend, user_id, "key_alias")
+                if not matched_user_ids:
+                    for user_id in await self.user_ids_from_recent_logs(email_prefix, backend):
+                        add_user_id(backend, user_id, "recent_usage_log")
 
             if backend.source == "Her":
                 await self.add_her_index_matches(backend, email_lower, name, add_user_id)
@@ -595,7 +604,7 @@ class LiteLLMClient:
         backend = backend or self.backends[0]
         user_ids: list[str] = []
         seen: set[str] = set()
-        for alias in (f"cursor-{email_prefix}", f"claude-code-{email_prefix}", email_prefix):
+        for alias in tool_account_aliases(email_prefix):
             payload = await self.request_backend(
                 backend,
                 "GET",
@@ -607,6 +616,45 @@ class LiteLLMClient:
                 if user_id and user_id not in seen:
                     seen.add(user_id)
                     user_ids.append(user_id)
+        return user_ids
+
+    async def user_ids_from_recent_logs(self, email_prefix: str, backend: LiteLLMBackend | None = None) -> list[str]:
+        backend = backend or self.backends[0]
+        if backend.source:
+            return []
+        aliases = set(tool_account_aliases(email_prefix))
+        if not aliases:
+            return []
+        end_date = date.today().isoformat()
+        start_date = (date.today() - timedelta(days=29)).isoformat()
+        utc_start, utc_end = _local_date_window_as_utc_text(start_date, end_date)
+        user_ids: list[str] = []
+        seen: set[str] = set()
+        max_pages = max(1, min(10, int(os.getenv("PERSONAL_ACCOUNT_DISCOVERY_LOG_PAGES", "5"))))
+        page_size = max(1, min(100, int(os.getenv("PERSONAL_ACCOUNT_DISCOVERY_PAGE_SIZE", "100"))))
+        for page in range(1, max_pages + 1):
+            payload = await self.request_backend(
+                backend,
+                "GET",
+                "/spend/logs/v2",
+                params={
+                    "start_date": utc_start,
+                    "end_date": utc_end,
+                    "page": page,
+                    "page_size": page_size,
+                    "sort_by": "startTime",
+                    "sort_order": "desc",
+                },
+            )
+            for log in _records(payload):
+                raw_user = self._log_raw_user(log)
+                normalized = raw_user.lower()
+                if normalized in aliases and raw_user not in seen:
+                    seen.add(raw_user)
+                    user_ids.append(raw_user)
+            total_pages = _as_int(payload.get("total_pages")) if isinstance(payload, dict) else 0
+            if total_pages and page >= total_pages:
+                break
         return user_ids
 
     async def usage_rows(self, user_id: str, start_date: str, end_date: str, source: str | None) -> list[dict[str, Any]]:
