@@ -1068,6 +1068,35 @@ class LiteLLMClient:
         scope = await self.key_model_scope(user_id, backend)
         return scope.models, scope.unrestricted
 
+    async def ensure_personal_key_budget(
+        self,
+        backend: LiteLLMBackend,
+        key_id: str,
+        changed_by: str,
+        user_id: str | None = None,
+        max_budget: float = DEFAULT_PERSONAL_KEY_MAX_BUDGET,
+        budget_duration: str = DEFAULT_PERSONAL_KEY_BUDGET_DURATION,
+    ) -> None:
+        if not key_id:
+            raise HTTPException(status_code=502, detail="上游未返回访问密钥编号，无法确认每日额度")
+        try:
+            await self.request_backend(
+                backend,
+                "POST",
+                "/key/update",
+                headers={"litellm-changed-by": changed_by},
+                json={
+                    "key": key_id,
+                    "max_budget": max_budget,
+                    "budget_duration": budget_duration,
+                },
+            )
+        except HTTPException as exc:
+            status_code = 503 if exc.status_code >= 500 else 502
+            raise HTTPException(status_code=status_code, detail="访问密钥已创建，但每日额度写入失败，请删除后重试") from exc
+        if user_id:
+            self.invalidate_key_cache(user_id, backend)
+
     async def create_key(
         self,
         user_id: str,
@@ -1119,6 +1148,7 @@ class LiteLLMClient:
             raise HTTPException(status_code=502, detail="上游未返回新的访问密钥")
         if not token_id or token_id.startswith("sk-"):
             token_id = safe_key_id(new_key)
+        await self.ensure_personal_key_budget(backend, token_id, changed_by, raw_user_id)
         self.invalidate_key_cache(raw_user_id, backend)
         expires = _first(payload, "expires", default=None)
         return {
@@ -1289,6 +1319,8 @@ class LiteLLMClient:
                 body[name] = rotation[name]
         if rotation.get("org_id"):
             body["organization_id"] = rotation["org_id"]
+        body.setdefault("max_budget", DEFAULT_PERSONAL_KEY_MAX_BUDGET)
+        body.setdefault("budget_duration", DEFAULT_PERSONAL_KEY_BUDGET_DURATION)
 
         payload = await self.request_backend(
             backend,
@@ -1303,6 +1335,14 @@ class LiteLLMClient:
             raise HTTPException(status_code=502, detail="上游未返回新的访问密钥")
         if not new_key_id or new_key_id.startswith("sk-"):
             new_key_id = safe_key_id(new_key)
+        await self.ensure_personal_key_budget(
+            backend,
+            new_key_id,
+            changed_by,
+            raw_user_id,
+            max_budget=body["max_budget"],
+            budget_duration=body["budget_duration"],
+        )
         self.invalidate_key_cache(raw_user_id, backend)
         expires = _first(payload, "expires", default=None)
         return {

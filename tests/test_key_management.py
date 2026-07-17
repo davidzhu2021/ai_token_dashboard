@@ -78,19 +78,23 @@ def test_create_key_uses_primary_user_llm_type_duration_and_clears_cache(
     monkeypatch, duration: str, expected_duration: str | None
 ) -> None:
     client, backend = make_client()
-    captured: dict[str, Any] = {}
+    requests: list[dict[str, Any]] = []
     client._key_cache.set("keys:primary:user-primary", [{"id": "cached"}], 300)
 
     async def fake_available_models(_user_id: str, _backend: LiteLLMBackend | None = None) -> tuple[list[str], bool]:
         return ["gpt-5", "claude-sonnet"], False
 
     async def fake_request_backend(_backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-        captured.update({"backend": _backend, "method": method, "path": path, **kwargs})
-        return {
-            "key": "sk-created-secret-WXYZ",
-            "token_id": "hash-created",
-            "expires": "2026-10-11T00:00:00Z" if duration != "never" else None,
-        }
+        requests.append({"backend": _backend, "method": method, "path": path, **kwargs})
+        if path == "/key/generate":
+            return {
+                "key": "sk-created-secret-WXYZ",
+                "token_id": "hash-created",
+                "expires": "2026-10-11T00:00:00Z" if duration != "never" else None,
+            }
+        if path == "/key/update":
+            return {"key": "hash-created", "max_budget": 100, "budget_duration": "1d"}
+        raise AssertionError(f"unexpected request {method} {path}")
 
     monkeypatch.setattr(client, "available_key_models", fake_available_models)
     monkeypatch.setattr(client, "request_backend", fake_request_backend)
@@ -106,9 +110,9 @@ def test_create_key_uses_primary_user_llm_type_duration_and_clears_cache(
         )
     )
 
-    body = captured["json"]
-    assert captured["method"] == "POST"
-    assert captured["path"] == "/key/generate"
+    assert [request["path"] for request in requests] == ["/key/generate", "/key/update"]
+    body = requests[0]["json"]
+    assert requests[0]["method"] == "POST"
     assert body["user_id"] == "user-primary"
     assert body["key_type"] == "llm_api"
     assert body["models"] == ["gpt-5", "claude-sonnet"]
@@ -117,8 +121,34 @@ def test_create_key_uses_primary_user_llm_type_duration_and_clears_cache(
     assert body["key_alias"].startswith("ai-usage-")
     assert body["metadata"]["display_name"] == "我的密钥"
     assert body.get("duration") == expected_duration
+    assert requests[1]["method"] == "POST"
+    assert requests[1]["json"] == {"key": "hash-created", "max_budget": 100, "budget_duration": "1d"}
+    assert requests[1]["headers"] == {"litellm-changed-by": "employee@example.com"}
     assert created["masked"] == "sk-...WXYZ"
     assert client._key_cache.get("keys:primary:user-primary")[0] is False
+
+
+def test_create_key_fails_when_budget_update_fails(monkeypatch) -> None:
+    client, _ = make_client()
+
+    async def fake_available_models(_user_id: str, _backend: LiteLLMBackend | None = None) -> tuple[list[str], bool]:
+        return ["gpt-5"], False
+
+    async def fake_request_backend(_backend: LiteLLMBackend, _method: str, path: str, **_kwargs: Any) -> dict[str, Any]:
+        if path == "/key/generate":
+            return {"key": "sk-created-secret-WXYZ", "token_id": "hash-created"}
+        if path == "/key/update":
+            raise HTTPException(status_code=500, detail="update failed")
+        raise AssertionError(f"unexpected path {path}")
+
+    monkeypatch.setattr(client, "available_key_models", fake_available_models)
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(client.create_key("user-primary", "我的密钥", "", "never", [], "employee@example.com"))
+
+    assert exc.value.status_code == 503
+    assert "每日额度写入失败" in str(exc.value.detail)
 
 
 def test_create_key_requires_model_subset(monkeypatch) -> None:
@@ -151,8 +181,12 @@ def test_unrestricted_user_may_create_all_model_key(monkeypatch) -> None:
         return ["gpt-5", "claude-sonnet"], True
 
     async def fake_request_backend(_backend: LiteLLMBackend, _method: str, _path: str, **kwargs: Any) -> dict[str, Any]:
-        captured.update(kwargs)
-        return {"key": "sk-unrestricted-1234", "token_id": "hash-new"}
+        if _path == "/key/generate":
+            captured.update(kwargs)
+            return {"key": "sk-unrestricted-1234", "token_id": "hash-new"}
+        if _path == "/key/update":
+            return {}
+        raise AssertionError(f"unexpected path {_path}")
 
     monkeypatch.setattr(client, "available_key_models", fake_available_models)
     monkeypatch.setattr(client, "request_backend", fake_request_backend)
@@ -175,6 +209,8 @@ def test_all_proxy_models_expands_to_real_models_for_new_key(monkeypatch) -> Non
         if path == "/key/generate":
             captured.update(kwargs)
             return {"key": "sk-created-ABCD", "token_id": "hash-new"}
+        if path == "/key/update":
+            return {}
         raise AssertionError(f"unexpected request {method} {path}")
 
     monkeypatch.setattr(client, "request_backend", fake_request_backend)
@@ -199,6 +235,8 @@ def test_no_default_models_uses_team_models_for_new_key(monkeypatch) -> None:
         if path == "/key/generate":
             captured.update(kwargs)
             return {"key": "sk-team-ABCD", "token_id": "hash-team"}
+        if path == "/key/update":
+            return {}
         raise AssertionError(f"unexpected request {method} {path}")
 
     monkeypatch.setattr(client, "request_backend", fake_request_backend)
@@ -721,7 +759,7 @@ def test_regenerate_endpoint_replaces_old_vault_record(monkeypatch) -> None:
 
 def test_replacement_key_intersects_models_inherits_limits_and_forces_llm_type(monkeypatch) -> None:
     client, backend = make_client()
-    captured: dict[str, Any] = {}
+    requests: list[dict[str, Any]] = []
 
     async def fake_keys_for_user(*_args, **_kwargs):
         return [{
@@ -744,8 +782,12 @@ def test_replacement_key_intersects_models_inherits_limits_and_forces_llm_type(m
         return ["gpt-5", "claude-sonnet"], False
 
     async def fake_request_backend(_backend, method, path, **kwargs):
-        captured.update({"backend": _backend, "method": method, "path": path, **kwargs})
-        return {"key": "sk-replacement-EFGH", "token_id": "new-hash"}
+        requests.append({"backend": _backend, "method": method, "path": path, **kwargs})
+        if path == "/key/generate":
+            return {"key": "sk-replacement-EFGH", "token_id": "new-hash"}
+        if path == "/key/update":
+            return {"key": "new-hash", "max_budget": 10, "budget_duration": "1d"}
+        raise AssertionError(f"unexpected request {method} {path}")
 
     monkeypatch.setattr(client, "keys_for_user", fake_keys_for_user)
     monkeypatch.setattr(client, "available_key_models", fake_available_models)
@@ -754,8 +796,8 @@ def test_replacement_key_intersects_models_inherits_limits_and_forces_llm_type(m
     result = asyncio.run(client.create_replacement_key("old-hash", "user-1", "employee@example.com"))
 
     assert result == {"key": "sk-replacement-EFGH", "id": "new-hash", "expiresAt": "永不过期"}
-    body = captured["json"]
-    assert captured["path"] == "/key/generate"
+    assert [request["path"] for request in requests] == ["/key/generate", "/key/update"]
+    body = requests[0]["json"]
     assert body["key_type"] == "llm_api"
     assert body["models"] == ["gpt-5"]
     assert body["max_budget"] == 10
@@ -764,6 +806,45 @@ def test_replacement_key_intersects_models_inherits_limits_and_forces_llm_type(m
     assert body["rpm_limit"] == 20
     assert body["metadata"]["display_name"] == "工作密钥"
     assert body["metadata"]["purpose"] == "Codex"
+    assert requests[1]["json"] == {"key": "new-hash", "max_budget": 10, "budget_duration": "1d"}
+
+
+def test_replacement_key_defaults_budget_when_old_key_has_no_budget(monkeypatch) -> None:
+    client, _ = make_client()
+    requests: list[dict[str, Any]] = []
+
+    async def fake_keys_for_user(*_args, **_kwargs):
+        return [{
+            "id": "old-hash",
+            "status": "正常",
+            "name": "工作密钥",
+            "_rotation": {
+                "models": ["gpt-5"],
+                "metadata": {},
+                "allowed_routes": ["llm_api_routes"],
+            },
+        }]
+
+    async def fake_available_models(*_args, **_kwargs):
+        return ["gpt-5"], False
+
+    async def fake_request_backend(_backend, method, path, **kwargs):
+        requests.append({"method": method, "path": path, **kwargs})
+        if path == "/key/generate":
+            return {"key": "sk-replacement-EFGH", "token_id": "new-hash"}
+        if path == "/key/update":
+            return {}
+        raise AssertionError(f"unexpected request {method} {path}")
+
+    monkeypatch.setattr(client, "keys_for_user", fake_keys_for_user)
+    monkeypatch.setattr(client, "available_key_models", fake_available_models)
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    asyncio.run(client.create_replacement_key("old-hash", "user-1", "employee@example.com"))
+
+    assert requests[0]["json"]["max_budget"] == 100
+    assert requests[0]["json"]["budget_duration"] == "1d"
+    assert requests[1]["json"] == {"key": "new-hash", "max_budget": 100, "budget_duration": "1d"}
 
 
 def test_replacement_key_rejects_custom_routes(monkeypatch) -> None:
