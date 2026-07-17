@@ -372,9 +372,8 @@ function setDepartmentOverviewVisible(visible) {
     "departmentOverviewHero",
     "departmentMetrics",
     "departmentTrendGrid",
-    "departmentSourceGrid",
     "departmentBreakdownGrid",
-  ].forEach((id) => el(id).classList.toggle("hidden", !visible));
+  ].forEach((id) => el(id)?.classList.toggle("hidden", !visible));
 }
 
 function teamScopeLabel() {
@@ -964,19 +963,19 @@ function renderTableSkeleton(tableId, countId, colSpan, label = "数据加载中
 function renderPersonalLoading() {
   const label = rangeLabel();
   const source = sourceText();
-  el("heroTotal").textContent = "加载中";
-  el("heroSpend").textContent = "--";
-  el("heroSuccess").textContent = "--";
-  el("heroSuccessSub").textContent = "-- / -- 次成功";
-  el("heroRequests").textContent = "--";
-  el("heroRequestsSub").textContent = "数据加载中";
-  el("heroShare").textContent = "--";
-  el("heroShareSub").textContent = "所选范围日均";
-  el("heroDate").textContent = "加载中";
-  el("heroContext").textContent = `${label} · ${source} · 数据加载中`;
-  el("heroTotalLabel").textContent = `${label} Token`;
-  el("trendBadge").textContent = `${label} · ${source}`;
-  el("spendBadge").textContent = `${label} · ${source}`;
+  setText("heroTotal", "加载中");
+  setText("heroSpend", "--");
+  setText("heroSuccess", "--");
+  setText("heroSuccessSub", "-- / -- 次成功");
+  setText("heroRequests", "--");
+  setText("heroRequestsSub", "数据加载中");
+  setText("heroShare", "--");
+  setText("heroShareSub", "所选范围日均");
+  setText("heroDate", "加载中");
+  setText("heroContext", `${label} · ${source} · 数据加载中`);
+  setText("heroTotalLabel", `${label} Token`);
+  setText("trendBadge", `${label} · ${source}`);
+  setText("spendBadge", `${label} · ${source}`);
   renderMetricSkeleton("metrics");
   renderChartSkeleton("trendChart");
   renderChartSkeleton("spendChart");
@@ -989,21 +988,21 @@ function renderPersonalLoading() {
 function renderAdminLoading() {
   const label = rangeLabel();
   const source = sourceText();
-  el("adminHeroTotal").textContent = "加载中";
-  el("adminHeroSpend").textContent = "--";
-  el("adminHeroTotalLabel").textContent = selectedAdminEmployee ? "所选范围员工 Token" : "所选范围全员 Token";
-  el("adminHeroTitle").textContent = selectedAdminEmployee ? "所选范围 · 员工视图" : "所选范围 · 管理员视图";
-  el("adminHeroRequests").textContent = "--";
-  el("adminHeroRequestsSub").textContent = "数据加载中";
-  el("adminHeroSuccess").textContent = "--";
-  el("adminHeroSuccessSub").textContent = "-- / -- 次成功";
-  el("adminHeroDate").textContent = "加载中";
-  el("adminHeroContext").textContent = `${label} · ${source} · 数据加载中`;
-  el("adminActiveUsers").textContent = "--";
-  el("adminActiveUsersSub").textContent = selectedAdminEmployee ? "当前员工" : "当前筛选范围";
-  el("adminTrendBadge").textContent = `${label} · ${source}`;
-  el("adminSpendBadge").textContent = `${label} · ${source}`;
-  el("adminLimitHint").textContent = "数据加载中";
+  setText("adminHeroTotal", "加载中");
+  setText("adminHeroSpend", "--");
+  setText("adminHeroTotalLabel", selectedAdminEmployee ? "所选范围员工 Token" : "所选范围全员 Token");
+  setText("adminHeroTitle", selectedAdminEmployee ? "所选范围 · 员工视图" : "所选范围 · 管理员视图");
+  setText("adminHeroRequests", "--");
+  setText("adminHeroRequestsSub", "数据加载中");
+  setText("adminHeroSuccess", "--");
+  setText("adminHeroSuccessSub", "-- / -- 次成功");
+  setText("adminHeroDate", "加载中");
+  setText("adminHeroContext", `${label} · ${source} · 数据加载中`);
+  setText("adminActiveUsers", "--");
+  setText("adminActiveUsersSub", selectedAdminEmployee ? "当前员工" : "当前筛选范围");
+  setText("adminTrendBadge", `${label} · ${source}`);
+  setText("adminSpendBadge", `${label} · ${source}`);
+  setText("adminLimitHint", "数据加载中");
   renderMetricSkeleton("adminMetrics");
   renderChartSkeleton("adminTrendChart");
   renderChartSkeleton("adminSpendChart");
@@ -1019,26 +1018,26 @@ function renderDepartmentLoading() {
   const source = sourceText();
   const scopeLabel = departmentScopeLabel();
   el("departmentBackButton").classList.toggle("hidden", !selectedDepartment);
-  el("departmentRankingTitle").textContent = selectedDepartment ? `${scopeLabel}员工排行` : "部门用量排行";
-  el("departmentRankingDesc").textContent = selectedDepartment
+  setText("departmentRankingTitle", selectedDepartment ? `${scopeLabel}员工排行` : "部门用量排行");
+  setText("departmentRankingDesc", selectedDepartment
     ? `当前展示 ${scopeLabel} 内员工用量，默认按 Token 从高到低排序。`
-    : "点击部门查看该部门用量看板和员工排行。";
-  el("departmentHeroTotal").textContent = "加载中";
-  el("departmentHeroSpend").textContent = "--";
-  el("departmentHeroTotalLabel").textContent = "所选范围 Token";
-  el("departmentWelcomeTitle").textContent = `所选范围 · ${scopeLabel}`;
-  el("departmentHeroRequests").textContent = "--";
-  el("departmentHeroRequestsSub").textContent = "数据加载中";
-  el("departmentHeroSuccess").textContent = "--";
-  el("departmentHeroSuccessSub").textContent = "-- / -- 次成功";
-  el("departmentHeroDate").textContent = "加载中";
-  el("departmentHeroContext").textContent = `${label} · ${source} · 数据加载中`;
-  el("departmentActiveUsers").textContent = "--";
-  el("departmentActiveLabel").textContent = selectedDepartment ? "活跃员工" : "活跃部门";
-  el("departmentActiveUsersSub").textContent = selectedDepartment ? "当前部门" : "当前筛选范围";
-  el("departmentTrendBadge").textContent = `${label} · ${source}`;
-  el("departmentSpendBadge").textContent = `${label} · ${source}`;
-  el("departmentLimitHint").textContent = "数据加载中";
+    : "点击部门查看该部门用量看板和员工排行。");
+  setText("departmentHeroTotal", "加载中");
+  setText("departmentHeroSpend", "--");
+  setText("departmentHeroTotalLabel", "所选范围 Token");
+  setText("departmentWelcomeTitle", `所选范围 · ${scopeLabel}`);
+  setText("departmentHeroRequests", "--");
+  setText("departmentHeroRequestsSub", "数据加载中");
+  setText("departmentHeroSuccess", "--");
+  setText("departmentHeroSuccessSub", "-- / -- 次成功");
+  setText("departmentHeroDate", "加载中");
+  setText("departmentHeroContext", `${label} · ${source} · 数据加载中`);
+  setText("departmentActiveUsers", "--");
+  setText("departmentActiveLabel", selectedDepartment ? "活跃员工" : "活跃部门");
+  setText("departmentActiveUsersSub", selectedDepartment ? "当前部门" : "当前筛选范围");
+  setText("departmentTrendBadge", `${label} · ${source}`);
+  setText("departmentSpendBadge", `${label} · ${source}`);
+  setText("departmentLimitHint", "数据加载中");
   el("departmentDetailCard").classList.toggle("show", Boolean(selectedDepartment));
   renderMetricSkeleton("departmentMetrics");
   renderChartSkeleton("departmentTrendChart");
@@ -1053,21 +1052,21 @@ function renderTeamLoading() {
   const label = rangeLabel();
   const source = sourceText();
   const scopeLabel = teamScopeLabel();
-  el("teamHeroTotal").textContent = "加载中";
-  el("teamHeroSpend").textContent = "--";
-  el("teamHeroTotalLabel").textContent = "所选范围 Token";
-  el("teamHeroRequests").textContent = "--";
-  el("teamHeroRequestsSub").textContent = "数据加载中";
-  el("teamHeroSuccess").textContent = "--";
-  el("teamHeroSuccessSub").textContent = "-- / -- 次成功";
-  el("teamHeroDate").textContent = "加载中";
-  el("teamHeroContext").textContent = `${label} · ${source} · 数据加载中`;
-  el("teamActiveUsers").textContent = "--";
-  el("teamActiveUsersSub").textContent = "当前筛选范围";
-  el("teamWelcomeTitle").textContent = `所选范围 · ${scopeLabel}`;
-  el("teamTrendBadge").textContent = `${label} · ${source}`;
-  el("teamSpendBadge").textContent = `${label} · ${source}`;
-  el("teamLimitHint").textContent = "数据加载中";
+  setText("teamHeroTotal", "加载中");
+  setText("teamHeroSpend", "--");
+  setText("teamHeroTotalLabel", "所选范围 Token");
+  setText("teamHeroRequests", "--");
+  setText("teamHeroRequestsSub", "数据加载中");
+  setText("teamHeroSuccess", "--");
+  setText("teamHeroSuccessSub", "-- / -- 次成功");
+  setText("teamHeroDate", "加载中");
+  setText("teamHeroContext", `${label} · ${source} · 数据加载中`);
+  setText("teamActiveUsers", "--");
+  setText("teamActiveUsersSub", "当前筛选范围");
+  setText("teamWelcomeTitle", `所选范围 · ${scopeLabel}`);
+  setText("teamTrendBadge", `${label} · ${source}`);
+  setText("teamSpendBadge", `${label} · ${source}`);
+  setText("teamLimitHint", "数据加载中");
   renderMetricSkeleton("teamMetrics");
   renderChartSkeleton("teamTrendChart");
   renderChartSkeleton("teamSpendChart");

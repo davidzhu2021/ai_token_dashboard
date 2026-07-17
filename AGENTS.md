@@ -26,6 +26,8 @@ python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
 
 Open `http://127.0.0.1:8000` to use the dashboard. For local data checks, copy `.env.example` to `.env`, provide LiteLLM and OIDC values, and temporarily set `DEV_LOGIN_ENABLED=true` only in development.
 
+Local verification should use `127.0.0.1:8000` only. If port `8000` is already occupied, first inspect the listening process and reuse it when it is this project's FastAPI app; otherwise report the conflict and ask before stopping the process. Do not silently switch to alternate ports such as `8001` or `8002`, and stop any temporary dev server you start before finishing.
+
 No automated test command is currently configured. At minimum, verify `GET /api/health`, login flow behavior, and key dashboard views after changes.
 
 ## Coding Style & Naming Conventions
