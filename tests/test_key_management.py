@@ -156,7 +156,79 @@ def test_unrestricted_user_may_create_all_model_key(monkeypatch) -> None:
     monkeypatch.setattr(client, "request_backend", fake_request_backend)
 
     asyncio.run(client.create_key("user-primary", "全部模型", "", "never", [], "employee@example.com"))
-    assert captured["json"]["models"] == []
+    assert captured["json"]["models"] == ["gpt-5", "claude-sonnet"]
+
+
+def test_all_proxy_models_expands_to_real_models_for_new_key(monkeypatch) -> None:
+    client, backend = make_client()
+    requests: list[tuple[str, str]] = []
+    captured: dict[str, Any] = {}
+
+    async def fake_request_backend(_backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        requests.append((method, path))
+        if path == "/v2/user/info":
+            return {"models": ["all-proxy-models"]}
+        if path == "/models":
+            return {"data": [{"id": "gpt-5"}, {"model_name": "claude-sonnet"}]}
+        if path == "/key/generate":
+            captured.update(kwargs)
+            return {"key": "sk-created-ABCD", "token_id": "hash-new"}
+        raise AssertionError(f"unexpected request {method} {path}")
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    asyncio.run(client.create_key("user-primary", "全部模型", "", "never", [], "employee@example.com"))
+
+    assert ("GET", "/v2/user/info") in requests
+    assert ("GET", "/models") in requests
+    assert captured["json"]["models"] == ["claude-sonnet", "gpt-5"]
+
+
+def test_no_default_models_uses_team_models_for_new_key(monkeypatch) -> None:
+    client, _ = make_client()
+    captured: dict[str, Any] = {}
+
+    async def fake_request_backend(_backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        if path == "/v2/user/info":
+            return {"models": ["no-default-models"], "teams": ["team-a"]}
+        if path == "/team/info":
+            assert kwargs["params"] == {"team_id": "team-a"}
+            return {"team_info": {"team_id": "team-a", "models": ["team-gpt", "team-claude"]}}
+        if path == "/key/generate":
+            captured.update(kwargs)
+            return {"key": "sk-team-ABCD", "token_id": "hash-team"}
+        raise AssertionError(f"unexpected request {method} {path}")
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    asyncio.run(client.create_key("user-primary", "团队模型", "", "never", [], "employee@example.com"))
+
+    assert captured["json"]["models"] == ["team-claude", "team-gpt"]
+
+
+def test_no_default_models_without_team_models_rejects_new_key(monkeypatch) -> None:
+    client, _ = make_client()
+    requested = False
+
+    async def fake_request_backend(_backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        nonlocal requested
+        if path == "/v2/user/info":
+            return {"models": ["no-default-models"], "teams": ["team-a"]}
+        if path == "/team/info":
+            return {"team_info": {"team_id": "team-a", "models": []}}
+        if path == "/key/generate":
+            requested = True
+            return {}
+        raise AssertionError(f"unexpected request {method} {path}")
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(client.create_key("user-primary", "无权限", "", "never", [], "employee@example.com"))
+
+    assert exc.value.status_code == 403
+    assert "当前账号没有可用于创建访问密钥的模型权限" in str(exc.value.detail)
+    assert requested is False
 
 
 def test_regenerate_checks_fresh_ownership_immediately_revokes_and_clears_cache(monkeypatch) -> None:

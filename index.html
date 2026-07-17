@@ -891,7 +891,7 @@
 
       .metrics {
         display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-template-columns: repeat(3, minmax(0, 1fr));
         gap: 14px;
         margin-bottom: 20px;
       }
@@ -2879,7 +2879,8 @@
             <div class="filter-zone">
               <div id="dashboardFilters" class="dashboard-filters">
                 <select id="rangeSelect" class="select" aria-label="日期范围">
-                  <option value="7" selected>近 7 天</option>
+                  <option value="1" selected>近 1 天</option>
+                  <option value="7">近 7 天</option>
                   <option value="14">近 14 天</option>
                   <option value="30">近 30 天</option>
                 </select>
@@ -2948,15 +2949,15 @@
 
         <main class="main">
         <section id="dashboardView" class="view-section">
-        <section class="daily-overview" aria-label="最近一天用量摘要">
+        <section class="daily-overview" aria-label="所选范围用量摘要">
           <div class="daily-main-card">
             <div class="daily-main-head">
-              <span class="daily-eyebrow">最近一天 · 个人用量</span>
-              <span id="heroContext" class="daily-context">近 7 天 · 全部来源 · 最新数据日 暂无日期</span>
+              <span class="daily-eyebrow">所选范围 · 个人用量</span>
+              <span id="heroContext" class="daily-context">近 1 天 · 全部来源 · 最新数据日 暂无日期</span>
             </div>
             <div class="daily-main-values">
               <div>
-                <span id="heroTotalLabel" class="daily-label">最近一天 Token</span>
+                <span id="heroTotalLabel" class="daily-label">所选范围 Token</span>
                 <strong id="heroTotal" class="daily-value">0</strong>
               </div>
               <div>
@@ -2969,7 +2970,7 @@
             <div class="daily-mini">
               <span class="daily-label">请求次数</span>
               <strong id="heroRequests">0</strong>
-              <span id="heroRequestsSub" class="daily-sub">最近一天累计</span>
+              <span id="heroRequestsSub" class="daily-sub">所选范围累计</span>
             </div>
             <div class="daily-mini">
               <span class="daily-label">成功率</span>
@@ -2979,9 +2980,9 @@
           </div>
           <div class="daily-stat-card">
             <div class="daily-mini accent">
-              <span class="daily-label">范围占比</span>
-              <strong id="heroShare">0%</strong>
-              <span id="heroShareSub" class="daily-sub">占所选范围 Token</span>
+              <span class="daily-label">日均 Token</span>
+              <strong id="heroShare">0</strong>
+              <span id="heroShareSub" class="daily-sub">所选范围日均</span>
             </div>
             <div class="daily-mini">
               <span class="daily-label">数据日期</span>
@@ -3003,7 +3004,7 @@
                   <p class="panel-desc">按日期汇总 Prompt 与 Completion Token。</p>
                 </div>
               </div>
-              <span id="trendBadge" class="chip">近 30 天</span>
+              <span id="trendBadge" class="chip">近 1 天</span>
             </div>
             <svg id="trendChart" class="chart" role="img" aria-label="每日 Token 趋势图"></svg>
           </div>
@@ -3017,7 +3018,7 @@
                   <p class="panel-desc">按日期汇总预估消费金额。</p>
                 </div>
               </div>
-              <span id="spendBadge" class="chip gold">近 30 天</span>
+              <span id="spendBadge" class="chip gold">近 1 天</span>
             </div>
             <svg id="spendChart" class="chart" role="img" aria-label="每日金额消费趋势图"></svg>
           </div>
@@ -3107,15 +3108,15 @@
         </section>
 
         <section id="adminView" class="view-section hidden">
-          <section class="daily-overview" aria-label="最近一天全员用量摘要">
+          <section class="daily-overview" aria-label="所选范围全员用量摘要">
             <div class="daily-main-card">
               <div class="daily-main-head">
-                <span id="adminHeroTitle" class="daily-eyebrow">最近一天 · 管理员视图</span>
-                <span id="adminHeroContext" class="daily-context">近 7 天 · 全部来源 · 最新数据日 暂无日期</span>
+                <span id="adminHeroTitle" class="daily-eyebrow">所选范围 · 管理员视图</span>
+                <span id="adminHeroContext" class="daily-context">近 1 天 · 全部来源 · 最新数据日 暂无日期</span>
               </div>
               <div class="daily-main-values">
                 <div>
-                  <span id="adminHeroTotalLabel" class="daily-label">最近一天 Token</span>
+                  <span id="adminHeroTotalLabel" class="daily-label">所选范围 Token</span>
                   <strong id="adminHeroTotal" class="daily-value">0</strong>
                 </div>
                 <div>
@@ -3128,7 +3129,7 @@
               <div class="daily-mini">
                 <span class="daily-label">请求次数</span>
                 <strong id="adminHeroRequests">0</strong>
-                <span id="adminHeroRequestsSub" class="daily-sub">最近一天累计</span>
+                <span id="adminHeroRequestsSub" class="daily-sub">所选范围累计</span>
               </div>
               <div class="daily-mini">
                 <span class="daily-label">成功率</span>
@@ -3172,7 +3173,7 @@
                     <p class="panel-desc">按日期汇总全员 Prompt 与 Completion Token。</p>
                   </div>
                 </div>
-                <span id="adminTrendBadge" class="chip">近 30 天</span>
+                <span id="adminTrendBadge" class="chip">近 1 天</span>
               </div>
               <svg id="adminTrendChart" class="chart" role="img" aria-label="全员每日 Token 趋势图"></svg>
             </div>
@@ -3186,7 +3187,7 @@
                     <p class="panel-desc">按日期汇总全员预估消费金额。</p>
                   </div>
                 </div>
-                <span id="adminSpendBadge" class="chip gold">近 30 天</span>
+                <span id="adminSpendBadge" class="chip gold">近 1 天</span>
               </div>
               <svg id="adminSpendChart" class="chart" role="img" aria-label="全员每日金额消费趋势图"></svg>
             </div>
@@ -3294,15 +3295,15 @@
               <select id="teamSelect" class="select" aria-label="选择团队"></select>
             </div>
 
-            <section class="daily-overview" aria-label="最近一天团队用量摘要">
+            <section class="daily-overview" aria-label="所选范围团队用量摘要">
               <div class="daily-main-card">
                 <div class="daily-main-head">
-                  <span id="teamWelcomeTitle" class="daily-eyebrow">最近一天 · 团队视图</span>
-                  <span id="teamHeroContext" class="daily-context">近 7 天 · 全部来源 · 最新数据日 暂无日期</span>
+                  <span id="teamWelcomeTitle" class="daily-eyebrow">所选范围 · 团队视图</span>
+                  <span id="teamHeroContext" class="daily-context">近 1 天 · 全部来源 · 最新数据日 暂无日期</span>
                 </div>
                 <div class="daily-main-values">
                   <div>
-                    <span id="teamHeroTotalLabel" class="daily-label">最近一天 Token</span>
+                    <span id="teamHeroTotalLabel" class="daily-label">所选范围 Token</span>
                     <strong id="teamHeroTotal" class="daily-value">0</strong>
                   </div>
                   <div>
@@ -3315,7 +3316,7 @@
                 <div class="daily-mini">
                   <span class="daily-label">请求次数</span>
                   <strong id="teamHeroRequests">0</strong>
-                  <span id="teamHeroRequestsSub" class="daily-sub">最近一天累计</span>
+                  <span id="teamHeroRequestsSub" class="daily-sub">所选范围累计</span>
                 </div>
                 <div class="daily-mini">
                   <span class="daily-label">成功率</span>
@@ -3349,7 +3350,7 @@
                       <p id="teamTrendDesc" class="panel-desc">按日期汇总团队 Prompt 与 Completion Token。</p>
                     </div>
                   </div>
-                  <span id="teamTrendBadge" class="chip">近 30 天</span>
+                  <span id="teamTrendBadge" class="chip">近 1 天</span>
                 </div>
                 <svg id="teamTrendChart" class="chart" role="img" aria-label="团队每日 Token 趋势图"></svg>
               </div>
@@ -3363,7 +3364,7 @@
                       <p id="teamSpendDesc" class="panel-desc">按日期汇总团队预估消费金额。</p>
                     </div>
                   </div>
-                  <span id="teamSpendBadge" class="chip blue">近 30 天</span>
+                  <span id="teamSpendBadge" class="chip blue">近 1 天</span>
                 </div>
                 <svg id="teamSpendChart" class="chart" role="img" aria-label="团队每日金额消费趋势图"></svg>
               </div>
@@ -3454,15 +3455,15 @@
         </section>
 
         <section id="departmentView" class="view-section hidden">
-          <section id="departmentOverviewHero" class="daily-overview" aria-label="最近一天部门用量摘要">
+          <section id="departmentOverviewHero" class="daily-overview" aria-label="所选范围部门用量摘要">
             <div class="daily-main-card">
               <div class="daily-main-head">
-                <span id="departmentWelcomeTitle" class="daily-eyebrow">最近一天 · 部门视图</span>
-                <span id="departmentHeroContext" class="daily-context">近 7 天 · 全部来源 · 最新数据日 暂无日期</span>
+                <span id="departmentWelcomeTitle" class="daily-eyebrow">所选范围 · 部门视图</span>
+                <span id="departmentHeroContext" class="daily-context">近 1 天 · 全部来源 · 最新数据日 暂无日期</span>
               </div>
               <div class="daily-main-values">
                 <div>
-                  <span id="departmentHeroTotalLabel" class="daily-label">最近一天 Token</span>
+                  <span id="departmentHeroTotalLabel" class="daily-label">所选范围 Token</span>
                   <strong id="departmentHeroTotal" class="daily-value">0</strong>
                 </div>
                 <div>
@@ -3475,7 +3476,7 @@
               <div class="daily-mini">
                 <span class="daily-label">请求次数</span>
                 <strong id="departmentHeroRequests">0</strong>
-                <span id="departmentHeroRequestsSub" class="daily-sub">最近一天累计</span>
+                <span id="departmentHeroRequestsSub" class="daily-sub">所选范围累计</span>
               </div>
               <div class="daily-mini">
                 <span class="daily-label">成功率</span>
@@ -3519,7 +3520,7 @@
                     <p id="departmentTrendDesc" class="panel-desc">按日期汇总全部部门 Prompt 与 Completion Token。</p>
                   </div>
                 </div>
-                <span id="departmentTrendBadge" class="chip">近 30 天</span>
+                <span id="departmentTrendBadge" class="chip">近 1 天</span>
               </div>
               <svg id="departmentTrendChart" class="chart" role="img" aria-label="部门每日 Token 趋势图"></svg>
             </div>
@@ -3533,7 +3534,7 @@
                     <p id="departmentSpendDesc" class="panel-desc">按日期汇总全部部门预估消费金额。</p>
                   </div>
                 </div>
-                <span id="departmentSpendBadge" class="chip gold">近 30 天</span>
+                <span id="departmentSpendBadge" class="chip gold">近 1 天</span>
               </div>
               <svg id="departmentSpendChart" class="chart" role="img" aria-label="部门每日金额消费趋势图"></svg>
             </div>
@@ -3803,6 +3804,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260714-key-rotation"></script>
+    <script src="/assets/app.js?v=20260716-range-1d"></script>
   </body>
 </html>

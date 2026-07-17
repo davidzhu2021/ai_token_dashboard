@@ -48,6 +48,16 @@ class LiteLLMBackend:
     source: str | None = None
 
 
+@dataclass(frozen=True)
+class KeyModelScope:
+    models: list[str]
+    unrestricted: bool
+
+
+ALL_PROXY_MODELS = "all-proxy-models"
+NO_DEFAULT_MODELS = "no-default-models"
+
+
 def _as_number(value: Any) -> float:
     if value is None:
         return 0.0
@@ -960,30 +970,101 @@ class LiteLLMClient:
         backend = backend or self.backends[0]
         self._key_cache.delete(f"keys:{backend.id}:{user_id}")
 
-    async def key_user_models(self, user_id: str, backend: LiteLLMBackend | None = None) -> list[str]:
+    async def key_user_info(self, user_id: str, backend: LiteLLMBackend | None = None) -> dict[str, Any]:
         backend = backend or self.backends[0]
         try:
             payload = await self.request_backend(backend, "GET", "/v2/user/info", params={"user_id": user_id})
-            models = payload.get("models") if isinstance(payload, dict) else []
+            return payload if isinstance(payload, dict) else {}
         except HTTPException as exc:
             if exc.status_code != 404:
                 raise
             payload = await self.request_backend(backend, "GET", "/user/info", params={"user_id": user_id})
             user_info = payload.get("user_info") if isinstance(payload, dict) else {}
-            models = user_info.get("models") if isinstance(user_info, dict) else []
-        return sorted({str(model) for model in models or [] if model})
+            return user_info if isinstance(user_info, dict) else {}
 
-    async def available_key_models(self, user_id: str, backend: LiteLLMBackend | None = None) -> tuple[list[str], bool]:
-        backend = backend or self.backends[0]
-        user_models = await self.key_user_models(user_id, backend)
-        if user_models and "all-proxy-models" not in user_models:
-            return user_models, False
+    async def key_user_models(self, user_id: str, backend: LiteLLMBackend | None = None) -> list[str]:
+        user_info = await self.key_user_info(user_id, backend)
+        models = user_info.get("models") if isinstance(user_info, dict) else []
+        return self._clean_model_list(models)
+
+    @staticmethod
+    def _clean_model_list(models: Any) -> list[str]:
+        if not isinstance(models, list):
+            return []
+        return sorted({_clean_text(model) for model in models if _clean_text(model)})
+
+    async def _proxy_model_names(self, backend: LiteLLMBackend) -> list[str]:
         payload = await self.request_backend(backend, "GET", "/models")
         model_names = {
             _clean_text(_first(item, "id", "model_name", "model", default=""))
             for item in _records(payload)
         }
-        return sorted(model for model in model_names if model), not user_models or "all-proxy-models" in user_models
+        return sorted(model for model in model_names if model)
+
+    def _team_ids_from_user_info(self, user_info: dict[str, Any]) -> list[str]:
+        raw_values: list[Any] = []
+        for key in ("teams", "team_ids", "team_id"):
+            value = user_info.get(key)
+            if isinstance(value, list):
+                raw_values.extend(value)
+            elif value:
+                raw_values.append(value)
+        team_ids: list[str] = []
+        for value in raw_values:
+            if isinstance(value, dict):
+                team_id = _clean_text(_first(value, "team_id", "id", default=""))
+            else:
+                team_id = _clean_text(value)
+            if team_id and team_id not in team_ids:
+                team_ids.append(team_id)
+        return team_ids
+
+    async def _team_key_models(self, backend: LiteLLMBackend, user_info: dict[str, Any]) -> list[str]:
+        models: set[str] = set()
+        for team_id in self._team_ids_from_user_info(user_info):
+            try:
+                team = await self.team_info(backend, team_id)
+            except HTTPException as exc:
+                if exc.status_code == 404:
+                    continue
+                raise
+            if not isinstance(team, dict):
+                continue
+            models.update(self._clean_model_list(team.get("models")))
+        return sorted(models)
+
+    async def key_model_scope(self, user_id: str, backend: LiteLLMBackend | None = None) -> KeyModelScope:
+        backend = backend or self.backends[0]
+        user_info = await self.key_user_info(user_id, backend)
+        user_models = self._clean_model_list(user_info.get("models"))
+        proxy_models: list[str] | None = None
+
+        if ALL_PROXY_MODELS in user_models:
+            proxy_models = await self._proxy_model_names(backend)
+            return KeyModelScope(proxy_models, True)
+
+        explicit_user_models = [model for model in user_models if model != NO_DEFAULT_MODELS]
+        if explicit_user_models:
+            return KeyModelScope(explicit_user_models, False)
+
+        team_models = await self._team_key_models(backend, user_info)
+        if ALL_PROXY_MODELS in team_models:
+            proxy_models = await self._proxy_model_names(backend)
+            return KeyModelScope(proxy_models, True)
+
+        explicit_team_models = [model for model in team_models if model != NO_DEFAULT_MODELS]
+        if explicit_team_models:
+            return KeyModelScope(sorted(set(explicit_team_models)), False)
+
+        if not user_models:
+            proxy_models = await self._proxy_model_names(backend)
+            return KeyModelScope(proxy_models, True)
+
+        return KeyModelScope([], False)
+
+    async def available_key_models(self, user_id: str, backend: LiteLLMBackend | None = None) -> tuple[list[str], bool]:
+        scope = await self.key_model_scope(user_id, backend)
+        return scope.models, scope.unrestricted
 
     async def create_key(
         self,
@@ -1003,7 +1084,9 @@ class LiteLLMClient:
         invalid_models = sorted(set(selected_models) - set(available_models))
         if invalid_models:
             raise HTTPException(status_code=400, detail=f"包含无权使用的模型：{', '.join(invalid_models)}")
-        effective_models = selected_models or ([] if unrestricted else available_models)
+        effective_models = selected_models or available_models
+        if not effective_models:
+            raise HTTPException(status_code=403, detail="当前账号没有可用于创建访问密钥的模型权限，请联系管理员开通模型权限。")
 
         body: dict[str, Any] = {
             "key_alias": f"ai-usage-{secrets.token_hex(8)}",
@@ -1137,13 +1220,15 @@ class LiteLLMClient:
         available_set = set(available_models)
         old_models = {str(model) for model in rotation.get("models") or [] if model}
         if unrestricted:
-            effective_models = [] if not old_models or "all-proxy-models" in old_models else sorted(old_models)
-        elif not old_models or "all-proxy-models" in old_models:
+            effective_models = available_models if not old_models or ALL_PROXY_MODELS in old_models else sorted(old_models)
+        elif not old_models or ALL_PROXY_MODELS in old_models:
             effective_models = available_models
         else:
             effective_models = sorted(old_models & available_set)
             if not effective_models:
                 raise HTTPException(status_code=409, detail="旧密钥的模型权限已与当前员工权限不一致，请新建密钥")
+        if not effective_models:
+            raise HTTPException(status_code=403, detail="当前账号没有可用于创建访问密钥的模型权限，请联系管理员开通模型权限。")
 
         metadata = dict(rotation.get("metadata") or {})
         metadata["display_name"] = str(owned.get("name") or metadata.get("display_name") or "个人访问密钥")

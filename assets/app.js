@@ -157,11 +157,6 @@ function overviewContext(latestDate) {
   return `${rangeLabel()} · ${sourceText()} · 最新数据日 ${dateText}`;
 }
 
-function tokenShareText(latestTokens, totalTokens) {
-  if (!totalTokens) return "0%";
-  return `${Math.round((latestTokens / totalTokens) * 1000) / 10}%`;
-}
-
 function setText(id, value) {
   const node = el(id);
   if (node) node.textContent = value;
@@ -182,7 +177,7 @@ function renderDailyOverview(config) {
     data,
     summary = null,
     title,
-    totalLabel = "最近一天 Token",
+    totalLabel = `${rangeLabel()} Token`,
     sideLabel,
     sideValue,
     sideSub = "当前筛选范围",
@@ -190,20 +185,19 @@ function renderDailyOverview(config) {
   } = config;
   const latest = latestUsageDay(data, summary);
   const latestDate = latest.date || "";
-  const latestTokens = Number(latest.totalTokens || 0);
-  const latestSpend = Number(latest.spend || 0);
-  const latestRequests = Number(latest.requestCount || 0);
-  const latestSuccesses = Number(latest.successCount || 0);
-  const totalTokens = sum(data, "totalTokens");
+  const rangeTokens = sum(data, "totalTokens");
+  const rangeSpend = sum(data, "spend");
+  const rangeRequests = sum(data, "requestCount");
+  const rangeSuccesses = sum(data, "successCount");
   const baseId = prefix ? `${prefix}Hero` : "hero";
 
   setText(`${baseId}TotalLabel`, totalLabel);
-  setText(`${baseId}Total`, formatTokens(latestTokens));
-  setText(`${baseId}Spend`, money.format(latestSpend));
-  setText(`${baseId}Requests`, fmt.format(latestRequests));
-  setText(`${baseId}RequestsSub`, latestDate ? `${latestDate} 累计` : "暂无最新日期");
-  setText(`${baseId}Success`, successRateText(latestRequests, latestSuccesses));
-  setText(`${baseId}SuccessSub`, `${fmt.format(latestSuccesses)} / ${fmt.format(latestRequests)} 次成功`);
+  setText(`${baseId}Total`, formatTokens(rangeTokens));
+  setText(`${baseId}Spend`, money.format(rangeSpend));
+  setText(`${baseId}Requests`, fmt.format(rangeRequests));
+  setText(`${baseId}RequestsSub`, "所选范围累计");
+  setText(`${baseId}Success`, successRateText(rangeRequests, rangeSuccesses));
+  setText(`${baseId}SuccessSub`, `${fmt.format(rangeSuccesses)} / ${fmt.format(rangeRequests)} 次成功`);
   setText(`${baseId}Context`, overviewContext(latestDate));
   setText(`${baseId}Date`, latestDate || "暂无");
 
@@ -211,9 +205,10 @@ function renderDailyOverview(config) {
   if (prefix === "team" || prefix === "department") setText(`${prefix}WelcomeTitle`, title);
 
   if (showShare) {
-    const share = tokenShareText(latestTokens, totalTokens);
-    setText("heroShare", share);
-    setText("heroShareSub", "占所选范围 Token");
+    const days = selectedDateRange().days || 1;
+    const dailyAvg = Math.round(rangeTokens / days);
+    setText("heroShare", formatTokens(dailyAvg));
+    setText("heroShareSub", "所选范围日均");
   } else {
     setText(`${prefix}ActiveUsers`, fmt.format(sideValue || 0));
     setText(`${prefix}ActiveUsersSub`, sideSub);
@@ -286,7 +281,6 @@ function metricScopeSuffix(mode) {
 }
 
 function renderMetricGroups(containerId, data, mode = "personal", summary = null, splitData = data) {
-  const latest = summary?.latestDay || aggregateByDate(data).slice(-1)[0] || {};
   const total = sum(data, "totalTokens");
   const cursor = sum(splitData.filter((item) => item.source === "Cursor"), "totalTokens");
   const cc = sum(splitData.filter((item) => item.source === "Claude Code"), "totalTokens");
@@ -294,16 +288,11 @@ function renderMetricGroups(containerId, data, mode = "personal", summary = null
   const successes = sum(data, "successCount");
   const successRate = requests ? Math.round((successes / requests) * 1000) / 10 : 0;
   const spend = sum(data, "spend");
-  const scope = mode === "admin" ? "全员" : mode === "department" ? "部门" : "个人";
   const label = rangeLabel();
   const source = sourceText();
   const scopeSuffix = metricScopeSuffix(mode);
 
   el(containerId).innerHTML = [
-    metricGroup("最近一天", latest.date || "暂无日期", [
-      metric("最近一天 Token", formatTokens(latest.totalTokens || 0), latest.date ? `${latest.date} 的整日汇总` : `最新日期${scope}消耗`, "最近", "", "token"),
-      metric("最近一天消耗金额", money.format(latest.spend || 0), latest.date ? `${latest.date} 的整日预估金额` : "最新日期预估金额", "最近", "gold", "cost"),
-    ]),
     metricGroup("所选范围消耗", `${label} · ${source}${scopeSuffix}`, [
       metric(`${label} Token`, formatTokens(total), "按当前日期与来源筛选累计", source, "gold", "trend"),
       metric(`${label} 消耗金额`, money.format(spend), "按用量记录汇总", "估算", "gold", "cost"),
@@ -340,8 +329,8 @@ function renderAdminMetrics(data) {
   renderDailyOverview({
     prefix: "admin",
     data: totalData,
-    title: selectedAdminEmployee ? "最近一天 · 员工视图" : "最近一天 · 管理员视图",
-    totalLabel: selectedAdminEmployee ? "最近一天员工 Token" : "最近一天全员 Token",
+    title: selectedAdminEmployee ? "所选范围 · 员工视图" : "所选范围 · 管理员视图",
+    totalLabel: selectedAdminEmployee ? "所选范围员工 Token" : "所选范围全员 Token",
     sideValue: adminEmployees.length,
     sideSub: selectedAdminEmployee ? "当前员工" : "当前筛选范围",
   });
@@ -357,8 +346,8 @@ function renderDepartmentMetrics(data) {
   renderDailyOverview({
     prefix: "department",
     data,
-    title: `最近一天 · ${scopeLabel}`,
-    totalLabel: "最近一天 Token",
+    title: `所选范围 · ${scopeLabel}`,
+    totalLabel: "所选范围 Token",
     sideLabel: selectedDepartment ? "活跃员工" : "活跃部门",
     sideValue: selectedDepartment ? departmentEmployees.length : departmentRankings.length,
     sideSub: selectedDepartment ? "当前部门" : "当前筛选范围",
@@ -426,8 +415,8 @@ function renderTeamMetrics(data) {
   renderDailyOverview({
     prefix: "team",
     data,
-    title: `最近一天 · ${scopeLabel}`,
-    totalLabel: "最近一天 Token",
+    title: `所选范围 · ${scopeLabel}`,
+    totalLabel: "所选范围 Token",
     sideValue: activeMembers,
     sideSub: "当前筛选范围",
   });
@@ -869,7 +858,7 @@ function loadingLine(width = "100%") {
 }
 
 function renderMetricSkeleton(containerId) {
-  el(containerId).innerHTML = Array.from({ length: 4 })
+  el(containerId).innerHTML = Array.from({ length: 3 })
     .map(
       (_, index) => `
         <section class="metric-group" aria-busy="true">
@@ -982,10 +971,10 @@ function renderPersonalLoading() {
   el("heroRequests").textContent = "--";
   el("heroRequestsSub").textContent = "数据加载中";
   el("heroShare").textContent = "--";
-  el("heroShareSub").textContent = "占所选范围 Token";
+  el("heroShareSub").textContent = "所选范围日均";
   el("heroDate").textContent = "加载中";
   el("heroContext").textContent = `${label} · ${source} · 数据加载中`;
-  el("heroTotalLabel").textContent = "最近一天 Token";
+  el("heroTotalLabel").textContent = `${label} Token`;
   el("trendBadge").textContent = `${label} · ${source}`;
   el("spendBadge").textContent = `${label} · ${source}`;
   renderMetricSkeleton("metrics");
@@ -1002,8 +991,8 @@ function renderAdminLoading() {
   const source = sourceText();
   el("adminHeroTotal").textContent = "加载中";
   el("adminHeroSpend").textContent = "--";
-  el("adminHeroTotalLabel").textContent = selectedAdminEmployee ? "最近一天员工 Token" : "最近一天全员 Token";
-  el("adminHeroTitle").textContent = selectedAdminEmployee ? "最近一天 · 员工视图" : "最近一天 · 管理员视图";
+  el("adminHeroTotalLabel").textContent = selectedAdminEmployee ? "所选范围员工 Token" : "所选范围全员 Token";
+  el("adminHeroTitle").textContent = selectedAdminEmployee ? "所选范围 · 员工视图" : "所选范围 · 管理员视图";
   el("adminHeroRequests").textContent = "--";
   el("adminHeroRequestsSub").textContent = "数据加载中";
   el("adminHeroSuccess").textContent = "--";
@@ -1036,8 +1025,8 @@ function renderDepartmentLoading() {
     : "点击部门查看该部门用量看板和员工排行。";
   el("departmentHeroTotal").textContent = "加载中";
   el("departmentHeroSpend").textContent = "--";
-  el("departmentHeroTotalLabel").textContent = "最近一天 Token";
-  el("departmentWelcomeTitle").textContent = `最近一天 · ${scopeLabel}`;
+  el("departmentHeroTotalLabel").textContent = "所选范围 Token";
+  el("departmentWelcomeTitle").textContent = `所选范围 · ${scopeLabel}`;
   el("departmentHeroRequests").textContent = "--";
   el("departmentHeroRequestsSub").textContent = "数据加载中";
   el("departmentHeroSuccess").textContent = "--";
@@ -1066,7 +1055,7 @@ function renderTeamLoading() {
   const scopeLabel = teamScopeLabel();
   el("teamHeroTotal").textContent = "加载中";
   el("teamHeroSpend").textContent = "--";
-  el("teamHeroTotalLabel").textContent = "最近一天 Token";
+  el("teamHeroTotalLabel").textContent = "所选范围 Token";
   el("teamHeroRequests").textContent = "--";
   el("teamHeroRequestsSub").textContent = "数据加载中";
   el("teamHeroSuccess").textContent = "--";
@@ -1075,7 +1064,7 @@ function renderTeamLoading() {
   el("teamHeroContext").textContent = `${label} · ${source} · 数据加载中`;
   el("teamActiveUsers").textContent = "--";
   el("teamActiveUsersSub").textContent = "当前筛选范围";
-  el("teamWelcomeTitle").textContent = `最近一天 · ${scopeLabel}`;
+  el("teamWelcomeTitle").textContent = `所选范围 · ${scopeLabel}`;
   el("teamTrendBadge").textContent = `${label} · ${source}`;
   el("teamSpendBadge").textContent = `${label} · ${source}`;
   el("teamLimitHint").textContent = "数据加载中";
@@ -1454,6 +1443,10 @@ function updateKeyModelMode() {
 }
 
 function openCreateKeyModal() {
+  if (!availableKeyModels.length) {
+    showToast("当前账号没有可用于创建访问密钥的模型权限，请联系管理员开通模型权限。");
+    return;
+  }
   el("createKeyForm").reset();
   el("keyModelMode").value = "all";
   renderKeyModelChoices();
@@ -1786,8 +1779,8 @@ async function showApp(user) {
   el("userEmail").textContent = user.email;
   el("userName").textContent = user.name;
   el("avatar").textContent = user.avatar || initials(user.email, user.name);
-  el("teamWelcomeTitle").textContent = `最近一天 · ${teamScopeLabel()}`;
-  el("departmentWelcomeTitle").textContent = "最近一天 · 全部部门";
+  el("teamWelcomeTitle").textContent = `所选范围 · ${teamScopeLabel()}`;
+  el("departmentWelcomeTitle").textContent = "所选范围 · 全部部门";
   switchView("dashboard");
   render();
   await Promise.all([loadCurrentViewData(), loadModels()]);
@@ -2017,6 +2010,10 @@ el("createKeyForm").addEventListener("submit", async (event) => {
   const purpose = el("keyPurposeInput").value.trim();
   const duration = el("keyDurationSelect").value;
   const customModels = [...el("keyModelChoices").querySelectorAll('input[name="keyModel"]:checked')].map((input) => input.value);
+  if (!availableKeyModels.length) {
+    showToast("当前账号没有可用于创建访问密钥的模型权限，请联系管理员开通模型权限。");
+    return;
+  }
   if (name.length < 2) {
     showToast("密钥名称至少需要 2 个字符");
     el("keyNameInput").focus();
