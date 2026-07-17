@@ -945,6 +945,12 @@
         font-weight: 900;
       }
 
+      .daily-mini .daily-date-value {
+        font-size: clamp(18px, 2vw, 24px);
+        line-height: 1.18;
+        letter-spacing: 0;
+      }
+
       .daily-mini .daily-sub {
         color: var(--muted);
         font-size: 12px;
@@ -1361,6 +1367,41 @@
 
       .table-wrap {
         overflow-x: auto;
+      }
+
+      .usage-detail-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: end;
+        gap: 10px;
+        margin: 0 0 14px;
+      }
+
+      .usage-detail-field {
+        display: grid;
+        gap: 6px;
+        min-width: 150px;
+      }
+
+      .usage-detail-field label {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .usage-detail-field .input,
+      .usage-detail-field .select {
+        min-width: 0;
+      }
+
+      .usage-detail-search {
+        min-width: min(100%, 260px);
+        flex: 1 1 260px;
+      }
+
+      .usage-detail-actions {
+        display: flex;
+        align-items: end;
       }
 
       .admin-toolbar {
@@ -2654,6 +2695,22 @@
           width: 100%;
         }
 
+        .usage-detail-toolbar {
+          align-items: stretch;
+          display: grid;
+          grid-template-columns: 1fr;
+        }
+
+        .usage-detail-field,
+        .usage-detail-search {
+          min-width: 0;
+          width: 100%;
+        }
+
+        .usage-detail-actions .ghost-btn {
+          width: 100%;
+        }
+
         .sidebar {
           position: static;
           width: 100%;
@@ -3061,7 +3118,7 @@
             </div>
             <div class="daily-mini">
               <span class="daily-label">数据日期</span>
-              <strong id="heroDate">暂无</strong>
+              <strong id="heroDate" class="daily-date-value">暂无</strong>
               <span class="daily-sub">当前筛选下最新日期</span>
             </div>
           </div>
@@ -3133,10 +3190,39 @@
                 <span class="panel-icon"><svg><use href="#icon-table"></use></svg></span>
                 <div>
                 <h3 class="panel-title">用量明细</h3>
-              <p class="panel-desc">当前展示按日期与来源筛选后的每日聚合记录。</p>
+              <p class="panel-desc">当前范围内的每日聚合记录，可再按日期、模型、状态和关键词细分。</p>
                 </div>
               </div>
             <span id="tableCount" class="chip blue">0 条</span>
+          </div>
+          <div class="usage-detail-toolbar" aria-label="用量明细筛选">
+            <div class="usage-detail-field">
+              <label for="usageDetailDateFilter">日期</label>
+              <select id="usageDetailDateFilter" class="select" aria-label="按日期筛选用量明细">
+                <option value="all">全部日期</option>
+              </select>
+            </div>
+            <div class="usage-detail-field">
+              <label for="usageDetailModelFilter">模型</label>
+              <select id="usageDetailModelFilter" class="select" aria-label="按模型筛选用量明细">
+                <option value="all">全部模型</option>
+              </select>
+            </div>
+            <div class="usage-detail-field">
+              <label for="usageDetailStatusFilter">状态</label>
+              <select id="usageDetailStatusFilter" class="select" aria-label="按状态筛选用量明细">
+                <option value="all">全部状态</option>
+                <option value="正常">正常</option>
+                <option value="有失败">有失败</option>
+              </select>
+            </div>
+            <div class="usage-detail-field usage-detail-search">
+              <label for="usageDetailSearch">搜索</label>
+              <input id="usageDetailSearch" class="input" type="search" placeholder="搜索模型或来源" aria-label="搜索用量明细" />
+            </div>
+            <div class="usage-detail-actions">
+              <button id="usageDetailReset" class="ghost-btn" type="button">重置</button>
+            </div>
           </div>
           <div class="table-wrap">
             <table>
@@ -3205,7 +3291,7 @@
               </div>
               <div class="daily-mini">
                 <span class="daily-label">数据日期</span>
-                <strong id="adminHeroDate">暂无</strong>
+                <strong id="adminHeroDate" class="daily-date-value">暂无</strong>
                 <span class="daily-sub">当前筛选下最新日期</span>
               </div>
             </div>
@@ -3375,7 +3461,7 @@
                 </div>
                 <div class="daily-mini">
                   <span class="daily-label">数据日期</span>
-                  <strong id="teamHeroDate">暂无</strong>
+                  <strong id="teamHeroDate" class="daily-date-value">暂无</strong>
                   <span class="daily-sub">当前筛选下最新日期</span>
                 </div>
               </div>
@@ -3522,7 +3608,7 @@
               </div>
               <div class="daily-mini">
                 <span class="daily-label">数据日期</span>
-                <strong id="departmentHeroDate">暂无</strong>
+                <strong id="departmentHeroDate" class="daily-date-value">暂无</strong>
                 <span class="daily-sub">当前筛选下最新日期</span>
               </div>
             </div>
@@ -3812,6 +3898,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260716-range-1d"></script>
+    <script src="/assets/app.js?v=20260717-usage-detail-filters"></script>
   </body>
 </html>

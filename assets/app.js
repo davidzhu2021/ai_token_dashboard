@@ -14,6 +14,7 @@ let currentUser = null;
 let currentView = "dashboard";
 let usageData = [];
 let usageSummary = null;
+let usageTableFilters = { date: "all", model: "all", status: "all", keyword: "" };
 let lastPersonalUsageCacheHit = false;
 let lastAdminUsageCacheHit = false;
 let lastDepartmentUsageCacheHit = false;
@@ -157,6 +158,11 @@ function overviewContext(latestDate) {
   return `${rangeLabel()} · ${sourceText()} · 最新数据日 ${dateText}`;
 }
 
+function selectedDateRangeText() {
+  const { startDate, endDate, days } = selectedDateRange();
+  return days === 1 ? endDate : `${startDate} 至 ${endDate}`;
+}
+
 function setText(id, value) {
   const node = el(id);
   if (node) node.textContent = value;
@@ -204,7 +210,7 @@ function renderDailyOverview(config) {
   setText(`${baseId}Success`, successRateText(rangeRequests, rangeSuccesses));
   setText(`${baseId}SuccessSub`, `${fmt.format(rangeSuccesses)} / ${fmt.format(rangeRequests)} 次成功`);
   setText(`${baseId}Context`, overviewContext(latestDate));
-  setText(`${baseId}Date`, latestDate || "暂无");
+  setText(`${baseId}Date`, selectedDateRangeText());
 
   if (prefix === "admin") setText("adminHeroTitle", title);
   if (prefix === "team" || prefix === "department") setText(`${prefix}WelcomeTitle`, title);
@@ -600,6 +606,61 @@ function renderSplitTo(svgId, data) {
   `;
 }
 
+function uniqueSorted(data, field) {
+  return Array.from(new Set(data.map((item) => String(item[field] || "").trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b, "zh-CN"));
+}
+
+function optionMarkup(value, label) {
+  return `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`;
+}
+
+function setupUsageTableFilters(data) {
+  const dateSelect = el("usageDetailDateFilter");
+  const modelSelect = el("usageDetailModelFilter");
+  if (!dateSelect || !modelSelect) return;
+
+  const dates = uniqueSorted(data, "date").reverse();
+  const models = uniqueSorted(data, "model");
+  if (usageTableFilters.date !== "all" && !dates.includes(usageTableFilters.date)) usageTableFilters.date = "all";
+  if (usageTableFilters.model !== "all" && !models.includes(usageTableFilters.model)) usageTableFilters.model = "all";
+
+  dateSelect.innerHTML = optionMarkup("all", "全部日期") + dates.map((date) => optionMarkup(date, date)).join("");
+  modelSelect.innerHTML = optionMarkup("all", "全部模型") + models.map((model) => optionMarkup(model, model)).join("");
+  dateSelect.value = usageTableFilters.date;
+  modelSelect.value = usageTableFilters.model;
+  el("usageDetailStatusFilter").value = usageTableFilters.status;
+  el("usageDetailSearch").value = usageTableFilters.keyword;
+}
+
+function filteredUsageRows() {
+  const keyword = usageTableFilters.keyword.trim().toLowerCase();
+  return usageData.filter((item) => {
+    const hasFailure = Number(item.failureCount || 0) > 0;
+    const displayStatus = hasFailure ? "有失败" : "正常";
+    const matchesDate = usageTableFilters.date === "all" || item.date === usageTableFilters.date;
+    const matchesModel = usageTableFilters.model === "all" || item.model === usageTableFilters.model;
+    const matchesStatus = usageTableFilters.status === "all" || usageTableFilters.status === displayStatus;
+    const text = `${item.model || ""} ${displaySource(item.source)}`.toLowerCase();
+    return matchesDate && matchesModel && matchesStatus && (!keyword || text.includes(keyword));
+  });
+}
+
+function updateUsageTableFilters() {
+  usageTableFilters = {
+    date: el("usageDetailDateFilter").value,
+    model: el("usageDetailModelFilter").value,
+    status: el("usageDetailStatusFilter").value,
+    keyword: el("usageDetailSearch").value.trim(),
+  };
+  renderPersonal();
+}
+
+function resetUsageTableFilters() {
+  usageTableFilters = { date: "all", model: "all", status: "all", keyword: "" };
+  setupUsageTableFilters(usageData);
+  renderPersonal();
+}
+
 function renderTable(data) {
   el("tableCount").textContent = `${data.length} 条`;
   el("usageTable").innerHTML = data.length
@@ -608,10 +669,10 @@ function renderTable(data) {
         .reverse()
         .map((item) => {
           const status = item.failureCount > 0 ? `<span class="chip rose">${item.failureCount} 次失败</span>` : `<span class="chip">正常</span>`;
-          return `<tr><td>${item.date}</td><td>${displaySource(item.source)}</td><td>${item.model}</td><td class="num">${fmt.format(item.requestCount || 0)}</td><td class="num">${fmt.format(item.promptTokens || 0)}</td><td class="num">${fmt.format(item.completionTokens || 0)}</td><td class="num"><strong>${fmt.format(item.totalTokens || 0)}</strong></td><td>${status}</td></tr>`;
+          return `<tr><td>${escapeHtml(item.date)}</td><td>${escapeHtml(displaySource(item.source))}</td><td>${escapeHtml(item.model)}</td><td class="num">${fmt.format(item.requestCount || 0)}</td><td class="num">${fmt.format(item.promptTokens || 0)}</td><td class="num">${fmt.format(item.completionTokens || 0)}</td><td class="num"><strong>${fmt.format(item.totalTokens || 0)}</strong></td><td>${status}</td></tr>`;
         })
         .join("")
-    : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">当前筛选范围暂无用量记录</td></tr>`;
+    : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">当前明细筛选条件下暂无用量记录</td></tr>`;
 }
 
 function sortedAdminEmployees(items) {
@@ -1087,13 +1148,14 @@ function renderPersonal() {
     renderPersonalLoading();
     return;
   }
+  setupUsageTableFilters(usageData);
   renderPersonalMetrics(usageData);
   renderTrendTo("trendChart", usageData);
   renderSpendTrendTo("spendChart", usageData);
   renderDonutTo("sourceDonut", "donutTotal", "sourceLegend", usageData);
   renderModelBarsTo("modelBars", usageData);
   renderSplitTo("splitChart", usageData);
-  renderTable(usageData);
+  renderTable(filteredUsageRows());
 }
 
 function renderAdmin() {
@@ -1889,6 +1951,12 @@ el("sourceSelect").addEventListener("change", async () => {
   closeDepartmentPicker();
   await loadCurrentViewData();
 });
+
+["usageDetailDateFilter", "usageDetailModelFilter", "usageDetailStatusFilter"].forEach((id) => {
+  el(id).addEventListener("change", updateUsageTableFilters);
+});
+el("usageDetailSearch").addEventListener("input", updateUsageTableFilters);
+el("usageDetailReset").addEventListener("click", resetUsageTableFilters);
 
 el("refreshButton").addEventListener("click", async () => {
   if (currentView === "keys") {
