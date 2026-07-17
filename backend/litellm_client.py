@@ -56,6 +56,8 @@ class KeyModelScope:
 
 ALL_PROXY_MODELS = "all-proxy-models"
 NO_DEFAULT_MODELS = "no-default-models"
+DEFAULT_PERSONAL_KEY_MAX_BUDGET = 100
+DEFAULT_PERSONAL_KEY_BUDGET_DURATION = "1d"
 
 
 def _as_number(value: Any) -> float:
@@ -1093,6 +1095,8 @@ class LiteLLMClient:
             "key_type": "llm_api",
             "user_id": raw_user_id,
             "models": effective_models,
+            "max_budget": DEFAULT_PERSONAL_KEY_MAX_BUDGET,
+            "budget_duration": DEFAULT_PERSONAL_KEY_BUDGET_DURATION,
             "metadata": {
                 "display_name": name,
                 "purpose": purpose,
@@ -1209,7 +1213,7 @@ class LiteLLMClient:
         rotation = owned.get("_rotation") if isinstance(owned.get("_rotation"), dict) else {}
         if owned.get("status") != "正常":
             raise HTTPException(status_code=409, detail="只有正常状态的访问密钥可以更新")
-        if rotation.get("budget_duration") or rotation.get("budget_limits"):
+        if rotation.get("budget_limits"):
             raise HTTPException(status_code=409, detail="旧密钥包含复杂预算规则，无法安全更新，请新建密钥")
         allowed_routes = rotation.get("allowed_routes") or []
         if allowed_routes and set(map(str, allowed_routes)) != {"llm_api_routes"}:

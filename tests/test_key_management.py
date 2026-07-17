@@ -112,6 +112,8 @@ def test_create_key_uses_primary_user_llm_type_duration_and_clears_cache(
     assert body["user_id"] == "user-primary"
     assert body["key_type"] == "llm_api"
     assert body["models"] == ["gpt-5", "claude-sonnet"]
+    assert body["max_budget"] == 100
+    assert body["budget_duration"] == "1d"
     assert body["key_alias"].startswith("ai-usage-")
     assert body["metadata"]["display_name"] == "我的密钥"
     assert body.get("duration") == expected_duration
@@ -731,6 +733,8 @@ def test_replacement_key_intersects_models_inherits_limits_and_forces_llm_type(m
                 "models": ["gpt-5", "removed-model"],
                 "metadata": {"owner": "me"},
                 "max_budget": 10,
+                "spend": 3.25,
+                "budget_duration": "1d",
                 "rpm_limit": 20,
                 "allowed_routes": ["llm_api_routes"],
             },
@@ -755,6 +759,8 @@ def test_replacement_key_intersects_models_inherits_limits_and_forces_llm_type(m
     assert body["key_type"] == "llm_api"
     assert body["models"] == ["gpt-5"]
     assert body["max_budget"] == 10
+    assert body["spend"] == 3.25
+    assert body["budget_duration"] == "1d"
     assert body["rpm_limit"] == 20
     assert body["metadata"]["display_name"] == "工作密钥"
     assert body["metadata"]["purpose"] == "Codex"
@@ -765,6 +771,29 @@ def test_replacement_key_rejects_custom_routes(monkeypatch) -> None:
 
     async def fake_keys_for_user(*_args, **_kwargs):
         return [{"id": "old-hash", "status": "正常", "_rotation": {"models": ["gpt-5"], "allowed_routes": ["/key/info"]}}]
+
+    monkeypatch.setattr(client, "keys_for_user", fake_keys_for_user)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(client.create_replacement_key("old-hash", "user-1", "employee@example.com"))
+
+    assert exc.value.status_code == 409
+
+
+def test_replacement_key_rejects_budget_windows(monkeypatch) -> None:
+    client, _ = make_client()
+
+    async def fake_keys_for_user(*_args, **_kwargs):
+        return [{
+            "id": "old-hash",
+            "status": "正常",
+            "_rotation": {
+                "models": ["gpt-5"],
+                "max_budget": 100,
+                "budget_duration": "1d",
+                "budget_limits": [{"max_budget": 10, "budget_duration": "1h"}],
+            },
+        }]
 
     monkeypatch.setattr(client, "keys_for_user", fake_keys_for_user)
 
