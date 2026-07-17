@@ -947,21 +947,25 @@
 
       .daily-average-money {
         display: flex;
+        justify-content: space-between;
         align-items: baseline;
-        gap: 6px;
+        gap: 12px;
         margin-top: -4px;
+      }
+
+      .daily-average-money .daily-average-label {
+        color: rgba(255, 255, 255, 0.66);
+        font-size: 13px;
+        font-weight: 800;
+        white-space: nowrap;
       }
 
       .daily-average-money strong {
         display: inline;
-        font-size: 18px;
-        line-height: 1.1;
-      }
-
-      .daily-average-money span {
-        color: rgba(255, 255, 255, 0.66);
-        font-size: 12px;
-        font-weight: 800;
+        overflow-wrap: anywhere;
+        font-size: 30px;
+        line-height: 1;
+        font-weight: 900;
       }
 
       .daily-mini .daily-date-value {
@@ -3136,8 +3140,8 @@
               <span class="daily-label">日均 Token</span>
               <strong id="heroShare">0</strong>
               <div class="daily-average-money">
+                <span class="daily-average-label">日均金额</span>
                 <strong id="heroAvgSpend">$0.00</strong>
-                <span>日均金额</span>
               </div>
               <span id="heroShareSub" class="daily-sub">所选范围日均</span>
             </div>
