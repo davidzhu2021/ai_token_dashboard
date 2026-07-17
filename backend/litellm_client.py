@@ -181,6 +181,11 @@ def tool_account_aliases(email_prefix: str) -> list[str]:
     return [alias for alias in aliases if alias]
 
 
+def _tool_alias_matches(alias: str, candidate: Any) -> bool:
+    text = _clean_text(candidate)
+    return text == alias or text.startswith(f"{alias}-")
+
+
 def mask_key(value: str) -> str:
     if not value:
         return "未返回"
@@ -604,18 +609,31 @@ class LiteLLMClient:
         backend = backend or self.backends[0]
         user_ids: list[str] = []
         seen: set[str] = set()
-        for alias in tool_account_aliases(email_prefix):
-            payload = await self.request_backend(
-                backend,
-                "GET",
-                "/key/list",
-                params={"key_alias": alias, "return_full_object": "true", "page": 1, "size": 100},
-            )
+        aliases = tool_account_aliases(email_prefix)
+
+        def add_user_id(value: Any) -> None:
+            user_id = str(value or "").strip()
+            if user_id and user_id not in seen:
+                seen.add(user_id)
+                user_ids.append(user_id)
+
+        async def fetch_alias(alias: str, substring_matching: bool = False) -> None:
+            params: dict[str, Any] = {"key_alias": alias, "return_full_object": "true", "page": 1, "size": 100}
+            if substring_matching:
+                params["substring_matching"] = "true"
+            payload = await self.request_backend(backend, "GET", "/key/list", params=params)
             for key in _records(payload):
-                user_id = str(key.get("user_id") or "").strip()
-                if user_id and user_id not in seen:
-                    seen.add(user_id)
-                    user_ids.append(user_id)
+                if substring_matching and not _tool_alias_matches(alias, key.get("key_alias")):
+                    continue
+                add_user_id(key.get("user_id"))
+
+        for alias in aliases:
+            await fetch_alias(alias)
+
+        for alias in tool_account_aliases(email_prefix):
+            if alias == email_prefix:
+                continue
+            await fetch_alias(alias, substring_matching=True)
         return user_ids
 
     async def user_ids_from_recent_logs(self, email_prefix: str, backend: LiteLLMBackend | None = None) -> list[str]:

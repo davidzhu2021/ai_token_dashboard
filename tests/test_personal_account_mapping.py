@@ -63,3 +63,62 @@ def test_resolve_user_falls_back_to_recent_logs() -> None:
 
     assert user["matched_user_ids"] == ["claude-code-zhuyida", "cursor-zhuyida"]
     assert all("recent_usage_log" in account["matchSources"] for account in user["matched_accounts"])
+
+
+def test_resolve_user_matches_tool_key_alias_with_suffix() -> None:
+    client = make_client()
+    key_list_calls: list[dict[str, Any]] = []
+
+    async def fake_request_backend(backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> Any:
+        if path == "/user/list":
+            return {"users": [], "total_pages": 1}
+        if path == "/key/list":
+            params = kwargs["params"]
+            key_list_calls.append(params)
+            if params.get("substring_matching") != "true":
+                return {"keys": [], "total_pages": 1}
+            if params["key_alias"] == "cursor-zhuyida":
+                return {"keys": [{"user_id": "cursor-zhuyida", "key_alias": "cursor-zhuyida-3pfs"}], "total_pages": 1}
+            if params["key_alias"] == "claude-code-zhuyida":
+                return {"keys": [{"user_id": "claude-code-zhuyida", "key_alias": "claude-code-zhuyida-3sth"}], "total_pages": 1}
+            return {"keys": [], "total_pages": 1}
+        if path == "/spend/logs/v2":
+            return {"logs": [], "total_pages": 1}
+        raise AssertionError(f"unexpected call {backend.id} {method} {path}")
+
+    client.request_backend = fake_request_backend  # type: ignore[assignment]
+
+    user = asyncio.run(client.resolve_user("zhuyida@auto-link.com.cn", "Zhuyida"))
+
+    assert user["matched_user_ids"] == ["claude-code-zhuyida", "cursor-zhuyida"]
+    assert {account["user_id"] for account in user["matched_accounts"]} == {"cursor-zhuyida", "claude-code-zhuyida"}
+    assert all("key_alias" in account["matchSources"] for account in user["matched_accounts"])
+    assert not any(call.get("key_alias") == "zhuyida" and call.get("substring_matching") == "true" for call in key_list_calls)
+
+
+def test_suffix_key_alias_matching_rejects_unrelated_substrings() -> None:
+    client = make_client()
+
+    async def fake_request_backend(backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> Any:
+        if path == "/user/list":
+            return {"users": [], "total_pages": 1}
+        if path == "/key/list":
+            params = kwargs["params"]
+            if params.get("substring_matching") == "true" and params["key_alias"] == "claude-code-zhuyida":
+                return {
+                    "keys": [
+                        {"user_id": "not-zhuyida", "key_alias": "team-claude-code-zhuyida"},
+                        {"user_id": "also-not-zhuyida", "key_alias": "claude-code-zhuyidaextra"},
+                    ],
+                    "total_pages": 1,
+                }
+            return {"keys": [], "total_pages": 1}
+        if path == "/spend/logs/v2":
+            return {"logs": [], "total_pages": 1}
+        raise AssertionError(f"unexpected call {backend.id} {method} {path}")
+
+    client.request_backend = fake_request_backend  # type: ignore[assignment]
+
+    user_ids = asyncio.run(client.user_ids_from_key_alias("zhuyida"))
+
+    assert user_ids == []
