@@ -160,7 +160,8 @@ function overviewContext(latestDate) {
 
 function selectedDateRangeText() {
   const { startDate, endDate, days } = selectedDateRange();
-  return days === 1 ? endDate : `${startDate} 至 ${endDate}`;
+  const shortDate = (value) => value.slice(5).replace("-", "/");
+  return days === 1 ? shortDate(endDate) : `${shortDate(startDate)} - ${shortDate(endDate)}`;
 }
 
 function setText(id, value) {
@@ -218,7 +219,9 @@ function renderDailyOverview(config) {
   if (showShare) {
     const days = selectedDateRange().days || 1;
     const dailyAvg = Math.round(rangeTokens / days);
+    const dailyAvgSpend = rangeSpend / days;
     setText("heroShare", formatTokens(dailyAvg));
+    setText("heroAvgSpend", money.format(dailyAvgSpend));
     setText("heroShareSub", "所选范围日均");
   } else {
     setText(`${prefix}ActiveUsers`, fmt.format(sideValue || 0));
@@ -1037,6 +1040,7 @@ function renderPersonalLoading() {
   setText("heroRequests", "--");
   setText("heroRequestsSub", "数据加载中");
   setText("heroShare", "--");
+  setText("heroAvgSpend", "--");
   setText("heroShareSub", "所选范围日均");
   setText("heroDate", "加载中");
   setText("heroContext", `${label} · ${source} · 数据加载中`);
