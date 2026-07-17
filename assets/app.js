@@ -261,6 +261,26 @@ function metricGroup(title, subtitle, items) {
   `;
 }
 
+function modelRankGroup(mode = "personal") {
+  const prefix = mode === "personal" ? "" : mode;
+  const titleId = prefix ? `${prefix}ModelTitle` : "";
+  const descId = prefix ? `${prefix}ModelDesc` : "";
+  const barsId = prefix ? `${prefix}ModelBars` : "modelBars";
+  const defaultTitle = mode === "admin" ? "全员模型使用排行" : mode === "team" ? "团队模型使用排行" : mode === "department" ? "全部部门模型使用排行" : "模型使用排行";
+  const defaultDesc = mode === "admin" ? "按全员总 Token 消耗排序。" : mode === "team" ? "按团队总 Token 消耗排序。" : mode === "department" ? "按全部部门总 Token 消耗排序。" : "按总 Token 消耗排序。";
+  return `
+    <section class="metric-group model-rank-group">
+      <div class="metric-group-head">
+        <div>
+          <h3${titleId ? ` id="${titleId}"` : ""}>${defaultTitle}</h3>
+          <p${descId ? ` id="${descId}"` : ""}>${defaultDesc}</p>
+        </div>
+      </div>
+      <div id="${barsId}" class="bars"></div>
+    </section>
+  `;
+}
+
 function sourceText() {
   const source = el("sourceSelect").value;
   return source === "all" ? "全部来源" : displaySource(source);
@@ -295,22 +315,16 @@ function metricScopeSuffix(mode) {
 }
 
 function renderMetricGroups(containerId, data, mode = "personal", summary = null, splitData = data) {
-  const total = sum(data, "totalTokens");
   const cursor = sum(splitData.filter((item) => item.source === "Cursor"), "totalTokens");
   const cc = sum(splitData.filter((item) => item.source === "Claude Code"), "totalTokens");
   const requests = sum(data, "requestCount");
   const successes = sum(data, "successCount");
   const successRate = requests ? Math.round((successes / requests) * 1000) / 10 : 0;
-  const spend = sum(data, "spend");
   const label = rangeLabel();
   const source = sourceText();
   const scopeSuffix = metricScopeSuffix(mode);
 
   el(containerId).innerHTML = [
-    metricGroup("所选范围消耗", `${label} · ${source}${scopeSuffix}`, [
-      metric(`${label} Token`, formatTokens(total), "按当前日期与来源筛选累计", source, "gold", "trend"),
-      metric(`${label} 消耗金额`, money.format(spend), "按用量记录汇总", "估算", "gold", "cost"),
-    ]),
     metricGroup("所选范围请求", `${label} · ${source}${scopeSuffix}`, [
       metric(`${label} 请求次数`, fmt.format(requests), "按当前筛选累计", "请求", "blue", "request"),
       metric(`${label} 请求成功率`, `${successRate}%`, `${fmt.format(successes)} / ${fmt.format(requests)} 次成功`, "稳定", "", "success"),
@@ -319,6 +333,7 @@ function renderMetricGroups(containerId, data, mode = "personal", summary = null
       metric(`${label} Codex Token`, formatTokens(cursor), "Codex 相关消耗", "Codex", "", "cursor"),
       metric(`${label} Claude Code Token`, formatTokens(cc), "终端工具相关消耗", "Claude Code", "blue", "terminal"),
     ]),
+    modelRankGroup(mode),
   ].join("");
 }
 
@@ -374,11 +389,9 @@ function renderDepartmentMetrics(data) {
   el("departmentSpendDesc").textContent = `按日期汇总${scopeLabel}预估消费金额。`;
   el("departmentSourceTitle").textContent = `${scopeLabel}用量占比`;
   el("departmentSourceDesc").textContent = `按${scopeLabel} Codex、Claude Code 与其他来源拆分用量。`;
-  el("departmentModelTitle").textContent = `${scopeLabel}模型使用排行`;
-  el("departmentModelDesc").textContent = `按${scopeLabel}总 Token 消耗排序。`;
-  el("departmentSplitTitle").textContent = `${scopeLabel} Prompt / Completion 拆分`;
-  el("departmentSplitDesc").textContent = `观察${scopeLabel}输入输出 Token 比例。`;
   renderMetricGroups("departmentMetrics", data, "department");
+  setText("departmentModelTitle", `${scopeLabel}模型使用排行`);
+  setText("departmentModelDesc", `按${scopeLabel}总 Token 消耗排序。`);
 }
 
 function setDepartmentOverviewVisible(visible) {
@@ -386,7 +399,6 @@ function setDepartmentOverviewVisible(visible) {
     "departmentOverviewHero",
     "departmentMetrics",
     "departmentTrendGrid",
-    "departmentBreakdownGrid",
   ].forEach((id) => el(id)?.classList.toggle("hidden", !visible));
 }
 
@@ -441,11 +453,9 @@ function renderTeamMetrics(data) {
   el("teamSpendDesc").textContent = `按日期汇总${scopeLabel}预估消费金额。`;
   el("teamSourceTitle").textContent = `${scopeLabel}用量占比`;
   el("teamSourceDesc").textContent = `按${scopeLabel} Codex、Claude Code 与其他来源拆分用量。`;
-  el("teamModelTitle").textContent = `${scopeLabel}模型使用排行`;
-  el("teamModelDesc").textContent = `按${scopeLabel}总 Token 消耗排序。`;
-  el("teamSplitTitle").textContent = `${scopeLabel} Prompt / Completion 拆分`;
-  el("teamSplitDesc").textContent = `观察${scopeLabel}输入输出 Token 比例。`;
   renderMetricGroups("teamMetrics", data, "team");
+  setText("teamModelTitle", `${scopeLabel}模型使用排行`);
+  setText("teamModelDesc", `按${scopeLabel}总 Token 消耗排序。`);
 }
 
 function showChartTooltip(event, html) {
@@ -588,25 +598,6 @@ function renderModelBarsTo(containerId, data) {
         .map((row) => `<div class="bar-row"><strong>${row.model}</strong><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3, (row.value / max) * 100)}%"></div></div><span class="num">${formatTokens(row.value)}</span></div>`)
         .join("")
     : `<div class="model-empty">当前筛选范围暂无模型用量</div>`;
-}
-
-function renderSplitTo(svgId, data) {
-  const svg = el(svgId);
-  const prompt = sum(data, "promptTokens");
-  const completion = sum(data, "completionTokens");
-  const total = Math.max(1, prompt + completion);
-  const promptWidth = (prompt / total) * 760;
-  svg.setAttribute("viewBox", "0 0 820 236");
-  svg.innerHTML = `
-    <rect width="820" height="236" rx="8" fill="#fffdf6"/>
-    <text x="30" y="42" fill="#65736f" font-size="14">Prompt Token</text>
-    <rect x="30" y="62" width="760" height="42" rx="6" fill="#edf0e8"/>
-    <rect x="30" y="62" width="${promptWidth}" height="42" rx="6" fill="#1f7a5b"/>
-    <text x="30" y="134" fill="#14201d" font-size="28" font-weight="800">${formatTokens(prompt)}</text>
-    <text x="30" y="176" fill="#65736f" font-size="14">Completion Token</text>
-    <rect x="30" y="196" width="760" height="18" rx="6" fill="#b88727"/>
-    <text x="660" y="176" fill="#14201d" font-size="28" font-weight="800">${formatTokens(completion)}</text>
-  `;
 }
 
 function uniqueSorted(data, field) {
@@ -997,17 +988,6 @@ function renderBarsSkeleton(containerId) {
     .join("");
 }
 
-function renderSplitSkeleton(svgId) {
-  const svg = el(svgId);
-  svg.setAttribute("viewBox", "0 0 820 236");
-  svg.innerHTML = `
-    <rect width="820" height="236" rx="8" fill="#fffdf6"/>
-    <text x="410" y="102" fill="#65736f" font-size="16" font-weight="800" text-anchor="middle">数据加载中</text>
-    <rect x="30" y="132" width="760" height="24" rx="8" fill="#e5ebe3"/>
-    <rect x="30" y="176" width="520" height="16" rx="8" fill="#edf1ea"/>
-  `;
-}
-
 function renderTableSkeleton(tableId, countId, colSpan, label = "数据加载中") {
   if (countId) el(countId).textContent = label;
   el(tableId).innerHTML = Array.from({ length: 5 })
@@ -1052,7 +1032,6 @@ function renderPersonalLoading() {
   renderChartSkeleton("spendChart");
   renderDonutSkeleton("donutTotal", "sourceLegend");
   renderBarsSkeleton("modelBars");
-  renderSplitSkeleton("splitChart");
   renderTableSkeleton("usageTable", "tableCount", 8);
 }
 
@@ -1079,7 +1058,6 @@ function renderAdminLoading() {
   renderChartSkeleton("adminSpendChart");
   renderDonutSkeleton("adminDonutTotal", "adminSourceLegend");
   renderBarsSkeleton("adminModelBars");
-  renderSplitSkeleton("adminSplitChart");
   renderTableSkeleton("adminUserTable", "adminUserCount", 8);
 }
 
@@ -1115,7 +1093,6 @@ function renderDepartmentLoading() {
   renderChartSkeleton("departmentSpendChart");
   renderDonutSkeleton("departmentDonutTotal", "departmentSourceLegend");
   renderBarsSkeleton("departmentModelBars");
-  renderSplitSkeleton("departmentSplitChart");
   renderTableSkeleton("departmentUserTable", "departmentUserCount", 8);
 }
 
@@ -1143,7 +1120,6 @@ function renderTeamLoading() {
   renderChartSkeleton("teamSpendChart");
   renderDonutSkeleton("teamDonutTotal", "teamSourceLegend");
   renderBarsSkeleton("teamModelBars");
-  renderSplitSkeleton("teamSplitChart");
   renderTableSkeleton("teamUserTable", "teamUserCount", 8);
 }
 
@@ -1158,7 +1134,6 @@ function renderPersonal() {
   renderSpendTrendTo("spendChart", usageData);
   renderDonutTo("sourceDonut", "donutTotal", "sourceLegend", usageData);
   renderModelBarsTo("modelBars", usageData);
-  renderSplitTo("splitChart", usageData);
   renderTable(filteredUsageRows());
 }
 
@@ -1173,7 +1148,6 @@ function renderAdmin() {
   renderSpendTrendTo("adminSpendChart", totalData);
   renderDonutTo("adminSourceDonut", "adminDonutTotal", "adminSourceLegend", adminUsageData);
   renderModelBarsTo("adminModelBars", adminUsageData);
-  renderSplitTo("adminSplitChart", adminUsageData);
   renderAdminUsers();
 
   const detailCard = el("adminDetailCard");
@@ -1198,7 +1172,6 @@ function renderDepartment() {
     renderSpendTrendTo("departmentSpendChart", totalData);
     renderDonutTo("departmentSourceDonut", "departmentDonutTotal", "departmentSourceLegend", departmentUsageData);
     renderModelBarsTo("departmentModelBars", departmentUsageData);
-    renderSplitTo("departmentSplitChart", departmentUsageData);
   }
   renderDepartmentUsers();
   renderDepartmentPickerOptions();
@@ -1234,7 +1207,6 @@ function renderTeam() {
   renderSpendTrendTo("teamSpendChart", totalData);
   renderDonutTo("teamSourceDonut", "teamDonutTotal", "teamSourceLegend", teamUsageData);
   renderModelBarsTo("teamModelBars", teamUsageData);
-  renderSplitTo("teamSplitChart", teamUsageData);
   renderTeamUsers();
 }
 

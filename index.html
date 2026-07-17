@@ -1083,6 +1083,24 @@
         margin-top: 6px;
       }
 
+      .model-rank-group .bars {
+        align-content: start;
+        gap: 12px;
+      }
+
+      .model-rank-group .bar-row {
+        grid-template-columns: minmax(72px, 0.82fr) minmax(0, 1fr) minmax(64px, auto);
+        gap: 10px;
+        font-size: 12px;
+      }
+
+      .model-rank-group .bar-row strong {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
       .chip {
         display: inline-flex;
         align-items: center;
@@ -3183,34 +3201,6 @@
           </div>
         </section>
 
-        <section class="dashboard-grid">
-          <div class="panel">
-            <div class="panel-header">
-              <div class="panel-heading">
-                <span class="panel-icon"><svg><use href="#icon-model"></use></svg></span>
-                <div>
-                  <h3 class="panel-title">模型使用排行</h3>
-                  <p class="panel-desc">按总 Token 消耗排序。</p>
-                </div>
-              </div>
-            </div>
-            <div id="modelBars" class="bars"></div>
-          </div>
-
-          <div class="panel">
-            <div class="panel-header">
-              <div class="panel-heading">
-                <span class="panel-icon"><svg><use href="#icon-split"></use></svg></span>
-                <div>
-                  <h3 class="panel-title">Prompt / Completion 拆分</h3>
-                  <p class="panel-desc">观察输入输出 Token 比例。</p>
-                </div>
-              </div>
-            </div>
-            <svg id="splitChart" class="chart chart-short" role="img" aria-label="Token 拆分图"></svg>
-          </div>
-        </section>
-
         <section class="panel">
           <div class="panel-header">
               <div class="panel-heading">
@@ -3366,34 +3356,6 @@
             </div>
           </section>
 
-          <section class="dashboard-grid">
-            <div class="panel">
-              <div class="panel-header">
-                <div class="panel-heading">
-                  <span class="panel-icon"><svg><use href="#icon-model"></use></svg></span>
-                  <div>
-                    <h3 class="panel-title">全员模型使用排行</h3>
-                    <p class="panel-desc">按总 Token 消耗排序。</p>
-                  </div>
-                </div>
-              </div>
-              <div id="adminModelBars" class="bars"></div>
-            </div>
-
-            <div class="panel">
-              <div class="panel-header">
-                <div class="panel-heading">
-                  <span class="panel-icon"><svg><use href="#icon-split"></use></svg></span>
-                  <div>
-                    <h3 class="panel-title">全员 Prompt / Completion 拆分</h3>
-                    <p class="panel-desc">观察全员输入输出 Token 比例。</p>
-                  </div>
-                </div>
-              </div>
-              <svg id="adminSplitChart" class="chart chart-short" role="img" aria-label="全员 Token 拆分图"></svg>
-            </div>
-          </section>
-
           <section class="panel">
             <div class="panel-header">
               <div class="panel-heading">
@@ -3526,34 +3488,6 @@
               </div>
             </section>
 
-            <section class="dashboard-grid">
-              <div class="panel">
-                <div class="panel-header">
-                  <div class="panel-heading">
-                    <span class="panel-icon"><svg><use href="#icon-model"></use></svg></span>
-                    <div>
-                      <h3 id="teamModelTitle" class="panel-title">团队模型使用排行</h3>
-                      <p id="teamModelDesc" class="panel-desc">按团队总 Token 消耗排序。</p>
-                    </div>
-                  </div>
-                </div>
-                <div id="teamModelBars" class="bars"></div>
-              </div>
-
-              <div class="panel">
-                <div class="panel-header">
-                  <div class="panel-heading">
-                    <span class="panel-icon"><svg><use href="#icon-split"></use></svg></span>
-                    <div>
-                      <h3 id="teamSplitTitle" class="panel-title">团队 Prompt / Completion 拆分</h3>
-                      <p id="teamSplitDesc" class="panel-desc">观察团队输入输出 Token 比例。</p>
-                    </div>
-                  </div>
-                </div>
-                <svg id="teamSplitChart" class="split-chart" role="img" aria-label="团队 Prompt 和 Completion Token 拆分图"></svg>
-              </div>
-            </section>
-
             <section class="panel table-panel">
               <div class="panel-header">
                 <div class="panel-heading">
@@ -3680,34 +3614,6 @@
                 <span id="departmentSpendBadge" class="chip gold">近 1 天</span>
               </div>
               <svg id="departmentSpendChart" class="chart" role="img" aria-label="部门每日金额消费趋势图"></svg>
-            </div>
-          </section>
-
-          <section id="departmentBreakdownGrid" class="dashboard-grid">
-            <div class="panel">
-              <div class="panel-header">
-                <div class="panel-heading">
-                  <span class="panel-icon"><svg><use href="#icon-model"></use></svg></span>
-                  <div>
-                    <h3 id="departmentModelTitle" class="panel-title">全部部门模型使用排行</h3>
-                    <p id="departmentModelDesc" class="panel-desc">按全部部门总 Token 消耗排序。</p>
-                  </div>
-                </div>
-              </div>
-              <div id="departmentModelBars" class="bars"></div>
-            </div>
-
-            <div class="panel">
-              <div class="panel-header">
-                <div class="panel-heading">
-                  <span class="panel-icon"><svg><use href="#icon-split"></use></svg></span>
-                  <div>
-                    <h3 id="departmentSplitTitle" class="panel-title">全部部门 Prompt / Completion 拆分</h3>
-                    <p id="departmentSplitDesc" class="panel-desc">观察全部部门输入输出 Token 比例。</p>
-                  </div>
-                </div>
-              </div>
-              <svg id="departmentSplitChart" class="chart chart-short" role="img" aria-label="部门 Token 拆分图"></svg>
             </div>
           </section>
 
