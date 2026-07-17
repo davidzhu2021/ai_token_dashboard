@@ -358,8 +358,8 @@ function renderDepartmentMetrics(data) {
   el("departmentTrendDesc").textContent = `按日期汇总${scopeLabel} Prompt 与 Completion Token。`;
   el("departmentSpendTitle").textContent = `${scopeLabel}每日金额消费趋势`;
   el("departmentSpendDesc").textContent = `按日期汇总${scopeLabel}预估消费金额。`;
-  el("departmentSourceTitle").textContent = `${scopeLabel}来源占比`;
-  el("departmentSourceDesc").textContent = `${scopeLabel} Codex、Claude Code 与其他来源占比。`;
+  el("departmentSourceTitle").textContent = `${scopeLabel}用量占比`;
+  el("departmentSourceDesc").textContent = `按${scopeLabel} Codex、Claude Code 与其他来源拆分用量。`;
   el("departmentModelTitle").textContent = `${scopeLabel}模型使用排行`;
   el("departmentModelDesc").textContent = `按${scopeLabel}总 Token 消耗排序。`;
   el("departmentSplitTitle").textContent = `${scopeLabel} Prompt / Completion 拆分`;
@@ -425,8 +425,8 @@ function renderTeamMetrics(data) {
   el("teamTrendDesc").textContent = `按日期汇总${scopeLabel} Prompt 与 Completion Token。`;
   el("teamSpendTitle").textContent = `${scopeLabel}每日金额消费趋势`;
   el("teamSpendDesc").textContent = `按日期汇总${scopeLabel}预估消费金额。`;
-  el("teamSourceTitle").textContent = `${scopeLabel}来源占比`;
-  el("teamSourceDesc").textContent = `${scopeLabel} Codex、Claude Code 与其他来源占比。`;
+  el("teamSourceTitle").textContent = `${scopeLabel}用量占比`;
+  el("teamSourceDesc").textContent = `按${scopeLabel} Codex、Claude Code 与其他来源拆分用量。`;
   el("teamModelTitle").textContent = `${scopeLabel}模型使用排行`;
   el("teamModelDesc").textContent = `按${scopeLabel}总 Token 消耗排序。`;
   el("teamSplitTitle").textContent = `${scopeLabel} Prompt / Completion 拆分`;
