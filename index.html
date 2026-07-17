@@ -756,6 +756,14 @@
         margin-bottom: 18px;
       }
 
+      .daily-overview.personal-single-day {
+        grid-template-columns: minmax(340px, 1.35fr) minmax(520px, 1.6fr);
+      }
+
+      .daily-overview.personal-single-day .daily-stat-card {
+        display: none;
+      }
+
       .daily-main-card,
       .daily-stat-card,
       .daily-source-card {
@@ -3008,7 +3016,7 @@
 
         <main class="main">
         <section id="dashboardView" class="view-section">
-        <section class="daily-overview" aria-label="所选范围用量摘要">
+        <section id="personalDailyOverview" class="daily-overview" aria-label="所选范围用量摘要">
           <div class="daily-main-card">
             <div class="daily-main-head">
               <span class="daily-eyebrow">所选范围 · 个人用量</span>

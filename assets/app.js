@@ -190,6 +190,11 @@ function renderDailyOverview(config) {
   const rangeRequests = sum(data, "requestCount");
   const rangeSuccesses = sum(data, "successCount");
   const baseId = prefix ? `${prefix}Hero` : "hero";
+  const personalOverview = el("personalDailyOverview");
+
+  if (showShare && personalOverview) {
+    personalOverview.classList.toggle("personal-single-day", selectedDateRange().days === 1);
+  }
 
   setText(`${baseId}TotalLabel`, totalLabel);
   setText(`${baseId}Total`, formatTokens(rangeTokens));
@@ -963,6 +968,7 @@ function renderTableSkeleton(tableId, countId, colSpan, label = "数据加载中
 function renderPersonalLoading() {
   const label = rangeLabel();
   const source = sourceText();
+  el("personalDailyOverview")?.classList.toggle("personal-single-day", selectedDateRange().days === 1);
   setText("heroTotal", "加载中");
   setText("heroSpend", "--");
   setText("heroSuccess", "--");
