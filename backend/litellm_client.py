@@ -80,6 +80,33 @@ def _records(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _pagination_value(payload: Any, *names: str, default: Any = None) -> Any:
+    if not isinstance(payload, dict):
+        return default
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    return _first(metadata, *names, default=_first(payload, *names, default=default))
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _should_stop_paging(payload: Any, page: int, item_count: int, page_size: int | None = None) -> bool:
+    total_pages = _as_int(_pagination_value(payload, "total_pages", "totalPages", default=0))
+    if total_pages:
+        return page >= total_pages
+
+    has_more = _pagination_value(payload, "has_more", "hasMore", default=None)
+    if has_more is not None:
+        return not _as_bool(has_more)
+
+    if page_size is not None:
+        return item_count < page_size
+    return item_count == 0
+
+
 def _metadata_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -366,7 +393,8 @@ class LiteLLMClient:
         index = self._empty_account_index()
         for page in range(1, 101):
             payload = await self.request_backend(backend, "GET", "/user/list", params={"page": page, "page_size": 100})
-            for user in _records(payload):
+            users = _records(payload)
+            for user in users:
                 metadata = _metadata_dict(user.get("metadata"))
                 user_id = user.get("user_id")
                 email = _normal_email(user.get("user_email") or user.get("sso_user_id") or metadata.get("email"))
@@ -383,8 +411,7 @@ class LiteLLMClient:
                     alias_name = _clean_text(user.get("user_alias") or metadata.get("display_name") or metadata.get("owner_name"))
                     index["profiles"][user_id_text] = {"email": email, "name": alias_name}
                     self._add_account_index_entry(index, user_id, "her_user_email" if email else "her_user_alias", email, names)
-            total_pages = _as_int(payload.get("total_pages")) if isinstance(payload, dict) else 0
-            if total_pages and page >= total_pages:
+            if _should_stop_paging(payload, page, len(users), 100):
                 break
 
         max_pages = max(1, _env_int("HER_KEY_LIST_MAX_PAGES", 20))
@@ -418,8 +445,7 @@ class LiteLLMClient:
                         profile_name = _clean_text(metadata.get("display_name") or metadata.get("owner_name") or existing.get("name"))
                         index["profiles"][user_id_text] = {"email": profile_email, "name": profile_name}
                     self._add_account_index_entry(index, key.get("user_id"), "her_key_metadata_email" if email else "her_key_metadata_name", email, names)
-            total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=0)) if isinstance(payload, dict) else 0
-            if total_pages and page >= total_pages:
+            if _should_stop_paging(payload, page, len(keys), 100):
                 break
 
         self._account_index_cache.set(cache_key, index, _env_int("HER_ACCOUNT_INDEX_CACHE_TTL_SECONDS", 1800))
@@ -568,7 +594,8 @@ class LiteLLMClient:
         for backend in self.backends:
             for page in range(1, 51):
                 payload = await self.request_backend(backend, "GET", "/user/list", params={"page": page, "page_size": 100})
-                for user in _records(payload):
+                users = _records(payload)
+                for user in users:
                     user_id = user.get("user_id")
                     email_candidates = [user.get("user_email"), user.get("sso_user_id")]
                     legacy_candidates = [user.get("user_id"), user.get("user_alias")]
@@ -578,8 +605,7 @@ class LiteLLMClient:
                     elif any(str(candidate or "").lower() in legacy_aliases for candidate in legacy_candidates):
                         matched_users.append(user)
                         add_user_id(backend, user_id, "tool_account_alias")
-                total_pages = _as_int(payload.get("total_pages")) if isinstance(payload, dict) else 0
-                if total_pages and page >= total_pages:
+                if _should_stop_paging(payload, page, len(users), 100):
                     break
 
             if backend.source != "Her":
@@ -618,14 +644,18 @@ class LiteLLMClient:
                 user_ids.append(user_id)
 
         async def fetch_alias(alias: str, substring_matching: bool = False) -> None:
-            params: dict[str, Any] = {"key_alias": alias, "return_full_object": "true", "page": 1, "size": 100}
-            if substring_matching:
-                params["substring_matching"] = "true"
-            payload = await self.request_backend(backend, "GET", "/key/list", params=params)
-            for key in _records(payload):
-                if substring_matching and not _tool_alias_matches(alias, key.get("key_alias")):
-                    continue
-                add_user_id(key.get("user_id"))
+            for page in range(1, max(1, _env_int("PERSONAL_ACCOUNT_DISCOVERY_KEY_PAGES", 5)) + 1):
+                params: dict[str, Any] = {"key_alias": alias, "return_full_object": "true", "page": page, "size": 100}
+                if substring_matching:
+                    params["substring_matching"] = "true"
+                payload = await self.request_backend(backend, "GET", "/key/list", params=params)
+                keys = _records(payload)
+                for key in keys:
+                    if substring_matching and not _tool_alias_matches(alias, key.get("key_alias")):
+                        continue
+                    add_user_id(key.get("user_id"))
+                if _should_stop_paging(payload, page, len(keys), 100):
+                    break
 
         for alias in aliases:
             await fetch_alias(alias)
@@ -664,14 +694,14 @@ class LiteLLMClient:
                     "sort_order": "desc",
                 },
             )
-            for log in _records(payload):
+            logs = _records(payload)
+            for log in logs:
                 raw_user = self._log_raw_user(log)
                 normalized = raw_user.lower()
                 if normalized in aliases and raw_user not in seen:
                     seen.add(raw_user)
                     user_ids.append(raw_user)
-            total_pages = _as_int(payload.get("total_pages")) if isinstance(payload, dict) else 0
-            if total_pages and page >= total_pages:
+            if _should_stop_paging(payload, page, len(logs), page_size):
                 break
         return user_ids
 
@@ -867,94 +897,103 @@ class LiteLLMClient:
             hit, value, _ = self._key_cache.get(cache_key)
             if hit:
                 return value
-        payload = await self.request_backend(
-            backend,
-            "GET",
-            "/key/list",
-            params={"user_id": user_id, "return_full_object": "true", "page": 1, "size": 100},
-        )
         keys = []
-        for item in _records(payload):
-            token_hash = safe_key_id(_first(item, "token", default=""))
-            if not token_hash:
-                continue
-            metadata = _metadata_dict(_first(item, "metadata", default={}))
-            alias = _clean_text(metadata.get("display_name") or item.get("key_alias")) or "个人访问密钥"
-            expires = _first(item, "expires", default=None)
-            if _first(item, "blocked", "deleted", default=False):
-                status = "已禁用"
-            elif _is_expired(expires):
-                status = "已过期"
-            else:
-                status = "正常"
-            last_used = _first(item, "last_used_at", default=None)
-            created_at = _first(item, "created_at", default=None)
-            models = item.get("models") if isinstance(item.get("models"), list) else []
-            rotation_fields = {
-                name: item.get(name)
-                for name in (
-                    "max_budget",
-                    "spend",
-                    "budget_duration",
-                    "budget_limits",
-                    "budget_id",
-                    "max_parallel_requests",
-                    "tpm_limit",
-                    "rpm_limit",
-                    "allowed_cache_controls",
-                    "allowed_routes",
-                    "config",
-                    "permissions",
-                    "model_max_budget",
-                    "budget_fallbacks",
-                    "model_rpm_limit",
-                    "model_tpm_limit",
-                    "guardrails",
-                    "policies",
-                    "prompts",
-                    "aliases",
-                    "object_permission",
-                    "tags",
-                    "disable_global_guardrails",
-                    "enforced_params",
-                    "allowed_passthrough_routes",
-                    "allowed_vector_store_indexes",
-                    "rpm_limit_type",
-                    "tpm_limit_type",
-                    "router_settings",
-                    "access_group_ids",
-                    "team_id",
-                    "agent_id",
-                    "project_id",
-                    "org_id",
-                )
-                if item.get(name) is not None
-            }
-            keys.append(
-                {
-                    "_backendId": backend.id,
-                    "_userId": user_id,
-                    "id": token_hash,
-                    "name": alias,
-                    "purpose": _clean_text(metadata.get("purpose")) or "用于个人 AI 工具访问。",
-                    "masked": safe_key_name(item.get("key_name")),
-                    "models": [str(model) for model in models if model],
-                    "createdAt": _date_text(created_at) if created_at else "-",
-                    "lastUsed": _date_text(last_used) if last_used else "-",
-                    "expiresAt": _date_text(expires) if expires else "永不过期",
-                    "monthTokens": _as_int(_first(item, "total_tokens", "token_usage", default=0)),
-                    "spend": _as_number(_first(item, "spend", "total_spend")),
-                    "status": status,
-                    "_rotation": {
-                        "metadata": metadata,
-                        "models": [str(model) for model in models if model],
-                        "expires": expires,
-                        **rotation_fields,
-                    },
-                }
+        page_size = 100
+        max_pages = max(1, _env_int("KEY_LIST_MAX_PAGES", 20))
+        for page in range(1, max_pages + 1):
+            payload = await self.request_backend(
+                backend,
+                "GET",
+                "/key/list",
+                params={"user_id": user_id, "return_full_object": "true", "page": page, "size": page_size},
             )
+            records = _records(payload)
+            for item in records:
+                key = self._key_summary(item, user_id, backend)
+                if key is not None:
+                    keys.append(key)
+            if _should_stop_paging(payload, page, len(records), page_size):
+                break
         self._key_cache.set(cache_key, keys, _env_int("KEY_LIST_CACHE_TTL_SECONDS", 300))
         return keys
+
+    def _key_summary(self, item: dict[str, Any], user_id: str, backend: LiteLLMBackend) -> dict[str, Any] | None:
+        token_hash = safe_key_id(_first(item, "token", default=""))
+        if not token_hash:
+            return None
+        metadata = _metadata_dict(_first(item, "metadata", default={}))
+        alias = _clean_text(metadata.get("display_name") or item.get("key_alias")) or "个人访问密钥"
+        expires = _first(item, "expires", default=None)
+        if _first(item, "blocked", "deleted", default=False):
+            status = "已禁用"
+        elif _is_expired(expires):
+            status = "已过期"
+        else:
+            status = "正常"
+        last_used = _first(item, "last_used_at", default=None)
+        created_at = _first(item, "created_at", default=None)
+        models = item.get("models") if isinstance(item.get("models"), list) else []
+        rotation_fields = {
+            name: item.get(name)
+            for name in (
+                "max_budget",
+                "spend",
+                "budget_duration",
+                "budget_limits",
+                "budget_id",
+                "max_parallel_requests",
+                "tpm_limit",
+                "rpm_limit",
+                "allowed_cache_controls",
+                "allowed_routes",
+                "config",
+                "permissions",
+                "model_max_budget",
+                "budget_fallbacks",
+                "model_rpm_limit",
+                "model_tpm_limit",
+                "guardrails",
+                "policies",
+                "prompts",
+                "aliases",
+                "object_permission",
+                "tags",
+                "disable_global_guardrails",
+                "enforced_params",
+                "allowed_passthrough_routes",
+                "allowed_vector_store_indexes",
+                "rpm_limit_type",
+                "tpm_limit_type",
+                "router_settings",
+                "access_group_ids",
+                "team_id",
+                "agent_id",
+                "project_id",
+                "org_id",
+            )
+            if item.get(name) is not None
+        }
+        return {
+            "_backendId": backend.id,
+            "_userId": user_id,
+            "id": token_hash,
+            "name": alias,
+            "purpose": _clean_text(metadata.get("purpose")) or "用于个人 AI 工具访问。",
+            "masked": safe_key_name(item.get("key_name")),
+            "models": [str(model) for model in models if model],
+            "createdAt": _date_text(created_at) if created_at else "-",
+            "lastUsed": _date_text(last_used) if last_used else "-",
+            "expiresAt": _date_text(expires) if expires else "永不过期",
+            "monthTokens": _as_int(_first(item, "total_tokens", "token_usage", default=0)),
+            "spend": _as_number(_first(item, "spend", "total_spend")),
+            "status": status,
+            "_rotation": {
+                "metadata": metadata,
+                "models": [str(model) for model in models if model],
+                "expires": expires,
+                **rotation_fields,
+            },
+        }
 
     def invalidate_key_cache(self, user_id: str, backend: LiteLLMBackend | None = None) -> None:
         backend = backend or self.backends[0]

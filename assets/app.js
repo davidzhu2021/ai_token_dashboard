@@ -265,6 +265,10 @@ function rangeLabel() {
   return `近 ${el("rangeSelect").value} 天`;
 }
 
+function rangeMetricTitle(suffix) {
+  return `${rangeLabel()}${suffix}`;
+}
+
 function selectedDepartmentInfo() {
   if (!selectedDepartment) return null;
   const matched = departmentRankings.find((item) => item.departmentId === selectedDepartment || item.departmentName === selectedDepartment);
@@ -304,11 +308,11 @@ function renderMetricGroups(containerId, data, mode = "personal", summary = null
       metric("最近一天 Token", formatTokens(latest.totalTokens || 0), latest.date ? `${latest.date} 的整日汇总` : `最新日期${scope}消耗`, "最近", "", "token"),
       metric("最近一天消耗金额", money.format(latest.spend || 0), latest.date ? `${latest.date} 的整日预估金额` : "最新日期预估金额", "最近", "gold", "cost"),
     ]),
-    metricGroup("所选范围消耗", `${label} · ${source}${scopeSuffix}`, [
+    metricGroup(rangeMetricTitle("消耗"), `${label} · ${source}${scopeSuffix}`, [
       metric(`${label} Token`, formatTokens(total), "按当前日期与来源筛选累计", source, "gold", "trend"),
       metric(`${label} 消耗金额`, money.format(spend), "按用量记录汇总", "估算", "gold", "cost"),
     ]),
-    metricGroup("所选范围请求", `${label} · ${source}${scopeSuffix}`, [
+    metricGroup(rangeMetricTitle("请求"), `${label} · ${source}${scopeSuffix}`, [
       metric(`${label} 请求次数`, fmt.format(requests), "按当前筛选累计", "请求", "blue", "request"),
       metric(`${label} 请求成功率`, `${successRate}%`, `${fmt.format(successes)} / ${fmt.format(requests)} 次成功`, "稳定", "", "success"),
     ]),
