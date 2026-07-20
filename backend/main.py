@@ -1208,11 +1208,11 @@ async def models(request: Request) -> dict[str, Any]:
 
 @app.get("/")
 async def index() -> FileResponse:
-    return FileResponse(ROOT_DIR / "index.html")
+    return FileResponse(ROOT_DIR / "index.html", headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 
 
 @app.get("/{path:path}")
 async def spa_fallback(path: str) -> FileResponse:
     if path.startswith("api/"):
         raise HTTPException(status_code=404, detail="接口不存在")
-    return FileResponse(ROOT_DIR / "index.html")
+    return FileResponse(ROOT_DIR / "index.html", headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
