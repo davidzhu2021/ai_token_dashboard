@@ -199,6 +199,13 @@ function setText(id, value) {
   if (node) node.textContent = value;
 }
 
+function setHtml(id, value) {
+  const node = el(id);
+  if (!node) return false;
+  node.innerHTML = value;
+  return true;
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -345,6 +352,8 @@ function metricScopeSuffix(mode) {
 }
 
 function renderMetricGroups(containerId, data, mode = "personal", summary = null, splitData = data) {
+  const container = el(containerId);
+  if (!container) return;
   const cursor = sum(splitData.filter((item) => item.source === "Cursor"), "totalTokens");
   const cc = sum(splitData.filter((item) => item.source === "Claude Code"), "totalTokens");
   const requests = sum(data, "requestCount");
@@ -354,7 +363,7 @@ function renderMetricGroups(containerId, data, mode = "personal", summary = null
   const source = sourceText();
   const scopeSuffix = metricScopeSuffix(mode);
 
-  el(containerId).innerHTML = [
+  container.innerHTML = [
     metricGroup("所选范围请求", `${label} · ${source}${scopeSuffix}`, [
       metric(`${label} 请求次数`, fmt.format(requests), "按当前筛选累计", "请求", "blue", "request"),
       metric(`${label} 请求成功率`, `${successRate}%`, `${fmt.format(successes)} / ${fmt.format(requests)} 次成功`, "稳定", "", "success"),
@@ -511,11 +520,13 @@ function tooltipMarkup(date, rows) {
 }
 
 function renderEmptyChart(svg, label) {
+  if (!svg) return;
   svg.setAttribute("viewBox", "0 0 900 280");
   svg.innerHTML = `<rect width="900" height="280" rx="8" fill="#fffdf6"/><text x="450" y="140" fill="#65736f" font-size="16" text-anchor="middle">${label}</text>`;
 }
 
 function renderLineChart({ svg, points, valueField, color, fill, axisFormatter, tooltipRows }) {
+  if (!svg) return;
   if (!points.length) {
     renderEmptyChart(svg, "当前筛选范围暂无数据");
     return;
@@ -591,6 +602,10 @@ function renderSpendTrendTo(svgId, data) {
 }
 
 function renderDonutTo(svgId, totalId, legendId, data) {
+  const svg = el(svgId);
+  const totalNode = el(totalId);
+  const legend = el(legendId);
+  if (!svg || !totalNode || !legend) return;
   const grouped = groupBy(data, "source");
   const totals = Object.keys(sourceColors).map((source) => ({ source, value: grouped[source] ? sum(grouped[source], "totalTokens") : 0 }));
   const total = totals.reduce((acc, item) => acc + item.value, 0);
@@ -606,9 +621,9 @@ function renderDonutTo(svgId, totalId, legendId, data) {
       return circle;
     })
     .join("");
-  el(svgId).innerHTML = `<circle cx="90" cy="90" r="${radius}" fill="none" stroke="#edf0e8" stroke-width="18"/>${circles}`;
-  el(totalId).textContent = formatTokens(total);
-  el(legendId).innerHTML = totals
+  svg.innerHTML = `<circle cx="90" cy="90" r="${radius}" fill="none" stroke="#edf0e8" stroke-width="18"/>${circles}`;
+  totalNode.textContent = formatTokens(total);
+  legend.innerHTML = totals
     .map((item) => {
       const pct = total ? Math.round((item.value / total) * 100) : 0;
       return `<div class="legend-item"><span><i class="dot" style="background:${sourceColors[item.source]}"></i>${displaySource(item.source)}</span><strong>${pct}%</strong></div>`;
@@ -617,13 +632,15 @@ function renderDonutTo(svgId, totalId, legendId, data) {
 }
 
 function renderModelBarsTo(containerId, data) {
+  const container = el(containerId);
+  if (!container) return;
   const grouped = groupBy(data, "model");
   const rows = Object.keys(grouped)
     .map((model) => ({ model, value: sum(grouped[model], "totalTokens") }))
     .sort((a, b) => b.value - a.value)
     .slice(0, 5);
   const max = Math.max(1, ...rows.map((row) => row.value));
-  el(containerId).innerHTML = rows.length
+  container.innerHTML = rows.length
     ? rows
         .map((row) => `<div class="bar-row"><strong>${row.model}</strong><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3, (row.value / max) * 100)}%"></div></div><span class="num">${formatTokens(row.value)}</span></div>`)
         .join("")
@@ -652,8 +669,10 @@ function setupUsageTableFilters(data) {
   modelSelect.innerHTML = optionMarkup("all", "全部模型") + models.map((model) => optionMarkup(model, model)).join("");
   dateSelect.value = usageTableFilters.date;
   modelSelect.value = usageTableFilters.model;
-  el("usageDetailStatusFilter").value = usageTableFilters.status;
-  el("usageDetailSearch").value = usageTableFilters.keyword;
+  const statusSelect = el("usageDetailStatusFilter");
+  const searchInput = el("usageDetailSearch");
+  if (statusSelect) statusSelect.value = usageTableFilters.status;
+  if (searchInput) searchInput.value = usageTableFilters.keyword;
 }
 
 function filteredUsageRows() {
@@ -686,8 +705,10 @@ function resetUsageTableFilters() {
 }
 
 function renderTable(data) {
-  el("tableCount").textContent = `${data.length} 条`;
-  el("usageTable").innerHTML = data.length
+  setText("tableCount", `${data.length} 条`);
+  setHtml(
+    "usageTable",
+    data.length
     ? data
         .slice()
         .reverse()
@@ -696,7 +717,8 @@ function renderTable(data) {
           return `<tr><td>${escapeHtml(item.date)}</td><td>${escapeHtml(displaySource(item.source))}</td><td>${escapeHtml(item.model)}</td><td class="num">${fmt.format(item.requestCount || 0)}</td><td class="num">${fmt.format(item.promptTokens || 0)}</td><td class="num">${fmt.format(item.completionTokens || 0)}</td><td class="num"><strong>${fmt.format(item.totalTokens || 0)}</strong></td><td>${status}</td></tr>`;
         })
         .join("")
-    : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">当前明细筛选条件下暂无用量记录</td></tr>`;
+    : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">当前明细筛选条件下暂无用量记录</td></tr>`,
+  );
 }
 
 function sortedAdminEmployees(items) {
@@ -947,7 +969,9 @@ function loadingLine(width = "100%") {
 }
 
 function renderMetricSkeleton(containerId) {
-  el(containerId).innerHTML = Array.from({ length: 3 })
+  setHtml(
+    containerId,
+    Array.from({ length: 3 })
     .map(
       (_, index) => `
         <section class="metric-group" aria-busy="true">
@@ -979,11 +1003,13 @@ function renderMetricSkeleton(containerId) {
         </section>
       `,
     )
-    .join("");
+    .join(""),
+  );
 }
 
 function renderChartSkeleton(svgId) {
   const svg = el(svgId);
+  if (!svg) return;
   svg.setAttribute("viewBox", "0 0 900 280");
   svg.innerHTML = `
     <rect width="900" height="280" rx="8" fill="#fffdf6"/>
@@ -995,17 +1021,22 @@ function renderChartSkeleton(svgId) {
 }
 
 function renderDonutSkeleton(totalId, legendId) {
-  el(totalId).textContent = "--";
-  el(legendId).innerHTML = `
+  setText(totalId, "--");
+  setHtml(
+    legendId,
+    `
     <div class="loading-status"><span class="loading-pill"></span><span>数据加载中</span></div>
     <div style="margin-top:18px">${loadingLine("86%")}</div>
     <div style="margin-top:14px">${loadingLine("72%")}</div>
     <div style="margin-top:14px">${loadingLine("64%")}</div>
-  `;
+  `,
+  );
 }
 
 function renderBarsSkeleton(containerId) {
-  el(containerId).innerHTML = Array.from({ length: 5 })
+  setHtml(
+    containerId,
+    Array.from({ length: 5 })
     .map(
       (_, index) => `
         <div class="bar-row">
@@ -1015,12 +1046,15 @@ function renderBarsSkeleton(containerId) {
         </div>
       `,
     )
-    .join("");
+    .join(""),
+  );
 }
 
 function renderTableSkeleton(tableId, countId, colSpan, label = "数据加载中") {
-  if (countId) el(countId).textContent = label;
-  el(tableId).innerHTML = Array.from({ length: 5 })
+  if (countId) setText(countId, label);
+  setHtml(
+    tableId,
+    Array.from({ length: 5 })
     .map(
       () => `
         <tr>
@@ -1036,7 +1070,8 @@ function renderTableSkeleton(tableId, countId, colSpan, label = "数据加载中
         </tr>
       `,
     )
-    .join("");
+    .join(""),
+  );
 }
 
 function renderPersonalLoading() {
