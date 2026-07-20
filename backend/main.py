@@ -43,13 +43,38 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("ai-token-dashboard")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+
+def session_cookie_secure() -> bool:
+    configured = os.getenv("SESSION_COOKIE_SECURE")
+    if configured is not None:
+        return env_bool("SESSION_COOKIE_SECURE", True)
+    return os.getenv("APP_BASE_URL", "").startswith("https://")
+
+
+def app_base_url_from_request(request: Request) -> str:
+    configured = os.getenv("APP_BASE_URL", "").strip().rstrip("/")
+    host = request.headers.get("host", "").strip()
+    if not host:
+        return configured or "http://127.0.0.1:8000"
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
+    scheme = forwarded_proto or request.url.scheme
+    return f"{scheme}://{host}"
+
+
+def oidc_redirect_uri(request: Request) -> str:
+    configured = os.getenv("OIDC_REDIRECT_URI", "").strip()
+    if configured:
+        return configured
+    return app_base_url_from_request(request).rstrip("/") + "/api/auth/callback"
+
+
 app = FastAPI(title="AI 用量中心")
 app.mount("/assets", StaticFiles(directory=ROOT_DIR / "assets"), name="assets")
 app.add_middleware(
     SessionMiddleware,
     secret_key=os.getenv("SESSION_SECRET", "dev-session-secret-change-me"),
     same_site="lax",
-    https_only=os.getenv("APP_BASE_URL", "").startswith("https://"),
+    https_only=session_cookie_secure(),
 )
 oauth = build_oauth()
 user_mapping_cache = TTLCache()
@@ -723,7 +748,8 @@ async def dev_login(request: Request) -> dict[str, Any]:
 async def sso_start(request: Request):
     if not oidc_configured():
         raise HTTPException(status_code=501, detail="企业统一认证参数尚未配置")
-    redirect_uri = os.getenv("APP_BASE_URL", "http://127.0.0.1:8000").rstrip("/") + "/api/auth/callback"
+    redirect_uri = oidc_redirect_uri(request)
+    logger.info("oidc start redirect_uri=%s host=%s proto=%s", redirect_uri, request.headers.get("host"), request.headers.get("x-forwarded-proto") or request.url.scheme)
     authorize_params: dict[str, str] = {}
     direct_provider = os.getenv("OIDC_DIRECT_PROVIDER", "").strip()
     direct_method = os.getenv("OIDC_DIRECT_METHOD", "").strip()

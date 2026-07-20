@@ -127,10 +127,12 @@ HER_KEY_LIST_MAX_PAGES=20
 
 APP_BASE_URL=https://myai.carher.net
 SESSION_SECRET=replace-with-a-random-long-string
+SESSION_COOKIE_SECURE=true
 
 OIDC_ISSUER_URL=http://10.68.13.198:30882
 OIDC_CLIENT_ID=ai-token-dashboard-client-id
 OIDC_CLIENT_SECRET=ai-token-dashboard-client-secret
+OIDC_REDIRECT_URI=https://myai.carher.net/api/auth/callback
 OIDC_CASDOOR_APPLICATION_ID=admin/ai-token-dashboard
 OIDC_APPLICATION_NAME=ai-token-dashboard
 OIDC_DIRECT_PROVIDER=lark-provider
@@ -172,6 +174,8 @@ USAGE_TIMEZONE_OFFSET_MINUTES=-480
 - `HER_LITELLM_BASE_URL` 和 `HER_LITELLM_ADMIN_KEY` 同时存在时启用 Her 数据源；留空则不加载 Her。
 - `APP_BASE_URL` 本地开发可改为 `http://127.0.0.1:8000`，生产环境使用正式域名。
 - `SESSION_SECRET` 必须使用随机长字符串，生产环境不要使用示例值。
+- `SESSION_COOKIE_SECURE` 控制登录会话 Cookie 是否只允许 HTTPS 发送；生产 HTTPS 域名保持 `true`，本地或内网 HTTP 地址测试时设为 `false`，否则会出现登录回调成功后首页仍显示登录页。
+- `OIDC_REDIRECT_URI` 可显式指定企业登录回调地址；域名迁移或反向代理场景建议设为当前公开域名的 `/api/auth/callback`，并同步加入 Casdoor 应用的 Redirect URLs。
 - `ADMIN_EMAILS` 是管理员白名单，普通员工不会看到全员或部门看板入口。
 - `USAGE_TIMEZONE_OFFSET_MINUTES=-480` 表示按北京时间统计日期窗口；如果部署环境改用其他业务时区，需要同步调整。
 - `ADMIN_USAGE_PAGE_SIZE` 必须小于等于 100；想扩大日志覆盖范围时增加 `ADMIN_USAGE_LOG_MAX_PAGES`，不要增大单页大小。
