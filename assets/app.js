@@ -58,6 +58,7 @@ let isDashboardLoading = false;
 let isAdminLoading = false;
 let isDepartmentLoading = false;
 let isTeamLoading = false;
+let isSsoRedirecting = false;
 let authConfig = { devLoginEnabled: false, oidcConfigured: false, providerName: "飞书扫码登录" };
 
 const el = (id) => document.getElementById(id);
@@ -81,6 +82,35 @@ function showToast(message) {
   toast.textContent = message;
   toast.classList.add("show");
   window.setTimeout(() => toast.classList.remove("show"), 2200);
+}
+
+function startSsoLogin() {
+  if (isSsoRedirecting) return;
+  if (!authConfig.oidcConfigured) {
+    showToast("企业统一认证参数尚未配置");
+    return;
+  }
+  isSsoRedirecting = true;
+  const ssoButton = el("ssoButton");
+  const devLoginButton = el("devLoginButton");
+  ssoButton.disabled = true;
+  devLoginButton.disabled = true;
+  ssoButton.lastChild.textContent = "正在前往飞书登录";
+  el("loginHint").textContent = "请在新打开的飞书认证页面完成扫码。";
+  window.location.href = "/api/auth/sso/start";
+}
+
+function showLoginCallbackMessage() {
+  const params = new URLSearchParams(window.location.search);
+  const authError = params.get("auth_error");
+  if (!authError) return;
+  const message = authError === "state" ? "登录状态已失效，请重新点击飞书扫码登录。" : "登录没有完成，请重新扫码。";
+  el("loginHint").textContent = message;
+  showToast(message);
+  params.delete("auth_error");
+  const cleanQuery = params.toString();
+  const cleanUrl = `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ""}${window.location.hash}`;
+  window.history.replaceState({}, "", cleanUrl);
 }
 
 async function api(path, options = {}) {
@@ -1831,6 +1861,7 @@ async function showApp(user) {
 
 function showLogin() {
   currentUser = null;
+  isSsoRedirecting = false;
   selectedAdminEmployee = "";
   selectedDepartment = "";
   departmentPickerOpen = false;
@@ -1869,13 +1900,16 @@ function showLogin() {
   closeDepartmentPicker();
   el("appView").classList.add("hidden");
   el("loginView").classList.remove("hidden");
+  el("ssoButton").disabled = false;
+  el("devLoginButton").disabled = false;
+  el("ssoButton").lastChild.textContent = authConfig.providerName || "飞书扫码登录";
 }
 
 document.addEventListener("submit", async (event) => {
   if (event.target.id !== "loginForm") return;
   event.preventDefault();
   if (!authConfig.devLoginEnabled) {
-    window.location.href = "/api/auth/sso/start";
+    startSsoLogin();
     return;
   }
   const email = el("emailInput").value.trim();
@@ -1887,13 +1921,7 @@ document.addEventListener("submit", async (event) => {
   }
 });
 
-el("ssoButton").addEventListener("click", () => {
-  if (!authConfig.oidcConfigured) {
-    showToast("企业统一认证参数尚未配置");
-    return;
-  }
-  window.location.href = "/api/auth/sso/start";
-});
+el("ssoButton").addEventListener("click", startSsoLogin);
 
 el("logoutButton").addEventListener("click", async () => {
   try {
@@ -2303,6 +2331,7 @@ async function init() {
   el("loginHint").textContent = authConfig.devLoginEnabled
     ? `开发登录已启用，仅允许 ${authConfig.allowedEmailDomain || "公司邮箱"} 账号；生产环境请关闭。`
     : "使用公司飞书账号扫码登录；本页面不会保存真实密码或登录凭据。";
+  showLoginCallbackMessage();
   setupModelFilters();
   try {
     const user = await api("/api/auth/me");

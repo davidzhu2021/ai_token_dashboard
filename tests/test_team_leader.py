@@ -46,7 +46,7 @@ def app_client(email: str = "leader@auto-link.com.cn") -> TestClient:
     }
     data = base64.b64encode(json.dumps(session).encode("utf-8"))
     signed = TimestampSigner(os.getenv("SESSION_SECRET", "dev-session-secret-change-me")).sign(data).decode("utf-8")
-    client.cookies.set("session", signed)
+    client.cookies.set(main.SESSION_COOKIE_NAME, signed)
     return client
 
 def patch_user(monkeypatch, user_id: str = "leader-user") -> None:

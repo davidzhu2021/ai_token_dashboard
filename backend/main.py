@@ -43,11 +43,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("ai-token-dashboard")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+SESSION_COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "ai_token_dashboard_session")
+OIDC_STATE_PREFIX = "_state_company_"
+
 app = FastAPI(title="AI 用量中心")
 app.mount("/assets", StaticFiles(directory=ROOT_DIR / "assets"), name="assets")
 app.add_middleware(
     SessionMiddleware,
     secret_key=os.getenv("SESSION_SECRET", "dev-session-secret-change-me"),
+    session_cookie=SESSION_COOKIE_NAME,
     same_site="lax",
     https_only=os.getenv("APP_BASE_URL", "").startswith("https://"),
 )
@@ -68,6 +72,20 @@ def allowed_provider_login_url(url: str) -> str | None:
     if parsed.scheme != "https" or parsed.hostname != allowed_host:
         return None
     return url
+
+
+def oidc_state_keys(request: Request) -> list[str]:
+    return sorted(key for key in request.session if key.startswith(OIDC_STATE_PREFIX))
+
+
+def request_host(value: str | None) -> str:
+    if not value:
+        return ""
+    return urlparse(value).hostname or ""
+
+
+def callback_query_state_present(request: Request) -> bool:
+    return bool(str(request.query_params.get("state") or "").strip())
 
 
 def find_provider_login_url(text: str, base_url: str) -> str | None:
@@ -737,11 +755,21 @@ async def sso_start(request: Request):
         authorize_params["method"] = direct_method
     casdoor_response = await oauth.company.authorize_redirect(request, redirect_uri, **authorize_params)
     casdoor_url = casdoor_response.headers.get("location")
+    logger.info(
+        "oidc start redirect_host=%s state_count=%s direct_provider=%s skip_casdoor=%s feishu_direct=%s cookie_present=%s",
+        request_host(redirect_uri),
+        len(oidc_state_keys(request)),
+        bool(direct_provider),
+        env_bool("OIDC_SKIP_CASDOOR_PAGE", False),
+        env_bool("FEISHU_DIRECT_LOGIN_ENABLED", False),
+        SESSION_COOKIE_NAME in request.cookies,
+    )
     if env_bool("FEISHU_DIRECT_LOGIN_ENABLED", False) and casdoor_url:
         return RedirectResponse(feishu_direct_url(casdoor_url))
     if env_bool("OIDC_SKIP_CASDOOR_PAGE", False) and casdoor_url:
         provider_url = await resolve_provider_login_url(casdoor_url)
         if provider_url:
+            logger.info("oidc start provider shortcut host=%s", request_host(provider_url))
             return RedirectResponse(provider_url)
         logger.warning("provider shortcut unavailable; falling back to Casdoor authorize page")
     return casdoor_response
@@ -767,8 +795,19 @@ async def sso_callback(request: Request):
         request.session[SESSION_USER_KEY] = user
         return RedirectResponse("/")
     except OAuthError as exc:
-        logger.warning("oidc callback oauth error: %s", exc.__class__.__name__)
-        request.session.clear()
+        state_keys = oidc_state_keys(request)
+        logger.warning(
+            "oidc callback oauth error=%s cookie_present=%s query_state_present=%s state_count=%s has_user=%s",
+            exc.__class__.__name__,
+            SESSION_COOKIE_NAME in request.cookies,
+            callback_query_state_present(request),
+            len(state_keys),
+            SESSION_USER_KEY in request.session,
+        )
+        if exc.__class__.__name__ == "MismatchingStateError":
+            return auth_error_response("登录状态已失效或扫码链接已过期，请从首页重新点击飞书扫码登录。", 400)
+        if SESSION_USER_KEY not in request.session:
+            request.session.clear()
         return auth_error_response("登录状态已失效或扫码链接已过期，请从首页重新发起飞书扫码登录。", 400)
     except HTTPException:
         raise
