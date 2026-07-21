@@ -853,7 +853,7 @@
         padding: 18px;
         background: rgba(255, 255, 255, 0.72);
         display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(156px, 1fr));
         gap: 10px;
       }
 
@@ -899,11 +899,44 @@
       }
 
       .daily-source-card .donut-center {
-        inset: 30px;
+        inset: 21px;
+        padding: 2px;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        gap: 3px;
+        overflow: hidden;
       }
 
       .daily-source-card .donut-center strong {
-        font-size: 15px;
+        display: block;
+        max-width: 100%;
+        font-size: 13px;
+        line-height: 1;
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .daily-source-card .donut-center > div {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 3px;
+        line-height: 1;
+      }
+
+      .daily-source-card .donut-center br {
+        display: none;
+      }
+
+      .daily-source-card .donut-center span {
+        display: block;
+        max-width: 100%;
+        color: var(--muted);
+        font-size: 10px;
+        line-height: 1.1;
+        white-space: nowrap;
       }
 
       .daily-source-card .legend {
@@ -969,9 +1002,11 @@
       .daily-mini .daily-date-value {
         overflow-wrap: normal;
         white-space: nowrap;
-        font-size: clamp(17px, 1.5vw, 22px);
+        max-width: 100%;
+        font-size: clamp(15px, 1.15vw, 18px);
         line-height: 1.15;
-        letter-spacing: 0;
+        letter-spacing: -0.02em;
+        font-variant-numeric: tabular-nums;
       }
 
       .daily-mini .daily-sub {
@@ -2503,6 +2538,10 @@
           grid-template-columns: 1fr;
         }
 
+        .daily-overview.personal-single-day {
+          grid-template-columns: 1fr;
+        }
+
         .key-grid,
         .model-grid {
           grid-template-columns: 1fr 1fr;
@@ -2929,10 +2968,6 @@
 
         .daily-context {
           text-align: left;
-        }
-
-        .daily-stat-card {
-          grid-template-columns: repeat(2, minmax(0, 1fr));
         }
 
         .user-pill {
