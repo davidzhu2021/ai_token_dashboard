@@ -215,6 +215,14 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
+function displayModelName(model) {
+  const rawName = String(model ?? "").trim();
+  if (!rawName) return "未知模型";
+  const separatorIndex = rawName.lastIndexOf("/");
+  const shortName = separatorIndex >= 0 ? rawName.slice(separatorIndex + 1).trim() : rawName;
+  return shortName || rawName;
+}
+
 function renderDailyOverview(config) {
   const {
     prefix,
@@ -642,7 +650,7 @@ function renderModelBarsTo(containerId, data) {
   const max = Math.max(1, ...rows.map((row) => row.value));
   container.innerHTML = rows.length
     ? rows
-        .map((row) => `<div class="bar-row"><strong>${row.model}</strong><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3, (row.value / max) * 100)}%"></div></div><span class="num">${formatTokens(row.value)}</span></div>`)
+        .map((row) => `<div class="bar-row"><strong>${escapeHtml(displayModelName(row.model))}</strong><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3, (row.value / max) * 100)}%"></div></div><span class="num">${formatTokens(row.value)}</span></div>`)
         .join("")
     : `<div class="model-empty">当前筛选范围暂无模型用量</div>`;
 }
