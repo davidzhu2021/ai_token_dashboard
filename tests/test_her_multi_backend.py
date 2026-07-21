@@ -187,7 +187,7 @@ def test_team_usage_with_her_team_ref_only_reads_authorized_team() -> None:
     assert payload["employees"][0]["employeeName"] == "Carol"
 
 
-def test_models_merges_multi_backend_and_deduplicates_per_backend() -> None:
+def test_models_merges_multi_backend_and_deduplicates_globally() -> None:
     client = make_client()
 
     async def fake_request_backend(backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> Any:
@@ -215,8 +215,7 @@ def test_models_merges_multi_backend_and_deduplicates_per_backend() -> None:
     models = asyncio.run(client.models())
     assert any(item["modelName"] == "gpt-4o" for item in models)
     assert any(item["modelName"] == "claude-3-7" for item in models)
-    # gpt-4o appears once per backend (primary + Her)
-    assert len([item for item in models if item["modelName"] == "gpt-4o"]) == 2
+    assert len([item for item in models if item["modelName"] == "gpt-4o"]) == 1
 
 
 def test_source_filter_behavior_for_her_and_all() -> None:

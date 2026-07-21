@@ -2349,7 +2349,7 @@ class LiteLLMClient:
             models = value
         else:
             models = []
-            seen_keys: set[tuple[str, str]] = set()
+            seen_model_names: set[str] = set()
             for backend in self.backends:
                 try:
                     payload = await self.request_backend(backend, "GET", "/models")
@@ -2361,11 +2361,11 @@ class LiteLLMClient:
                     if isinstance(values, list):
                         raw_models = [{"id": str(value), "model_name": str(value)} if isinstance(value, str) else value for value in values]
                 for index, item in enumerate(raw_models):
-                    model_name = str(_first(item, "model_name", "model", "id", "litellm_model_name", default=f"model-{index + 1}"))
-                    dedupe_key = (backend.id, model_name.lower())
-                    if dedupe_key in seen_keys:
+                    model_name = _clean_text(_first(item, "model_name", "model", "id", "litellm_model_name", default=f"model-{index + 1}"))
+                    normalized_name = self._normalized_model_name(model_name)
+                    if not normalized_name or normalized_name in seen_model_names:
                         continue
-                    seen_keys.add(dedupe_key)
+                    seen_model_names.add(normalized_name)
                     provider = str(_first(item, "provider", "litellm_provider", default=provider_from_model(model_name)))
                     capabilities = ["代码"] if any(word in model_name.lower() for word in ("code", "coder", "claude", "gpt")) else ["通用"]
                     if any(word in model_name.lower() for word in ("vision", "gemini")):

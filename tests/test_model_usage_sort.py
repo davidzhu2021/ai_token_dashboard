@@ -229,15 +229,15 @@ def test_model_usage_counts_does_not_cache_invalid_activity_envelope() -> None:
     assert calls == ["primary", "secondary", "primary", "secondary"]
 
 
-def test_models_sort_by_usage_ties_by_name_and_keep_duplicate_backend_cards(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_models_sort_by_usage_ties_by_name_and_deduplicate_backend_cards(monkeypatch: pytest.MonkeyPatch) -> None:
     client = make_client()
     monkeypatch.setattr("backend.litellm_client.usage_today", lambda: date(2026, 7, 30))
 
     async def fake_request_backend(backend: LiteLLMBackend, _method: str, path: str, **_kwargs: Any) -> Any:
         if path == "/models":
             if backend.id == "primary":
-                return {"data": [{"id": "zeta"}, {"id": "Alpha"}, {"id": "gpt-4o"}]}
-            return {"data": [{"id": "gpt-4o"}, {"id": "beta"}]}
+                return {"data": [{"id": "zeta"}, {"id": "Alpha"}, {"id": "primary-gpt", "model_name": "gpt-4o", "description": "primary"}]}
+            return {"data": [{"id": "secondary-gpt", "model_name": "gpt-4o", "description": "secondary"}, {"id": "beta"}]}
         if path == "/user/daily/activity/aggregated":
             if backend.id == "primary":
                 return {"results": [_daily_item("2026-07-01", {"gpt-4o": 10, "Alpha": 5})]}
@@ -248,9 +248,31 @@ def test_models_sort_by_usage_ties_by_name_and_keep_duplicate_backend_cards(monk
 
     models = asyncio.run(client.models())
 
-    # Duplicate cards from different backends remain, and ties sort by name.
-    assert [item["modelName"] for item in models] == ["gpt-4o", "gpt-4o", "Alpha", "beta", "zeta"]
+    assert [item["modelName"] for item in models] == ["gpt-4o", "Alpha", "beta", "zeta"]
+    assert models[0]["id"] == "primary-gpt"
+    assert models[0]["description"] == "primary"
     assert all("usageCount" not in item for item in models)
+
+
+def test_models_deduplicate_trimmed_casefold_names_but_keep_similar_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = make_client()
+    monkeypatch.setattr("backend.litellm_client.usage_today", lambda: date(2026, 7, 30))
+
+    async def fake_request_backend(backend: LiteLLMBackend, _method: str, path: str, **_kwargs: Any) -> Any:
+        if path == "/models":
+            if backend.id == "primary":
+                return {"data": [{"id": "primary", "model_name": " GPT-5.5 "}, {"id": "chatgpt-gpt-5.5"}]}
+            return {"data": [{"id": "secondary", "model_name": "gpt-5.5"}]}
+        if path == "/user/daily/activity/aggregated":
+            return {"results": []}
+        raise AssertionError(f"unexpected path: {path}")
+
+    client.request_backend = fake_request_backend  # type: ignore[assignment]
+
+    models = asyncio.run(client.models())
+
+    assert [item["modelName"] for item in models] == ["chatgpt-gpt-5.5", "GPT-5.5"]
+    assert len([item for item in models if item["modelName"].casefold() == "gpt-5.5"]) == 1
 
 
 def test_models_return_complete_name_sorted_catalog_when_all_usage_sources_fail(monkeypatch: pytest.MonkeyPatch) -> None:
