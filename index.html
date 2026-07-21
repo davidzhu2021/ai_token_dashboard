@@ -780,8 +780,10 @@
           linear-gradient(130deg, rgba(255, 255, 255, 0.97), rgba(232, 247, 241, 0.82)),
           var(--panel);
         display: grid;
-        align-content: space-between;
-        gap: 20px;
+        grid-template-rows: auto auto;
+        align-content: start;
+        gap: clamp(18px, 2.4vw, 28px);
+        min-height: 174px;
         overflow: hidden;
         position: relative;
       }
@@ -807,7 +809,7 @@
       .daily-main-head {
         display: flex;
         justify-content: space-between;
-        gap: 16px;
+        gap: 20px;
         align-items: flex-start;
         position: relative;
         z-index: 1;
@@ -818,15 +820,26 @@
         font-size: 13px;
         text-align: right;
         line-height: 1.6;
+        max-width: 260px;
       }
 
       .daily-main-values {
         display: grid;
-        grid-template-columns: minmax(0, 1fr) minmax(160px, 0.42fr);
-        gap: 18px;
-        align-items: end;
+        grid-template-columns: minmax(0, max-content) minmax(142px, 0.34fr);
+        gap: clamp(22px, 4vw, 54px);
+        align-items: baseline;
+        justify-content: space-between;
         position: relative;
         z-index: 1;
+      }
+
+      .daily-main-values > div {
+        min-width: 0;
+      }
+
+      .daily-main-values > div:last-child {
+        justify-self: end;
+        text-align: left;
       }
 
       .daily-value {
@@ -836,6 +849,7 @@
         line-height: 0.95;
         letter-spacing: 0;
         font-weight: 900;
+        overflow-wrap: anywhere;
       }
 
       .daily-money {
@@ -846,6 +860,7 @@
         letter-spacing: 0;
         font-weight: 900;
         color: var(--gold);
+        overflow-wrap: anywhere;
       }
 
       .daily-stat-card {
@@ -2960,6 +2975,10 @@
         .daily-main-values,
         .key-meta {
           grid-template-columns: 1fr;
+        }
+
+        .daily-main-values > div:last-child {
+          justify-self: start;
         }
 
         .daily-main-head {
