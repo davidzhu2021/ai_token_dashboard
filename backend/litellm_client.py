@@ -136,6 +136,10 @@ def usage_timezone_offset_minutes() -> int:
         return -480
 
 
+def usage_today() -> date:
+    return (datetime.now(timezone.utc) - timedelta(minutes=usage_timezone_offset_minutes())).date()
+
+
 def _local_date_window_as_utc_text(start_date: str, end_date: str) -> tuple[str, str]:
     offset = timedelta(minutes=usage_timezone_offset_minutes())
     local_start = datetime.strptime(start_date, "%Y-%m-%d")
@@ -269,6 +273,7 @@ class LiteLLMClient:
         self._semaphore = asyncio.Semaphore(max(1, _env_int("LITELLM_MAX_CONCURRENCY", 4)))
         self._key_cache = TTLCache()
         self._model_cache = TTLCache()
+        self._model_usage_cache = TTLCache()
         self._account_index_cache = TTLCache()
 
     async def close(self) -> None:
@@ -2268,46 +2273,128 @@ class LiteLLMClient:
             name.lower(),
         )
 
+    @staticmethod
+    def _normalized_model_name(value: Any) -> str:
+        return _clean_text(value).casefold()
+
+    @staticmethod
+    def _model_usage_from_activity(payload: Any) -> dict[str, int]:
+        usage: dict[str, int] = defaultdict(int)
+        for item in _records(payload):
+            breakdown = item.get("breakdown") if isinstance(item.get("breakdown"), dict) else {}
+            model_groups = breakdown.get("model_groups") if isinstance(breakdown.get("model_groups"), dict) else {}
+            models = breakdown.get("models") if isinstance(breakdown.get("models"), dict) else {}
+            buckets = model_groups or models
+            for model_name, value in buckets.items():
+                normalized_name = LiteLLMClient._normalized_model_name(model_name)
+                if not normalized_name or not isinstance(value, dict):
+                    continue
+                metrics = value.get("metrics") if isinstance(value.get("metrics"), dict) else value
+                usage[normalized_name] += _as_int(_first(metrics, "api_requests", "total_api_requests", "requestCount"))
+        return dict(usage)
+
+    async def model_usage_counts(self, start_date: str, end_date: str) -> dict[str, int]:
+        model_usage_cache = getattr(self, "_model_usage_cache", None)
+        if model_usage_cache is None:
+            model_usage_cache = TTLCache()
+            self._model_usage_cache = model_usage_cache
+        cache_key = f"model-usage:{start_date}:{end_date}:tz{usage_timezone_offset_minutes()}"
+        hit, value, _ = model_usage_cache.get(cache_key)
+        if hit:
+            return value
+
+        async def load_backend(backend: LiteLLMBackend) -> dict[str, int] | None:
+            try:
+                payload = await self.request_backend(
+                    backend,
+                    "GET",
+                    "/user/daily/activity/aggregated",
+                    params={
+                        "start_date": start_date,
+                        "end_date": end_date,
+                        "timezone": usage_timezone_offset_minutes(),
+                    },
+                )
+                if isinstance(payload, list):
+                    return self._model_usage_from_activity(payload)
+                if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+                    logger.warning("model usage query returned an invalid response for backend %s", backend.id)
+                    return None
+                return self._model_usage_from_activity(payload)
+            except HTTPException as exc:
+                logger.warning("model usage query failed for backend %s: HTTP %s", backend.id, exc.status_code)
+                return None
+            except Exception:
+                logger.warning("model usage query failed for backend %s", backend.id)
+                return None
+
+        results = await asyncio.gather(*(load_backend(backend) for backend in self.backends))
+        merged: dict[str, int] = defaultdict(int)
+        successful_backends = 0
+        for result in results:
+            if result is None:
+                continue
+            successful_backends += 1
+            for model_name, request_count in result.items():
+                merged[model_name] += request_count
+
+        value = dict(merged)
+        if successful_backends:
+            model_usage_cache.set(cache_key, value, _env_int("MODEL_USAGE_CACHE_TTL_SECONDS", 300))
+        return value
+
     async def models(self) -> list[dict[str, Any]]:
         hit, value, _ = self._model_cache.get("models")
         if hit:
-            return value
-        models = []
-        seen_keys: set[tuple[str, str]] = set()
-        for backend in self.backends:
-            try:
-                payload = await self.request_backend(backend, "GET", "/models")
-            except HTTPException:
-                continue
-            raw_models = _records(payload)
-            if not raw_models and isinstance(payload, dict):
-                values = payload.get("data") or payload.get("models") or []
-                if isinstance(values, list):
-                    raw_models = [{"id": str(value), "model_name": str(value)} if isinstance(value, str) else value for value in values]
-            for index, item in enumerate(raw_models):
-                model_name = str(_first(item, "model_name", "model", "id", "litellm_model_name", default=f"model-{index + 1}"))
-                dedupe_key = (backend.id, model_name.lower())
-                if dedupe_key in seen_keys:
+            models = value
+        else:
+            models = []
+            seen_keys: set[tuple[str, str]] = set()
+            for backend in self.backends:
+                try:
+                    payload = await self.request_backend(backend, "GET", "/models")
+                except HTTPException:
                     continue
-                seen_keys.add(dedupe_key)
-                provider = str(_first(item, "provider", "litellm_provider", default=provider_from_model(model_name)))
-                capabilities = ["代码"] if any(word in model_name.lower() for word in ("code", "coder", "claude", "gpt")) else ["通用"]
-                if any(word in model_name.lower() for word in ("vision", "gemini")):
-                    capabilities.append("多模态")
-                models.append(
-                    {
-                        "id": str(_first(item, "id", "model_info_id", default=model_name)),
-                        "modelName": model_name,
-                        "provider": provider,
-                        "capabilities": capabilities,
-                        "description": str(_first(item, "description", default="当前账号可用模型。")),
-                        "contextWindow": str(_first(item, "max_input_tokens", "context_window", "contextWindow", default="未标注")),
-                        "status": "可用",
-                        "recommendedFor": str(_first(item, "recommended_for", default="按任务需求复制模型名称后使用")),
-                    }
-                )
-        self._model_cache.set("models", models, _env_int("MODEL_CACHE_TTL_SECONDS", 1800))
-        return models
+                raw_models = _records(payload)
+                if not raw_models and isinstance(payload, dict):
+                    values = payload.get("data") or payload.get("models") or []
+                    if isinstance(values, list):
+                        raw_models = [{"id": str(value), "model_name": str(value)} if isinstance(value, str) else value for value in values]
+                for index, item in enumerate(raw_models):
+                    model_name = str(_first(item, "model_name", "model", "id", "litellm_model_name", default=f"model-{index + 1}"))
+                    dedupe_key = (backend.id, model_name.lower())
+                    if dedupe_key in seen_keys:
+                        continue
+                    seen_keys.add(dedupe_key)
+                    provider = str(_first(item, "provider", "litellm_provider", default=provider_from_model(model_name)))
+                    capabilities = ["代码"] if any(word in model_name.lower() for word in ("code", "coder", "claude", "gpt")) else ["通用"]
+                    if any(word in model_name.lower() for word in ("vision", "gemini")):
+                        capabilities.append("多模态")
+                    models.append(
+                        {
+                            "id": str(_first(item, "id", "model_info_id", default=model_name)),
+                            "modelName": model_name,
+                            "provider": provider,
+                            "capabilities": capabilities,
+                            "description": str(_first(item, "description", default="当前账号可用模型。")),
+                            "contextWindow": str(_first(item, "max_input_tokens", "context_window", "contextWindow", default="未标注")),
+                            "status": "可用",
+                            "recommendedFor": str(_first(item, "recommended_for", default="按任务需求复制模型名称后使用")),
+                        }
+                    )
+            self._model_cache.set("models", models, _env_int("MODEL_CACHE_TTL_SECONDS", 1800))
+
+        end_day = usage_today()
+        end_date = end_day.isoformat()
+        start_date = (end_day - timedelta(days=29)).isoformat()
+        usage = await self.model_usage_counts(start_date, end_date)
+        return sorted(
+            models,
+            key=lambda item: (
+                -usage.get(self._normalized_model_name(item.get("modelName")), 0),
+                self._normalized_model_name(item.get("modelName")),
+            ),
+        )
 
 
 def default_date_range(days: int = 30) -> tuple[str, str]:

@@ -158,6 +158,7 @@ TEAM_AUTH_CACHE_TTL_SECONDS=300
 TEAM_USAGE_CACHE_TTL_SECONDS=300
 KEY_LIST_CACHE_TTL_SECONDS=300
 MODEL_CACHE_TTL_SECONDS=1800
+MODEL_USAGE_CACHE_TTL_SECONDS=300
 LITELLM_MAX_CONCURRENCY=4
 LITELLM_SLOW_REQUEST_MS=800
 PERSONAL_USAGE_LOG_FALLBACK_ENABLED=false
@@ -268,6 +269,7 @@ GET /api/auth/sso/start
 - 管理员、部门和团队用量缓存默认 300 秒。
 - 团队负责人权限缓存默认 300 秒。
 - 模型列表缓存默认 1800 秒。
+- 模型广场全公司近 30 天使用频率缓存默认 300 秒。
 - 缓存 key 按用户、日期范围、来源、团队或部门隔离；点击刷新或缓存过期后会重新查询上游。
 
 ## 访问密钥
