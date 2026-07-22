@@ -2069,7 +2069,15 @@ async function loadTeamData(forceRefresh = false) {
   }
 }
 
-async function loadTeamMemberData(employee, forceRefresh = false) {
+function scrollToPageTop() {
+  try {
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  } catch {
+    window.scrollTo(0, 0);
+  }
+}
+
+async function loadTeamMemberData(employee, forceRefresh = false, scrollToTop = true) {
   if (!currentUser?.isTeamLeader || !leaderTeams.length || isTeamMemberLoading) return;
   ensureSelectedTeamRef();
   const keepFilters = forceRefresh && selectedTeamEmployee === employee;
@@ -2099,6 +2107,7 @@ async function loadTeamMemberData(employee, forceRefresh = false) {
   } finally {
     isTeamMemberLoading = false;
     renderTeam();
+    if (scrollToTop) scrollToPageTop();
   }
 }
 
@@ -2262,7 +2271,7 @@ el("refreshButton").addEventListener("click", async () => {
     showToast(lastAdminUsageCacheHit ? "\u5df2\u52a0\u8f7d\u7f13\u5b58\u5168\u5458\u6570\u636e" : "\u5df2\u5237\u65b0\u5168\u5458\u7528\u91cf\u6570\u636e");
   } else if (currentView === "team") {
     if (selectedTeamEmployee) {
-      await loadTeamMemberData(selectedTeamEmployee, true);
+      await loadTeamMemberData(selectedTeamEmployee, true, false);
       showToast("已刷新成员用量明细");
     } else {
       await loadTeamData(true);
