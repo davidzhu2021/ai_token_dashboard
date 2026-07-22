@@ -30,6 +30,7 @@ let departmentEmployees = [];
 let teamUsageData = [];
 let teamSummaryData = [];
 let teamEmployees = [];
+let selectedTeamEmployee = "";
 let teamInfo = null;
 let leaderTeams = [];
 let selectedTeamRef = "";
@@ -697,6 +698,36 @@ function filteredUsageRows() {
   });
 }
 
+function teamSelectedEmployeeInfo() {
+  if (!selectedTeamEmployee) return null;
+  return teamEmployees.find((item) => item.employeeEmail === selectedTeamEmployee || item.employeeId === selectedTeamEmployee) || null;
+}
+
+function teamSelectedRows() {
+  if (!selectedTeamEmployee) return teamUsageData;
+  const target = selectedTeamEmployee.toLowerCase();
+  return teamUsageData.filter((item) => {
+    const employeeId = String(item.employeeId || "").toLowerCase();
+    const employeeEmail = String(item.employeeEmail || "").toLowerCase();
+    return employeeId === target || employeeEmail === target;
+  });
+}
+
+function teamDetailRows() {
+  if (selectedTeamEmployee) return teamSelectedRows();
+  return teamSummaryData.length ? teamSummaryData : teamUsageData;
+}
+
+function teamDetailBaseRows() {
+  return selectedTeamEmployee ? teamSelectedRows() : teamUsageData;
+}
+
+function syncSelectedTeamEmployee() {
+  if (selectedTeamEmployee && !teamSelectedEmployeeInfo()) {
+    selectedTeamEmployee = "";
+  }
+}
+
 function updateUsageTableFilters() {
   usageTableFilters = {
     date: el("usageDetailDateFilter").value,
@@ -713,10 +744,10 @@ function resetUsageTableFilters() {
   renderPersonal();
 }
 
-function renderTable(data) {
-  setText("tableCount", `${data.length} 条`);
+function renderUsageRowsTo(tableId, countId, data, emptyText) {
+  setText(countId, `${data.length} 条`);
   setHtml(
-    "usageTable",
+    tableId,
     data.length
     ? data
         .slice()
@@ -726,8 +757,12 @@ function renderTable(data) {
           return `<tr><td>${escapeHtml(item.date)}</td><td>${escapeHtml(displaySource(item.source))}</td><td>${escapeHtml(item.model)}</td><td class="num">${fmt.format(item.requestCount || 0)}</td><td class="num">${fmt.format(item.promptTokens || 0)}</td><td class="num">${fmt.format(item.completionTokens || 0)}</td><td class="num"><strong>${fmt.format(item.totalTokens || 0)}</strong></td><td>${status}</td></tr>`;
         })
         .join("")
-    : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">当前明细筛选条件下暂无用量记录</td></tr>`,
+    : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">${emptyText}</td></tr>`,
   );
+}
+
+function renderTable(data) {
+  renderUsageRowsTo("usageTable", "tableCount", data, "当前明细筛选条件下暂无用量记录");
 }
 
 function sortedAdminEmployees(items) {
@@ -973,6 +1008,57 @@ function renderTeamUsers() {
   renderEmployeeRanking("teamUserTable", "teamUserCount", teamEmployees, "当前团队暂无成员用量");
 }
 
+function renderTeamMemberDetail() {
+  const detailCard = el("teamDetailCard");
+  if (!detailCard) return;
+  syncSelectedTeamEmployee();
+  const employee = teamSelectedEmployeeInfo();
+  const hasSelection = Boolean(employee && selectedTeamEmployee);
+  const rows = hasSelection ? teamSelectedRows() : teamDetailRows();
+  const detailBaseRows = hasSelection ? rows : teamDetailBaseRows();
+  const detailTitle = el("teamDetailTitle");
+  const detailSubtitle = el("teamDetailSubtitle");
+  const backButton = el("teamClearEmployee");
+
+  detailCard.classList.toggle("show", hasSelection);
+  if (backButton) backButton.classList.toggle("hidden", !hasSelection);
+  if (hasSelection) {
+    const name = employee?.employeeName || employee?.employeeEmail || employee?.employeeId || selectedTeamEmployee;
+    if (detailTitle) detailTitle.textContent = `${name} 的用量详情`;
+    if (detailSubtitle) detailSubtitle.textContent = employee?.employeeEmail || employee?.employeeId || selectedTeamEmployee;
+  }
+
+  const title = hasSelection ? `${employee?.employeeName || selectedTeamEmployee} 的用量详情` : "团队用量明细";
+  const subtitle = hasSelection ? "展示该成员在当前筛选范围内的汇总、趋势、模型排行和明细。" : "展示团队当前筛选范围内的每日聚合明细。";
+  setText("teamUsageDetailTitle", title);
+  setText("teamUsageDetailDesc", subtitle);
+
+  const heroLabel = hasSelection ? "成员 Token" : "团队 Token";
+  const heroRows = hasSelection ? rows : detailBaseRows;
+  const totalTokens = sum(heroRows, "totalTokens");
+  const requests = sum(heroRows, "requestCount");
+  const successes = sum(heroRows, "successCount");
+  const successRate = requests ? Math.round((successes / requests) * 1000) / 10 : 0;
+  const latestDate = aggregateByDate(heroRows).slice(-1)[0]?.date || "暂无";
+
+  setText("teamUsageTotalLabel", heroLabel);
+  setText("teamUsageTotal", formatTokens(totalTokens));
+  setText("teamUsageSpend", money.format(sum(heroRows, "spend")));
+  setText("teamUsageRequests", fmt.format(requests));
+  setText("teamUsageRequestsSub", "请求总数");
+  setText("teamUsageSuccess", `${successRate}%`);
+  setText("teamUsageSuccessSub", `${fmt.format(successes)} / ${fmt.format(requests)} 次成功`);
+  setText("teamUsageDate", latestDate);
+  setText("teamUsageDateSub", hasSelection ? "当前成员最新日期" : "当前筛选范围最新日期");
+  setText("teamUsageContext", hasSelection ? `${rangeLabel()} · ${sourceText()} · 当前成员` : `${rangeLabel()} · ${sourceText()} · 团队视图`);
+  renderMetricGroups("teamUsageMetrics", heroRows, hasSelection ? "personal" : "team", null, heroRows);
+  renderTrendTo("teamUsageTrendChart", heroRows);
+  renderSpendTrendTo("teamUsageSpendChart", heroRows);
+  renderDonutTo("teamUsageSourceDonut", "teamUsageDonutTotal", "teamUsageSourceLegend", heroRows);
+  renderModelBarsTo("teamUsageModelBars", heroRows);
+  renderUsageRowsTo("teamUsageTable", "teamUsageCount", heroRows, hasSelection ? "当前成员暂无用量记录" : "当前团队暂无用量记录");
+}
+
 function loadingLine(width = "100%") {
   return `<div class="loading-line" style="width:${width}"></div>`;
 }
@@ -1195,6 +1281,12 @@ function renderTeamLoading() {
   renderDonutSkeleton("teamDonutTotal", "teamSourceLegend");
   renderBarsSkeleton("teamModelBars");
   renderTableSkeleton("teamUserTable", "teamUserCount", 8);
+  renderDonutSkeleton("teamUsageDonutTotal", "teamUsageSourceLegend");
+  renderBarsSkeleton("teamUsageModelBars");
+  renderChartSkeleton("teamUsageTrendChart");
+  renderChartSkeleton("teamUsageSpendChart");
+  renderMetricSkeleton("teamUsageMetrics");
+  renderTableSkeleton("teamUsageTable", "teamUsageCount", 8);
 }
 
 function renderPersonal() {
@@ -1282,6 +1374,7 @@ function renderTeam() {
   renderDonutTo("teamSourceDonut", "teamDonutTotal", "teamSourceLegend", teamUsageData);
   renderModelBarsTo("teamModelBars", teamUsageData);
   renderTeamUsers();
+  renderTeamMemberDetail();
 }
 
 function render() {
@@ -1851,6 +1944,7 @@ async function loadTeamData(forceRefresh = false) {
     teamUsageData = payload.rows || [];
     teamSummaryData = payload.summaryRows || teamUsageData;
     teamEmployees = payload.employees || [];
+    syncSelectedTeamEmployee();
     teamInfo = payload.team || currentUser.team || null;
     lastTeamUsageCacheHit = Boolean(payload.cache?.hit);
     if (payload.truncated) {
@@ -1863,6 +1957,7 @@ async function loadTeamData(forceRefresh = false) {
     teamUsageData = [];
     teamSummaryData = [];
     teamEmployees = [];
+    selectedTeamEmployee = "";
   } finally {
     isTeamLoading = false;
     renderTeam();
@@ -1887,6 +1982,7 @@ async function showApp(user) {
   currentUser = user;
   leaderTeams = normalizeLeaderTeams(user);
   selectedTeamRef = user.team?.teamRef || leaderTeams[0]?.teamRef || "";
+  selectedTeamEmployee = "";
   ensureSelectedTeamRef();
   el("loginView").classList.add("hidden");
   el("appView").classList.remove("hidden");
@@ -1921,6 +2017,7 @@ function showLogin() {
   teamUsageData = [];
   teamSummaryData = [];
   teamEmployees = [];
+  selectedTeamEmployee = "";
   teamInfo = null;
   leaderTeams = [];
   selectedTeamRef = "";
@@ -1982,6 +2079,7 @@ el("rangeSelect").addEventListener("change", async () => {
   teamUsageData = [];
   teamSummaryData = [];
   teamEmployees = [];
+  selectedTeamEmployee = "";
   el("departmentEmployeeSearch").value = "";
   departmentPickerOptions = [];
   closeDepartmentPicker();
@@ -1994,6 +2092,7 @@ el("sourceSelect").addEventListener("change", async () => {
   teamUsageData = [];
   teamSummaryData = [];
   teamEmployees = [];
+  selectedTeamEmployee = "";
   el("departmentEmployeeSearch").value = "";
   departmentPickerOptions = [];
   closeDepartmentPicker();
@@ -2109,7 +2208,20 @@ el("teamSelect").addEventListener("change", async (event) => {
   teamUsageData = [];
   teamSummaryData = [];
   teamEmployees = [];
+  selectedTeamEmployee = "";
   await loadTeamData();
+});
+
+el("teamUserTable").addEventListener("click", (event) => {
+  const row = event.target.closest("[data-employee]");
+  if (!row) return;
+  selectedTeamEmployee = row.dataset.employee;
+  renderTeam();
+});
+
+el("teamClearEmployee").addEventListener("click", () => {
+  selectedTeamEmployee = "";
+  renderTeam();
 });
 
 el("modelSearch").addEventListener("input", renderModels);
