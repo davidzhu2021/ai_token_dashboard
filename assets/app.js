@@ -1,8 +1,8 @@
 const sourceColors = {
-  Cursor: "#1f7a5b",
+  Cursor: "#0673d2",
   "Claude Code": "#b88727",
   Her: "#d45d42",
-  "其他": "#2e6f9f",
+  "其他": "#7a8ba0",
 };
 
 const sourceLabels = {
@@ -618,7 +618,7 @@ function tooltipMarkup(date, rows) {
 function renderEmptyChart(svg, label) {
   if (!svg) return;
   svg.setAttribute("viewBox", "0 0 900 280");
-  svg.innerHTML = `<rect width="900" height="280" rx="8" fill="#fffdf6"/><text x="450" y="140" fill="#65736f" font-size="16" text-anchor="middle">${label}</text>`;
+  svg.innerHTML = `<rect width="900" height="280" rx="8" fill="#fbfdff"/><text x="450" y="140" fill="#66748a" font-size="16" text-anchor="middle">${label}</text>`;
 }
 
 function renderLineChart({ svg, points, valueField, color, fill, axisFormatter, tooltipRows }) {
@@ -640,7 +640,7 @@ function renderLineChart({ svg, points, valueField, color, fill, axisFormatter, 
   const grid = [0, 0.25, 0.5, 0.75, 1]
     .map((ratio) => {
       const yy = y(max * ratio);
-      return `<line x1="${pad.left}" y1="${yy}" x2="${width - pad.right}" y2="${yy}" stroke="#dbe2d5" stroke-dasharray="4 7"/><text x="12" y="${yy + 4}" fill="#65736f" font-size="12">${axisFormatter(max * ratio)}</text>`;
+      return `<line x1="${pad.left}" y1="${yy}" x2="${width - pad.right}" y2="${yy}" stroke="#dde5ee" stroke-dasharray="4 7"/><text x="12" y="${yy + 4}" fill="#66748a" font-size="12">${axisFormatter(max * ratio)}</text>`;
     })
     .join("");
   const dots = points
@@ -655,11 +655,11 @@ function renderLineChart({ svg, points, valueField, color, fill, axisFormatter, 
     .filter((_, index) => index === 0 || index === points.length - 1 || index % labelEvery === 0)
     .map((p, index, arr) => {
       const originalIndex = points.findIndex((item) => item.date === p.date);
-      return `<text x="${x(originalIndex)}" y="${height - 16}" fill="#65736f" font-size="12" text-anchor="${index === arr.length - 1 ? "end" : "middle"}">${p.date.slice(5)}</text>`;
+      return `<text x="${x(originalIndex)}" y="${height - 16}" fill="#66748a" font-size="12" text-anchor="${index === arr.length - 1 ? "end" : "middle"}">${p.date.slice(5)}</text>`;
     })
     .join("");
 
-  svg.innerHTML = `<rect width="${width}" height="${height}" rx="8" fill="#fffdf6"/>${grid}<path d="${area}" fill="${fill}"/><path d="${path}" fill="none" stroke="${color}" stroke-width="4"/>${dots}${labels}`;
+  svg.innerHTML = `<rect width="${width}" height="${height}" rx="8" fill="#fbfdff"/>${grid}<path d="${area}" fill="${fill}"/><path d="${path}" fill="none" stroke="${color}" stroke-width="4"/>${dots}${labels}`;
   svg.querySelectorAll(".chart-hit").forEach((node) => {
     node.addEventListener("pointermove", (event) => showChartTooltip(event, decodeURIComponent(node.dataset.tooltip)));
     node.addEventListener("pointerleave", hideChartTooltip);
@@ -673,8 +673,8 @@ function renderTrendTo(svgId, data) {
     svg: el(svgId),
     points,
     valueField: "totalTokens",
-    color: "#1f7a5b",
-    fill: "rgba(31,122,91,.13)",
+    color: "#0673d2",
+    fill: "rgba(6,115,210,.13)",
     axisFormatter: formatTokens,
     tooltipRows: (p) => [
       { label: "总 Token", value: fmt.format(p.totalTokens) },
@@ -717,7 +717,7 @@ function renderDonutTo(svgId, totalId, legendId, data) {
       return circle;
     })
     .join("");
-  svg.innerHTML = `<circle cx="90" cy="90" r="${radius}" fill="none" stroke="#edf0e8" stroke-width="18"/>${circles}`;
+  svg.innerHTML = `<circle cx="90" cy="90" r="${radius}" fill="none" stroke="#e8eef5" stroke-width="18"/>${circles}`;
   totalNode.textContent = formatTokens(total);
   legend.innerHTML = totals
     .map((item) => {
@@ -1201,11 +1201,11 @@ function renderChartSkeleton(svgId) {
   if (!svg) return;
   svg.setAttribute("viewBox", "0 0 900 280");
   svg.innerHTML = `
-    <rect width="900" height="280" rx="8" fill="#fffdf6"/>
-    <text x="450" y="126" fill="#65736f" font-size="16" font-weight="800" text-anchor="middle">数据加载中</text>
-    <text x="450" y="154" fill="#8a938f" font-size="13" text-anchor="middle">正在从后端汇总当前筛选范围</text>
-    <rect x="64" y="196" width="772" height="14" rx="7" fill="#e5ebe3"/>
-    <rect x="64" y="224" width="512" height="10" rx="5" fill="#edf1ea"/>
+    <rect width="900" height="280" rx="8" fill="#fbfdff"/>
+    <text x="450" y="126" fill="#66748a" font-size="16" font-weight="800" text-anchor="middle">数据加载中</text>
+    <text x="450" y="154" fill="#8894a5" font-size="13" text-anchor="middle">正在从后端汇总当前筛选范围</text>
+    <rect x="64" y="196" width="772" height="14" rx="7" fill="#e3e9f1"/>
+    <rect x="64" y="224" width="512" height="10" rx="5" fill="#eaeff6"/>
   `;
 }
 
@@ -1230,7 +1230,7 @@ function renderBarsSkeleton(containerId) {
       (_, index) => `
         <div class="bar-row">
           <strong><span class="loading-line" style="display:block;width:${70 - index * 6}px"></span></strong>
-          <div class="bar-track"><div class="bar-fill" style="width:${78 - index * 10}%;background:#dfe6de"></div></div>
+          <div class="bar-track"><div class="bar-fill" style="width:${78 - index * 10}%;background:#dee5ee"></div></div>
           <span class="num">--</span>
         </div>
       `,
