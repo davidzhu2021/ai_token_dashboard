@@ -1,9 +1,11 @@
 import base64
+import asyncio
 import hashlib
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from base64 import urlsafe_b64encode
 from html import unescape
 from pathlib import Path
@@ -32,8 +34,10 @@ from .auth import (
     require_user,
     validate_company_email,
 )
-from .litellm_client import LiteLLMClient, default_date_range, mask_key
+from .litellm_client import LiteLLMClient, default_date_range, mask_key, usage_today
 from .key_vault import KeyVault, KeyVaultError
+from .usage_store import UsageStore
+from .usage_sync import UsageSynchronizer
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -46,7 +50,16 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 SESSION_COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "ai_token_dashboard_session")
 OIDC_STATE_PREFIX = "_state_company_"
 
-app = FastAPI(title="AI 用量中心")
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI):
+    await start_usage_sync()
+    try:
+        yield
+    finally:
+        await close_litellm_client()
+
+
+app = FastAPI(title="AI 用量中心", lifespan=app_lifespan)
 app.mount("/assets", StaticFiles(directory=ROOT_DIR / "assets"), name="assets")
 app.add_middleware(
     SessionMiddleware,
@@ -65,6 +78,11 @@ team_usage_cache = TTLCache()
 team_member_usage_cache = TTLCache()
 _litellm_client: LiteLLMClient | None = None
 _key_vault: KeyVault | None = None
+_usage_store: UsageStore | None = UsageStore.from_environment()
+_usage_sync_task: asyncio.Task[Any] | None = None
+_usage_refresh_task: asyncio.Task[Any] | None = None
+_usage_sync_stop: asyncio.Event | None = None
+_usage_sync_status: dict[str, Any] = {"status": "disabled", "lastRun": None}
 
 
 def allowed_provider_login_url(url: str) -> str | None:
@@ -221,8 +239,154 @@ def key_vault() -> KeyVault:
     return _key_vault
 
 
-@app.on_event("shutdown")
+def usage_store() -> UsageStore | None:
+    return _usage_store
+
+
+def usage_backend_ids() -> list[str]:
+    return [backend.id for backend in client().backends]
+
+
+def usage_data_freshness(last_synced: datetime | None, start_date: str, end_date: str) -> dict[str, Any]:
+    """Mark only ranges containing today as stale when their snapshot is old."""
+    max_age = max(60, env_int("USAGE_LIVE_REFRESH_MAX_AGE_SECONDS", 1800))
+    today = usage_today().isoformat()
+    stale = False
+    if end_date >= today:
+        stale = last_synced is None or (datetime.now(timezone.utc) - last_synced).total_seconds() >= max_age
+    return {
+        "source": "database",
+        "lastSyncedAt": last_synced.isoformat() if last_synced else None,
+        "stale": stale,
+    }
+
+
+async def run_usage_sync(days: int) -> dict[str, Any]:
+    store = usage_store()
+    if store is None:
+        return {"status": "disabled", "rowCount": 0, "backendCount": 0}
+    try:
+        await store.connect()
+        result = await UsageSynchronizer(client(), store).sync(
+            *UsageSynchronizer.date_range(days),
+        )
+        _usage_sync_status.update(
+            {
+                "status": result.get("status", "ok"),
+                "lastRun": datetime.now(timezone.utc).isoformat(),
+                "rowCount": result.get("rowCount", 0),
+                "backendCount": result.get("backendCount", 0),
+                "errors": result.get("errors", []),
+            }
+        )
+        return result
+    except Exception as exc:
+        logger.exception("usage sync failed")
+        _usage_sync_status.update(
+            {
+                "status": "error",
+                "lastRun": datetime.now(timezone.utc).isoformat(),
+                "error": exc.__class__.__name__,
+            }
+        )
+        return {"status": "error", "rowCount": 0, "backendCount": 0}
+
+
+async def usage_sync_loop() -> None:
+    initial_days = max(1, env_int("USAGE_INITIAL_BACKFILL_DAYS", 90))
+    lookback_days = max(1, env_int("USAGE_SYNC_LOOKBACK_DAYS", 3))
+    interval_seconds = max(60, env_int("USAGE_SYNC_INTERVAL_SECONDS", 1800))
+    store = usage_store()
+    try:
+        if store is not None:
+            await store.connect()
+        backend_ids = usage_backend_ids()
+        previous_day = usage_today() - timedelta(days=1)
+        start_date, end_date = UsageSynchronizer.date_range(initial_days, previous_day)
+        has_history = bool(store and await store.has_complete_coverage(start_date, end_date, backend_ids))
+        if not has_history:
+            await run_usage_sync(initial_days)
+        else:
+            _usage_sync_status.update({"status": "ready", "lastRun": None, "initialBackfill": "complete"})
+    except Exception:
+        logger.exception("initial usage coverage check failed")
+        await run_usage_sync(initial_days)
+    while _usage_sync_stop is not None and not _usage_sync_stop.is_set():
+        try:
+            await asyncio.wait_for(_usage_sync_stop.wait(), timeout=interval_seconds)
+        except asyncio.TimeoutError:
+            await run_usage_sync(lookback_days)
+
+
+async def schedule_usage_refresh(start_date: str, end_date: str, force: bool = False) -> None:
+    store = usage_store()
+    if store is None:
+        return
+    today = usage_today().isoformat()
+    if end_date < today:
+        return
+    backend_ids = usage_backend_ids()
+    covered = await store.covered_backend_ids(start_date, end_date, backend_ids)
+    last_sync = await store.latest_sync_at(start_date, end_date, covered)
+    stale = set(covered) != set(backend_ids) or usage_data_freshness(last_sync, start_date, end_date)["stale"]
+    if not force and not stale:
+        return
+    await run_usage_sync(max(1, env_int("USAGE_SYNC_LOOKBACK_DAYS", 3)))
+
+
+async def prepare_usage_refresh(start_date: str, end_date: str, force: bool = False) -> None:
+    if force:
+        await run_usage_sync(max(1, env_int("USAGE_SYNC_LOOKBACK_DAYS", 3)))
+    else:
+        trigger_usage_refresh(start_date, end_date)
+
+
+def trigger_usage_refresh(start_date: str, end_date: str, force: bool = False) -> None:
+    global _usage_refresh_task
+    if _usage_refresh_task is not None and not _usage_refresh_task.done():
+        return
+
+    async def refresh() -> None:
+        try:
+            await schedule_usage_refresh(start_date, end_date, force)
+        except Exception:
+            logger.exception("usage refresh failed")
+
+    _usage_refresh_task = asyncio.create_task(refresh(), name="usage-live-refresh")
+
+
+async def start_usage_sync() -> None:
+    global _usage_sync_task, _usage_sync_stop
+    if usage_store() is None:
+        return
+    if _usage_sync_task is not None and not _usage_sync_task.done():
+        return
+    _usage_sync_status.update({"status": "starting", "lastRun": None})
+    _usage_sync_stop = asyncio.Event()
+    _usage_sync_task = asyncio.create_task(usage_sync_loop(), name="usage-sync-loop")
+
+
 async def close_litellm_client() -> None:
+    global _usage_sync_task, _usage_refresh_task, _usage_sync_stop
+    if _usage_sync_stop is not None:
+        _usage_sync_stop.set()
+    if _usage_sync_task is not None:
+        _usage_sync_task.cancel()
+        try:
+            await _usage_sync_task
+        except asyncio.CancelledError:
+            pass
+        _usage_sync_task = None
+        _usage_sync_stop = None
+    if _usage_refresh_task is not None:
+        _usage_refresh_task.cancel()
+        try:
+            await _usage_refresh_task
+        except asyncio.CancelledError:
+            pass
+        _usage_refresh_task = None
+    if usage_store() is not None:
+        await usage_store().close()
     global _litellm_client
     if _litellm_client is not None:
         await _litellm_client.close()
@@ -397,6 +561,30 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
         payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
         return payload
 
+    store = usage_store()
+    if store is not None:
+        try:
+            await store.connect()
+            await prepare_usage_refresh(start_date, end_date, refresh)
+            stored = await store.personal_rows(app_user["email"], start_date, end_date, source, usage_backend_ids())
+            if stored is not None:
+                rows = stored["rows"]
+                payload = {
+                    "user": app_user,
+                    "startDate": start_date,
+                    "endDate": end_date,
+                    "source": source,
+                    "rows": rows,
+                    "summary": usage_summary(rows),
+                    "mappingCache": {"hit": True, "ttlSeconds": 0},
+                    "dataFreshness": usage_data_freshness(stored.get("lastSyncedAt"), start_date, end_date),
+                }
+                personal_usage_cache.set(cache_key, payload, env_int("PERSONAL_USAGE_CACHE_TTL_SECONDS", 300))
+                payload["cache"] = {"hit": False, "ttlSeconds": 0}
+                return payload
+        except Exception:
+            logger.exception("local personal usage query failed; falling back to upstream")
+
     upstream_user, mapping_cache = await cached_resolve_user(app_user["email"], app_user.get("name"), refresh)
     user_ids = upstream_user_ids(upstream_user)
     if not user_ids:
@@ -425,6 +613,21 @@ async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: 
             payload = dict(value)
             payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
             return payload
+    store = usage_store()
+    if store is not None:
+        try:
+            await store.connect()
+            await prepare_usage_refresh(start_date, end_date, refresh)
+            stored = await store.admin_rows(start_date, end_date, source, employee, usage_backend_ids())
+            if stored is not None:
+                stored = dict(stored)
+                last_synced = stored.pop("lastSyncedAt", None)
+                stored["dataFreshness"] = usage_data_freshness(last_synced, start_date, end_date)
+                admin_usage_cache.set(cache_key, stored, env_int("ADMIN_USAGE_CACHE_TTL_SECONDS", 300))
+                stored["cache"] = {"hit": False, "ttlSeconds": 0}
+                return stored
+        except Exception:
+            logger.exception("local admin usage query failed; falling back to upstream")
     payload = await client().admin_usage_rows(start_date, end_date, source, employee)
     admin_usage_cache.set(cache_key, payload, env_int("ADMIN_USAGE_CACHE_TTL_SECONDS", 300))
     payload = dict(payload)
@@ -440,6 +643,21 @@ async def department_usage_payload(admin: dict[str, Any], start_date: str, end_d
             payload = dict(value)
             payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
             return payload
+    store = usage_store()
+    if store is not None:
+        try:
+            await store.connect()
+            await prepare_usage_refresh(start_date, end_date, refresh)
+            stored = await store.department_rows(start_date, end_date, source, department, usage_backend_ids())
+            if stored is not None:
+                stored = dict(stored)
+                last_synced = stored.pop("lastSyncedAt", None)
+                stored["dataFreshness"] = usage_data_freshness(last_synced, start_date, end_date)
+                department_usage_cache.set(cache_key, stored, env_int("DEPARTMENT_USAGE_CACHE_TTL_SECONDS", 300))
+                stored["cache"] = {"hit": False, "ttlSeconds": 0}
+                return stored
+        except Exception:
+            logger.exception("local department usage query failed; falling back to upstream")
     payload = await client().admin_department_usage_rows(start_date, end_date, source, department)
     department_usage_cache.set(cache_key, payload, env_int("DEPARTMENT_USAGE_CACHE_TTL_SECONDS", 300))
     payload = dict(payload)
@@ -505,9 +723,28 @@ async def team_usage_payload(
             payload = dict(value)
             payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
             return payload
-    payload = dict(await client().team_usage_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source))
+    store = usage_store()
+    payload = None
+    if store is not None:
+        try:
+            await store.connect()
+            await prepare_usage_refresh(start_date, end_date, refresh)
+            if not enrich_member_rankings:
+                payload = await store.team_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source)
+            else:
+                payload = await store.team_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source)
+            if payload is not None:
+                payload = dict(payload)
+                last_synced = payload.pop("lastSyncedAt", None)
+                payload["dataFreshness"] = usage_data_freshness(last_synced, start_date, end_date)
+        except Exception:
+            logger.exception("local team usage query failed; falling back to upstream")
+            payload = None
+    if payload is None:
+        payload = dict(await client().team_usage_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source))
     if enrich_member_rankings:
-        payload["employees"] = await team_member_rankings_from_accounts(payload.get("employees") or [], start_date, end_date, source, refresh)
+        if not payload.get("dataFreshness") or payload.get("dataFreshness", {}).get("source") != "database":
+            payload["employees"] = await team_member_rankings_from_accounts(payload.get("employees") or [], start_date, end_date, source, refresh)
     payload["team"] = public_team_from_payload(team, payload.get("team"))
     if enrich_member_rankings:
         team_usage_cache.set(cache_key, payload, env_int("TEAM_USAGE_CACHE_TTL_SECONDS", 300))
@@ -667,11 +904,24 @@ async def team_member_usage_payload(
 
     team_payload = await team_usage_payload(app_user, start_date, end_date, source, refresh, team_ref_value, enrich_member_rankings=False)
     selected_employee = find_team_employee(team_payload, employee)
-    user_ids = await user_ids_for_team_employee(selected_employee, refresh)
+    rows: list[dict[str, Any]] | None = None
+    stored_payload: dict[str, Any] | None = None
+    store = usage_store()
+    if store is not None:
+        try:
+            await store.connect()
+            await prepare_usage_refresh(start_date, end_date, refresh)
+            stored_payload = await store.team_member_rows(str(team["backend"]), str(team["id"]), employee, start_date, end_date, source)
+            if stored_payload is not None:
+                rows = stored_payload["rows"]
+        except Exception:
+            logger.exception("local team member usage query failed; falling back to upstream")
+    user_ids = ["stored"] if rows is not None else await user_ids_for_team_employee(selected_employee, refresh)
     if not user_ids:
         raise HTTPException(status_code=404, detail="该团队成员缺少可查询的用量账号")
 
-    rows = await client().usage_rows_for_user_ids(user_ids, start_date, end_date, source)
+    if rows is None:
+        rows = await client().usage_rows_for_user_ids(user_ids, start_date, end_date, source)
     public_user = team_employee_public_user(selected_employee, team)
     payload = {
         "user": public_user,
@@ -690,6 +940,9 @@ async def team_member_usage_payload(
             "bindStatus": selected_employee.get("bindStatus"),
         },
     }
+    if stored_payload is not None:
+        last_synced = stored_payload.get("lastSyncedAt")
+        payload["dataFreshness"] = usage_data_freshness(last_synced, start_date, end_date)
     team_member_usage_cache.set(cache_key, payload, env_int("TEAM_MEMBER_USAGE_CACHE_TTL_SECONDS", 300))
     payload = dict(payload)
     payload["cache"] = {"hit": False, "ttlSeconds": 0}
@@ -900,8 +1153,18 @@ async def debug_admin_usage_compare(
 
 
 @app.get("/api/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health() -> dict[str, Any]:
+    result: dict[str, Any] = {"status": "ok", "usageSync": dict(_usage_sync_status)}
+    store = usage_store()
+    if store is not None:
+        result["usageDatabase"] = await store.health()
+        if result["usageDatabase"].get("status") in {"error", "disconnected"}:
+            result["status"] = "degraded"
+    else:
+        result["usageDatabase"] = {"enabled": False, "connected": False, "status": "disabled"}
+    if result["usageSync"].get("status") in {"error", "failed", "partial"}:
+        result["status"] = "degraded"
+    return result
 
 
 @app.get("/api/auth/config")

@@ -108,6 +108,18 @@ def _clean_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+_ACCOUNT_ALIAS_PREFIX_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*-acct-\d+-", re.IGNORECASE)
+
+
+def normalize_model_display_name(value: Any) -> str:
+    """去掉 chatgpt-acct-84- 这类账号别名前缀，使同一模型在用量统计中聚合为一条。"""
+    text = _clean_text(value)
+    if not text:
+        return ""
+    stripped = _ACCOUNT_ALIAS_PREFIX_RE.sub("", text, count=1)
+    return stripped or text
+
+
 def _normal_email(value: Any) -> str:
     text = _clean_text(value).lower()
     return text if "@" in text else ""
@@ -349,7 +361,7 @@ class LiteLLMClient:
         for field in ("model_id", "litellm_model_name", "model", "model_group"):
             value = _clean_text(_first(record, field, default=""))
             if value:
-                return value
+                return normalize_model_display_name(value)
         breakdown = record.get("breakdown") if isinstance(record.get("breakdown"), dict) else {}
         for field in ("models", "model_groups"):
             bucket = breakdown.get(field)
@@ -357,7 +369,7 @@ class LiteLLMClient:
                 for name in bucket.keys():
                     value = _clean_text(name)
                     if value:
-                        return value
+                        return normalize_model_display_name(value)
         return fallback
 
     def _is_backend_usage_account(self, backend: LiteLLMBackend, user_id: Any) -> bool:
@@ -880,9 +892,9 @@ class LiteLLMClient:
         models = breakdown.get("models") if isinstance(breakdown.get("models"), dict) else {}
         if models:
             day = _date_text(_first(item, "date", "day"))
-            rows: list[dict[str, Any]] = []
+            grouped: dict[str, dict[str, Any]] = {}
             for model_name, model_value in models.items():
-                model = _clean_text(model_name)
+                model = normalize_model_display_name(model_name)
                 if not model:
                     continue
                 metrics = _metrics_dict(model_value)
@@ -894,22 +906,16 @@ class LiteLLMClient:
                 failures = _as_int(_first(metrics, "failed_requests", "total_failed_requests", "failureCount"))
                 if not successes and requests:
                     successes = max(0, requests - failures)
-                rows.append(
-                    {
-                        "date": day,
-                        "source": source,
-                        "model": model,
-                        "promptTokens": prompt,
-                        "completionTokens": completion,
-                        "totalTokens": total,
-                        "requestCount": requests,
-                        "successCount": successes,
-                        "failureCount": failures,
-                        "spend": _as_number(_first(metrics, "spend", "total_spend")),
-                    }
-                )
-            if rows:
-                return rows
+                row = grouped.setdefault(model, self._empty_usage_row(day, source, model))
+                row["promptTokens"] += prompt
+                row["completionTokens"] += completion
+                row["totalTokens"] += total
+                row["requestCount"] += requests
+                row["successCount"] += successes
+                row["failureCount"] += failures
+                row["spend"] += _as_number(_first(metrics, "spend", "total_spend"))
+            if grouped:
+                return list(grouped.values())
         return [self._row_from_daily_activity_item(item, source)]
 
     async def _usage_from_daily_activity(
@@ -2460,6 +2466,6 @@ class LiteLLMClient:
 
 
 def default_date_range(days: int = 30) -> tuple[str, str]:
-    end = date.today()
+    end = usage_today()
     start = end - timedelta(days=days - 1)
     return start.isoformat(), end.isoformat()

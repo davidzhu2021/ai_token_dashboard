@@ -176,6 +176,9 @@ USAGE_TIMEZONE_OFFSET_MINUTES=-480
 - `ADMIN_EMAILS` 是管理员白名单，普通员工不会看到全员或部门看板入口。
 - `USAGE_TIMEZONE_OFFSET_MINUTES=-480` 表示按北京时间统计日期窗口；如果部署环境改用其他业务时区，需要同步调整。
 - `ADMIN_USAGE_PAGE_SIZE` 必须小于等于 100；想扩大日志覆盖范围时增加 `ADMIN_USAGE_LOG_MAX_PAGES`，不要增大单页大小。
+- `USAGE_SYNC_ENABLED=true` 时启用独立 PostgreSQL 聚合快照；数据库只保存按日期、账号、来源和模型聚合的 Token、请求、成功/失败及金额，不保存 API Key、提示词、响应正文或请求明细。
+- `USAGE_DATABASE_URL` 应填写应用容器可访问的 PostgreSQL 地址，例如 `postgresql://ai_dashboard:<password>@usage-db:5432/ai_usage`；`USAGE_DB_PASSWORD` 只用于 Compose 初始化数据库用户密码。
+- 首次启动会异步回填 `USAGE_INITIAL_BACKFILL_DAYS`（默认 90）天，之后按 `USAGE_SYNC_INTERVAL_SECONDS`（默认 1800 秒）刷新最近 `USAGE_SYNC_LOOKBACK_DAYS`（默认 3）天。历史范围优先查询快照库，当前日期超过 `USAGE_LIVE_REFRESH_MAX_AGE_SECONDS` 后后台刷新，手动点击刷新会强制刷新。
 
 ## 飞书扫码登录配置
 

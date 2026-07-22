@@ -1,4 +1,20 @@
 services:
+  usage-db:
+    image: postgres:16-alpine
+    container_name: ai-token-dashboard-db
+    environment:
+      POSTGRES_DB: ai_usage
+      POSTGRES_USER: ai_dashboard
+      POSTGRES_PASSWORD: ${USAGE_DB_PASSWORD:?USAGE_DB_PASSWORD must be set}
+    volumes:
+      - usage-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_dashboard -d ai_usage"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   ai-token-dashboard:
     build:
       context: .
@@ -8,9 +24,13 @@ services:
       - .env
     volumes:
       - key-vault-data:/app/.data
+    depends_on:
+      usage-db:
+        condition: service_healthy
     ports:
       - "8000:8000"
     restart: unless-stopped
 
 volumes:
   key-vault-data:
+  usage-db-data:

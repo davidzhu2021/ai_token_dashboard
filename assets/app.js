@@ -19,6 +19,10 @@ let lastPersonalUsageCacheHit = false;
 let lastAdminUsageCacheHit = false;
 let lastDepartmentUsageCacheHit = false;
 let lastTeamUsageCacheHit = false;
+let personalDataFreshness = null;
+let adminDataFreshness = null;
+let departmentDataFreshness = null;
+let teamDataFreshness = null;
 let adminUsageData = [];
 let adminSummaryData = [];
 let adminEmployees = [];
@@ -192,6 +196,15 @@ function latestUsageDay(data, summary = null) {
 function overviewContext(latestDate) {
   const dateText = latestDate || "暂无日期";
   return `${rangeLabel()} · ${sourceText()} · 最新数据日 ${dateText}`;
+}
+
+function freshnessText(freshness) {
+  if (!freshness) return "数据更新时间：实时查询";
+  if (!freshness.lastSyncedAt) return "数据更新时间：暂未同步";
+  const parsed = new Date(freshness.lastSyncedAt);
+  if (Number.isNaN(parsed.getTime())) return "数据更新时间：未知";
+  const timeText = parsed.toLocaleString("zh-CN", { hour12: false });
+  return `${freshness.stale ? "数据更新时间（待刷新）" : "数据更新时间"}：${timeText}`;
 }
 
 function selectedDateRangeText() {
@@ -417,6 +430,7 @@ function renderPersonalMetrics(data) {
   el("trendBadge").textContent = `${label} · ${source}`;
   el("spendBadge").textContent = `${label} · ${source}`;
   renderMetricGroups("metrics", data, "personal", usageSummary);
+  setText("heroFreshness", freshnessText(personalDataFreshness));
 }
 
 function renderAdminMetrics(data) {
@@ -434,6 +448,7 @@ function renderAdminMetrics(data) {
   el("adminTrendBadge").textContent = `${label} · ${source}`;
   el("adminSpendBadge").textContent = `${label} · ${source}`;
   renderMetricGroups("adminMetrics", totalData, "admin", null, data);
+  setText("adminHeroFreshness", freshnessText(adminDataFreshness));
 }
 
 function renderDepartmentMetrics(data) {
@@ -458,6 +473,7 @@ function renderDepartmentMetrics(data) {
   el("departmentSourceTitle").textContent = `${scopeLabel}用量占比`;
   el("departmentSourceDesc").textContent = `按${scopeLabel} Codex、Claude Code 与其他来源拆分用量。`;
   renderMetricGroups("departmentMetrics", data, "department");
+  setText("departmentHeroFreshness", freshnessText(departmentDataFreshness));
   setText("departmentModelTitle", `${scopeLabel}模型使用排行`);
   setText("departmentModelDesc", `按${scopeLabel}总 Token 消耗排序。`);
 }
@@ -531,6 +547,7 @@ function renderTeamMetrics(data) {
   el("teamSourceTitle").textContent = `${scopeLabel}用量占比`;
   el("teamSourceDesc").textContent = `按${scopeLabel} Codex、Claude Code 与其他来源拆分用量。`;
   renderMetricGroups("teamMetrics", data, "team");
+  setText("teamHeroFreshness", freshnessText(teamDataFreshness));
   setText("teamModelTitle", `${scopeLabel}模型使用排行`);
   setText("teamModelDesc", `按${scopeLabel}总 Token 消耗排序。`);
 }
@@ -596,6 +613,7 @@ function renderTeamMemberMetrics(data) {
   el("teamSourceTitle").textContent = `${employeeName}用量占比`;
   el("teamSourceDesc").textContent = `按${employeeName} Codex、Claude Code 与其他来源拆分用量。`;
   renderMetricGroups("teamMetrics", data, "team", teamMemberUsageSummary);
+  setText("teamHeroFreshness", freshnessText(teamDataFreshness));
   setText("teamModelTitle", `${employeeName}模型使用排行`);
   setText("teamModelDesc", `按${employeeName}总 Token 消耗排序。`);
 }
@@ -1990,6 +2008,7 @@ async function loadDashboardData(forceRefresh = false) {
     const payload = await api(`/api/me/usage?start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&source=${encodeURIComponent(source)}${forceRefresh ? "&refresh=1" : ""}`);
     usageData = payload.rows || [];
     usageSummary = payload.summary || null;
+    personalDataFreshness = payload.dataFreshness || null;
     lastPersonalUsageCacheHit = Boolean(payload.cache?.hit);
   } catch (error) {
     showToast(error.message || "用量数据加载失败");
@@ -2017,6 +2036,7 @@ async function loadAdminData(forceRefresh = false) {
     adminUsageData = payload.rows || [];
     adminSummaryData = payload.summaryRows || adminUsageData;
     adminEmployees = payload.employees || [];
+    adminDataFreshness = payload.dataFreshness || null;
     lastAdminUsageCacheHit = Boolean(payload.cache?.hit);
     if (payload.truncated) {
       el("adminLimitHint").textContent = `默认按 Token 从高到低排序；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），员工排行可能不完整`;
@@ -2051,6 +2071,7 @@ async function loadDepartmentData(forceRefresh = false) {
     departmentSummaryData = payload.summaryRows || departmentUsageData;
     departmentRankings = payload.departments || [];
     departmentEmployees = payload.employees || [];
+    departmentDataFreshness = payload.dataFreshness || null;
     if (!department) departmentPickerOptions = departmentRankings;
     lastDepartmentUsageCacheHit = Boolean(payload.cache?.hit);
     const rankingSubject = selectedDepartment ? "员工排行" : "部门排行";
@@ -2089,6 +2110,7 @@ async function loadTeamData(forceRefresh = false) {
     teamSummaryData = payload.summaryRows || teamUsageData;
     teamEmployees = payload.employees || [];
     teamInfo = payload.team || currentUser.team || null;
+    teamDataFreshness = payload.dataFreshness || null;
     lastTeamUsageCacheHit = Boolean(payload.cache?.hit);
     if (payload.truncated) {
       el("teamLimitHint").textContent = "成员排行按团队成员账号用量汇总，当前数据读取达到上限，排行可能不完整";
@@ -2129,6 +2151,7 @@ async function loadTeamMemberData(employee, forceRefresh = false, scrollToCard =
     if (requestId !== teamMemberUsageRequestId) return;
     teamMemberUsageData = payload.rows || [];
     teamMemberUsageSummary = payload.summary || null;
+    teamDataFreshness = payload.dataFreshness || null;
     const employeePayload = payload.employee || {};
     const employeeId = employeePayload.employeeEmail || employeePayload.employeeId || employee;
     if (employeeId && employeeId !== selectedTeamEmployee) selectedTeamEmployee = employeeId;
