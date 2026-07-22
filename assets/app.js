@@ -321,9 +321,12 @@ function modelRankGroup(mode = "personal") {
   return `
     <section class="metric-group model-rank-group">
       <div class="metric-group-head">
-        <div>
-          <h3${titleId ? ` id="${titleId}"` : ""}>${defaultTitle}</h3>
-          <p${descId ? ` id="${descId}"` : ""}>${defaultDesc}</p>
+        <div class="panel-heading">
+          <span class="panel-icon">${icon("model")}</span>
+          <div>
+            <h3${titleId ? ` id="${titleId}"` : ""}>${defaultTitle}</h3>
+            <p${descId ? ` id="${descId}"` : ""}>${defaultDesc}</p>
+          </div>
         </div>
       </div>
       <div id="${barsId}" class="bars"></div>
