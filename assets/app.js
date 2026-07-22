@@ -31,6 +31,10 @@ let teamUsageData = [];
 let teamSummaryData = [];
 let teamEmployees = [];
 let teamInfo = null;
+let teamMemberUsageData = [];
+let teamMemberUsageSummary = null;
+let selectedTeamEmployee = "";
+let teamMemberUsageFilters = { date: "all", model: "all", status: "all", keyword: "" };
 let leaderTeams = [];
 let selectedTeamRef = "";
 let selectedDepartment = "";
@@ -58,6 +62,7 @@ let isDashboardLoading = false;
 let isAdminLoading = false;
 let isDepartmentLoading = false;
 let isTeamLoading = false;
+let isTeamMemberLoading = false;
 let isSsoRedirecting = false;
 let authConfig = { devLoginEnabled: false, oidcConfigured: false, providerName: "飞书扫码登录" };
 
@@ -505,6 +510,44 @@ function renderTeamMetrics(data) {
   setText("teamModelDesc", `按${scopeLabel}总 Token 消耗排序。`);
 }
 
+function selectedTeamEmployeeInfo() {
+  if (!selectedTeamEmployee) return null;
+  return teamEmployees.find((item) => item.employeeEmail === selectedTeamEmployee || item.employeeId === selectedTeamEmployee) || null;
+}
+
+function selectedTeamEmployeeLabel() {
+  const employee = selectedTeamEmployeeInfo();
+  return employee?.employeeName || employee?.employeeEmail || employee?.employeeId || selectedTeamEmployee || "团队成员";
+}
+
+function renderTeamMemberMetrics(data) {
+  const label = rangeLabel();
+  const source = sourceText();
+  const employee = selectedTeamEmployeeInfo();
+  const employeeName = selectedTeamEmployeeLabel();
+  renderDailyOverview({
+    prefix: "team",
+    data,
+    summary: teamMemberUsageSummary,
+    title: `所选范围 · 成员视图`,
+    totalLabel: "所选成员 Token",
+    sideLabel: "当前成员",
+    sideValue: 1,
+    sideSub: employee?.employeeEmail || employee?.employeeId || selectedTeamEmployee,
+  });
+  el("teamTrendBadge").textContent = `${label} · ${source}`;
+  el("teamSpendBadge").textContent = `${label} · ${source}`;
+  el("teamTrendTitle").textContent = `${employeeName}每日 Token 趋势`;
+  el("teamTrendDesc").textContent = `按日期汇总${employeeName} Prompt 与 Completion Token。`;
+  el("teamSpendTitle").textContent = `${employeeName}每日金额消费趋势`;
+  el("teamSpendDesc").textContent = `按日期汇总${employeeName}预估消费金额。`;
+  el("teamSourceTitle").textContent = `${employeeName}用量占比`;
+  el("teamSourceDesc").textContent = `按${employeeName} Codex、Claude Code 与其他来源拆分用量。`;
+  renderMetricGroups("teamMetrics", data, "team", teamMemberUsageSummary);
+  setText("teamModelTitle", `${employeeName}模型使用排行`);
+  setText("teamModelDesc", `按${employeeName}总 Token 消耗排序。`);
+}
+
 function showChartTooltip(event, html) {
   const tooltip = el("chartTooltip");
   tooltip.innerHTML = html;
@@ -683,9 +726,32 @@ function setupUsageTableFilters(data) {
   if (searchInput) searchInput.value = usageTableFilters.keyword;
 }
 
-function filteredUsageRows() {
+function setupTeamMemberUsageFilters(data) {
+  const dateSelect = el("teamMemberUsageDetailDateFilter");
+  const modelSelect = el("teamMemberUsageDetailModelFilter");
+  if (!dateSelect || !modelSelect) return;
+
+  const dates = uniqueSorted(data, "date").reverse();
+  const models = uniqueSorted(data, "model");
+  if (teamMemberUsageFilters.date !== "all" && !dates.includes(teamMemberUsageFilters.date)) teamMemberUsageFilters.date = "all";
+  if (teamMemberUsageFilters.model !== "all" && !models.includes(teamMemberUsageFilters.model)) teamMemberUsageFilters.model = "all";
+
+  dateSelect.innerHTML = optionMarkup("all", "全部日期") + dates.map((date) => optionMarkup(date, date)).join("");
+  modelSelect.innerHTML = optionMarkup("all", "全部模型") + models.map((model) => optionMarkup(model, model)).join("");
+  dateSelect.value = teamMemberUsageFilters.date;
+  modelSelect.value = teamMemberUsageFilters.model;
+  const statusSelect = el("teamMemberUsageDetailStatusFilter");
+  const searchInput = el("teamMemberUsageDetailSearch");
+  if (statusSelect) {
+    statusSelect.innerHTML = optionMarkup("all", "全部状态") + optionMarkup("正常", "正常") + optionMarkup("有失败", "有失败");
+    statusSelect.value = teamMemberUsageFilters.status;
+  }
+  if (searchInput) searchInput.value = teamMemberUsageFilters.keyword;
+}
+
+function filteredUsageRows(data = usageData) {
   const keyword = usageTableFilters.keyword.trim().toLowerCase();
-  return usageData.filter((item) => {
+  return data.filter((item) => {
     const hasFailure = Number(item.failureCount || 0) > 0;
     const displayStatus = hasFailure ? "有失败" : "正常";
     const matchesDate = usageTableFilters.date === "all" || item.date === usageTableFilters.date;
@@ -694,6 +760,35 @@ function filteredUsageRows() {
     const text = `${item.model || ""} ${displaySource(item.source)}`.toLowerCase();
     return matchesDate && matchesModel && matchesStatus && (!keyword || text.includes(keyword));
   });
+}
+
+function filteredTeamMemberUsageRows() {
+  const keyword = teamMemberUsageFilters.keyword.trim().toLowerCase();
+  return teamMemberUsageData.filter((item) => {
+    const hasFailure = Number(item.failureCount || 0) > 0;
+    const displayStatus = hasFailure ? "有失败" : "正常";
+    const matchesDate = teamMemberUsageFilters.date === "all" || item.date === teamMemberUsageFilters.date;
+    const matchesModel = teamMemberUsageFilters.model === "all" || item.model === teamMemberUsageFilters.model;
+    const matchesStatus = teamMemberUsageFilters.status === "all" || teamMemberUsageFilters.status === displayStatus;
+    const text = `${item.model || ""} ${displaySource(item.source)}`.toLowerCase();
+    return matchesDate && matchesModel && matchesStatus && (!keyword || text.includes(keyword));
+  });
+}
+
+function updateTeamMemberUsageFilters() {
+  teamMemberUsageFilters = {
+    date: el("teamMemberUsageDetailDateFilter").value,
+    model: el("teamMemberUsageDetailModelFilter").value,
+    status: el("teamMemberUsageDetailStatusFilter").value,
+    keyword: el("teamMemberUsageDetailSearch").value.trim(),
+  };
+  renderTeam();
+}
+
+function resetTeamMemberUsageFilters() {
+  teamMemberUsageFilters = { date: "all", model: "all", status: "all", keyword: "" };
+  setupTeamMemberUsageFilters(teamMemberUsageData);
+  renderTeam();
 }
 
 function updateUsageTableFilters() {
@@ -712,10 +807,10 @@ function resetUsageTableFilters() {
   renderPersonal();
 }
 
-function renderTable(data) {
-  setText("tableCount", `${data.length} 条`);
+function renderTable(data, tableId = "usageTable", countId = "tableCount") {
+  setText(countId, `${data.length} 条`);
   setHtml(
-    "usageTable",
+    tableId,
     data.length
     ? data
         .slice()
@@ -909,7 +1004,7 @@ function renderEmployeeRanking(tableId, countId, employees, emptyText) {
           const requests = Number(item.requestCount || 0);
           const successRate = requests ? Math.round((Number(item.successCount || 0) / requests) * 1000) / 10 : 0;
           return `
-            <tr class="admin-employee-row" data-employee="${item.employeeEmail || item.employeeId}">
+            <tr class="admin-employee-row ${tableId === "teamUserTable" && selectedTeamEmployee === (item.employeeEmail || item.employeeId) ? "active" : ""}" data-employee="${escapeHtml(item.employeeEmail || item.employeeId)}">
               <td><strong>${item.employeeName || item.employeeId}</strong></td>
               <td>${item.employeeEmail || "未绑定邮箱"}</td>
               <td>${tableId === "teamUserTable" ? (item.teamRole === "admin" ? "负责人" : "成员") : displaySource(item.primarySource)}</td>
@@ -970,6 +1065,44 @@ function renderDepartmentUsers() {
 
 function renderTeamUsers() {
   renderEmployeeRanking("teamUserTable", "teamUserCount", teamEmployees, "当前团队暂无成员用量");
+  renderTeamMemberTable();
+}
+
+function renderTeamMemberTable() {
+  const table = el("teamMemberUsageTable");
+  const count = el("teamMemberTableCount");
+  const detailCard = el("teamMemberDetailCard");
+  if (!table || !count || !detailCard) return;
+  const visible = Boolean(selectedTeamEmployee);
+  detailCard.classList.toggle("hidden", !visible);
+  if (!visible) {
+    table.innerHTML = "";
+    count.textContent = "0 条";
+    return;
+  }
+  setupTeamMemberUsageFilters(teamMemberUsageData);
+  const rows = filteredTeamMemberUsageRows();
+  setText("teamMemberTableCount", `${rows.length} 条`);
+  setHtml(
+    "teamMemberUsageTable",
+    rows.length
+      ? rows
+          .slice()
+          .reverse()
+          .map((item) => {
+            const status = item.failureCount > 0 ? `<span class="chip rose">${item.failureCount} 次失败</span>` : `<span class="chip">正常</span>`;
+            return `<tr><td>${escapeHtml(item.date)}</td><td>${escapeHtml(displaySource(item.source))}</td><td>${escapeHtml(item.model)}</td><td class="num">${fmt.format(item.requestCount || 0)}</td><td class="num">${fmt.format(item.promptTokens || 0)}</td><td class="num">${fmt.format(item.completionTokens || 0)}</td><td class="num"><strong>${fmt.format(item.totalTokens || 0)}</strong></td><td>${status}</td></tr>`;
+          })
+          .join("")
+      : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">当前成员在所选范围内暂无用量记录</td></tr>`,
+  );
+}
+
+function resetTeamMemberSelection() {
+  selectedTeamEmployee = "";
+  teamMemberUsageData = [];
+  teamMemberUsageSummary = null;
+  teamMemberUsageFilters = { date: "all", model: "all", status: "all", keyword: "" };
 }
 
 function loadingLine(width = "100%") {
@@ -1173,9 +1306,10 @@ function renderTeamLoading() {
   const label = rangeLabel();
   const source = sourceText();
   const scopeLabel = teamScopeLabel();
+  const memberLabel = selectedTeamEmployee ? selectedTeamEmployeeLabel() : "";
   setText("teamHeroTotal", "加载中");
   setText("teamHeroSpend", "--");
-  setText("teamHeroTotalLabel", "所选范围 Token");
+  setText("teamHeroTotalLabel", selectedTeamEmployee ? "所选成员 Token" : "所选范围 Token");
   setText("teamHeroRequests", "--");
   setText("teamHeroRequestsSub", "数据加载中");
   setText("teamHeroSuccess", "--");
@@ -1183,8 +1317,8 @@ function renderTeamLoading() {
   setText("teamHeroDate", "加载中");
   setText("teamHeroContext", `${label} · ${source} · 数据加载中`);
   setText("teamActiveUsers", "--");
-  setText("teamActiveUsersSub", "当前筛选范围");
-  setText("teamWelcomeTitle", `所选范围 · ${scopeLabel}`);
+  setText("teamActiveUsersSub", selectedTeamEmployee ? (memberLabel || "当前成员") : "当前筛选范围");
+  setText("teamWelcomeTitle", selectedTeamEmployee ? "所选范围 · 成员视图" : `所选范围 · ${scopeLabel}`);
   setText("teamTrendBadge", `${label} · ${source}`);
   setText("teamSpendBadge", `${label} · ${source}`);
   setText("teamLimitHint", "数据加载中");
@@ -1193,7 +1327,7 @@ function renderTeamLoading() {
   renderChartSkeleton("teamSpendChart");
   renderDonutSkeleton("teamDonutTotal", "teamSourceLegend");
   renderBarsSkeleton("teamModelBars");
-  renderTableSkeleton("teamUserTable", "teamUserCount", 8);
+  renderTableSkeleton(selectedTeamEmployee ? "teamMemberUsageTable" : "teamUserTable", selectedTeamEmployee ? "teamMemberTableCount" : "teamUserCount", 8);
 }
 
 function renderPersonal() {
@@ -1266,12 +1400,35 @@ function renderTeamBlocked() {
   if (!allowed) el("teamBlockedDesc").textContent = "当前账号还没有团队负责人权限。";
 }
 
+function renderTeamDetailCard() {
+  const detailCard = el("teamDetailCard");
+  if (!detailCard) return;
+  detailCard.classList.toggle("show", Boolean(selectedTeamEmployee));
+  const backButton = el("teamBackButton");
+  backButton?.classList.toggle("hidden", !selectedTeamEmployee);
+  if (selectedTeamEmployee) {
+    const employee = selectedTeamEmployeeInfo();
+    el("teamDetailTitle").textContent = `${employee?.employeeName || selectedTeamEmployee} 的用量详情`;
+    el("teamDetailSubtitle").textContent = employee?.employeeEmail || employee?.employeeId || selectedTeamEmployee;
+  }
+}
+
 function renderTeam() {
   renderTeamBlocked();
   if (!currentUser?.isTeamLeader || !leaderTeams.length) return;
   renderTeamSelector();
-  if (isTeamLoading) {
+  if (isTeamLoading || isTeamMemberLoading) {
     renderTeamLoading();
+    return;
+  }
+  renderTeamDetailCard();
+  if (selectedTeamEmployee) {
+    renderTeamMemberMetrics(teamMemberUsageData);
+    renderTrendTo("teamTrendChart", teamMemberUsageData);
+    renderSpendTrendTo("teamSpendChart", teamMemberUsageData);
+    renderDonutTo("teamSourceDonut", "teamDonutTotal", "teamSourceLegend", teamMemberUsageData);
+    renderModelBarsTo("teamModelBars", teamMemberUsageData);
+    renderTeamUsers();
     return;
   }
   const totalData = teamSummaryData.length ? teamSummaryData : teamUsageData;
@@ -1838,6 +1995,7 @@ async function loadDepartmentData(forceRefresh = false) {
 async function loadTeamData(forceRefresh = false) {
   if (!currentUser?.isTeamLeader || !leaderTeams.length || isTeamLoading) return;
   ensureSelectedTeamRef();
+  resetTeamMemberSelection();
   isTeamLoading = true;
   renderTeam();
   const { startDate, endDate } = selectedDateRange();
@@ -1868,6 +2026,44 @@ async function loadTeamData(forceRefresh = false) {
   }
 }
 
+async function loadTeamMemberData(employee, forceRefresh = false) {
+  if (!currentUser?.isTeamLeader || !leaderTeams.length || isTeamMemberLoading) return;
+  ensureSelectedTeamRef();
+  const keepFilters = forceRefresh && selectedTeamEmployee === employee;
+  selectedTeamEmployee = employee;
+  teamMemberUsageData = [];
+  teamMemberUsageSummary = null;
+  if (!keepFilters) teamMemberUsageFilters = { date: "all", model: "all", status: "all", keyword: "" };
+  isTeamMemberLoading = true;
+  renderTeam();
+  const { startDate, endDate } = selectedDateRange();
+  const source = el("sourceSelect").value;
+  const query = new URLSearchParams({ start_date: startDate, end_date: endDate, source, employee });
+  if (selectedTeamRef) query.set("team_ref", selectedTeamRef);
+  if (forceRefresh) query.set("refresh", "1");
+  try {
+    const payload = await api(`/api/team/member/usage?${query.toString()}`);
+    teamMemberUsageData = payload.rows || [];
+    teamMemberUsageSummary = payload.summary || null;
+    const employeePayload = payload.employee || {};
+    const employeeId = employeePayload.employeeEmail || employeePayload.employeeId || employee;
+    if (employeeId && employeeId !== selectedTeamEmployee) selectedTeamEmployee = employeeId;
+    setText("teamLimitHint", "成员排行保留当前团队汇总，已切换上方看板为所选成员明细");
+  } catch (error) {
+    showToast(error.message || "成员用量明细加载失败");
+    teamMemberUsageData = [];
+    teamMemberUsageSummary = null;
+  } finally {
+    isTeamMemberLoading = false;
+    renderTeam();
+  }
+}
+
+function clearTeamMemberSelection() {
+  resetTeamMemberSelection();
+  renderTeam();
+}
+
 async function loadModels() {
   try {
     const payload = await api("/api/models");
@@ -1886,6 +2082,7 @@ async function showApp(user) {
   currentUser = user;
   leaderTeams = normalizeLeaderTeams(user);
   selectedTeamRef = user.team?.teamRef || leaderTeams[0]?.teamRef || "";
+  resetTeamMemberSelection();
   ensureSelectedTeamRef();
   el("loginView").classList.add("hidden");
   el("appView").classList.remove("hidden");
@@ -1920,6 +2117,9 @@ function showLogin() {
   teamUsageData = [];
   teamSummaryData = [];
   teamEmployees = [];
+  teamMemberUsageData = [];
+  teamMemberUsageSummary = null;
+  resetTeamMemberSelection();
   teamInfo = null;
   leaderTeams = [];
   selectedTeamRef = "";
@@ -1978,6 +2178,7 @@ document.querySelectorAll("[data-view]").forEach((button) => button.addEventList
 el("rangeSelect").addEventListener("change", async () => {
   selectedAdminEmployee = "";
   selectedDepartment = "";
+  resetTeamMemberSelection();
   teamUsageData = [];
   teamSummaryData = [];
   teamEmployees = [];
@@ -1990,6 +2191,7 @@ el("rangeSelect").addEventListener("change", async () => {
 el("sourceSelect").addEventListener("change", async () => {
   selectedAdminEmployee = "";
   selectedDepartment = "";
+  resetTeamMemberSelection();
   teamUsageData = [];
   teamSummaryData = [];
   teamEmployees = [];
@@ -2016,8 +2218,13 @@ el("refreshButton").addEventListener("click", async () => {
     await loadAdminData(true);
     showToast(lastAdminUsageCacheHit ? "\u5df2\u52a0\u8f7d\u7f13\u5b58\u5168\u5458\u6570\u636e" : "\u5df2\u5237\u65b0\u5168\u5458\u7528\u91cf\u6570\u636e");
   } else if (currentView === "team") {
-    await loadTeamData(true);
-    showToast(lastTeamUsageCacheHit ? "已加载缓存团队数据" : "已刷新团队用量数据");
+    if (selectedTeamEmployee) {
+      await loadTeamMemberData(selectedTeamEmployee, true);
+      showToast("已刷新成员用量明细");
+    } else {
+      await loadTeamData(true);
+      showToast(lastTeamUsageCacheHit ? "已加载缓存团队数据" : "已刷新团队用量数据");
+    }
   } else if (currentView === "department") {
     await loadDepartmentData(true);
     showToast(lastDepartmentUsageCacheHit ? "\u5df2\u52a0\u8f7d\u7f13\u5b58\u90e8\u95e8\u6570\u636e" : "\u5df2\u5237\u65b0\u90e8\u95e8\u7528\u91cf\u6570\u636e");
@@ -2108,8 +2315,23 @@ el("teamSelect").addEventListener("change", async (event) => {
   teamUsageData = [];
   teamSummaryData = [];
   teamEmployees = [];
+  resetTeamMemberSelection();
   await loadTeamData();
 });
+
+el("teamUserTable").addEventListener("click", async (event) => {
+  const row = event.target.closest("[data-employee]");
+  if (!row) return;
+  await loadTeamMemberData(row.dataset.employee);
+});
+
+el("teamBackButton").addEventListener("click", clearTeamMemberSelection);
+
+["teamMemberUsageDetailDateFilter", "teamMemberUsageDetailModelFilter", "teamMemberUsageDetailStatusFilter"].forEach((id) => {
+  el(id).addEventListener("change", updateTeamMemberUsageFilters);
+});
+el("teamMemberUsageDetailSearch").addEventListener("input", updateTeamMemberUsageFilters);
+el("teamMemberUsageDetailReset").addEventListener("click", resetTeamMemberUsageFilters);
 
 el("modelSearch").addEventListener("input", renderModels);
 el("providerFilter").addEventListener("change", renderModels);

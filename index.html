@@ -1652,6 +1652,11 @@
         background: rgba(31, 122, 91, 0.06);
       }
 
+      .admin-employee-row.active {
+        background: rgba(31, 122, 91, 0.12);
+        box-shadow: inset 3px 0 0 #1f7a5b;
+      }
+
       table {
         width: 100%;
         border-collapse: collapse;
@@ -3551,6 +3556,16 @@
 
             <section id="teamMetrics" class="metrics"></section>
 
+            <section id="teamDetailCard" class="panel admin-detail-card">
+              <div class="admin-detail-head">
+                <div>
+                  <h3 id="teamDetailTitle">成员详情</h3>
+                  <p id="teamDetailSubtitle">点击成员排行中的一行查看个人明细。</p>
+                </div>
+                <button id="teamBackButton" class="ghost-btn hidden" type="button">返回团队总览</button>
+              </div>
+            </section>
+
             <section class="trend-grid">
               <div class="panel">
                 <div class="panel-header">
@@ -3610,6 +3625,57 @@
                     </tr>
                   </thead>
                   <tbody id="teamUserTable"></tbody>
+                </table>
+              </div>
+            </section>
+
+            <section id="teamMemberDetailCard" class="panel table-panel hidden">
+              <div class="panel-header">
+                <div class="panel-heading">
+                  <span class="panel-icon"><svg><use href="#icon-table"></use></svg></span>
+                  <div>
+                    <h3 class="panel-title">成员用量明细</h3>
+                    <p class="panel-desc">按当前日期范围与来源筛选展示所选成员的每日模型用量。</p>
+                  </div>
+                </div>
+                <span id="teamMemberTableCount" class="chip blue">0 条</span>
+              </div>
+              <div class="usage-detail-toolbar" aria-label="成员用量明细筛选">
+                <div class="usage-detail-field">
+                  <label for="teamMemberUsageDetailDateFilter">日期</label>
+                  <select id="teamMemberUsageDetailDateFilter" class="select" aria-label="按日期筛选成员用量明细"></select>
+                </div>
+                <div class="usage-detail-field">
+                  <label for="teamMemberUsageDetailModelFilter">模型</label>
+                  <select id="teamMemberUsageDetailModelFilter" class="select" aria-label="按模型筛选成员用量明细"></select>
+                </div>
+                <div class="usage-detail-field">
+                  <label for="teamMemberUsageDetailStatusFilter">状态</label>
+                  <select id="teamMemberUsageDetailStatusFilter" class="select" aria-label="按状态筛选成员用量明细"></select>
+                </div>
+                <div class="usage-detail-field usage-detail-search">
+                  <label for="teamMemberUsageDetailSearch">搜索</label>
+                  <input id="teamMemberUsageDetailSearch" class="input" type="search" placeholder="搜索模型或来源" aria-label="搜索成员用量明细" />
+                </div>
+                <div class="usage-detail-actions">
+                  <button id="teamMemberUsageDetailReset" class="ghost-btn" type="button">重置</button>
+                </div>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>日期</th>
+                      <th>来源</th>
+                      <th>模型</th>
+                      <th class="num">请求数</th>
+                      <th class="num">Prompt</th>
+                      <th class="num">Completion</th>
+                      <th class="num">总 Token</th>
+                      <th>状态</th>
+                    </tr>
+                  </thead>
+                  <tbody id="teamMemberUsageTable"></tbody>
                 </table>
               </div>
             </section>
@@ -3924,6 +3990,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260721-model-rank-names"></script>
+    <script src="/assets/app.js?v=20260722-team-member-detail"></script>
   </body>
 </html>

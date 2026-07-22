@@ -11,10 +11,12 @@ from backend.litellm_client import LiteLLMBackend, LiteLLMClient
 
 
 class FakeLiteLLMClient:
-    def __init__(self, scope: dict[str, Any], payload: dict[str, Any] | None = None) -> None:
+    def __init__(self, scope: dict[str, Any], payload: dict[str, Any] | None = None, usage_rows: list[dict[str, Any]] | None = None) -> None:
         self.scope = scope
         self.payload = payload or {}
         self.calls: list[tuple[str, str, str, str, str | None]] = []
+        self.usage_calls: list[tuple[list[str], str, str, str | None]] = []
+        self.usage_rows = usage_rows or []
 
     async def team_leader_scope(self, upstream_user: dict[str, Any]) -> dict[str, Any]:
         return self.scope
@@ -23,11 +25,16 @@ class FakeLiteLLMClient:
         self.calls.append((backend, team_id, start_date, end_date, source))
         return self.payload
 
+    async def usage_rows_for_user_ids(self, user_ids: list[str], start_date: str, end_date: str, source: str | None) -> list[dict[str, Any]]:
+        self.usage_calls.append((user_ids, start_date, end_date, source))
+        return self.usage_rows
+
 
 def reset_caches() -> None:
     main.user_mapping_cache.clear()
     main.team_auth_cache.clear()
     main.team_usage_cache.clear()
+    main.team_member_usage_cache.clear()
 
 
 def app_client(email: str = "leader@auto-link.com.cn") -> TestClient:
@@ -385,3 +392,124 @@ def test_team_usage_ignores_client_team_override(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert fake.calls[0][1] == "authorized-team"
+
+
+def team_member_scope() -> dict[str, Any]:
+    return {
+        "isTeamLeader": True,
+        "teamBoardStatus": "single",
+        "team": {"id": "team-a", "name": "Team A", "memberCount": 2, "backend": "primary"},
+        "leaderTeams": [{"id": "team-a", "name": "Team A", "memberCount": 2, "backend": "primary"}],
+    }
+
+
+def team_member_payload() -> dict[str, Any]:
+    return {
+        "rows": [],
+        "summaryRows": [],
+        "employees": [
+            {
+                "employeeId": "alice@auto-link.com.cn",
+                "employeeName": "Alice",
+                "employeeEmail": "alice@auto-link.com.cn",
+                "userIds": ["alice-user"],
+                "totalTokens": 10,
+                "teamRole": "user",
+                "bindStatus": "已绑定邮箱",
+            },
+            {
+                "employeeId": "bob-id",
+                "employeeName": "Bob",
+                "employeeEmail": "",
+                "userIds": ["bob-user"],
+                "totalTokens": 0,
+                "teamRole": "user",
+                "bindStatus": "未绑定邮箱",
+            },
+        ],
+        "team": {"id": "team-a", "name": "Team A", "memberCount": 2, "backend": "primary"},
+    }
+
+
+def test_non_team_admin_cannot_access_team_member_usage(monkeypatch) -> None:
+    reset_caches()
+    patch_user(monkeypatch)
+    fake = FakeLiteLLMClient({"isTeamLeader": False, "teamBoardStatus": "none", "team": None, "leaderTeams": []})
+    monkeypatch.setattr(main, "client", lambda: fake)
+
+    response = app_client("member@auto-link.com.cn").get("/api/team/member/usage?employee=alice@auto-link.com.cn")
+
+    assert response.status_code == 403
+    assert fake.usage_calls == []
+
+
+def test_team_member_usage_rejects_invalid_team_ref(monkeypatch) -> None:
+    reset_caches()
+    patch_user(monkeypatch)
+    fake = FakeLiteLLMClient(team_member_scope(), team_member_payload())
+    monkeypatch.setattr(main, "client", lambda: fake)
+
+    response = app_client().get("/api/team/member/usage?team_ref=not-authorized&employee=alice@auto-link.com.cn")
+
+    assert response.status_code == 403
+    assert fake.usage_calls == []
+
+
+def test_team_member_usage_matches_member_email_and_returns_empty_summary(monkeypatch) -> None:
+    reset_caches()
+    patch_user(monkeypatch)
+    fake = FakeLiteLLMClient(team_member_scope(), team_member_payload())
+    monkeypatch.setattr(main, "client", lambda: fake)
+
+    response = app_client().get("/api/team/member/usage?employee=alice@auto-link.com.cn&start_date=2026-07-01&end_date=2026-07-22")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["rows"] == []
+    assert payload["summary"]["rangeTotal"]["totalTokens"] == 0
+    assert payload["user"]["email"] == "alice@auto-link.com.cn"
+    assert fake.usage_calls == [(["alice-user"], "2026-07-01", "2026-07-22", "all")]
+
+
+def test_team_member_usage_matches_employee_id_and_user_ids(monkeypatch) -> None:
+    reset_caches()
+    patch_user(monkeypatch)
+    fake = FakeLiteLLMClient(
+        team_member_scope(),
+        team_member_payload(),
+        [
+            {
+                "date": "2026-07-22",
+                "source": "Cursor",
+                "model": "gpt-5",
+                "promptTokens": 7,
+                "completionTokens": 3,
+                "totalTokens": 10,
+                "requestCount": 1,
+                "successCount": 1,
+                "failureCount": 0,
+                "spend": 0.01,
+            }
+        ],
+    )
+    monkeypatch.setattr(main, "client", lambda: fake)
+
+    response = app_client().get("/api/team/member/usage?employee=bob-id")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["summary"]["rangeTotal"]["totalTokens"] == 10
+    assert payload["user"]["employeeId"] == "bob-id"
+    assert fake.usage_calls[0][0] == ["bob-user"]
+
+
+def test_team_member_usage_rejects_non_team_member(monkeypatch) -> None:
+    reset_caches()
+    patch_user(monkeypatch)
+    fake = FakeLiteLLMClient(team_member_scope(), team_member_payload())
+    monkeypatch.setattr(main, "client", lambda: fake)
+
+    response = app_client().get("/api/team/member/usage?employee=mallory@auto-link.com.cn")
+
+    assert response.status_code == 404
+    assert fake.usage_calls == []

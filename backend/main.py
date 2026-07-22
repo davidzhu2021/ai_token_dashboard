@@ -62,6 +62,7 @@ admin_usage_cache = TTLCache()
 department_usage_cache = TTLCache()
 team_auth_cache = TTLCache()
 team_usage_cache = TTLCache()
+team_member_usage_cache = TTLCache()
 _litellm_client: LiteLLMClient | None = None
 _key_vault: KeyVault | None = None
 
@@ -276,6 +277,10 @@ def team_auth_cache_key(email: str, name: str | None) -> str:
 
 def team_usage_cache_key(email: str, team: dict[str, Any], start_date: str, end_date: str, source: str) -> str:
     return f"team-usage:v2:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{start_date}:{end_date}:{source or 'all'}"
+
+
+def team_member_usage_cache_key(email: str, team: dict[str, Any], employee: str, start_date: str, end_date: str, source: str) -> str:
+    return f"team-member-usage:v1:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{employee.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def team_ref(team: dict[str, Any]) -> str:
@@ -495,6 +500,123 @@ async def team_usage_payload(app_user: dict[str, Any], start_date: str, end_date
     payload = dict(await client().team_usage_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source))
     payload["team"] = public_team_from_payload(team, payload.get("team"))
     team_usage_cache.set(cache_key, payload, env_int("TEAM_USAGE_CACHE_TTL_SECONDS", 300))
+    payload = dict(payload)
+    payload["cache"] = {"hit": False, "ttlSeconds": 0}
+    return payload
+
+
+def clean_identifier(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def team_employee_public_user(employee: dict[str, Any], selected_team: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "email": clean_identifier(employee.get("employeeEmail")),
+        "name": clean_identifier(employee.get("employeeName")) or clean_identifier(employee.get("employeeId")) or "团队成员",
+        "avatar": initials_text(clean_identifier(employee.get("employeeEmail")), clean_identifier(employee.get("employeeName"))),
+        "department": clean_identifier(selected_team.get("name")) or "团队",
+        "isAdmin": False,
+        "isTeamLeader": False,
+        "team": public_team(selected_team),
+        "employeeId": clean_identifier(employee.get("employeeId")),
+        "teamRole": clean_identifier(employee.get("teamRole")) or "user",
+        "bindStatus": clean_identifier(employee.get("bindStatus")),
+    }
+
+
+def initials_text(email: str, name: str | None = None) -> str:
+    text = (name or email or "员工").strip()
+    return text[:1].upper()
+
+
+def employee_match_values(employee: dict[str, Any]) -> set[str]:
+    values = {
+        clean_identifier(employee.get("employeeId")).lower(),
+        clean_identifier(employee.get("employeeEmail")).lower(),
+        clean_identifier(employee.get("employeeName")).lower(),
+    }
+    user_ids = employee.get("userIds")
+    if isinstance(user_ids, list):
+        values.update(clean_identifier(item).lower() for item in user_ids)
+    return {value for value in values if value}
+
+
+def find_team_employee(payload: dict[str, Any], employee: str) -> dict[str, Any]:
+    normalized = employee.strip().lower()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="请选择要查看的团队成员")
+    for item in payload.get("employees") or []:
+        if isinstance(item, dict) and normalized in employee_match_values(item):
+            return item
+    raise HTTPException(status_code=404, detail="未找到该团队成员")
+
+
+async def user_ids_for_team_employee(employee: dict[str, Any], refresh: bool) -> list[str]:
+    user_ids = employee.get("userIds")
+    if isinstance(user_ids, list):
+        cleaned = [clean_identifier(item) for item in user_ids if clean_identifier(item)]
+        if cleaned:
+            return cleaned
+
+    email = clean_identifier(employee.get("employeeEmail")).lower()
+    if email:
+        upstream_user, _ = await cached_resolve_user(email, clean_identifier(employee.get("employeeName")), refresh)
+        resolved = upstream_user_ids(upstream_user)
+        if resolved:
+            return resolved
+
+    employee_id = clean_identifier(employee.get("employeeId"))
+    return [employee_id] if employee_id else []
+
+
+async def team_member_usage_payload(
+    app_user: dict[str, Any],
+    start_date: str,
+    end_date: str,
+    source: str,
+    employee: str,
+    refresh: bool = False,
+    team_ref_value: str | None = None,
+) -> dict[str, Any]:
+    scope = await team_scope_for_user(app_user, refresh)
+    if not scope.get("isTeamLeader"):
+        raise HTTPException(status_code=403, detail="当前账号还没有团队负责人权限")
+
+    team = select_authorized_team(scope, team_ref_value)
+    cache_key = team_member_usage_cache_key(app_user["email"], team, employee, start_date, end_date, source)
+    if not refresh:
+        hit, value, ttl_seconds = team_member_usage_cache.get(cache_key)
+        if hit:
+            payload = dict(value)
+            payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+            return payload
+
+    team_payload = await team_usage_payload(app_user, start_date, end_date, source, refresh, team_ref_value)
+    selected_employee = find_team_employee(team_payload, employee)
+    user_ids = await user_ids_for_team_employee(selected_employee, refresh)
+    if not user_ids:
+        raise HTTPException(status_code=404, detail="该团队成员缺少可查询的用量账号")
+
+    rows = await client().usage_rows_for_user_ids(user_ids, start_date, end_date, source)
+    public_user = team_employee_public_user(selected_employee, team)
+    payload = {
+        "user": public_user,
+        "team": public_team_from_payload(team, team_payload.get("team")),
+        "teamRef": team_payload.get("team", {}).get("teamRef", team_ref_value or ""),
+        "startDate": start_date,
+        "endDate": end_date,
+        "source": source,
+        "rows": rows,
+        "summary": usage_summary(rows),
+        "employee": {
+            "employeeId": selected_employee.get("employeeId"),
+            "employeeName": selected_employee.get("employeeName"),
+            "employeeEmail": selected_employee.get("employeeEmail"),
+            "teamRole": selected_employee.get("teamRole"),
+            "bindStatus": selected_employee.get("bindStatus"),
+        },
+    }
+    team_member_usage_cache.set(cache_key, payload, env_int("TEAM_MEMBER_USAGE_CACHE_TTL_SECONDS", 300))
     payload = dict(payload)
     payload["cache"] = {"hit": False, "ttlSeconds": 0}
     return payload
@@ -850,6 +972,32 @@ async def team_usage(
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
     payload = await team_usage_payload(app_user, start_date, end_date, source, refresh, team_ref)
+    return {
+        "leader": {"email": app_user["email"], "name": app_user["name"]},
+        "startDate": start_date,
+        "endDate": end_date,
+        "source": source,
+        "teamRef": payload.get("team", {}).get("teamRef", team_ref or ""),
+        **payload,
+    }
+
+
+@app.get("/api/team/member/usage")
+async def team_member_usage(
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    source: str = Query("all"),
+    team_ref: str | None = None,
+    employee: str | None = None,
+    refresh: bool = Query(False),
+) -> dict[str, Any]:
+    app_user = require_user(request)
+    if not start_date or not end_date:
+        start_date, end_date = default_date_range()
+    if not employee:
+        raise HTTPException(status_code=400, detail="请选择要查看的团队成员")
+    payload = await team_member_usage_payload(app_user, start_date, end_date, source, employee, refresh, team_ref)
     return {
         "leader": {"email": app_user["email"], "name": app_user["name"]},
         "startDate": start_date,
