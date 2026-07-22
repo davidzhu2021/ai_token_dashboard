@@ -2054,9 +2054,9 @@ async function loadTeamData(forceRefresh = false) {
     teamInfo = payload.team || currentUser.team || null;
     lastTeamUsageCacheHit = Boolean(payload.cache?.hit);
     if (payload.truncated) {
-      el("teamLimitHint").textContent = `成员排行默认按 Token 从高到低排序；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），排行可能不完整`;
+      el("teamLimitHint").textContent = "成员排行按团队成员账号用量汇总，当前数据读取达到上限，排行可能不完整";
     } else {
-      el("teamLimitHint").textContent = `成员排行默认按 Token 从高到低排序；已读取 ${payload.pagesRead || 0} 页日志，并包含团队内零用量成员`;
+      el("teamLimitHint").textContent = "成员排行按团队成员账号用量汇总，包含零用量成员";
     }
   } catch (error) {
     showToast(error.message || "团队数据加载失败");

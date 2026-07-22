@@ -276,7 +276,7 @@ def team_auth_cache_key(email: str, name: str | None) -> str:
 
 
 def team_usage_cache_key(email: str, team: dict[str, Any], start_date: str, end_date: str, source: str) -> str:
-    return f"team-usage:v4:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{start_date}:{end_date}:{source or 'all'}"
+    return f"team-usage:v5:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def team_member_usage_cache_key(email: str, team: dict[str, Any], employee: str, start_date: str, end_date: str, source: str) -> str:
@@ -485,21 +485,32 @@ async def app_user_with_team_scope(app_user: dict[str, Any]) -> dict[str, Any]:
     return enriched
 
 
-async def team_usage_payload(app_user: dict[str, Any], start_date: str, end_date: str, source: str, refresh: bool = False, team_ref_value: str | None = None) -> dict[str, Any]:
+async def team_usage_payload(
+    app_user: dict[str, Any],
+    start_date: str,
+    end_date: str,
+    source: str,
+    refresh: bool = False,
+    team_ref_value: str | None = None,
+    enrich_member_rankings: bool = True,
+) -> dict[str, Any]:
     scope = await team_scope_for_user(app_user, refresh)
     if not scope.get("isTeamLeader"):
         raise HTTPException(status_code=403, detail="当前账号还没有团队负责人权限")
     team = select_authorized_team(scope, team_ref_value)
     cache_key = team_usage_cache_key(app_user["email"], team, start_date, end_date, source)
-    if not refresh:
+    if enrich_member_rankings and not refresh:
         hit, value, ttl_seconds = team_usage_cache.get(cache_key)
         if hit:
             payload = dict(value)
             payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
             return payload
     payload = dict(await client().team_usage_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source))
+    if enrich_member_rankings:
+        payload["employees"] = await team_member_rankings_from_accounts(payload.get("employees") or [], start_date, end_date, source, refresh)
     payload["team"] = public_team_from_payload(team, payload.get("team"))
-    team_usage_cache.set(cache_key, payload, env_int("TEAM_USAGE_CACHE_TTL_SECONDS", 300))
+    if enrich_member_rankings:
+        team_usage_cache.set(cache_key, payload, env_int("TEAM_USAGE_CACHE_TTL_SECONDS", 300))
     payload = dict(payload)
     payload["cache"] = {"hit": False, "ttlSeconds": 0}
     return payload
@@ -569,6 +580,69 @@ async def user_ids_for_team_employee(employee: dict[str, Any], refresh: bool) ->
     return [employee_id] if employee_id else []
 
 
+def team_employee_empty_summary(employee: dict[str, Any]) -> dict[str, Any]:
+    employee_id = clean_identifier(employee.get("employeeId")) or clean_identifier(employee.get("employeeEmail"))
+    user_ids = employee.get("userIds")
+    clean_user_ids = [clean_identifier(item) for item in user_ids if clean_identifier(item)] if isinstance(user_ids, list) else []
+    return {
+        "employeeId": employee_id,
+        "employeeName": clean_identifier(employee.get("employeeName")) or employee_id or "团队成员",
+        "employeeEmail": clean_identifier(employee.get("employeeEmail")),
+        "bindStatus": clean_identifier(employee.get("bindStatus")) or "未绑定邮箱",
+        "userIds": clean_user_ids,
+        "promptTokens": 0,
+        "completionTokens": 0,
+        "totalTokens": 0,
+        "requestCount": 0,
+        "successCount": 0,
+        "failureCount": 0,
+        "spend": 0.0,
+        "primarySource": "其他",
+        "teamRole": clean_identifier(employee.get("teamRole")) or "user",
+    }
+
+
+def team_employee_sort_key(employee: dict[str, Any]) -> tuple[float, float, float, str]:
+    name = clean_identifier(employee.get("employeeName")) or clean_identifier(employee.get("employeeEmail")) or clean_identifier(employee.get("employeeId"))
+    return (
+        -float(employee.get("totalTokens") or 0),
+        -float(employee.get("spend") or 0),
+        -float(employee.get("requestCount") or 0),
+        name.lower(),
+    )
+
+
+async def team_member_rankings_from_accounts(
+    employees: list[dict[str, Any]],
+    start_date: str,
+    end_date: str,
+    source: str,
+    refresh: bool,
+) -> list[dict[str, Any]]:
+    rankings: list[dict[str, Any]] = []
+    litellm = client()
+    for employee in employees:
+        if not isinstance(employee, dict):
+            continue
+        summary = team_employee_empty_summary(employee)
+        try:
+            user_ids = await user_ids_for_team_employee(employee, refresh)
+            summary["userIds"] = user_ids
+            rows = await litellm.usage_rows_for_user_ids(user_ids, start_date, end_date, source) if user_ids else []
+        except HTTPException:
+            rows = []
+        totals = usage_summary(rows)
+        range_total = totals["rangeTotal"]
+        for field in ("promptTokens", "completionTokens", "totalTokens", "requestCount", "successCount", "failureCount"):
+            summary[field] = range_total[field]
+        summary["spend"] = range_total["spend"]
+        source_breakdown = totals.get("sourceBreakdown") or []
+        if source_breakdown:
+            summary["primarySource"] = source_breakdown[0].get("source") or "其他"
+        rankings.append(summary)
+    return sorted(rankings, key=team_employee_sort_key)
+
+
 async def team_member_usage_payload(
     app_user: dict[str, Any],
     start_date: str,
@@ -591,7 +665,7 @@ async def team_member_usage_payload(
             payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
             return payload
 
-    team_payload = await team_usage_payload(app_user, start_date, end_date, source, refresh, team_ref_value)
+    team_payload = await team_usage_payload(app_user, start_date, end_date, source, refresh, team_ref_value, enrich_member_rankings=False)
     selected_employee = find_team_employee(team_payload, employee)
     user_ids = await user_ids_for_team_employee(selected_employee, refresh)
     if not user_ids:

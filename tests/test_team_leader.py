@@ -11,7 +11,12 @@ from backend.litellm_client import LiteLLMBackend, LiteLLMClient
 
 
 class FakeLiteLLMClient:
-    def __init__(self, scope: dict[str, Any], payload: dict[str, Any] | None = None, usage_rows: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        scope: dict[str, Any],
+        payload: dict[str, Any] | None = None,
+        usage_rows: list[dict[str, Any]] | dict[str, list[dict[str, Any]]] | None = None,
+    ) -> None:
         self.scope = scope
         self.payload = payload or {}
         self.calls: list[tuple[str, str, str, str, str | None]] = []
@@ -27,6 +32,11 @@ class FakeLiteLLMClient:
 
     async def usage_rows_for_user_ids(self, user_ids: list[str], start_date: str, end_date: str, source: str | None) -> list[dict[str, Any]]:
         self.usage_calls.append((user_ids, start_date, end_date, source))
+        if isinstance(self.usage_rows, dict):
+            rows: list[dict[str, Any]] = []
+            for user_id in user_ids:
+                rows.extend(self.usage_rows.get(user_id, []))
+            return rows
         return self.usage_rows
 
 
@@ -372,6 +382,182 @@ def test_team_usage_includes_zero_usage_members(monkeypatch) -> None:
     assert response.status_code == 200
     employees = response.json()["employees"]
     assert {employee["employeeId"] for employee in employees} == {"active", "quiet"}
+
+
+def test_team_usage_ranking_uses_member_account_usage(monkeypatch) -> None:
+    reset_caches()
+    patch_user(monkeypatch)
+    fake = FakeLiteLLMClient(
+        {
+            "isTeamLeader": True,
+            "teamBoardStatus": "single",
+            "team": {"id": "team-a", "name": "Team A", "memberCount": 2, "backend": "primary"},
+            "leaderTeams": [{"id": "team-a", "name": "Team A", "memberCount": 2, "backend": "primary"}],
+        },
+        {
+            "rows": [
+                {
+                    "date": "2026-07-22",
+                    "source": "Claude Code",
+                    "model": "team-model",
+                    "employeeId": "alice@auto-link.com.cn",
+                    "employeeName": "Alice",
+                    "employeeEmail": "alice@auto-link.com.cn",
+                    "promptTokens": 600,
+                    "completionTokens": 399,
+                    "totalTokens": 999,
+                    "requestCount": 9,
+                    "successCount": 9,
+                    "failureCount": 0,
+                    "spend": 9.99,
+                }
+            ],
+            "summaryRows": [],
+            "employees": [
+                {
+                    "employeeId": "alice@auto-link.com.cn",
+                    "employeeName": "Alice",
+                    "employeeEmail": "alice@auto-link.com.cn",
+                    "userIds": ["alice-user"],
+                    "totalTokens": 10,
+                    "teamRole": "user",
+                    "bindStatus": "已绑定邮箱",
+                },
+                {
+                    "employeeId": "quiet",
+                    "employeeName": "Quiet",
+                    "employeeEmail": "",
+                    "userIds": ["quiet-user"],
+                    "totalTokens": 0,
+                    "teamRole": "user",
+                    "bindStatus": "未绑定邮箱",
+                },
+            ],
+            "team": {"id": "team-a", "name": "Team A", "memberCount": 2, "backend": "primary"},
+        },
+        {
+            "alice-user": [
+                {
+                    "date": "2026-07-22",
+                    "source": "Cursor",
+                    "model": "gpt-5",
+                    "promptTokens": 20,
+                    "completionTokens": 10,
+                    "totalTokens": 30,
+                    "requestCount": 2,
+                    "successCount": 2,
+                    "failureCount": 0,
+                    "spend": 1.23,
+                }
+            ],
+            "quiet-user": [],
+        },
+    )
+    monkeypatch.setattr(main, "client", lambda: fake)
+
+    response = app_client().get("/api/team/usage")
+
+    assert response.status_code == 200
+    payload = response.json()
+    employees = {item["employeeId"]: item for item in payload["employees"]}
+    assert payload["rows"][0]["totalTokens"] == 999
+    assert employees["alice@auto-link.com.cn"]["totalTokens"] == 30
+    assert employees["alice@auto-link.com.cn"]["requestCount"] == 2
+    assert employees["quiet"]["totalTokens"] == 0
+    assert fake.usage_calls[0][0] == ["alice-user"]
+    assert fake.usage_calls[1][0] == ["quiet-user"]
+
+
+def test_team_usage_ranking_matches_member_detail_total(monkeypatch) -> None:
+    reset_caches()
+    patch_user(monkeypatch)
+    usage_rows = {
+        "alice-user": [
+            {
+                "date": "2026-07-22",
+                "source": "Claude Code",
+                "model": "anthropic.claude-opus-4-8",
+                "promptTokens": 400,
+                "completionTokens": 100,
+                "totalTokens": 500,
+                "requestCount": 4,
+                "successCount": 4,
+                "failureCount": 0,
+                "spend": 2.5,
+            }
+        ],
+        "bob-user": [],
+    }
+    fake = FakeLiteLLMClient(team_member_scope(), team_member_payload(), usage_rows)
+    monkeypatch.setattr(main, "client", lambda: fake)
+
+    ranking_response = app_client().get("/api/team/usage")
+    member_response = app_client().get("/api/team/member/usage?employee=alice@auto-link.com.cn")
+
+    assert ranking_response.status_code == 200
+    assert member_response.status_code == 200
+    alice = next(item for item in ranking_response.json()["employees"] if item["employeeId"] == "alice@auto-link.com.cn")
+    assert alice["totalTokens"] == member_response.json()["summary"]["rangeTotal"]["totalTokens"]
+    assert alice["requestCount"] == member_response.json()["summary"]["rangeTotal"]["requestCount"]
+
+
+def test_team_usage_ranking_resolves_member_email_without_user_ids(monkeypatch) -> None:
+    reset_caches()
+
+    async def fake_cached_resolve_user(email: str, name: str | None = None, refresh: bool = False):
+        if email == "alice@auto-link.com.cn":
+            return {
+                "matched_user_ids": ["alice-resolved-user"],
+                "matched_accounts": [{"backend": "primary", "user_id": "alice-resolved-user", "account_id": "alice-resolved-user"}],
+            }, {"hit": False, "ttlSeconds": 0}
+        return {
+            "matched_user_ids": ["leader-user"],
+            "matched_accounts": [{"backend": "primary", "user_id": "leader-user", "account_id": "leader-user"}],
+        }, {"hit": False, "ttlSeconds": 0}
+
+    monkeypatch.setattr(main, "cached_resolve_user", fake_cached_resolve_user)
+    fake = FakeLiteLLMClient(
+        team_member_scope(),
+        {
+            "rows": [],
+            "summaryRows": [],
+            "employees": [
+                {
+                    "employeeId": "alice@auto-link.com.cn",
+                    "employeeName": "Alice",
+                    "employeeEmail": "alice@auto-link.com.cn",
+                    "userIds": [],
+                    "teamRole": "user",
+                    "bindStatus": "已绑定邮箱",
+                },
+            ],
+            "team": {"id": "team-a", "name": "Team A", "memberCount": 1, "backend": "primary"},
+        },
+        {
+            "alice-resolved-user": [
+                {
+                    "date": "2026-07-22",
+                    "source": "Cursor",
+                    "model": "gpt-5",
+                    "promptTokens": 5,
+                    "completionTokens": 5,
+                    "totalTokens": 10,
+                    "requestCount": 1,
+                    "successCount": 1,
+                    "failureCount": 0,
+                    "spend": 0.1,
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(main, "client", lambda: fake)
+
+    response = app_client().get("/api/team/usage")
+
+    assert response.status_code == 200
+    alice = response.json()["employees"][0]
+    assert alice["totalTokens"] == 10
+    assert alice["userIds"] == ["alice-resolved-user"]
 
 
 def test_team_usage_ignores_client_team_override(monkeypatch) -> None:
