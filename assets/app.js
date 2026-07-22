@@ -34,6 +34,7 @@ let teamInfo = null;
 let teamMemberUsageData = [];
 let teamMemberUsageSummary = null;
 let selectedTeamEmployee = "";
+let teamMemberUsageRequestId = 0;
 let teamMemberUsageFilters = { date: "all", model: "all", status: "all", keyword: "" };
 let leaderTeams = [];
 let selectedTeamRef = "";
@@ -535,6 +536,21 @@ function selectedTeamEmployeeInfo() {
 function selectedTeamEmployeeLabel() {
   const employee = selectedTeamEmployeeInfo();
   return employee?.employeeName || employee?.employeeEmail || employee?.employeeId || selectedTeamEmployee || "团队成员";
+}
+
+function updateTeamMemberLoadingLabels() {
+  const employee = selectedTeamEmployeeInfo();
+  const employeeName = selectedTeamEmployeeLabel();
+  setText("teamDetailTitle", `${employeeName} 的用量详情`);
+  setText("teamDetailSubtitle", employee?.employeeEmail || employee?.employeeId || selectedTeamEmployee || "");
+  el("teamTrendTitle").textContent = `${employeeName}每日 Token 趋势`;
+  el("teamTrendDesc").textContent = `按日期汇总${employeeName} Prompt 与 Completion Token。`;
+  el("teamSpendTitle").textContent = `${employeeName}每日金额消费趋势`;
+  el("teamSpendDesc").textContent = `按日期汇总${employeeName}预估消费金额。`;
+  el("teamSourceTitle").textContent = `${employeeName}用量占比`;
+  el("teamSourceDesc").textContent = `按${employeeName} Codex、Claude Code 与其他来源拆分用量。`;
+  setText("teamModelTitle", `${employeeName}模型使用排行`);
+  setText("teamModelDesc", `按${employeeName}总 Token 消耗排序。`);
 }
 
 function renderTeamMemberMetrics(data) {
@@ -1129,6 +1145,7 @@ function renderTeamMemberTable() {
 
 function resetTeamMemberSelection() {
   selectedTeamEmployee = "";
+  teamMemberUsageRequestId += 1;
   teamMemberUsageData = [];
   teamMemberUsageSummary = null;
   teamMemberUsageFilters = { date: "all", model: "all", status: "all", keyword: "" };
@@ -1353,12 +1370,14 @@ function renderTeamLoading() {
   setText("teamTrendBadge", `${label} · ${source}`);
   setText("teamSpendBadge", `${label} · ${source}`);
   setText("teamLimitHint", "数据加载中");
+  renderTeamDetailCard();
   if (selectedTeamEmployee) {
     const isSingleDay = selectedDateRange().days === 1;
     el("teamDailyOverview")?.classList.toggle("personal-single-day", isSingleDay);
     el("teamAvgSpendWrap")?.classList.toggle("hidden", isSingleDay);
     setText("teamActiveLabel", "日均 Token");
     setText("teamHeroDateSub", "当前筛选下最新日期");
+    updateTeamMemberLoadingLabels();
   } else {
     el("teamDailyOverview")?.classList.remove("personal-single-day");
     el("teamAvgSpendWrap")?.classList.add("hidden");
@@ -2078,14 +2097,17 @@ function scrollToPageTop() {
 }
 
 async function loadTeamMemberData(employee, forceRefresh = false, scrollToTop = true) {
-  if (!currentUser?.isTeamLeader || !leaderTeams.length || isTeamMemberLoading) return;
+  if (!currentUser?.isTeamLeader || !leaderTeams.length) return;
   ensureSelectedTeamRef();
   const keepFilters = forceRefresh && selectedTeamEmployee === employee;
   selectedTeamEmployee = employee;
+  const requestId = ++teamMemberUsageRequestId;
   teamMemberUsageData = [];
   teamMemberUsageSummary = null;
   if (!keepFilters) teamMemberUsageFilters = { date: "all", model: "all", status: "all", keyword: "" };
   isTeamMemberLoading = true;
+  updateTeamMemberLoadingLabels();
+  if (scrollToTop) scrollToPageTop();
   renderTeam();
   const { startDate, endDate } = selectedDateRange();
   const source = el("sourceSelect").value;
@@ -2094,6 +2116,7 @@ async function loadTeamMemberData(employee, forceRefresh = false, scrollToTop = 
   if (forceRefresh) query.set("refresh", "1");
   try {
     const payload = await api(`/api/team/member/usage?${query.toString()}`);
+    if (requestId !== teamMemberUsageRequestId) return;
     teamMemberUsageData = payload.rows || [];
     teamMemberUsageSummary = payload.summary || null;
     const employeePayload = payload.employee || {};
@@ -2101,13 +2124,15 @@ async function loadTeamMemberData(employee, forceRefresh = false, scrollToTop = 
     if (employeeId && employeeId !== selectedTeamEmployee) selectedTeamEmployee = employeeId;
     setText("teamLimitHint", "成员排行保留当前团队汇总，已切换上方看板为所选成员明细");
   } catch (error) {
+    if (requestId !== teamMemberUsageRequestId) return;
     showToast(error.message || "成员用量明细加载失败");
     teamMemberUsageData = [];
     teamMemberUsageSummary = null;
   } finally {
-    isTeamMemberLoading = false;
-    renderTeam();
-    if (scrollToTop) scrollToPageTop();
+    if (requestId === teamMemberUsageRequestId) {
+      isTeamMemberLoading = false;
+      renderTeam();
+    }
   }
 }
 
