@@ -1,5 +1,13 @@
 # Repository Guidelines
 
+## Concurrent User Edits Are Normal
+
+Agent 工作期间，用户可能会同时手动修改仓库中的文件。这是正常协作方式，不是异常情况：
+
+- 发现文件内容与预期不符、出现未预期的 diff、或文件在读取后被外部修改时，不要惊慌、不要反复向用户确认，也不要因此中断当前任务。
+- 重新读取相关文件获取最新内容，在最新内容的基础上继续完成当前工作。
+- 提交前照常 review `git diff`，但不要将用户的并发改动视为需要"修复"或回退的问题；若用户改动与本次任务的提交范围无关，遵循现有规则不要将其混入提交。
+
 ## Project Structure & Module Organization
 
 This repository contains a FastAPI backend and a static frontend for the AI usage dashboard.
