@@ -852,9 +852,9 @@
       }
 
       .daily-main-values {
-        display: grid;
-        grid-template-columns: minmax(0, max-content) minmax(142px, 0.34fr);
-        gap: clamp(22px, 4vw, 54px);
+        display: flex;
+        flex-wrap: wrap;
+        gap: 18px clamp(18px, 3vw, 40px);
         align-items: baseline;
         justify-content: space-between;
         position: relative;
@@ -865,15 +865,22 @@
         min-width: 0;
       }
 
+      .daily-main-values > div:first-child {
+        flex: 1 1 190px;
+        min-width: 190px;
+      }
+
       .daily-main-values > div:last-child {
-        justify-self: end;
+        flex: 0 0 auto;
+        min-width: max-content;
+        margin-left: auto;
         text-align: left;
       }
 
       .daily-value {
         display: block;
         margin-top: 6px;
-        font-size: clamp(34px, 5vw, 58px);
+        font-size: clamp(30px, calc(1.6rem + 1.6vw), 54px);
         line-height: 0.95;
         letter-spacing: 0;
         font-weight: 900;
@@ -883,12 +890,15 @@
       .daily-money {
         display: block;
         margin-top: 6px;
-        font-size: clamp(24px, 2.4vw, 34px);
+        font-size: clamp(22px, calc(1rem + 1vw), 32px);
         line-height: 1;
         letter-spacing: 0;
         font-weight: 900;
         color: var(--gold);
-        overflow-wrap: anywhere;
+        overflow-wrap: normal;
+        word-break: normal;
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
       }
 
       .daily-stat-card {
@@ -3026,7 +3036,20 @@
           grid-template-columns: 90px 1fr 72px;
         }
 
-        .daily-main-values,
+        .daily-main-values {
+          display: grid;
+          grid-template-columns: 1fr;
+        }
+
+        .daily-main-values > div:first-child {
+          min-width: 0;
+        }
+
+        .daily-main-values > div:last-child {
+          min-width: 0;
+          margin-left: 0;
+        }
+
         .key-meta {
           grid-template-columns: 1fr;
         }
