@@ -157,6 +157,23 @@ def test_usage_store_environment_requires_both_enable_flag_and_dsn(monkeypatch) 
     assert UsageStore.from_environment() is None
 
 
+def test_usage_store_date_values_are_asyncpg_compatible() -> None:
+    usage_record = UsageStore._usage_record(
+        "primary",
+        {"date": "2026-07-22", "_userId": "alice", "model": "gpt-4o"},
+        datetime.now(timezone.utc),
+    )
+    membership_record = UsageStore._membership_record(
+        "primary",
+        {"snapshotDate": "2026-07-22", "teamId": "team-1", "userId": "alice"},
+    )
+
+    assert usage_record[1] == date(2026, 7, 22)
+    assert isinstance(usage_record[1], date)
+    assert membership_record[1] == date(2026, 7, 22)
+    assert isinstance(membership_record[1], date)
+
+
 def test_usage_schema_is_idempotent_and_uses_aggregate_only_columns() -> None:
     from backend.usage_store import USAGE_SCHEMA
 

@@ -98,6 +98,14 @@ def _as_float(value: Any) -> float:
         return 0.0
 
 
+def _as_date(value: Any) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(_clean_text(value)[:10])
+
+
 def empty_totals() -> dict[str, Any]:
     return {
         "promptTokens": 0,
@@ -218,8 +226,8 @@ class UsageStore:
                 RETURNING id
                 """,
                 datetime.now(timezone.utc),
-                start_date,
-                end_date,
+                _as_date(start_date),
+                _as_date(end_date),
             )
         )
 
@@ -251,7 +259,7 @@ class UsageStore:
         user_id = _clean_text(row.get("_userId") or row.get("userId")) or "unknown"
         return (
             backend_id,
-            _clean_text(row.get("date")),
+            _as_date(row.get("date")),
             user_id,
             _clean_text(row.get("employeeEmail") or row.get("employee_email")),
             _clean_text(row.get("employeeName") or row.get("employee_name")),
@@ -293,7 +301,7 @@ class UsageStore:
     def _membership_record(backend_id: str, row: dict[str, Any]) -> tuple[Any, ...]:
         return (
             backend_id,
-            _clean_text(row.get("snapshotDate")),
+            _as_date(row.get("snapshotDate")),
             _clean_text(row.get("teamId")),
             _clean_text(row.get("teamName")),
             _clean_text(row.get("userId")) or "unknown",
@@ -323,20 +331,20 @@ class UsageStore:
                 await connection.execute(
                     "DELETE FROM usage_daily WHERE backend_id = $1 AND usage_date BETWEEN $2::date AND $3::date",
                     backend_id,
-                    start_date,
-                    end_date,
+                    _as_date(start_date),
+                    _as_date(end_date),
                 )
                 await connection.execute(
                     "DELETE FROM usage_team_membership_daily WHERE backend_id = $1 AND snapshot_date BETWEEN $2::date AND $3::date",
                     backend_id,
-                    start_date,
-                    end_date,
+                    _as_date(start_date),
+                    _as_date(end_date),
                 )
                 await connection.execute(
                     "DELETE FROM usage_sync_coverage WHERE backend_id = $1 AND usage_date BETWEEN $2::date AND $3::date",
                     backend_id,
-                    start_date,
-                    end_date,
+                    _as_date(start_date),
+                    _as_date(end_date),
                 )
                 if usage_records:
                     await connection.executemany(
@@ -383,15 +391,15 @@ class UsageStore:
                     ON CONFLICT (backend_id, usage_date) DO UPDATE SET synced_at = EXCLUDED.synced_at
                     """,
                     backend_id,
-                    start_date,
-                    end_date,
+                    _as_date(start_date),
+                    _as_date(end_date),
                     collected_at,
                 )
         return len(usage_records)
 
     async def latest_sync_at(self, start_date: str, end_date: str, backend_ids: list[str] | None = None) -> datetime | None:
         backend_filter = ""
-        args: list[Any] = [start_date, end_date]
+        args: list[Any] = [_as_date(start_date), _as_date(end_date)]
         if backend_ids:
             backend_filter = " AND backend_id = ANY($3::text[])"
             args.append(backend_ids)
@@ -413,8 +421,8 @@ class UsageStore:
             WHERE backend_id = $1 AND usage_date BETWEEN $2::date AND $3::date
             """,
             backend_id,
-            start_date,
-            end_date,
+            _as_date(start_date),
+            _as_date(end_date),
         )
 
     async def has_coverage(self, start_date: str, end_date: str, backend_ids: list[str]) -> bool:
@@ -431,8 +439,8 @@ class UsageStore:
             GROUP BY backend_id
             HAVING COUNT(*) = (($2::date - $1::date) + 1)
             """,
-            start_date,
-            end_date,
+            _as_date(start_date),
+            _as_date(end_date),
             backend_ids,
         )
         return [str(record["backend_id"]) for record in records]
@@ -443,7 +451,7 @@ class UsageStore:
 
     async def _fetch_usage(self, start_date: str, end_date: str, backend_ids: list[str] | None = None) -> list[dict[str, Any]]:
         backend_filter = ""
-        args: list[Any] = [start_date, end_date]
+        args: list[Any] = [_as_date(start_date), _as_date(end_date)]
         if backend_ids:
             backend_filter = " AND backend_id = ANY($3::text[])"
             args.append(backend_ids)
@@ -524,8 +532,8 @@ class UsageStore:
               AND backend_id = ANY($4::text[])
               AND ($5 = 'all' OR source = $5)
             """,
-            start_date,
-            end_date,
+            _as_date(start_date),
+            _as_date(end_date),
             email.strip().lower(),
             covered,
             source or "all",
@@ -616,7 +624,7 @@ class UsageStore:
 
     async def _membership_rows(self, start_date: str, end_date: str, backend_id: str | None = None, team_id: str | None = None) -> list[Any]:
         conditions = ["snapshot_date BETWEEN $1::date AND $2::date"]
-        args: list[Any] = [start_date, end_date]
+        args: list[Any] = [_as_date(start_date), _as_date(end_date)]
         if backend_id:
             args.append(backend_id)
             conditions.append(f"backend_id = ${len(args)}")
@@ -643,8 +651,8 @@ class UsageStore:
               AND u.backend_id = ANY($3::text[])
               AND ($4 = 'all' OR u.source = $4)
             """,
-            start_date,
-            end_date,
+            _as_date(start_date),
+            _as_date(end_date),
             covered,
             source or "all",
         )
@@ -717,8 +725,8 @@ class UsageStore:
             """,
             backend_id,
             team_id,
-            start_date,
-            end_date,
+            _as_date(start_date),
+            _as_date(end_date),
             source or "all",
         )
         rows = []
