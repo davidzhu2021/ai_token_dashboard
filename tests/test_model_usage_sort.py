@@ -105,7 +105,7 @@ def test_model_usage_counts_aggregate_model_groups_across_dates_and_backends() -
     assert {backend_id for backend_id, _, _ in calls} == {"primary", "secondary"}
 
 
-def test_model_usage_counts_includes_failed_requests_and_prefers_model_groups() -> None:
+def test_model_usage_counts_prefers_models_over_model_groups() -> None:
     client = make_client()
 
     async def fake_request_backend(_backend: LiteLLMBackend, _method: str, path: str, **_kwargs: Any) -> Any:
@@ -124,8 +124,119 @@ def test_model_usage_counts_includes_failed_requests_and_prefers_model_groups() 
 
     counts = asyncio.run(client.model_usage_counts("2026-07-01", "2026-07-01"))
 
-    # api_requests is the frequency measure, regardless of success/failure split.
-    assert counts == {"gpt-4o": 14}
+    assert counts == {"gpt-4o": 198, "wrong-fallback": 100}
+
+
+def test_usage_from_logs_prefers_actual_model_id_and_falls_back_in_order() -> None:
+    client = make_client()
+    client.backends = [client.backends[0]]
+    client._backend_map = {backend.id: backend for backend in client.backends}
+
+    async def fake_request_backend(_backend: LiteLLMBackend, _method: str, path: str, **_kwargs: Any) -> Any:
+        assert path == "/spend/logs/v2"
+        return {
+            "logs": [
+                {
+                    "startTime": "2026-07-01T01:00:00Z",
+                    "model": "gpt-4o",
+                    "model_group": "auto-router",
+                    "model_id": "claude-sonnet-4-deploy",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+                {
+                    "startTime": "2026-07-01T02:00:00Z",
+                    "model": "request-model",
+                    "model_group": "fallback-group",
+                    "litellm_model_name": "provider-model",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "total_tokens": 5,
+                },
+                {
+                    "startTime": "2026-07-01T03:00:00Z",
+                    "model_group": "fallback-group",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            ],
+            "total_pages": 1,
+        }
+
+    client.request_backend = fake_request_backend  # type: ignore[assignment]
+
+    rows = asyncio.run(client._usage_from_logs("user-1", "2026-07-01", "2026-07-01", "all"))
+
+    assert [(row["model"], row["totalTokens"]) for row in rows] == [
+        ("claude-sonnet-4-deploy", 15),
+        ("fallback-group", 2),
+        ("provider-model", 5),
+    ]
+
+
+def test_daily_activity_expands_actual_models_from_breakdown() -> None:
+    client = make_client()
+
+    rows = client._rows_from_daily_activity_item(
+        {
+            "date": "2026-07-01",
+            "model_group": "auto-router",
+            "metrics": {"total_tokens": 999, "api_requests": 99},
+            "breakdown": {
+                "models": {
+                    "claude-sonnet-4-deploy": {
+                        "metrics": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 5,
+                            "total_tokens": 15,
+                            "api_requests": 2,
+                            "successful_requests": 2,
+                            "spend": 0.12,
+                        }
+                    },
+                    "gpt-4o-deploy": {
+                        "metrics": {
+                            "prompt_tokens": 7,
+                            "completion_tokens": 3,
+                            "total_tokens": 10,
+                            "api_requests": 1,
+                            "failed_requests": 1,
+                            "spend": 0.08,
+                        }
+                    },
+                }
+            },
+        },
+        "Cursor",
+    )
+
+    assert [(row["model"], row["totalTokens"], row["requestCount"]) for row in rows] == [
+        ("claude-sonnet-4-deploy", 15, 2),
+        ("gpt-4o-deploy", 10, 1),
+    ]
+
+
+def test_daily_activity_falls_back_to_model_groups_when_models_missing() -> None:
+    client = make_client()
+
+    rows = client._rows_from_daily_activity_item(
+        {
+            "date": "2026-07-01",
+            "breakdown": {
+                "model_groups": {
+                    "auto-router": {"metrics": {"total_tokens": 15, "api_requests": 2}},
+                }
+            },
+            "metrics": {"total_tokens": 15, "api_requests": 2},
+        },
+        "Cursor",
+    )
+
+    assert rows[0]["model"] == "auto-router"
+    assert rows[0]["totalTokens"] == 15
+    assert rows[0]["requestCount"] == 2
 
 
 def test_model_usage_counts_falls_back_to_legacy_models_breakdown() -> None:

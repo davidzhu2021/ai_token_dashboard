@@ -128,6 +128,15 @@ def _date_text(value: Any) -> str:
     return text[:10]
 
 
+def _metrics_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        metrics = value.get("metrics")
+        if isinstance(metrics, dict):
+            return metrics
+        return value
+    return {}
+
+
 def usage_timezone_offset_minutes() -> int:
     raw_value = os.getenv("USAGE_TIMEZONE_OFFSET_MINUTES", "-480")
     try:
@@ -334,6 +343,22 @@ class LiteLLMClient:
             backend_id, user_id = account_id.split(":", 1)
             return self._backend_map.get(backend_id, self.backends[0]), user_id
         return self.backends[0], account_id
+
+    @staticmethod
+    def _usage_model_name(record: dict[str, Any], fallback: str = "未知模型") -> str:
+        for field in ("model_id", "litellm_model_name", "model", "model_group"):
+            value = _clean_text(_first(record, field, default=""))
+            if value:
+                return value
+        breakdown = record.get("breakdown") if isinstance(record.get("breakdown"), dict) else {}
+        for field in ("models", "model_groups"):
+            bucket = breakdown.get(field)
+            if isinstance(bucket, dict):
+                for name in bucket.keys():
+                    value = _clean_text(name)
+                    if value:
+                        return value
+        return fallback
 
     def _is_backend_usage_account(self, backend: LiteLLMBackend, user_id: Any) -> bool:
         text = _clean_text(user_id).lower()
@@ -787,7 +812,7 @@ class LiteLLMClient:
                 detected_source = backend.source or detect_source(log)
                 if source and source != "all" and detected_source != source:
                     continue
-                model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
+                model = self._usage_model_name(log)
                 day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
                 key = (day, detected_source, model)
                 row = grouped.setdefault(key, self._empty_usage_row(day, detected_source, model))
@@ -828,9 +853,7 @@ class LiteLLMClient:
 
     def _row_from_daily_activity_item(self, item: dict[str, Any], source: str, fallback_model: str = "全部模型") -> dict[str, Any]:
         metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else item
-        breakdown = item.get("breakdown") if isinstance(item.get("breakdown"), dict) else {}
-        models = breakdown.get("models") if isinstance(breakdown.get("models"), dict) else {}
-        model = str(_first(item, "model", "model_group", default=None) or next(iter(models.keys()), fallback_model))
+        model = self._usage_model_name(item, fallback_model)
         prompt = _as_int(_first(metrics, "prompt_tokens", "promptTokens", "total_prompt_tokens"))
         completion = _as_int(_first(metrics, "completion_tokens", "completionTokens", "total_completion_tokens"))
         total = _as_int(_first(metrics, "total_tokens", "totalTokens", default=prompt + completion))
@@ -851,6 +874,43 @@ class LiteLLMClient:
             "failureCount": failures,
             "spend": _as_number(_first(metrics, "spend", "total_spend")),
         }
+
+    def _rows_from_daily_activity_item(self, item: dict[str, Any], source: str) -> list[dict[str, Any]]:
+        breakdown = item.get("breakdown") if isinstance(item.get("breakdown"), dict) else {}
+        models = breakdown.get("models") if isinstance(breakdown.get("models"), dict) else {}
+        if models:
+            day = _date_text(_first(item, "date", "day"))
+            rows: list[dict[str, Any]] = []
+            for model_name, model_value in models.items():
+                model = _clean_text(model_name)
+                if not model:
+                    continue
+                metrics = _metrics_dict(model_value)
+                prompt = _as_int(_first(metrics, "prompt_tokens", "promptTokens", "total_prompt_tokens"))
+                completion = _as_int(_first(metrics, "completion_tokens", "completionTokens", "total_completion_tokens"))
+                total = _as_int(_first(metrics, "total_tokens", "totalTokens", default=prompt + completion))
+                requests = _as_int(_first(metrics, "api_requests", "total_api_requests", "requestCount"))
+                successes = _as_int(_first(metrics, "successful_requests", "total_successful_requests", "successCount"))
+                failures = _as_int(_first(metrics, "failed_requests", "total_failed_requests", "failureCount"))
+                if not successes and requests:
+                    successes = max(0, requests - failures)
+                rows.append(
+                    {
+                        "date": day,
+                        "source": source,
+                        "model": model,
+                        "promptTokens": prompt,
+                        "completionTokens": completion,
+                        "totalTokens": total,
+                        "requestCount": requests,
+                        "successCount": successes,
+                        "failureCount": failures,
+                        "spend": _as_number(_first(metrics, "spend", "total_spend")),
+                    }
+                )
+            if rows:
+                return rows
+        return [self._row_from_daily_activity_item(item, source)]
 
     async def _usage_from_daily_activity(
         self,
@@ -874,7 +934,7 @@ class LiteLLMClient:
             payload = await self.request_backend(backend, "GET", "/user/daily/activity", params=params)
         rows = []
         for item in _records(payload):
-            rows.append(self._row_from_daily_activity_item(item, source_override or "其他"))
+            rows.extend(self._rows_from_daily_activity_item(item, source_override or "其他"))
         return rows
 
     async def keys_for_user(self, user_id: str, backend: LiteLLMBackend | None = None, refresh: bool = False) -> list[dict[str, Any]]:
@@ -1481,7 +1541,7 @@ class LiteLLMClient:
 
                     employee_key = employee_info["id"]
                     employees.setdefault(employee_key, employee_info)
-                    model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
+                    model = self._usage_model_name(log)
                     day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
                     key = (day, employee_key, detected_source, model)
                     row = grouped.setdefault(key, self._admin_empty_row(day, employee_info, detected_source, model))
@@ -1957,7 +2017,7 @@ class LiteLLMClient:
                     department_id = department_info["id"]
                     departments.setdefault(department_id, department_info)
                     employees.setdefault(employee_info["id"], employee_info)
-                    model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
+                    model = self._usage_model_name(log)
                     day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
                     key = (day, department_id, employee_info["id"], detected_source, model)
                     row = grouped.setdefault(key, self._department_empty_row(day, department_info, detected_source, model, employee_info))
@@ -2114,7 +2174,7 @@ class LiteLLMClient:
                 employee_info = self._employee_info_from_log(log, user_map, backend, account_index)
                 employee_key = employee_info["id"]
                 employees.setdefault(employee_key, employee_info)
-                model = str(_first(log, "model", "model_group", "model_id", default="未知模型"))
+                model = self._usage_model_name(log)
                 day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
                 key = (day, employee_key, detected_source, model)
                 row = grouped.setdefault(key, self._admin_empty_row(day, employee_info, detected_source, model))
@@ -2286,7 +2346,7 @@ class LiteLLMClient:
             breakdown = item.get("breakdown") if isinstance(item.get("breakdown"), dict) else {}
             model_groups = breakdown.get("model_groups") if isinstance(breakdown.get("model_groups"), dict) else {}
             models = breakdown.get("models") if isinstance(breakdown.get("models"), dict) else {}
-            buckets = model_groups or models
+            buckets = models or model_groups
             for model_name, value in buckets.items():
                 normalized_name = LiteLLMClient._normalized_model_name(model_name)
                 if not normalized_name or not isinstance(value, dict):

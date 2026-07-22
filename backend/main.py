@@ -260,15 +260,15 @@ async def cached_resolve_user(email: str, name: str | None = None, refresh: bool
 
 
 def personal_usage_cache_key(email: str, start_date: str, end_date: str, source: str) -> str:
-    return f"usage:v3:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
+    return f"usage:v5:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def admin_usage_cache_key(email: str, start_date: str, end_date: str, source: str, employee: str | None) -> str:
-    return f"admin-usage:v2:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(employee or '').strip().lower()}"
+    return f"admin-usage:v4:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(employee or '').strip().lower()}"
 
 
 def department_usage_cache_key(email: str, start_date: str, end_date: str, source: str, department: str | None) -> str:
-    return f"department-usage:v2:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(department or '').strip().lower()}"
+    return f"department-usage:v4:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(department or '').strip().lower()}"
 
 
 def team_auth_cache_key(email: str, name: str | None) -> str:
@@ -276,11 +276,11 @@ def team_auth_cache_key(email: str, name: str | None) -> str:
 
 
 def team_usage_cache_key(email: str, team: dict[str, Any], start_date: str, end_date: str, source: str) -> str:
-    return f"team-usage:v2:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{start_date}:{end_date}:{source or 'all'}"
+    return f"team-usage:v4:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def team_member_usage_cache_key(email: str, team: dict[str, Any], employee: str, start_date: str, end_date: str, source: str) -> str:
-    return f"team-member-usage:v1:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{employee.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
+    return f"team-member-usage:v3:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{employee.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def team_ref(team: dict[str, Any]) -> str:
