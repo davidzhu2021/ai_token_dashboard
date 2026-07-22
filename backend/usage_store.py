@@ -458,7 +458,8 @@ class UsageStore:
             """,
             *args,
         )
-        return [self._usage_row(record) for record in records]
+        rows = [self._usage_row(record) for record in records]
+        return self._merge_rows_by(rows, ("_backendId", "date", "_userId", "source", "model"))
 
     @staticmethod
     def _usage_row(record: Any) -> dict[str, Any]:
@@ -665,6 +666,7 @@ class UsageStore:
                 }
             )
             rows.append(row)
+        rows = self._merge_rows_by(rows, ("_backendId", "date", "_userId", "departmentId", "source", "model"))
         departments = self._group_rows(rows, ("departmentId", "departmentName"))
         department_sources: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
         department_employees: dict[str, set[str]] = defaultdict(set)
@@ -731,6 +733,7 @@ class UsageStore:
                 }
             )
             rows.append(row)
+        rows = self._merge_rows_by(rows, ("_backendId", "date", "_userId", "source", "model"))
         latest_members: dict[str, Any] = {}
         for member in memberships:
             key = str(member["user_id"])

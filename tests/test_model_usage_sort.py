@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 from fastapi import HTTPException
 
-from backend.litellm_client import LiteLLMBackend, LiteLLMClient
+from backend.litellm_client import LiteLLMBackend, LiteLLMClient, normalize_model_display_name
 from backend.cache import TTLCache
 
 
@@ -423,3 +423,123 @@ def test_models_keep_catalog_when_one_usage_source_fails(monkeypatch: pytest.Mon
     models = asyncio.run(client.models())
 
     assert [item["modelName"] for item in models] == ["high", "low"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("chatgpt-acct-84-gpt-5.6-terra", "gpt-5.6-terra"),
+        ("claude-acct-2-sonnet-x", "sonnet-x"),
+        ("ChatGPT-Acct-12-GPT-5.6", "GPT-5.6"),
+        ("  chatgpt-acct-84-gpt-5.6-terra  ", "gpt-5.6-terra"),
+        ("claude-opus-4-8", "claude-opus-4-8"),
+        ("my-model-acct-3-v2", "my-model-acct-3-v2"),
+        ("gpt-acct-x-y", "gpt-acct-x-y"),
+        ("chatgpt-acct-84-", "chatgpt-acct-84-"),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_normalize_model_display_name_strips_account_alias_prefixes(raw: Any, expected: str) -> None:
+    assert normalize_model_display_name(raw) == expected
+
+
+def test_usage_from_logs_merges_account_alias_models() -> None:
+    client = make_client()
+    client.backends = [client.backends[0]]
+    client._backend_map = {backend.id: backend for backend in client.backends}
+
+    async def fake_request_backend(_backend: LiteLLMBackend, _method: str, path: str, **_kwargs: Any) -> Any:
+        assert path == "/spend/logs/v2"
+        return {
+            "logs": [
+                {
+                    "startTime": "2026-07-01T01:00:00Z",
+                    "model_id": "chatgpt-acct-84-gpt-5.6-terra",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+                {
+                    "startTime": "2026-07-01T02:00:00Z",
+                    "model_id": "chatgpt-acct-33-gpt-5.6-terra",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "total_tokens": 5,
+                },
+                {
+                    "startTime": "2026-07-01T03:00:00Z",
+                    "model_id": "claude-opus-4-8",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            ],
+            "total_pages": 1,
+        }
+
+    client.request_backend = fake_request_backend  # type: ignore[assignment]
+
+    rows = asyncio.run(client._usage_from_logs("user-1", "2026-07-01", "2026-07-01", "all"))
+
+    assert [(row["model"], row["totalTokens"], row["requestCount"]) for row in rows] == [
+        ("claude-opus-4-8", 2, 1),
+        ("gpt-5.6-terra", 20, 2),
+    ]
+
+
+def test_daily_activity_merges_account_alias_breakdown_models() -> None:
+    client = make_client()
+
+    rows = client._rows_from_daily_activity_item(
+        {
+            "date": "2026-07-01",
+            "breakdown": {
+                "models": {
+                    "chatgpt-acct-84-gpt-5.6-terra": {
+                        "metrics": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 5,
+                            "total_tokens": 15,
+                            "api_requests": 2,
+                            "successful_requests": 2,
+                            "spend": 0.12,
+                        }
+                    },
+                    "CHATGPT-ACCT-96-gpt-5.6-terra": {
+                        "metrics": {
+                            "prompt_tokens": 7,
+                            "completion_tokens": 3,
+                            "total_tokens": 10,
+                            "api_requests": 1,
+                            "failed_requests": 1,
+                            "spend": 0.08,
+                        }
+                    },
+                    "claude-opus-4-8": {
+                        "metrics": {
+                            "prompt_tokens": 2,
+                            "completion_tokens": 2,
+                            "total_tokens": 4,
+                            "api_requests": 1,
+                            "successful_requests": 1,
+                            "spend": 0.02,
+                        }
+                    },
+                }
+            },
+        },
+        "Codex",
+    )
+
+    by_model = {row["model"]: row for row in rows}
+    assert set(by_model) == {"gpt-5.6-terra", "claude-opus-4-8"}
+    merged = by_model["gpt-5.6-terra"]
+    assert merged["promptTokens"] == 17
+    assert merged["completionTokens"] == 8
+    assert merged["totalTokens"] == 25
+    assert merged["requestCount"] == 3
+    assert merged["successCount"] == 2
+    assert merged["failureCount"] == 1
+    assert merged["spend"] == pytest.approx(0.2)
+    assert by_model["claude-opus-4-8"]["totalTokens"] == 4

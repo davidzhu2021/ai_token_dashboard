@@ -82,6 +82,63 @@ def test_coalesce_usage_rows_prevents_duplicate_upsert_records() -> None:
     assert result[0]["totalTokens"] == 5
 
 
+def test_usage_record_normalizes_account_alias_models() -> None:
+    record = UsageStore._usage_record(
+        "primary",
+        {
+            "date": "2026-07-22",
+            "_userId": "alice",
+            "source": "Codex",
+            "model": "chatgpt-acct-84-gpt-5.6-terra",
+            "totalTokens": 3,
+        },
+        datetime.now(timezone.utc),
+    )
+
+    assert record[6] == "gpt-5.6-terra"
+
+
+def test_usage_row_normalizes_account_alias_models_from_history() -> None:
+    row = UsageStore._usage_row(
+        {
+            "usage_date": date(2026, 7, 22),
+            "source": "Codex",
+            "model": "chatgpt-acct-33-gpt-5.6-terra",
+            "prompt_tokens": 1,
+            "completion_tokens": 2,
+            "total_tokens": 3,
+            "request_count": 1,
+            "success_count": 1,
+            "failure_count": 0,
+            "spend": 0.01,
+            "backend_id": "primary",
+            "user_id": "alice",
+            "employee_email": "alice@example.com",
+            "employee_name": "Alice",
+        }
+    )
+
+    assert row["model"] == "gpt-5.6-terra"
+
+
+def test_merge_rows_by_sums_duplicate_normalized_models() -> None:
+    rows = [
+        {"_backendId": "primary", "date": "2026-07-22", "_userId": "alice", "source": "Codex", "model": "gpt-5.6-terra", "totalTokens": 2, "requestCount": 1, "spend": 0.1, "employeeName": "Alice"},
+        {"_backendId": "primary", "date": "2026-07-22", "_userId": "alice", "source": "Codex", "model": "gpt-5.6-terra", "totalTokens": 3, "requestCount": 2, "spend": 0.2, "employeeName": "Alice"},
+        {"_backendId": "primary", "date": "2026-07-22", "_userId": "alice", "source": "Codex", "model": "claude-opus-4-8", "totalTokens": 4, "requestCount": 1, "spend": 0.3, "employeeName": "Alice"},
+    ]
+
+    result = UsageStore._merge_rows_by(rows, ("_backendId", "date", "_userId", "source", "model"))
+
+    by_model = {item["model"]: item for item in result}
+    assert len(result) == 2
+    assert by_model["gpt-5.6-terra"]["totalTokens"] == 5
+    assert by_model["gpt-5.6-terra"]["requestCount"] == 3
+    assert by_model["gpt-5.6-terra"]["spend"] == 0.1 + 0.2
+    assert by_model["gpt-5.6-terra"]["employeeName"] == "Alice"
+    assert by_model["claude-opus-4-8"]["totalTokens"] == 4
+
+
 def test_usage_sync_date_range_uses_inclusive_days() -> None:
     start, end = UsageSynchronizer.date_range(3, date(2026, 7, 22))
     assert start == "2026-07-20"
