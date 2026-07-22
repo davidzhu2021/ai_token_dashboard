@@ -239,6 +239,7 @@ function renderDailyOverview(config) {
     sideValue,
     sideSub = "当前筛选范围",
     showShare = false,
+    compactSingleDay = false,
   } = config;
   const latest = latestUsageDay(data, summary);
   const latestDate = latest.date || "";
@@ -248,9 +249,13 @@ function renderDailyOverview(config) {
   const rangeSuccesses = sum(data, "successCount");
   const baseId = prefix ? `${prefix}Hero` : "hero";
   const personalOverview = el("personalDailyOverview");
+  const teamOverview = el("teamDailyOverview");
 
   if (showShare && personalOverview) {
     personalOverview.classList.toggle("personal-single-day", selectedDateRange().days === 1);
+  }
+  if (compactSingleDay && teamOverview) {
+    teamOverview.classList.toggle("personal-single-day", selectedDateRange().days === 1);
   }
 
   setText(`${baseId}TotalLabel`, totalLabel);
@@ -492,6 +497,7 @@ function renderTeamMetrics(data) {
   const source = sourceText();
   const scopeLabel = teamScopeLabel();
   const activeMembers = teamEmployees.filter((item) => Number(item.totalTokens || 0) > 0 || Number(item.requestCount || 0) > 0).length;
+  const days = selectedDateRange().days || 1;
   renderDailyOverview({
     prefix: "team",
     data,
@@ -499,7 +505,15 @@ function renderTeamMetrics(data) {
     totalLabel: "所选范围 Token",
     sideValue: activeMembers,
     sideSub: "当前筛选范围",
+    compactSingleDay: false,
   });
+  el("teamDailyOverview")?.classList.remove("personal-single-day");
+  el("teamAvgSpendWrap")?.classList.add("hidden");
+  setText("teamActiveLabel", "活跃成员");
+  setText("teamActiveUsers", fmt.format(activeMembers));
+  setText("teamActiveUsersSub", "当前筛选范围");
+  setText("teamAvgSpend", money.format(sum(data, "spend") / days));
+  setText("teamHeroDateSub", "当前筛选下最新日期");
   el("teamTrendBadge").textContent = `${label} · ${source}`;
   el("teamSpendBadge").textContent = `${label} · ${source}`;
   el("teamTrendTitle").textContent = `${scopeLabel}每日 Token 趋势`;
@@ -528,6 +542,9 @@ function renderTeamMemberMetrics(data) {
   const source = sourceText();
   const employee = selectedTeamEmployeeInfo();
   const employeeName = selectedTeamEmployeeLabel();
+  const { days, endDate } = selectedDateRange();
+  const isSingleDay = days === 1;
+  const dailyAvgSpend = days ? sum(data, "spend") / days : 0;
   renderDailyOverview({
     prefix: "team",
     data,
@@ -537,7 +554,16 @@ function renderTeamMemberMetrics(data) {
     sideLabel: "当前成员",
     sideValue: 1,
     sideSub: employee?.employeeEmail || employee?.employeeId || selectedTeamEmployee,
+    compactSingleDay: true,
   });
+  el("teamDailyOverview")?.classList.toggle("personal-single-day", isSingleDay);
+  el("teamAvgSpendWrap")?.classList.toggle("hidden", isSingleDay);
+  setText("teamActiveLabel", "日均 Token");
+  setText("teamActiveUsers", formatTokens(Math.round(sum(data, "totalTokens") / (days || 1))));
+  setText("teamActiveUsersSub", "所选范围日均");
+  setText("teamAvgSpend", money.format(dailyAvgSpend));
+  setText("teamHeroDate", isSingleDay ? endDate.slice(5).replace("-", "/") : selectedDateRangeText());
+  setText("teamHeroDateSub", "当前筛选下最新日期");
   el("teamTrendBadge").textContent = `${label} · ${source}`;
   el("teamSpendBadge").textContent = `${label} · ${source}`;
   el("teamTrendTitle").textContent = `${employeeName}每日 Token 趋势`;
@@ -1106,6 +1132,8 @@ function resetTeamMemberSelection() {
   teamMemberUsageData = [];
   teamMemberUsageSummary = null;
   teamMemberUsageFilters = { date: "all", model: "all", status: "all", keyword: "" };
+  el("teamDailyOverview")?.classList.remove("personal-single-day");
+  el("teamAvgSpendWrap")?.classList.add("hidden");
 }
 
 function loadingLine(width = "100%") {
@@ -1325,6 +1353,18 @@ function renderTeamLoading() {
   setText("teamTrendBadge", `${label} · ${source}`);
   setText("teamSpendBadge", `${label} · ${source}`);
   setText("teamLimitHint", "数据加载中");
+  if (selectedTeamEmployee) {
+    const isSingleDay = selectedDateRange().days === 1;
+    el("teamDailyOverview")?.classList.toggle("personal-single-day", isSingleDay);
+    el("teamAvgSpendWrap")?.classList.toggle("hidden", isSingleDay);
+    setText("teamActiveLabel", "日均 Token");
+    setText("teamHeroDateSub", "当前筛选下最新日期");
+  } else {
+    el("teamDailyOverview")?.classList.remove("personal-single-day");
+    el("teamAvgSpendWrap")?.classList.add("hidden");
+    setText("teamActiveLabel", "活跃成员");
+    setText("teamHeroDateSub", "当前筛选下最新日期");
+  }
   renderMetricSkeleton("teamMetrics");
   renderChartSkeleton("teamTrendChart");
   renderChartSkeleton("teamSpendChart");

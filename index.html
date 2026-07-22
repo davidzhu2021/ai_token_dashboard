@@ -3508,7 +3508,7 @@
               <select id="teamSelect" class="select" aria-label="选择团队"></select>
             </div>
 
-            <section class="daily-overview" aria-label="所选范围团队用量摘要">
+            <section id="teamDailyOverview" class="daily-overview" aria-label="所选范围团队用量摘要">
               <div class="daily-main-card">
                 <div class="daily-main-head">
                   <span id="teamWelcomeTitle" class="daily-eyebrow">所选范围 · 团队视图</span>
@@ -3545,14 +3545,18 @@
               </div>
               <div class="daily-stat-card">
                 <div class="daily-mini accent">
-                  <span class="daily-label">活跃成员</span>
+                  <span id="teamActiveLabel" class="daily-label">活跃成员</span>
                   <strong id="teamActiveUsers">0</strong>
+                  <div id="teamAvgSpendWrap" class="daily-average-money hidden">
+                    <span class="daily-average-label">日均金额</span>
+                    <strong id="teamAvgSpend">$0.00</strong>
+                  </div>
                   <span id="teamActiveUsersSub" class="daily-sub">当前筛选范围</span>
                 </div>
                 <div class="daily-mini">
                   <span class="daily-label">数据日期</span>
                   <strong id="teamHeroDate" class="daily-date-value">暂无</strong>
-                  <span class="daily-sub">当前筛选下最新日期</span>
+                  <span id="teamHeroDateSub" class="daily-sub">当前筛选下最新日期</span>
                 </div>
               </div>
             </section>
