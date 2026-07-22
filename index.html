@@ -1621,6 +1621,7 @@
       .admin-detail-card {
         display: none;
         margin-bottom: 18px;
+        scroll-margin-top: 82px;
       }
 
       .admin-detail-card.show {
@@ -1634,14 +1635,20 @@
         gap: 14px;
       }
 
+      .admin-detail-head > div {
+        min-width: 0;
+      }
+
       .admin-detail-head h3 {
         margin: 0;
         font-size: 20px;
+        overflow-wrap: anywhere;
       }
 
       .admin-detail-head p {
         margin: 6px 0 0;
         color: var(--muted);
+        overflow-wrap: anywhere;
       }
 
       .admin-employee-row {
@@ -2819,6 +2826,10 @@
           flex-direction: column;
         }
 
+        .admin-detail-card {
+          scroll-margin-top: 16px;
+        }
+
         .admin-search {
           min-width: 0;
           width: 100%;
@@ -3364,7 +3375,17 @@
         </section>
 
         <section id="adminView" class="view-section hidden">
-          <section class="daily-overview" aria-label="所选范围全员用量摘要">
+          <section id="adminDetailCard" class="panel admin-detail-card">
+            <div class="admin-detail-head">
+              <div>
+                <h3 id="adminDetailTitle">员工详情</h3>
+                <p id="adminDetailSubtitle">点击员工排行中的一行查看个人明细。</p>
+              </div>
+              <button id="adminClearEmployee" class="ghost-btn" type="button">返回全员</button>
+            </div>
+          </section>
+
+          <section id="adminDailyOverview" class="daily-overview" aria-label="所选范围全员用量摘要">
             <div class="daily-main-card">
               <div class="daily-main-head">
                 <span id="adminHeroTitle" class="daily-eyebrow">所选范围 · 管理员视图</span>
@@ -3416,16 +3437,6 @@
           </section>
 
           <section id="adminMetrics" class="metrics"></section>
-
-          <section id="adminDetailCard" class="panel admin-detail-card">
-            <div class="admin-detail-head">
-              <div>
-                <h3 id="adminDetailTitle">员工详情</h3>
-                <p id="adminDetailSubtitle">点击员工排行中的一行查看个人明细。</p>
-              </div>
-              <button id="adminClearEmployee" class="ghost-btn" type="button">返回全员</button>
-            </div>
-          </section>
 
           <section class="trend-grid">
             <div class="panel">
@@ -3508,6 +3519,16 @@
               <select id="teamSelect" class="select" aria-label="选择团队"></select>
             </div>
 
+            <section id="teamDetailCard" class="panel admin-detail-card">
+              <div class="admin-detail-head">
+                <div>
+                  <h3 id="teamDetailTitle">成员详情</h3>
+                  <p id="teamDetailSubtitle">点击成员排行中的一行查看个人明细。</p>
+                </div>
+                <button id="teamBackButton" class="ghost-btn hidden" type="button">返回团队总览</button>
+              </div>
+            </section>
+
             <section id="teamDailyOverview" class="daily-overview" aria-label="所选范围团队用量摘要">
               <div class="daily-main-card">
                 <div class="daily-main-head">
@@ -3562,16 +3583,6 @@
             </section>
 
             <section id="teamMetrics" class="metrics"></section>
-
-            <section id="teamDetailCard" class="panel admin-detail-card">
-              <div class="admin-detail-head">
-                <div>
-                  <h3 id="teamDetailTitle">成员详情</h3>
-                  <p id="teamDetailSubtitle">点击成员排行中的一行查看个人明细。</p>
-                </div>
-                <button id="teamBackButton" class="ghost-btn hidden" type="button">返回团队总览</button>
-              </div>
-            </section>
 
             <section class="trend-grid">
               <div class="panel">
@@ -3690,6 +3701,16 @@
         </section>
 
         <section id="departmentView" class="view-section hidden">
+          <section id="departmentDetailCard" class="panel admin-detail-card">
+            <div class="admin-detail-head">
+              <div>
+                <h3 id="departmentDetailTitle">员工详情</h3>
+                <p id="departmentDetailSubtitle">点击部门排行中的一行查看部门明细。</p>
+              </div>
+              <button id="departmentClearEmployee" class="ghost-btn" type="button">返回全部部门</button>
+            </div>
+          </section>
+
           <section id="departmentOverviewHero" class="daily-overview" aria-label="所选范围部门用量摘要">
             <div class="daily-main-card">
               <div class="daily-main-head">
@@ -3742,16 +3763,6 @@
           </section>
 
           <section id="departmentMetrics" class="metrics"></section>
-
-          <section id="departmentDetailCard" class="panel admin-detail-card">
-            <div class="admin-detail-head">
-              <div>
-                <h3 id="departmentDetailTitle">员工详情</h3>
-                <p id="departmentDetailSubtitle">点击部门排行中的一行查看部门明细。</p>
-              </div>
-              <button id="departmentClearEmployee" class="ghost-btn" type="button">返回全部部门</button>
-            </div>
-          </section>
 
           <section id="departmentTrendGrid" class="trend-grid">
             <div class="panel">
@@ -3997,6 +4008,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260722-blue-theme"></script>
+    <script src="/assets/app.js?v=20260722-detail-card-top"></script>
   </body>
 </html>

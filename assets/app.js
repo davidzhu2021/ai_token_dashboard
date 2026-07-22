@@ -345,6 +345,13 @@ function sourceText() {
   return source === "all" ? "全部来源" : displaySource(source);
 }
 
+function scrollToDetailCard(id) {
+  const card = el(id);
+  if (!card || card.classList.contains("hidden") || getComputedStyle(card).display === "none") return;
+  const behavior = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ? "auto" : "smooth";
+  card.scrollIntoView({ behavior, block: "start", inline: "nearest" });
+}
+
 function displaySource(source) {
   return sourceLabels[source] || source || "其他";
 }
@@ -976,7 +983,9 @@ async function selectDepartmentOption(item) {
   selectedDepartment = departmentOptionKey(item);
   el("departmentEmployeeSearch").value = departmentOptionName(item);
   closeDepartmentPicker();
-  await loadDepartmentData();
+  const loading = loadDepartmentData();
+  scrollToDetailCard("departmentDetailCard");
+  await loading;
 }
 
 async function selectAllDepartments() {
@@ -1313,6 +1322,7 @@ function renderAdminLoading() {
   renderDonutSkeleton("adminDonutTotal", "adminSourceLegend");
   renderBarsSkeleton("adminModelBars");
   renderTableSkeleton("adminUserTable", "adminUserCount", 8);
+  renderAdminDetailCard();
 }
 
 function renderDepartmentLoading() {
@@ -1341,7 +1351,7 @@ function renderDepartmentLoading() {
   setText("departmentTrendBadge", `${label} · ${source}`);
   setText("departmentSpendBadge", `${label} · ${source}`);
   setText("departmentLimitHint", "数据加载中");
-  el("departmentDetailCard").classList.toggle("show", Boolean(selectedDepartment));
+  renderDepartmentDetailCard();
   renderMetricSkeleton("departmentMetrics");
   renderChartSkeleton("departmentTrendChart");
   renderChartSkeleton("departmentSpendChart");
@@ -1419,13 +1429,17 @@ function renderAdmin() {
   renderModelBarsTo("adminModelBars", adminUsageData);
   renderAdminUsers();
 
+  renderAdminDetailCard();
+}
+
+function renderAdminDetailCard() {
   const detailCard = el("adminDetailCard");
+  if (!detailCard) return;
   detailCard.classList.toggle("show", Boolean(selectedAdminEmployee));
-  if (selectedAdminEmployee) {
-    const employee = adminEmployees.find((item) => item.employeeEmail === selectedAdminEmployee || item.employeeId === selectedAdminEmployee);
-    el("adminDetailTitle").textContent = `${employee?.employeeName || selectedAdminEmployee} 的用量详情`;
-    el("adminDetailSubtitle").textContent = employee?.employeeEmail || employee?.employeeId || selectedAdminEmployee;
-  }
+  if (!selectedAdminEmployee) return;
+  const employee = adminEmployees.find((item) => item.employeeEmail === selectedAdminEmployee || item.employeeId === selectedAdminEmployee);
+  el("adminDetailTitle").textContent = `${employee?.employeeName || selectedAdminEmployee} 的用量详情`;
+  el("adminDetailSubtitle").textContent = employee?.employeeEmail || employee?.employeeId || selectedAdminEmployee;
 }
 
 function renderDepartment() {
@@ -1445,13 +1459,17 @@ function renderDepartment() {
   renderDepartmentUsers();
   renderDepartmentPickerOptions();
 
+  renderDepartmentDetailCard();
+}
+
+function renderDepartmentDetailCard() {
   const detailCard = el("departmentDetailCard");
+  if (!detailCard) return;
   detailCard.classList.toggle("show", Boolean(selectedDepartment));
-  if (selectedDepartment) {
-    const department = selectedDepartmentInfo();
-    el("departmentDetailTitle").textContent = `${department.name} 的部门详情`;
-    el("departmentDetailSubtitle").textContent = `部门 ID：${department.id} · 数据来源：${department.bindStatus} · 下方排行已切换为该部门员工用量`;
-  }
+  if (!selectedDepartment) return;
+  const department = selectedDepartmentInfo();
+  el("departmentDetailTitle").textContent = `${department.name} 的部门详情`;
+  el("departmentDetailSubtitle").textContent = `部门 ID：${department.id} · 数据来源：${department.bindStatus} · 下方排行已切换为该部门员工用量`;
 }
 
 function renderTeamBlocked() {
@@ -2088,15 +2106,7 @@ async function loadTeamData(forceRefresh = false) {
   }
 }
 
-function scrollToPageTop() {
-  try {
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  } catch {
-    window.scrollTo(0, 0);
-  }
-}
-
-async function loadTeamMemberData(employee, forceRefresh = false, scrollToTop = true) {
+async function loadTeamMemberData(employee, forceRefresh = false, scrollToCard = true) {
   if (!currentUser?.isTeamLeader || !leaderTeams.length) return;
   ensureSelectedTeamRef();
   const keepFilters = forceRefresh && selectedTeamEmployee === employee;
@@ -2107,8 +2117,8 @@ async function loadTeamMemberData(employee, forceRefresh = false, scrollToTop = 
   if (!keepFilters) teamMemberUsageFilters = { date: "all", model: "all", status: "all", keyword: "" };
   isTeamMemberLoading = true;
   updateTeamMemberLoadingLabels();
-  if (scrollToTop) scrollToPageTop();
   renderTeam();
+  if (scrollToCard) scrollToDetailCard("teamDetailCard");
   const { startDate, endDate } = selectedDateRange();
   const source = el("sourceSelect").value;
   const query = new URLSearchParams({ start_date: startDate, end_date: endDate, source, employee });
@@ -2328,7 +2338,9 @@ el("adminUserTable").addEventListener("click", async (event) => {
   if (!row) return;
   selectedAdminEmployee = row.dataset.employee;
   el("adminEmployeeSearch").value = "";
-  await loadAdminData();
+  const loading = loadAdminData();
+  scrollToDetailCard("adminDetailCard");
+  await loading;
 });
 
 el("adminClearEmployee").addEventListener("click", async () => {
@@ -2369,7 +2381,9 @@ el("departmentUserTable").addEventListener("click", async (event) => {
   selectedDepartment = row.dataset.department;
   el("departmentEmployeeSearch").value = "";
   closeDepartmentPicker();
-  await loadDepartmentData();
+  const loading = loadDepartmentData();
+  scrollToDetailCard("departmentDetailCard");
+  await loading;
 });
 
 el("departmentClearEmployee").addEventListener("click", async () => {
