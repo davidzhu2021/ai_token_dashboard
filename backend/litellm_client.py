@@ -2091,16 +2091,31 @@ class LiteLLMClient:
         }
 
     def _admin_employee_summaries_with_zeroes(self, rows: list[dict[str, Any]], employees: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-        summaries = {item["employeeId"]: item for item in self._admin_employee_summaries(rows, employees)}
+        summaries: dict[str, dict[str, Any]] = {}
+        for item in self._admin_employee_summaries(rows, employees):
+            email = str(item.get("employeeEmail") or "").strip().lower()
+            identity = email or str(item.get("employeeId") or "").strip().lower()
+            existing = summaries.get(identity)
+            if existing is None:
+                summaries[identity] = item
+                continue
+            for field in ("promptTokens", "completionTokens", "totalTokens", "requestCount", "successCount", "failureCount", "spend"):
+                existing[field] += item.get(field) or 0
+            for user_id in item.get("userIds") or []:
+                if user_id not in existing["userIds"]:
+                    existing["userIds"].append(user_id)
+
         for employee_id, employee in employees.items():
-            summaries.setdefault(
-                employee_id,
+            email = str(employee.get("email") or "").strip().lower()
+            identity = email or str(employee_id).strip().lower()
+            summary = summaries.setdefault(
+                identity,
                 {
-                    "employeeId": employee_id,
+                    "employeeId": employee.get("id") or employee_id,
                     "employeeName": employee.get("name") or employee_id,
-                    "employeeEmail": employee.get("email") or "",
+                    "employeeEmail": email,
                     "bindStatus": employee.get("bindStatus") or "未绑定邮箱",
-                    "userIds": list(employee.get("userIds") or []),
+                    "userIds": [],
                     "promptTokens": 0,
                     "completionTokens": 0,
                     "totalTokens": 0,
@@ -2112,6 +2127,14 @@ class LiteLLMClient:
                     "teamRole": employee.get("teamRole") or "user",
                 },
             )
+            for user_id in employee.get("userIds") or []:
+                if user_id not in summary["userIds"]:
+                    summary["userIds"].append(user_id)
+            if not summary.get("employeeEmail") and email:
+                summary["employeeEmail"] = email
+                summary["bindStatus"] = "已绑定邮箱"
+            if summary.get("teamRole") != "admin" and employee.get("teamRole") == "admin":
+                summary["teamRole"] = "admin"
         return sorted(summaries.values(), key=self._admin_employee_sort_key)
 
     async def team_usage_rows(

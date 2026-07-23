@@ -1055,7 +1055,7 @@ class UsageStore:
             f"""
             WITH filtered AS (
                 SELECT u.*, m.team_role,
-                       lower(COALESCE(NULLIF(u.employee_email, ''), u.user_id)) AS employee_key,
+                       lower(COALESCE(NULLIF(btrim(u.employee_email), ''), btrim(u.user_id))) AS employee_key,
                        {model_sql} AS model_name
                 FROM usage_daily u
                 JOIN usage_team_membership_daily m
@@ -1105,15 +1105,7 @@ class UsageStore:
             }
             for user_id in item["userIds"]:
                 employee_by_user_id[str(user_id)] = item
-        employees: list[dict[str, Any]] = []
-        for member in latest_members:
-            item = employee_by_user_id.get(str(member["user_id"]))
-            if item is None:
-                item = {"employeeId": member["user_id"], "employeeName": member["employee_name"] or member["user_id"], "employeeEmail": member["employee_email"] or "", "bindStatus": "已绑定邮箱" if member["employee_email"] else "未绑定邮箱", **empty_totals(), "primarySource": "其他", "userIds": [member["user_id"]], "teamRole": member["team_role"] or "user"}
-            else:
-                item = dict(item)
-                item["teamRole"] = member["team_role"] or item.get("teamRole") or "user"
-            employees.append(item)
+        employees = self._merge_team_members(latest_members, employee_by_user_id)
         employees.sort(key=lambda item: (-item["totalTokens"], -item["spend"], str(item["employeeName"]).lower()))
         team_name = latest_members[0]["team_name"] or team_id
         summary_records = await pool.fetch(
@@ -1147,6 +1139,33 @@ class UsageStore:
             "dataQuality": {"summarySource": "database", "rankingSource": "database"},
             "lastSyncedAt": await self.latest_sync_at(start_date, end_date, [backend_id]),
         }
+
+    @staticmethod
+    def _merge_team_members(latest_members: list[Any], employee_by_user_id: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        employees_by_identity: dict[str, dict[str, Any]] = {}
+        for member in latest_members:
+            item = employee_by_user_id.get(str(member["user_id"]))
+            if item is None:
+                item = {"employeeId": member["user_id"], "employeeName": member["employee_name"] or member["user_id"], "employeeEmail": member["employee_email"] or "", "bindStatus": "已绑定邮箱" if member["employee_email"] else "未绑定邮箱", **empty_totals(), "primarySource": "其他", "userIds": [member["user_id"]], "teamRole": member["team_role"] or "user"}
+            else:
+                item = dict(item)
+                item["teamRole"] = member["team_role"] or item.get("teamRole") or "user"
+            email = str(item.get("employeeEmail") or member["employee_email"] or "").strip().lower()
+            identity = email or str(item.get("employeeId") or member["user_id"]).strip().lower()
+            existing = employees_by_identity.get(identity)
+            if existing is None:
+                employees_by_identity[identity] = item
+                continue
+            for user_id in item.get("userIds") or []:
+                if user_id not in existing["userIds"]:
+                    existing["userIds"].append(user_id)
+            if not existing.get("employeeEmail") and item.get("employeeEmail"):
+                existing["employeeEmail"] = item["employeeEmail"]
+            if not existing.get("employeeName") and item.get("employeeName"):
+                existing["employeeName"] = item["employeeName"]
+            if existing.get("teamRole") != "admin" and item.get("teamRole") == "admin":
+                existing["teamRole"] = "admin"
+        return list(employees_by_identity.values())
 
     async def team_member_rows(self, backend_id: str, team_id: str, employee: str, start_date: str, end_date: str, source: str) -> dict[str, Any] | None:
         if not await self.has_coverage(start_date, end_date, [backend_id]):

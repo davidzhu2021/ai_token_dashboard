@@ -82,6 +82,45 @@ def test_coalesce_usage_rows_prevents_duplicate_upsert_records() -> None:
     assert result[0]["totalTokens"] == 5
 
 
+def test_team_member_ranking_merges_accounts_by_normalized_email() -> None:
+    members = [
+        {"user_id": "alice-1", "employee_email": " Alice@example.com ", "employee_name": "Alice", "team_role": "user"},
+        {"user_id": "alice-2", "employee_email": "alice@EXAMPLE.com", "employee_name": "Alice", "team_role": "admin"},
+        {"user_id": "bob-1", "employee_email": "bob@example.com", "employee_name": "Bob", "team_role": "user"},
+        {"user_id": "shared-name-1", "employee_email": "", "employee_name": "Shared", "team_role": "user"},
+        {"user_id": "shared-name-2", "employee_email": "", "employee_name": "Shared", "team_role": "user"},
+    ]
+    alice_summary = {
+        "employeeId": "alice-1",
+        "employeeName": "Alice",
+        "employeeEmail": "alice@example.com",
+        "bindStatus": "已绑定邮箱",
+        "promptTokens": 70,
+        "completionTokens": 30,
+        "totalTokens": 100,
+        "requestCount": 4,
+        "successCount": 4,
+        "failureCount": 0,
+        "spend": 1.5,
+        "primarySource": "Codex",
+        "userIds": ["alice-1", "alice-2"],
+        "teamRole": "user",
+    }
+
+    result = UsageStore._merge_team_members(
+        members,
+        {"alice-1": alice_summary, "alice-2": alice_summary},
+    )
+
+    assert len(result) == 4
+    alice = next(item for item in result if item["employeeEmail"] == "alice@example.com")
+    assert alice["userIds"] == ["alice-1", "alice-2"]
+    assert alice["totalTokens"] == 100
+    assert alice["requestCount"] == 4
+    assert alice["teamRole"] == "admin"
+    assert len([item for item in result if item["employeeName"] == "Shared"]) == 2
+
+
 def test_usage_record_normalizes_account_alias_models() -> None:
     record = UsageStore._usage_record(
         "primary",
