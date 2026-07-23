@@ -622,7 +622,32 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
     return payload
 
 
+async def batched_person_usage_rows(
+    emails: list[str],
+    start_date: str,
+    end_date: str,
+    source: str,
+    refresh: bool = False,
+) -> dict[str, dict[str, Any]] | None:
+    store = usage_store()
+    if store is None or refresh:
+        return None
+    try:
+        await store.connect()
+        stored = await store.rows_by_employee_emails(emails, start_date, end_date, source, usage_backend_ids())
+        if stored is not None:
+            return stored
+    except Exception:
+        logger.exception("batched employee usage SQL query failed; falling back to upstream")
+    return None
+
+
 async def person_usage_rows(email: str, name: str | None, start_date: str, end_date: str, source: str, refresh: bool = False, extra_user_ids: list[str] | None = None) -> tuple[list[dict[str, Any]], list[str]]:
+    stored = await batched_person_usage_rows([email], start_date, end_date, source, refresh)
+    stored_item = stored.get(email.strip().lower()) if stored is not None else None
+    if stored_item is not None:
+        user_ids = list(dict.fromkeys([str(item).strip() for item in (stored_item.get("userIds") or []) if str(item).strip()] + [str(item).strip() for item in (extra_user_ids or []) if str(item).strip()]))
+        return stored_item["rows"], user_ids
     payload = await personal_usage_payload({"email": email, "name": name or email}, start_date, end_date, source, refresh)
     upstream, _ = await cached_resolve_user(email, name, refresh)
     user_ids = upstream_user_ids(upstream) if upstream.get("matched_accounts") else []
@@ -788,6 +813,7 @@ async def team_usage_payload(
                 payload = dict(payload)
                 last_synced = payload.pop("lastSyncedAt", None)
                 payload["dataFreshness"] = usage_data_freshness(last_synced, start_date, end_date)
+                payload.setdefault("dataQuality", {})["backends"] = usage_backend_ids()
         except Exception:
             logger.exception("local team usage query failed; falling back to upstream")
             payload = None
@@ -909,18 +935,30 @@ async def team_member_rankings_from_accounts(
 ) -> list[dict[str, Any]]:
     rankings: list[dict[str, Any]] = []
     litellm = client()
+    email_rows = await batched_person_usage_rows(
+        [clean_identifier(item.get("employeeEmail")) for item in employees if isinstance(item, dict)],
+        start_date,
+        end_date,
+        source,
+        refresh,
+    )
     for employee in employees:
         if not isinstance(employee, dict):
             continue
         summary = team_employee_empty_summary(employee)
         try:
             email = clean_identifier(employee.get("employeeEmail"))
-            user_ids = await user_ids_for_team_employee(employee, refresh)
-            summary["userIds"] = user_ids
-            if email:
+            stored = email_rows.get(email.lower()) if email_rows is not None and email else None
+            if stored is not None:
+                rows = stored["rows"]
+                summary["userIds"] = stored.get("userIds") or summary["userIds"]
+            else:
+                user_ids = await user_ids_for_team_employee(employee, refresh)
+                summary["userIds"] = user_ids
+            if stored is None and email:
                 rows, user_ids = await person_usage_rows(email, clean_identifier(employee.get("employeeName")), start_date, end_date, source, refresh, user_ids)
                 summary["userIds"] = user_ids
-            else:
+            elif stored is None:
                 rows = await litellm.usage_rows_for_user_ids(user_ids, start_date, end_date, source) if user_ids else []
         except HTTPException:
             rows = []
@@ -964,27 +1002,18 @@ async def team_member_usage_payload(
     selected_employee = find_team_employee(team_payload, employee)
     rows: list[dict[str, Any]] | None = None
     stored_payload: dict[str, Any] | None = None
-    store = usage_store()
-    if store is not None:
-        try:
-            db_started = asyncio.get_running_loop().time()
-            await store.connect()
-            connected_at = asyncio.get_running_loop().time()
-            await prepare_usage_refresh(start_date, end_date, refresh)
-            stored_payload = await store.team_member_rows(str(team["backend"]), str(team["id"]), employee, start_date, end_date, source)
-            queried_at = asyncio.get_running_loop().time()
-            logger.info("team member usage sql refresh=%s connect_ms=%.0f query_ms=%.0f total_ms=%.0f", refresh, (connected_at - db_started) * 1000, (queried_at - connected_at) * 1000, (queried_at - request_started) * 1000)
-            if stored_payload is not None:
-                rows = stored_payload["rows"]
-        except Exception:
-            logger.exception("local team member usage query failed; falling back to upstream")
-    if refresh and rows is None:
-        raise manual_refresh_database_unavailable()
     user_ids = await user_ids_for_team_employee(selected_employee, refresh)
     email = clean_identifier(selected_employee.get("employeeEmail"))
     if email:
-        rows, user_ids = await person_usage_rows(email, clean_identifier(selected_employee.get("employeeName")), start_date, end_date, source, refresh, user_ids)
-        stored_payload = None
+        batched = await batched_person_usage_rows([email], start_date, end_date, source, refresh)
+        if batched is not None and email.lower() in batched:
+            stored_payload = batched[email.lower()]
+            rows = stored_payload["rows"]
+            user_ids = stored_payload.get("userIds") or user_ids
+        else:
+            if refresh and usage_store() is not None:
+                raise manual_refresh_database_unavailable()
+            rows, user_ids = await person_usage_rows(email, clean_identifier(selected_employee.get("employeeName")), start_date, end_date, source, refresh, user_ids)
     if not user_ids:
         raise HTTPException(status_code=404, detail="该团队成员缺少可查询的用量账号")
 

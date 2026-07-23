@@ -250,6 +250,29 @@ def test_model_usage_counts_uses_complete_database_coverage_and_normalizes_model
     assert result == {"gpt-4o": 5}
 
 
+def test_rows_by_employee_emails_requires_all_backends_and_merges_her() -> None:
+    class FakePool:
+        async def fetch(self, query, *_args):
+            if "FROM usage_sync_coverage" in query:
+                return [{"backend_id": "primary"}, {"backend_id": "her"}]
+            return [
+                {"employee_email": "alice@example.com", "usage_date": date(2026, 7, 22), "source": "Cursor", "model": "gpt-5", "prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10, "request_count": 1, "success_count": 1, "failure_count": 0, "spend": 0.1, "user_ids": ["alice-primary"]},
+                {"employee_email": "alice@example.com", "usage_date": date(2026, 7, 22), "source": "Her", "model": "gpt-5", "prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20, "request_count": 2, "success_count": 2, "failure_count": 0, "spend": 0.2, "user_ids": ["alice-her"]},
+            ]
+
+        async def fetchval(self, *_args):
+            return datetime(2026, 7, 22, tzinfo=timezone.utc)
+
+    store = UsageStore("postgresql://unused")
+    store.pool = FakePool()
+    result = asyncio.run(store.rows_by_employee_emails(["alice@example.com"], "2026-07-22", "2026-07-22", "all", ["primary", "her"]))
+
+    assert result is not None
+    alice = result["alice@example.com"]
+    assert sum(row["totalTokens"] for row in alice["rows"]) == 30
+    assert alice["userIds"] == ["alice-her", "alice-primary"]
+
+
 def test_model_usage_counts_returns_none_when_any_backend_lacks_coverage() -> None:
     class FakePool:
         async def fetch(self, query, *_args):

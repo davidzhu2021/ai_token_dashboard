@@ -557,7 +557,7 @@ class UsageStore:
 
     async def personal_rows(self, email: str, start_date: str, end_date: str, source: str, backend_ids: list[str]) -> dict[str, Any] | None:
         covered = await self.covered_backend_ids(start_date, end_date, backend_ids)
-        if not covered:
+        if set(covered) != set(backend_ids):
             return None
         records = await self._require_pool().fetch(
             """
@@ -590,6 +590,57 @@ class UsageStore:
             for record in records
         ]
         return {"rows": self._group_rows(rows, ("date", "source", "model")), "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered)}
+
+    async def rows_by_employee_emails(
+        self,
+        emails: list[str],
+        start_date: str,
+        end_date: str,
+        source: str,
+        backend_ids: list[str],
+    ) -> dict[str, dict[str, Any]] | None:
+        normalized = sorted({str(email).strip().lower() for email in emails if str(email).strip()})
+        if not normalized or set(await self.covered_backend_ids(start_date, end_date, backend_ids)) != set(backend_ids):
+            return None
+        records = await self._require_pool().fetch(
+            """
+            SELECT employee_email, usage_date, source, model, prompt_tokens, completion_tokens,
+                   total_tokens, request_count, success_count, failure_count, spend,
+                   ARRAY_AGG(DISTINCT user_id) AS user_ids
+            FROM usage_daily
+            WHERE usage_date BETWEEN $1::date AND $2::date
+              AND employee_email = ANY($3::text[])
+              AND backend_id = ANY($4::text[])
+              AND ($5 = 'all' OR source = $5)
+            GROUP BY employee_email, usage_date, source, model
+            ORDER BY employee_email, usage_date, source, model
+            """,
+            _as_date(start_date), _as_date(end_date), normalized, backend_ids, source or "all",
+        )
+        result: dict[str, dict[str, Any]] = {email: {"rows": [], "userIds": [], "lastSyncedAt": None} for email in normalized}
+        for record in records:
+            email = str(record["employee_email"] or "").strip().lower()
+            if email not in result:
+                continue
+            result[email]["rows"].append({
+                "date": record["usage_date"].isoformat(),
+                "source": record["source"],
+                "model": normalize_model_display_name(record["model"]) or "未知模型",
+                "promptTokens": _as_int(record["prompt_tokens"]),
+                "completionTokens": _as_int(record["completion_tokens"]),
+                "totalTokens": _as_int(record["total_tokens"]),
+                "requestCount": _as_int(record["request_count"]),
+                "successCount": _as_int(record["success_count"]),
+                "failureCount": _as_int(record["failure_count"]),
+                "spend": _as_float(record["spend"]),
+            })
+            result[email]["userIds"].extend(str(item) for item in (record["user_ids"] or []) if item)
+        last_synced = await self.latest_sync_at(start_date, end_date, backend_ids)
+        for item in result.values():
+            item["rows"] = self._group_rows(item["rows"], ("date", "source", "model"))
+            item["userIds"] = sorted(set(item["userIds"]))
+            item["lastSyncedAt"] = last_synced
+        return result
 
     @staticmethod
     def _aggregate_metrics_sql(prefix: str = "") -> str:
