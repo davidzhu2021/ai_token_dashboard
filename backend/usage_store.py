@@ -1078,9 +1078,14 @@ class UsageStore:
                    u.source, {model_sql} AS model_name,
                    {self._aggregate_metrics_sql('u.')}
             FROM usage_daily u
-            JOIN usage_team_membership_daily m
-              ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
-             AND m.team_id = $2
+            JOIN LATERAL (
+                SELECT m.team_role, m.employee_email, m.employee_name
+                FROM usage_team_membership_daily m
+                WHERE m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.team_id = $2
+                  AND (m.user_id = u.user_id OR (NULLIF(btrim(m.employee_email), '') IS NOT NULL AND lower(btrim(m.employee_email)) = lower(btrim(u.employee_email))))
+                ORDER BY (m.user_id = u.user_id) DESC, m.user_id
+                LIMIT 1
+            ) m ON TRUE
             WHERE u.backend_id = $1
               AND u.usage_date BETWEEN $3::date AND $4::date
               AND ($5 = 'all' OR u.source = $5)
@@ -1106,12 +1111,17 @@ class UsageStore:
             f"""
             WITH filtered AS (
                 SELECT u.*, m.team_role,
-                       lower(COALESCE(NULLIF(btrim(u.employee_email), ''), btrim(u.user_id))) AS employee_key,
+                       lower(COALESCE(NULLIF(btrim(m.employee_email), ''), NULLIF(btrim(u.employee_email), ''), btrim(u.user_id))) AS employee_key,
                        {model_sql} AS model_name
                 FROM usage_daily u
-                JOIN usage_team_membership_daily m
-                  ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
-                 AND m.team_id = $2
+                JOIN LATERAL (
+                    SELECT m.team_role, m.employee_email
+                    FROM usage_team_membership_daily m
+                    WHERE m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.team_id = $2
+                      AND (m.user_id = u.user_id OR (NULLIF(btrim(m.employee_email), '') IS NOT NULL AND lower(btrim(m.employee_email)) = lower(btrim(u.employee_email))))
+                    ORDER BY (m.user_id = u.user_id) DESC, m.user_id
+                    LIMIT 1
+                ) m ON TRUE
                 WHERE u.backend_id = $1
                   AND u.usage_date BETWEEN $3::date AND $4::date
                   AND ($5 = 'all' OR u.source = $5)
@@ -1121,7 +1131,7 @@ class UsageStore:
                        MAX(NULLIF(employee_name, '')) AS employee_name,
                        MAX(team_role) AS team_role,
                        {self._aggregate_metrics_sql('')}
-                FROM filtered GROUP BY employee_key
+            FROM filtered GROUP BY employee_key
             ), source_totals AS (
                 SELECT employee_key, source, SUM(total_tokens)::bigint AS source_tokens
                 FROM filtered GROUP BY employee_key, source
@@ -1156,6 +1166,8 @@ class UsageStore:
             }
             for user_id in item["userIds"]:
                 employee_by_user_id[str(user_id)] = item
+            if item["employeeEmail"]:
+                employee_by_user_id[f"email:{item['employeeEmail'].strip().lower()}"] = item
         employees = self._merge_team_members(latest_members, employee_by_user_id)
         employees.sort(key=lambda item: (-item["totalTokens"], -item["spend"], str(item["employeeName"]).lower()))
         team_name = latest_members[0]["team_name"] or team_id
@@ -1163,9 +1175,13 @@ class UsageStore:
             f"""
             SELECT u.usage_date, u.source, {model_sql} AS model_name, {self._aggregate_metrics_sql('u.')}
             FROM usage_daily u
-            JOIN usage_team_membership_daily m
-              ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
-             AND m.team_id = $2
+            JOIN LATERAL (
+                SELECT 1
+                FROM usage_team_membership_daily m
+                WHERE m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.team_id = $2
+                  AND (m.user_id = u.user_id OR (NULLIF(btrim(m.employee_email), '') IS NOT NULL AND lower(btrim(m.employee_email)) = lower(btrim(u.employee_email))))
+                LIMIT 1
+            ) m ON TRUE
             WHERE u.backend_id = $1
               AND u.usage_date BETWEEN $3::date AND $4::date
               AND ($5 = 'all' OR u.source = $5)
@@ -1195,7 +1211,8 @@ class UsageStore:
     def _merge_team_members(latest_members: list[Any], employee_by_user_id: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
         employees_by_identity: dict[str, dict[str, Any]] = {}
         for member in latest_members:
-            item = employee_by_user_id.get(str(member["user_id"]))
+            member_email = str(member["employee_email"] or "").strip().lower()
+            item = employee_by_user_id.get(str(member["user_id"])) or (employee_by_user_id.get(f"email:{member_email}") if member_email else None)
             if item is None:
                 item = {"employeeId": member["user_id"], "employeeName": member["employee_name"] or member["user_id"], "employeeEmail": member["employee_email"] or "", "bindStatus": "已绑定邮箱" if member["employee_email"] else "未绑定邮箱", **empty_totals(), "primarySource": "其他", "userIds": [member["user_id"]], "teamRole": member["team_role"] or "user"}
             else:
@@ -1229,7 +1246,7 @@ class UsageStore:
             FROM usage_team_membership_daily
             WHERE backend_id = $1 AND team_id = $2
               AND snapshot_date BETWEEN $3::date AND $4::date
-              AND ($5 = lower(user_id) OR $5 = lower(employee_email) OR $5 = lower(employee_name))
+              AND ($5 = lower(btrim(user_id)) OR $5 = lower(btrim(employee_email)) OR $5 = lower(btrim(employee_name)))
             ORDER BY user_id, snapshot_date DESC
             """,
             backend_id, team_id, _as_date(start_date), _as_date(end_date), normalized,
@@ -1237,7 +1254,8 @@ class UsageStore:
         if not members:
             return None
         selected_user_ids = [str(member["user_id"]) for member in members]
-        args: list[Any] = [backend_id, team_id, _as_date(start_date), _as_date(end_date), source or "all", selected_user_ids]
+        selected_emails = sorted({str(member["employee_email"]).strip().lower() for member in members if member["employee_email"]})
+        args: list[Any] = [backend_id, team_id, _as_date(start_date), _as_date(end_date), source or "all", selected_user_ids, selected_emails]
         model_sql = "regexp_replace(u.model, '^[A-Za-z][A-Za-z0-9]*-acct-[0-9]+-', '', 'i')"
         records = await pool.fetch(
             f"""
@@ -1247,13 +1265,17 @@ class UsageStore:
                    u.source, {model_sql} AS model_name,
                    {self._aggregate_metrics_sql('u.')}
             FROM usage_daily u
-            JOIN usage_team_membership_daily m
-              ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
-             AND m.team_id = $2
+            JOIN LATERAL (
+                SELECT 1
+                FROM usage_team_membership_daily m
+                WHERE m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.team_id = $2
+                  AND (m.user_id = u.user_id OR (NULLIF(btrim(m.employee_email), '') IS NOT NULL AND lower(btrim(m.employee_email)) = lower(btrim(u.employee_email))))
+                LIMIT 1
+            ) m ON TRUE
             WHERE u.backend_id = $1
               AND u.usage_date BETWEEN $3::date AND $4::date
               AND ($5 = 'all' OR u.source = $5)
-              AND u.user_id = ANY($6::text[])
+              AND (u.user_id = ANY($6::text[]) OR lower(NULLIF(btrim(u.employee_email), '')) = ANY($7::text[]))
             GROUP BY u.backend_id, u.usage_date, u.user_id, u.source, {model_sql}
             ORDER BY u.usage_date, u.source, model_name
             """,

@@ -449,11 +449,11 @@ def team_auth_cache_key(email: str, name: str | None) -> str:
 
 
 def team_usage_cache_key(email: str, team: dict[str, Any], start_date: str, end_date: str, source: str) -> str:
-    return f"team-usage:v6:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{start_date}:{end_date}:{source or 'all'}"
+    return f"team-usage:v7:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def team_member_usage_cache_key(email: str, team: dict[str, Any], employee: str, start_date: str, end_date: str, source: str) -> str:
-    return f"team-member-usage:v4:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{employee.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
+    return f"team-member-usage:v5:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{employee.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def team_ref(team: dict[str, Any]) -> str:
@@ -827,6 +827,7 @@ async def team_usage_payload(
         payload["employees"] = payload.get("employees") or []
         payload.setdefault("dataQuality", {})["rankingSource"] = "team_membership_database" if store is not None and payload.get("dataQuality", {}).get("summarySource") == "database" else "team_membership_upstream"
         payload["dataQuality"]["rankingScope"] = "selected_team"
+        payload["dataQuality"]["memberIdentityMatch"] = "user_id_or_email"
     payload["team"] = public_team_from_payload(team, payload.get("team"))
     if enrich_member_rankings:
         team_usage_cache.set(cache_key, payload, env_int("TEAM_USAGE_CACHE_TTL_SECONDS", 300))
@@ -924,13 +925,20 @@ async def team_member_usage_payload(
 
     team_payload = await team_usage_payload(app_user, start_date, end_date, source, refresh, team_ref_value, enrich_member_rankings=False)
     selected_employee = find_team_employee(team_payload, employee)
-    selected_values = employee_match_values(selected_employee)
-    rows = [row for row in team_payload.get("rows") or [] if employee_match_values(row) & selected_values]
-    user_ids = list(dict.fromkeys(clean_identifier(item) for item in (selected_employee.get("userIds") or []) if clean_identifier(item)))
-    if not user_ids:
-        user_ids = [clean_identifier(selected_employee.get("employeeId"))] if clean_identifier(selected_employee.get("employeeId")) else []
-    if not user_ids:
-        raise HTTPException(status_code=404, detail="该团队成员缺少可查询的团队账号")
+    stored_payload: dict[str, Any] | None = None
+    store = usage_store()
+    if store is not None:
+        try:
+            await store.connect()
+            stored_payload = await store.team_member_rows(str(team["backend"]), str(team["id"]), employee, start_date, end_date, source)
+        except Exception:
+            logger.exception("local team member usage query failed")
+    if stored_payload is not None:
+        rows = stored_payload.get("rows") or []
+        selected_employee = stored_payload.get("employee") or selected_employee
+    else:
+        selected_values = employee_match_values(selected_employee)
+        rows = [row for row in team_payload.get("rows") or [] if employee_match_values(row) & selected_values]
     public_user = team_employee_public_user(selected_employee, team)
     payload = {
         "user": public_user,
@@ -949,7 +957,9 @@ async def team_member_usage_payload(
             "bindStatus": selected_employee.get("bindStatus"),
         },
     }
-    if team_payload.get("dataFreshness"):
+    if stored_payload is not None:
+        payload["dataFreshness"] = usage_data_freshness(stored_payload.get("lastSyncedAt"), start_date, end_date)
+    elif team_payload.get("dataFreshness"):
         payload["dataFreshness"] = team_payload["dataFreshness"]
     team_member_usage_cache.set(cache_key, payload, env_int("TEAM_MEMBER_USAGE_CACHE_TTL_SECONDS", 300))
     payload = dict(payload)

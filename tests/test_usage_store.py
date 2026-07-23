@@ -121,6 +121,27 @@ def test_team_member_ranking_merges_accounts_by_normalized_email() -> None:
     assert len([item for item in result if item["employeeName"] == "Shared"]) == 2
 
 
+def test_team_member_ranking_matches_usage_summary_by_email_when_user_id_differs() -> None:
+    members = [
+        {"user_id": "claude-code-linsen", "employee_email": "lin@example.com", "employee_name": "Lin", "team_role": "user"},
+    ]
+    summary = {
+        "employeeId": "cursor-lin",
+        "employeeName": "Lin",
+        "employeeEmail": "lin@example.com",
+        "userIds": ["cursor-lin"],
+        "totalTokens": 399,
+        "requestCount": 4,
+        "spend": 1.2,
+        "teamRole": "user",
+    }
+
+    result = UsageStore._merge_team_members(members, {"email:lin@example.com": summary})
+
+    assert result[0]["totalTokens"] == 399
+    assert result[0]["userIds"] == ["cursor-lin"]
+
+
 def test_usage_record_normalizes_account_alias_models() -> None:
     record = UsageStore._usage_record(
         "primary",
