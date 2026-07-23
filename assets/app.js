@@ -2236,16 +2236,19 @@ async function loadDepartmentData(forceRefresh = false) {
 }
 
 async function loadTeamData(forceRefresh = false) {
-  if (!currentUser?.isTeamLeader || !leaderTeams.length || isTeamLoading) return;
+  if (!currentUser?.isTeamLeader || !leaderTeams.length) return;
   ensureSelectedTeamRef();
   resetTeamMemberSelection();
+  const requestId = ++teamUsageRequestId;
+  if (teamUsageRequestController) teamUsageRequestController.abort();
+  teamUsageRequestController = new AbortController();
+  teamUsageData = [];
+  teamSummaryData = [];
+  teamEmployees = [];
   isTeamLoading = true;
   renderTeam();
   const { startDate, endDate } = selectedDateRange();
   const source = el("sourceSelect").value;
-  const requestId = ++teamUsageRequestId;
-  if (teamUsageRequestController) teamUsageRequestController.abort();
-  teamUsageRequestController = new AbortController();
   const query = new URLSearchParams({ start_date: startDate, end_date: endDate, source });
   if (selectedTeamRef) query.set("team_ref", selectedTeamRef);
   const cacheKey = `${selectedTeamRef}|${startDate}|${endDate}|${source}`;
