@@ -2417,21 +2417,21 @@ el("refreshButton").addEventListener("click", async () => {
     showToast("\u5df2\u5237\u65b0\u6a21\u578b\u5217\u8868");
   } else if (currentView === "admin") {
     await loadAdminData(true);
-    showToast("已重新读取数据库中的全员用量");
+    showToast("已刷新全员用量");
   } else if (currentView === "team") {
     if (selectedTeamEmployee) {
       await loadTeamMemberData(selectedTeamEmployee, true, false);
-      showToast("已重新读取数据库中的成员明细");
+      showToast("已刷新成员明细");
     } else {
       await loadTeamData(true);
-      showToast("已重新读取数据库中的团队用量");
+      showToast("已刷新团队用量");
     }
   } else if (currentView === "department") {
     await loadDepartmentData(true);
-    showToast("已重新读取数据库中的部门用量");
+    showToast("已刷新部门用量");
   } else {
     await loadDashboardData(true);
-    showToast("已重新读取数据库中的个人用量");
+    showToast("已刷新个人用量");
   }
 });
 
