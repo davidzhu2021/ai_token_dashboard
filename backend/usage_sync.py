@@ -138,7 +138,9 @@ class UsageSynchronizer:
 
         async def collect_user(user_id: str, info: dict[str, Any]) -> list[dict[str, Any]]:
             async with semaphore:
-                rows = await self.client.usage_rows(user_id, start_date, end_date, "all")
+                encoder = getattr(self.client, "_encode_account_id", None)
+                routed_user_id = encoder(backend, user_id) if encoder else user_id
+                rows = await self.client.usage_rows(routed_user_id, start_date, end_date, "all")
             result: list[dict[str, Any]] = []
             for row in rows:
                 item = dict(row)
@@ -156,6 +158,14 @@ class UsageSynchronizer:
             *(collect_user(user_id, info) for user_id, info in account_users.items()),
         )
         rows = [row for batch in results for row in batch]
+        logger.info(
+            "usage snapshot collected backend=%s users=%s rows=%s start=%s end=%s",
+            backend.id,
+            len(account_users),
+            len(rows),
+            start_date,
+            end_date,
+        )
         memberships = await self.collect_memberships(backend, users, start_date, end_date, account_index)
         return BackendSnapshot(backend.id, rows, memberships)
 
