@@ -335,10 +335,19 @@ async def schedule_usage_refresh(start_date: str, end_date: str, force: bool = F
 
 
 async def prepare_usage_refresh(start_date: str, end_date: str, force: bool = False) -> None:
+    # 手动刷新只重读 SQL 快照，避免把一次页面刷新升级成全量上游同步。
     if force:
-        await run_usage_sync(max(1, env_int("USAGE_SYNC_LOOKBACK_DAYS", 3)))
-    else:
-        trigger_usage_refresh(start_date, end_date)
+        logger.info(
+            "manual refresh skips upstream usage sync start=%s end=%s",
+            start_date,
+            end_date,
+        )
+        return
+    trigger_usage_refresh(start_date, end_date)
+
+
+def manual_refresh_database_unavailable() -> HTTPException:
+    return HTTPException(status_code=503, detail="用量数据库暂时不可用，请稍后重试")
 
 
 def trigger_usage_refresh(start_date: str, end_date: str, force: bool = False) -> None:
@@ -554,6 +563,7 @@ def feishu_direct_url(casdoor_authorize_url: str) -> str:
 
 
 async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_date: str, source: str, refresh: bool = False) -> dict[str, Any]:
+    request_started = asyncio.get_running_loop().time()
     cache_key = personal_usage_cache_key(app_user["email"], start_date, end_date, source)
     hit, value, ttl_seconds = personal_usage_cache.get(cache_key)
     if hit and not refresh:
@@ -564,9 +574,13 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
     store = usage_store()
     if store is not None:
         try:
+            db_started = asyncio.get_running_loop().time()
             await store.connect()
+            connected_at = asyncio.get_running_loop().time()
             await prepare_usage_refresh(start_date, end_date, refresh)
             stored = await store.personal_rows(app_user["email"], start_date, end_date, source, usage_backend_ids())
+            queried_at = asyncio.get_running_loop().time()
+            logger.info("personal usage sql refresh=%s connect_ms=%.0f query_ms=%.0f total_ms=%.0f", refresh, (connected_at - db_started) * 1000, (queried_at - connected_at) * 1000, (queried_at - request_started) * 1000)
             if stored is not None:
                 rows = stored["rows"]
                 payload = {
@@ -584,6 +598,9 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
                 return payload
         except Exception:
             logger.exception("local personal usage query failed; falling back to upstream")
+
+    if refresh:
+        raise manual_refresh_database_unavailable()
 
     upstream_user, mapping_cache = await cached_resolve_user(app_user["email"], app_user.get("name"), refresh)
     user_ids = upstream_user_ids(upstream_user)
@@ -606,6 +623,7 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
 
 
 async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: str, source: str, employee: str | None, refresh: bool = False) -> dict[str, Any]:
+    request_started = asyncio.get_running_loop().time()
     cache_key = admin_usage_cache_key(admin["email"], start_date, end_date, source, employee)
     if not refresh:
         hit, value, ttl_seconds = admin_usage_cache.get(cache_key)
@@ -616,9 +634,13 @@ async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: 
     store = usage_store()
     if store is not None:
         try:
+            db_started = asyncio.get_running_loop().time()
             await store.connect()
+            connected_at = asyncio.get_running_loop().time()
             await prepare_usage_refresh(start_date, end_date, refresh)
             stored = await store.admin_rows(start_date, end_date, source, employee, usage_backend_ids())
+            queried_at = asyncio.get_running_loop().time()
+            logger.info("admin usage sql refresh=%s connect_ms=%.0f query_ms=%.0f total_ms=%.0f", refresh, (connected_at - db_started) * 1000, (queried_at - connected_at) * 1000, (queried_at - request_started) * 1000)
             if stored is not None:
                 stored = dict(stored)
                 last_synced = stored.pop("lastSyncedAt", None)
@@ -628,6 +650,8 @@ async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: 
                 return stored
         except Exception:
             logger.exception("local admin usage query failed; falling back to upstream")
+    if refresh:
+        raise manual_refresh_database_unavailable()
     payload = await client().admin_usage_rows(start_date, end_date, source, employee)
     admin_usage_cache.set(cache_key, payload, env_int("ADMIN_USAGE_CACHE_TTL_SECONDS", 300))
     payload = dict(payload)
@@ -636,6 +660,7 @@ async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: 
 
 
 async def department_usage_payload(admin: dict[str, Any], start_date: str, end_date: str, source: str, department: str | None, refresh: bool = False) -> dict[str, Any]:
+    request_started = asyncio.get_running_loop().time()
     cache_key = department_usage_cache_key(admin["email"], start_date, end_date, source, department)
     if not refresh:
         hit, value, ttl_seconds = department_usage_cache.get(cache_key)
@@ -646,9 +671,13 @@ async def department_usage_payload(admin: dict[str, Any], start_date: str, end_d
     store = usage_store()
     if store is not None:
         try:
+            db_started = asyncio.get_running_loop().time()
             await store.connect()
+            connected_at = asyncio.get_running_loop().time()
             await prepare_usage_refresh(start_date, end_date, refresh)
             stored = await store.department_rows(start_date, end_date, source, department, usage_backend_ids())
+            queried_at = asyncio.get_running_loop().time()
+            logger.info("department usage sql refresh=%s connect_ms=%.0f query_ms=%.0f total_ms=%.0f", refresh, (connected_at - db_started) * 1000, (queried_at - connected_at) * 1000, (queried_at - request_started) * 1000)
             if stored is not None:
                 stored = dict(stored)
                 last_synced = stored.pop("lastSyncedAt", None)
@@ -658,6 +687,8 @@ async def department_usage_payload(admin: dict[str, Any], start_date: str, end_d
                 return stored
         except Exception:
             logger.exception("local department usage query failed; falling back to upstream")
+    if refresh:
+        raise manual_refresh_database_unavailable()
     payload = await client().admin_department_usage_rows(start_date, end_date, source, department)
     department_usage_cache.set(cache_key, payload, env_int("DEPARTMENT_USAGE_CACHE_TTL_SECONDS", 300))
     payload = dict(payload)
@@ -712,7 +743,9 @@ async def team_usage_payload(
     team_ref_value: str | None = None,
     enrich_member_rankings: bool = True,
 ) -> dict[str, Any]:
-    scope = await team_scope_for_user(app_user, refresh)
+    request_started = asyncio.get_running_loop().time()
+    # 权限范围不是用量数据，刷新用量时沿用缓存，避免再次访问上游。
+    scope = await team_scope_for_user(app_user, False)
     if not scope.get("isTeamLeader"):
         raise HTTPException(status_code=403, detail="当前账号还没有团队负责人权限")
     team = select_authorized_team(scope, team_ref_value)
@@ -727,12 +760,16 @@ async def team_usage_payload(
     payload = None
     if store is not None:
         try:
+            db_started = asyncio.get_running_loop().time()
             await store.connect()
+            connected_at = asyncio.get_running_loop().time()
             await prepare_usage_refresh(start_date, end_date, refresh)
             if not enrich_member_rankings:
                 payload = await store.team_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source)
             else:
                 payload = await store.team_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source)
+            queried_at = asyncio.get_running_loop().time()
+            logger.info("team usage sql refresh=%s connect_ms=%.0f query_ms=%.0f total_ms=%.0f", refresh, (connected_at - db_started) * 1000, (queried_at - connected_at) * 1000, (queried_at - request_started) * 1000)
             if payload is not None:
                 payload = dict(payload)
                 last_synced = payload.pop("lastSyncedAt", None)
@@ -741,6 +778,8 @@ async def team_usage_payload(
             logger.exception("local team usage query failed; falling back to upstream")
             payload = None
     if payload is None:
+        if refresh:
+            raise manual_refresh_database_unavailable()
         payload = dict(await client().team_usage_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source))
     if enrich_member_rankings:
         if not payload.get("dataFreshness") or payload.get("dataFreshness", {}).get("source") != "database":
@@ -889,7 +928,9 @@ async def team_member_usage_payload(
     refresh: bool = False,
     team_ref_value: str | None = None,
 ) -> dict[str, Any]:
-    scope = await team_scope_for_user(app_user, refresh)
+    request_started = asyncio.get_running_loop().time()
+    # 成员明细刷新只重读 SQL，不刷新团队权限缓存。
+    scope = await team_scope_for_user(app_user, False)
     if not scope.get("isTeamLeader"):
         raise HTTPException(status_code=403, detail="当前账号还没有团队负责人权限")
 
@@ -909,13 +950,19 @@ async def team_member_usage_payload(
     store = usage_store()
     if store is not None:
         try:
+            db_started = asyncio.get_running_loop().time()
             await store.connect()
+            connected_at = asyncio.get_running_loop().time()
             await prepare_usage_refresh(start_date, end_date, refresh)
             stored_payload = await store.team_member_rows(str(team["backend"]), str(team["id"]), employee, start_date, end_date, source)
+            queried_at = asyncio.get_running_loop().time()
+            logger.info("team member usage sql refresh=%s connect_ms=%.0f query_ms=%.0f total_ms=%.0f", refresh, (connected_at - db_started) * 1000, (queried_at - connected_at) * 1000, (queried_at - request_started) * 1000)
             if stored_payload is not None:
                 rows = stored_payload["rows"]
         except Exception:
             logger.exception("local team member usage query failed; falling back to upstream")
+    if refresh and rows is None:
+        raise manual_refresh_database_unavailable()
     user_ids = ["stored"] if rows is not None else await user_ids_for_team_employee(selected_employee, refresh)
     if not user_ids:
         raise HTTPException(status_code=404, detail="该团队成员缺少可查询的用量账号")

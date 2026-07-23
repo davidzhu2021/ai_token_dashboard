@@ -2417,21 +2417,21 @@ el("refreshButton").addEventListener("click", async () => {
     showToast("\u5df2\u5237\u65b0\u6a21\u578b\u5217\u8868");
   } else if (currentView === "admin") {
     await loadAdminData(true);
-    showToast(lastAdminUsageCacheHit ? "\u5df2\u52a0\u8f7d\u7f13\u5b58\u5168\u5458\u6570\u636e" : "\u5df2\u5237\u65b0\u5168\u5458\u7528\u91cf\u6570\u636e");
+    showToast("已重新读取数据库中的全员用量");
   } else if (currentView === "team") {
     if (selectedTeamEmployee) {
       await loadTeamMemberData(selectedTeamEmployee, true, false);
-      showToast("已刷新成员用量明细");
+      showToast("已重新读取数据库中的成员明细");
     } else {
       await loadTeamData(true);
-      showToast(lastTeamUsageCacheHit ? "已加载缓存团队数据" : "已刷新团队用量数据");
+      showToast("已重新读取数据库中的团队用量");
     }
   } else if (currentView === "department") {
     await loadDepartmentData(true);
-    showToast(lastDepartmentUsageCacheHit ? "\u5df2\u52a0\u8f7d\u7f13\u5b58\u90e8\u95e8\u6570\u636e" : "\u5df2\u5237\u65b0\u90e8\u95e8\u7528\u91cf\u6570\u636e");
+    showToast("已重新读取数据库中的部门用量");
   } else {
     await loadDashboardData(true);
-    showToast(lastPersonalUsageCacheHit ? "\u5df2\u52a0\u8f7d\u7f13\u5b58\u7528\u91cf\u6570\u636e" : "\u5df2\u5237\u65b0\u771f\u5b9e\u7528\u91cf\u6570\u636e");
+    showToast("已重新读取数据库中的个人用量");
   }
 });
 
