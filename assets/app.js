@@ -159,6 +159,10 @@ function selectedDateRange() {
   return { startDate: localDate(start), endDate: localDate(end), days };
 }
 
+function toggleTrendGrid(gridId) {
+  el(gridId)?.classList.toggle("hidden", selectedDateRange().days === 1);
+}
+
 function sum(data, field) {
   return data.reduce((acc, item) => acc + Number(item[field] || 0), 0);
 }
@@ -1394,6 +1398,7 @@ function renderPersonalLoading() {
   renderMetricSkeleton("metrics");
   renderChartSkeleton("trendChart");
   renderChartSkeleton("spendChart");
+  toggleTrendGrid("personalTrendGrid");
   renderDonutSkeleton("donutTotal", "sourceLegend");
   renderBarsSkeleton("modelBars");
   renderTableSkeleton("usageTable", "tableCount", 8);
@@ -1423,6 +1428,7 @@ function renderAdminLoading() {
   renderMetricSkeleton("adminMetrics");
   renderChartSkeleton("adminTrendChart");
   renderChartSkeleton("adminSpendChart");
+  toggleTrendGrid("adminTrendGrid");
   renderDonutSkeleton("adminDonutTotal", "adminSourceLegend");
   renderBarsSkeleton("adminModelBars");
   renderTableSkeleton("adminUserTable", "adminUserCount", 8);
@@ -1459,6 +1465,7 @@ function renderDepartmentLoading() {
   renderMetricSkeleton("departmentMetrics");
   renderChartSkeleton("departmentTrendChart");
   renderChartSkeleton("departmentSpendChart");
+  if (selectedDepartment) toggleTrendGrid("departmentTrendGrid");
   renderDonutSkeleton("departmentDonutTotal", "departmentSourceLegend");
   renderBarsSkeleton("departmentModelBars");
   renderBarsSkeleton("departmentBars");
@@ -1502,6 +1509,7 @@ function renderTeamLoading() {
   renderMetricSkeleton("teamMetrics");
   renderChartSkeleton("teamTrendChart");
   renderChartSkeleton("teamSpendChart");
+  toggleTrendGrid("teamTrendGrid");
   renderDonutSkeleton("teamDonutTotal", "teamSourceLegend");
   renderBarsSkeleton("teamModelBars");
   renderTableSkeleton(selectedTeamEmployee ? "teamMemberUsageTable" : "teamUserTable", selectedTeamEmployee ? "teamMemberTableCount" : "teamUserCount", 8);
@@ -1512,6 +1520,7 @@ function renderPersonal() {
     renderPersonalLoading();
     return;
   }
+  toggleTrendGrid("personalTrendGrid");
   setupUsageTableFilters(usageData);
   renderPersonalMetrics(usageData);
   renderTrendTo("trendChart", usageData);
@@ -1526,6 +1535,7 @@ function renderAdmin() {
     renderAdminLoading();
     return;
   }
+  toggleTrendGrid("adminTrendGrid");
   if (selectedAdminEmployee) {
     renderAdminMemberMetrics(adminUsageData);
     renderTrendTo("adminTrendChart", adminUsageData);
@@ -1564,6 +1574,8 @@ function renderDepartment() {
   }
   setDepartmentOverviewVisible(Boolean(selectedDepartment));
   const totalData = departmentSummaryData.length ? departmentSummaryData : departmentUsageData;
+
+  if (selectedDepartment) toggleTrendGrid("departmentTrendGrid");
 
   const barsPanel = el("departmentBars")?.closest(".panel");
 
@@ -1627,6 +1639,7 @@ function renderTeam() {
     return;
   }
   renderTeamDetailCard();
+  toggleTrendGrid("teamTrendGrid");
   if (selectedTeamEmployee) {
     renderTeamMemberMetrics(teamMemberUsageData);
     renderTrendTo("teamTrendChart", teamMemberUsageData);
