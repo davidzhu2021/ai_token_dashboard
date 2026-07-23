@@ -3441,8 +3441,8 @@
                 <div class="panel-heading">
                   <span class="panel-icon"><svg><use href="#icon-donut"></use></svg></span>
                   <div>
-                    <h3 class="panel-title">全员用量占比</h3>
-                    <p class="panel-desc">按 Codex、Claude Code 与其他来源拆分用量。</p>
+                    <h3 id="adminSourceTitle" class="panel-title">全员用量占比</h3>
+                    <p id="adminSourceDesc" class="panel-desc">按 Codex、Claude Code 与其他来源拆分用量。</p>
                   </div>
                 </div>
               </div>
@@ -3458,14 +3458,18 @@
             </div>
             <div class="daily-stat-card">
               <div class="daily-mini accent">
-                <span class="daily-label">活跃员工</span>
+                <span id="adminActiveLabel" class="daily-label">活跃员工</span>
                 <strong id="adminActiveUsers">0</strong>
+                <div id="adminAvgSpendWrap" class="daily-average-money hidden">
+                  <span class="daily-average-label">日均金额</span>
+                  <strong id="adminAvgSpend">$0.00</strong>
+                </div>
                 <span id="adminActiveUsersSub" class="daily-sub">当前筛选范围</span>
               </div>
               <div class="daily-mini">
                 <span class="daily-label">数据日期</span>
                 <strong id="adminHeroDate" class="daily-date-value">暂无</strong>
-                <span class="daily-sub">当前筛选下最新日期</span>
+                <span id="adminHeroDateSub" class="daily-sub">当前筛选下最新日期</span>
               </div>
             </div>
           </section>
@@ -3478,8 +3482,8 @@
                 <div class="panel-heading">
                   <span class="panel-icon"><svg><use href="#icon-trend"></use></svg></span>
                   <div>
-                    <h3 class="panel-title">全员每日 Token 趋势</h3>
-                    <p class="panel-desc">按日期汇总全员 Prompt 与 Completion Token。</p>
+                    <h3 id="adminTrendTitle" class="panel-title">全员每日 Token 趋势</h3>
+                    <p id="adminTrendDesc" class="panel-desc">按日期汇总全员 Prompt 与 Completion Token。</p>
                   </div>
                 </div>
                 <span id="adminTrendBadge" class="chip">近 1 天</span>
@@ -3492,8 +3496,8 @@
                 <div class="panel-heading">
                   <span class="panel-icon"><svg><use href="#icon-cost"></use></svg></span>
                   <div>
-                    <h3 class="panel-title">全员每日金额消费趋势</h3>
-                    <p class="panel-desc">按日期汇总全员预估消费金额。</p>
+                    <h3 id="adminSpendTitle" class="panel-title">全员每日金额消费趋势</h3>
+                    <p id="adminSpendDesc" class="panel-desc">按日期汇总全员预估消费金额。</p>
                   </div>
                 </div>
                 <span id="adminSpendBadge" class="chip gold">近 1 天</span>
@@ -4044,6 +4048,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260722-detail-card-top"></script>
+    <script src="/assets/app.js?v=20260723-admin-member-drilldown"></script>
   </body>
 </html>

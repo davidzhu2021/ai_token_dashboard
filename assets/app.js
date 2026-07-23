@@ -443,6 +443,28 @@ function renderPersonalMetrics(data) {
   setText("heroFreshness", freshnessText(personalDataFreshness));
 }
 
+function selectedAdminEmployeeInfo() {
+  if (!selectedAdminEmployee) return null;
+  return adminEmployees.find((item) => item.employeeEmail === selectedAdminEmployee || item.employeeId === selectedAdminEmployee) || null;
+}
+
+function selectedAdminEmployeeLabel() {
+  const employee = selectedAdminEmployeeInfo();
+  return employee?.employeeName || employee?.employeeEmail || employee?.employeeId || selectedAdminEmployee || "员工";
+}
+
+function updateAdminChartTitles() {
+  const scopeName = selectedAdminEmployee ? selectedAdminEmployeeLabel() : "全员";
+  setText("adminTrendTitle", `${scopeName}每日 Token 趋势`);
+  setText("adminTrendDesc", `按日期汇总${scopeName} Prompt 与 Completion Token。`);
+  setText("adminSpendTitle", `${scopeName}每日金额消费趋势`);
+  setText("adminSpendDesc", `按日期汇总${scopeName}预估消费金额。`);
+  setText("adminSourceTitle", `${scopeName}用量占比`);
+  setText("adminSourceDesc", selectedAdminEmployee
+    ? `按${scopeName} Codex、Claude Code 与其他来源拆分用量。`
+    : "按 Codex、Claude Code 与其他来源拆分用量。");
+}
+
 function renderAdminMetrics(data) {
   const totalData = adminSummaryData.length ? adminSummaryData : data;
   const label = rangeLabel();
@@ -450,14 +472,45 @@ function renderAdminMetrics(data) {
   renderDailyOverview({
     prefix: "admin",
     data: totalData,
-    title: selectedAdminEmployee ? "所选范围 · 员工视图" : "所选范围 · 管理员视图",
-    totalLabel: selectedAdminEmployee ? "所选范围员工 Token" : "所选范围全员 Token",
+    title: "所选范围 · 管理员视图",
+    totalLabel: "所选范围全员 Token",
+    sideLabel: "活跃员工",
     sideValue: adminEmployees.length,
-    sideSub: selectedAdminEmployee ? "当前员工" : "当前筛选范围",
+    sideSub: "当前筛选范围",
   });
+  el("adminAvgSpendWrap")?.classList.add("hidden");
   el("adminTrendBadge").textContent = `${label} · ${source}`;
   el("adminSpendBadge").textContent = `${label} · ${source}`;
+  updateAdminChartTitles();
   renderMetricGroups("adminMetrics", totalData, "admin", null, data);
+  setText("adminHeroFreshness", freshnessText(adminDataFreshness));
+}
+
+function renderAdminMemberMetrics(data) {
+  const label = rangeLabel();
+  const source = sourceText();
+  const employee = selectedAdminEmployeeInfo();
+  const { days } = selectedDateRange();
+  const isSingleDay = days === 1;
+  const dailyAvgSpend = days ? sum(data, "spend") / days : 0;
+  renderDailyOverview({
+    prefix: "admin",
+    data,
+    title: "所选范围 · 员工视图",
+    totalLabel: "所选范围员工 Token",
+    sideLabel: "当前员工",
+    sideValue: 1,
+    sideSub: employee?.employeeEmail || employee?.employeeId || selectedAdminEmployee,
+  });
+  el("adminAvgSpendWrap")?.classList.toggle("hidden", isSingleDay);
+  setText("adminActiveLabel", "日均 Token");
+  setText("adminActiveUsers", formatTokens(Math.round(sum(data, "totalTokens") / (days || 1))));
+  setText("adminActiveUsersSub", "所选范围日均");
+  setText("adminAvgSpend", money.format(dailyAvgSpend));
+  el("adminTrendBadge").textContent = `${label} · ${source}`;
+  el("adminSpendBadge").textContent = `${label} · ${source}`;
+  updateAdminChartTitles();
+  renderMetricGroups("adminMetrics", data, "admin", null, data);
   setText("adminHeroFreshness", freshnessText(adminDataFreshness));
 }
 
@@ -1340,7 +1393,10 @@ function renderAdminLoading() {
   setText("adminHeroDate", "加载中");
   setText("adminHeroContext", `${label} · ${source} · 数据加载中`);
   setText("adminActiveUsers", "--");
-  setText("adminActiveUsersSub", selectedAdminEmployee ? "当前员工" : "当前筛选范围");
+  setText("adminActiveLabel", selectedAdminEmployee ? "日均 Token" : "活跃员工");
+  setText("adminActiveUsersSub", selectedAdminEmployee ? "所选范围日均" : "当前筛选范围");
+  el("adminAvgSpendWrap")?.classList.add("hidden");
+  updateAdminChartTitles();
   setText("adminTrendBadge", `${label} · ${source}`);
   setText("adminSpendBadge", `${label} · ${source}`);
   setText("adminLimitHint", "数据加载中");
@@ -1447,6 +1503,16 @@ function renderPersonal() {
 function renderAdmin() {
   if (isAdminLoading) {
     renderAdminLoading();
+    return;
+  }
+  if (selectedAdminEmployee) {
+    renderAdminMemberMetrics(adminUsageData);
+    renderTrendTo("adminTrendChart", adminUsageData);
+    renderSpendTrendTo("adminSpendChart", adminUsageData);
+    renderDonutTo("adminSourceDonut", "adminDonutTotal", "adminSourceLegend", adminUsageData);
+    renderModelBarsTo("adminModelBars", adminUsageData);
+    renderAdminUsers();
+    renderAdminDetailCard();
     return;
   }
   const totalData = adminSummaryData.length ? adminSummaryData : adminUsageData;
