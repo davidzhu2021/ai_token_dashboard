@@ -225,6 +225,13 @@ function setText(id, value) {
   if (node) node.textContent = value;
 }
 
+function setDailyMiniValue(id, value, isTokenValue = false) {
+  const node = el(id);
+  if (!node) return;
+  node.textContent = value;
+  node.classList.toggle("daily-token-value", isTokenValue);
+}
+
 function setDailyTokenValue(id, value) {
   const node = el(id);
   if (!node) return;
@@ -523,7 +530,7 @@ function renderAdminMemberMetrics(data) {
   el("adminAvgSpendWrap")?.classList.toggle("hidden", isSingleDay);
   el("adminDailyOverview")?.classList.toggle("personal-single-day", isSingleDay);
   setText("adminActiveLabel", "日均 Token");
-  setText("adminActiveUsers", formatTokens(Math.round(sum(data, "totalTokens") / (days || 1))));
+  setDailyMiniValue("adminActiveUsers", formatTokens(Math.round(sum(data, "totalTokens") / (days || 1))), true);
   setText("adminActiveUsersSub", "所选范围日均");
   setText("adminAvgSpend", money.format(dailyAvgSpend));
   el("adminTrendBadge").textContent = `${label} · ${source}`;
@@ -616,7 +623,7 @@ function renderTeamMetrics(data) {
   el("teamDailyOverview")?.classList.remove("personal-single-day");
   el("teamAvgSpendWrap")?.classList.add("hidden");
   setText("teamActiveLabel", "活跃成员");
-  setText("teamActiveUsers", fmt.format(activeMembers));
+  setDailyMiniValue("teamActiveUsers", fmt.format(activeMembers));
   setText("teamActiveUsersSub", "当前筛选范围");
   setText("teamAvgSpend", money.format(sum(data, "spend") / days));
   setText("teamHeroDateSub", "当前筛选下最新日期");
@@ -681,7 +688,7 @@ function renderTeamMemberMetrics(data) {
   el("teamDailyOverview")?.classList.toggle("personal-single-day", isSingleDay);
   el("teamAvgSpendWrap")?.classList.toggle("hidden", isSingleDay);
   setText("teamActiveLabel", "日均 Token");
-  setText("teamActiveUsers", formatTokens(Math.round(sum(data, "totalTokens") / (days || 1))));
+  setDailyMiniValue("teamActiveUsers", formatTokens(Math.round(sum(data, "totalTokens") / (days || 1))), true);
   setText("teamActiveUsersSub", "所选范围日均");
   setText("teamAvgSpend", money.format(dailyAvgSpend));
   setText("teamHeroDate", isSingleDay ? endDate.slice(5).replace("-", "/") : selectedDateRangeText());
@@ -1432,7 +1439,7 @@ function renderAdminLoading() {
   setText("adminHeroSuccessSub", "-- / -- 次成功");
   setText("adminHeroDate", "加载中");
   setText("adminHeroContext", `${label} · ${source} · 数据加载中`);
-  setText("adminActiveUsers", "--");
+  setDailyMiniValue("adminActiveUsers", "--", Boolean(selectedAdminEmployee));
   setText("adminActiveLabel", selectedAdminEmployee ? "日均 Token" : "活跃员工");
   setText("adminActiveUsersSub", selectedAdminEmployee ? "所选范围日均" : "当前筛选范围");
   el("adminAvgSpendWrap")?.classList.add("hidden");
@@ -1501,7 +1508,7 @@ function renderTeamLoading() {
   setText("teamHeroSuccessSub", "-- / -- 次成功");
   setText("teamHeroDate", "加载中");
   setText("teamHeroContext", `${label} · ${source} · 数据加载中`);
-  setText("teamActiveUsers", "--");
+  setDailyMiniValue("teamActiveUsers", "--", Boolean(selectedTeamEmployee));
   setText("teamActiveUsersSub", selectedTeamEmployee ? (memberLabel || "当前成员") : "当前筛选范围");
   setText("teamWelcomeTitle", selectedTeamEmployee ? "所选范围 · 成员视图" : `所选范围 · ${scopeLabel}`);
   setText("teamTrendBadge", `${label} · ${source}`);

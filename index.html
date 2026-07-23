@@ -1056,10 +1056,19 @@
 
       .daily-mini strong {
         display: block;
-        overflow-wrap: anywhere;
+        min-width: 0;
+        max-width: 100%;
         font-size: 30px;
         line-height: 1;
         font-weight: 900;
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .daily-mini .daily-token-value {
+        /* Keep compact token summaries on one line in narrow stat cards. */
+        font-size: clamp(18px, 1.7vw, 28px);
+        letter-spacing: -0.035em;
       }
 
       .daily-average-money {
@@ -3330,7 +3339,7 @@
           <div class="daily-stat-card">
             <div class="daily-mini accent">
               <span class="daily-label">日均 Token</span>
-              <strong id="heroShare">0</strong>
+              <strong id="heroShare" class="daily-token-value">0</strong>
               <div class="daily-average-money">
                 <span class="daily-average-label">日均金额</span>
                 <strong id="heroAvgSpend">$0.00</strong>
