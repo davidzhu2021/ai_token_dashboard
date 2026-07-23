@@ -479,6 +479,7 @@ function renderAdminMetrics(data) {
     sideSub: "当前筛选范围",
   });
   el("adminAvgSpendWrap")?.classList.add("hidden");
+  el("adminDailyOverview")?.classList.remove("personal-single-day");
   el("adminTrendBadge").textContent = `${label} · ${source}`;
   el("adminSpendBadge").textContent = `${label} · ${source}`;
   updateAdminChartTitles();
@@ -503,6 +504,7 @@ function renderAdminMemberMetrics(data) {
     sideSub: employee?.employeeEmail || employee?.employeeId || selectedAdminEmployee,
   });
   el("adminAvgSpendWrap")?.classList.toggle("hidden", isSingleDay);
+  el("adminDailyOverview")?.classList.toggle("personal-single-day", isSingleDay);
   setText("adminActiveLabel", "日均 Token");
   setText("adminActiveUsers", formatTokens(Math.round(sum(data, "totalTokens") / (days || 1))));
   setText("adminActiveUsersSub", "所选范围日均");
@@ -2381,31 +2383,24 @@ el("logoutButton").addEventListener("click", async () => {
 
 document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
 
-el("rangeSelect").addEventListener("change", async () => {
-  selectedAdminEmployee = "";
-  selectedDepartment = "";
-  resetTeamMemberSelection();
-  teamUsageData = [];
-  teamSummaryData = [];
-  teamEmployees = [];
-  el("departmentEmployeeSearch").value = "";
-  departmentPickerOptions = [];
-  closeDepartmentPicker();
+async function reloadForFilterChange() {
+  // 保留当前下钻选择:切换时间范围/来源时应停留在已下钻的员工/成员/部门,
+  // 而不是退回聚合看板。各 load 函数已把选择变量透传给后端查询。
+  if (currentView === "team") {
+    // loadTeamData 内部会 resetTeamMemberSelection,故成员下钻时须走成员加载。
+    if (selectedTeamEmployee) {
+      await loadTeamMemberData(selectedTeamEmployee, false, false);
+    } else {
+      await loadTeamData();
+    }
+    return;
+  }
   await loadCurrentViewData();
-});
+}
 
-el("sourceSelect").addEventListener("change", async () => {
-  selectedAdminEmployee = "";
-  selectedDepartment = "";
-  resetTeamMemberSelection();
-  teamUsageData = [];
-  teamSummaryData = [];
-  teamEmployees = [];
-  el("departmentEmployeeSearch").value = "";
-  departmentPickerOptions = [];
-  closeDepartmentPicker();
-  await loadCurrentViewData();
-});
+el("rangeSelect").addEventListener("change", reloadForFilterChange);
+
+el("sourceSelect").addEventListener("change", reloadForFilterChange);
 
 ["usageDetailDateFilter", "usageDetailModelFilter", "usageDetailStatusFilter"].forEach((id) => {
   el(id).addEventListener("change", updateUsageTableFilters);
