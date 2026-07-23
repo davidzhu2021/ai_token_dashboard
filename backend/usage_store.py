@@ -14,6 +14,16 @@ except ImportError:  # pragma: no cover - optional for local development
 from .litellm_client import normalize_model_display_name
 
 
+def _model_normalize_sql(column: str) -> str:
+    """生成规范化模型名称的 SQL 表达式：同时去掉账号别名前缀和供应商前缀。
+
+    与 normalize_model_display_name() 保持一致，确保 SQL GROUP BY 阶段
+    就把同一模型（如 anthropic.claude-opus-4-8 与 claude-opus-4-8）聚合为一条。
+    """
+    account_stripped = f"regexp_replace({column}, '^[A-Za-z][A-Za-z0-9]*-acct-[0-9]+-', '', 'i')"
+    return f"regexp_replace({account_stripped}, '^[A-Za-z][A-Za-z0-9]*\\.', '', 'i')"
+
+
 USAGE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS usage_daily (
     backend_id TEXT NOT NULL,
@@ -704,7 +714,7 @@ class UsageStore:
         if team_id:
             args.append(team_id)
             conditions.append(f"m.team_id = ${len(args)}")
-        model_sql = "regexp_replace(u.model, '^[A-Za-z][A-Za-z0-9]*-acct-[0-9]+-', '', 'i')"
+        model_sql = _model_normalize_sql("u.model")
         records = await self._require_pool().fetch(
             f"""
             SELECT u.backend_id, u.usage_date, u.user_id,
@@ -738,7 +748,7 @@ class UsageStore:
             args.append(employee_filter)
         where_sql = " AND ".join(conditions)
         pool = self._require_pool()
-        model_sql = "regexp_replace(model, '^[A-Za-z][A-Za-z0-9]*-acct-[0-9]+-', '', 'i')"
+        model_sql = _model_normalize_sql("model")
         row_records = await pool.fetch(
             f"""
             SELECT backend_id, usage_date, user_id, MAX(employee_email) AS employee_email,
@@ -893,7 +903,7 @@ class UsageStore:
             AND ($4 = 'all' OR u.source = $4)
             AND ($5 = '' OR lower(m.team_id) = $5 OR lower(m.team_name) = $5)
         """
-        model_sql = "regexp_replace(u.model, '^[A-Za-z][A-Za-z0-9]*-acct-[0-9]+-', '', 'i')"
+        model_sql = _model_normalize_sql("u.model")
         pool = self._require_pool()
         records = await pool.fetch(
             f"""
@@ -1069,7 +1079,7 @@ class UsageStore:
         if not latest_members:
             return None
         args: list[Any] = [backend_id, team_id, _as_date(start_date), _as_date(end_date), source or "all"]
-        model_sql = "regexp_replace(u.model, '^[A-Za-z][A-Za-z0-9]*-acct-[0-9]+-', '', 'i')"
+        model_sql = _model_normalize_sql("u.model")
         records = await pool.fetch(
             f"""
             SELECT u.backend_id, u.usage_date, u.user_id,
@@ -1256,7 +1266,7 @@ class UsageStore:
         selected_user_ids = [str(member["user_id"]) for member in members]
         selected_emails = sorted({str(member["employee_email"]).strip().lower() for member in members if member["employee_email"]})
         args: list[Any] = [backend_id, team_id, _as_date(start_date), _as_date(end_date), source or "all", selected_user_ids, selected_emails]
-        model_sql = "regexp_replace(u.model, '^[A-Za-z][A-Za-z0-9]*-acct-[0-9]+-', '', 'i')"
+        model_sql = _model_normalize_sql("u.model")
         records = await pool.fetch(
             f"""
             SELECT u.backend_id, u.usage_date, u.user_id,
