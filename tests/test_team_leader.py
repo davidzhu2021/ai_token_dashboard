@@ -42,6 +42,7 @@ class FakeLiteLLMClient:
 
 def reset_caches() -> None:
     main.user_mapping_cache.clear()
+    main.personal_usage_cache.clear()
     main.team_auth_cache.clear()
     main.team_usage_cache.clear()
     main.team_member_usage_cache.clear()
@@ -68,9 +69,10 @@ def app_client(email: str = "leader@auto-link.com.cn") -> TestClient:
 
 def patch_user(monkeypatch, user_id: str = "leader-user") -> None:
     async def fake_cached_resolve_user(email: str, name: str | None = None, refresh: bool = False):
+        resolved_user_id = "alice-user" if email == "alice@auto-link.com.cn" else user_id
         return {
-            "matched_user_ids": [user_id],
-            "matched_accounts": [{"backend": "primary", "user_id": user_id, "account_id": user_id}],
+            "matched_user_ids": [resolved_user_id],
+            "matched_accounts": [{"backend": "primary", "user_id": resolved_user_id, "account_id": resolved_user_id}],
         }, {"hit": False, "ttlSeconds": 0}
 
     monkeypatch.setattr(main, "cached_resolve_user", fake_cached_resolve_user)
@@ -585,6 +587,38 @@ def test_team_usage_ranking_resolves_member_email_without_user_ids(monkeypatch) 
     assert alice["userIds"] == ["alice-resolved-user"]
 
 
+def test_team_usage_ranking_aggregates_all_accounts_for_member_email(monkeypatch) -> None:
+    reset_caches()
+
+    async def fake_cached_resolve_user(email: str, name: str | None = None, refresh: bool = False):
+        return {
+            "matched_user_ids": ["alice-claude", "alice-cursor", "alice-claude"],
+            "matched_accounts": [{"user_id": "alice-claude"}, {"user_id": "alice-cursor"}],
+        }, {"hit": False, "ttlSeconds": 0}
+
+    monkeypatch.setattr(main, "cached_resolve_user", fake_cached_resolve_user)
+    fake = FakeLiteLLMClient(
+        team_member_scope(),
+        {"rows": [], "summaryRows": [], "employees": [{
+            "employeeId": "alice@example.com", "employeeName": "Alice", "employeeEmail": "alice@example.com",
+            "userIds": ["alice-claude"], "teamRole": "user", "bindStatus": "已绑定邮箱",
+        }], "team": {"id": "team-a", "name": "Team A", "memberCount": 1}},
+        {
+            "alice-claude": [{"source": "Claude Code", "totalTokens": 100, "requestCount": 1}],
+            "alice-cursor": [{"source": "Cursor", "totalTokens": 250, "requestCount": 2}],
+        },
+    )
+    monkeypatch.setattr(main, "client", lambda: fake)
+
+    response = app_client().get("/api/team/usage")
+
+    assert response.status_code == 200
+    employee = response.json()["employees"][0]
+    assert employee["totalTokens"] == 350
+    assert employee["requestCount"] == 3
+    assert employee["userIds"] == ["alice-claude", "alice-cursor"]
+
+
 def test_team_usage_ignores_client_team_override(monkeypatch) -> None:
     reset_caches()
     patch_user(monkeypatch)
@@ -680,6 +714,31 @@ def test_team_member_usage_matches_member_email_and_returns_empty_summary(monkey
     assert payload["summary"]["rangeTotal"]["totalTokens"] == 0
     assert payload["user"]["email"] == "alice@auto-link.com.cn"
     assert fake.usage_calls == [(["alice-user"], "2026-07-01", "2026-07-22", "all")]
+
+
+def test_team_member_usage_matches_personal_dashboard_for_same_email(monkeypatch) -> None:
+    reset_caches()
+
+    async def fake_cached_resolve_user(email: str, name: str | None = None, refresh: bool = False):
+        ids = ["alice-claude", "alice-cursor"] if email == "alice@auto-link.com.cn" else ["leader-user"]
+        return {"matched_user_ids": ids, "matched_accounts": [{"user_id": item} for item in ids]}, {"hit": False, "ttlSeconds": 0}
+
+    usage_rows = {
+        "alice-claude": [{"date": "2026-07-22", "source": "Claude Code", "model": "claude", "totalTokens": 100, "requestCount": 1}],
+        "alice-cursor": [{"date": "2026-07-22", "source": "Cursor", "model": "gpt-5", "totalTokens": 200, "requestCount": 2}],
+    }
+    monkeypatch.setattr(main, "cached_resolve_user", fake_cached_resolve_user)
+    fake = FakeLiteLLMClient(team_member_scope(), team_member_payload(), usage_rows)
+    monkeypatch.setattr(main, "client", lambda: fake)
+
+    member = app_client().get("/api/team/member/usage?employee=alice@auto-link.com.cn&start_date=2026-07-22&end_date=2026-07-22")
+    personal = asyncio.run(main.personal_usage_payload(
+        {"email": "alice@auto-link.com.cn", "name": "Alice"}, "2026-07-22", "2026-07-22", "all",
+    ))
+
+    assert member.status_code == 200
+    assert member.json()["rows"] == personal["rows"]
+    assert member.json()["summary"] == personal["summary"]
 
 
 def test_team_member_usage_matches_employee_id_and_user_ids(monkeypatch) -> None:

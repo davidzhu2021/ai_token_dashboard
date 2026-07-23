@@ -355,6 +355,39 @@ def test_usage_sync_passes_backend_account_index_to_membership_snapshot() -> Non
     assert captured["account_index"]["profiles"]["carher-001"]["email"] == "alice@example.com"
 
 
+def test_usage_sync_expands_team_membership_to_all_email_accounts() -> None:
+    class FakeClient:
+        def _admin_user_map(self, _users):
+            return {"team-user": {"name": "Alice", "email": "alice@example.com", "userIds": ["team-user"]}}
+
+        async def teams(self, _backend):
+            return [{"team_id": "team-a", "members_with_roles": [{"user_id": "team-user", "user_email": "alice@example.com", "role": "user"}]}]
+
+        async def resolve_user(self, _email, _name):
+            return {"matched_accounts": [
+                {"backend": "primary", "user_id": "team-user"},
+                {"backend": "primary", "user_id": "cursor-user"},
+                {"backend": "secondary", "user_id": "other-user"},
+            ]}
+
+        def _is_backend_usage_account(self, _backend, _user_id):
+            return True
+
+    backend = type("Backend", (), {"id": "primary", "source": None})()
+    synchronizer = UsageSynchronizer(FakeClient(), object())
+
+    rows = asyncio.run(synchronizer.collect_memberships(
+        backend,
+        [{"user_id": "team-user", "user_email": "alice@example.com"}, {"user_id": "cursor-user", "user_email": "alice@example.com"}],
+        "2026-07-22",
+        "2026-07-22",
+    ))
+
+    team_rows = [row for row in rows if row["teamId"] == "team-a"]
+    assert {row["userId"] for row in team_rows} == {"team-user", "cursor-user"}
+    assert len(team_rows) == 2
+
+
 def test_usage_sync_lock_failure_is_recorded_and_not_released() -> None:
     class FakeStore:
         released = False

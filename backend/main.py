@@ -433,7 +433,7 @@ async def cached_resolve_user(email: str, name: str | None = None, refresh: bool
 
 
 def personal_usage_cache_key(email: str, start_date: str, end_date: str, source: str) -> str:
-    return f"usage:v5:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
+    return f"usage:v6:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def admin_usage_cache_key(email: str, start_date: str, end_date: str, source: str, employee: str | None) -> str:
@@ -449,11 +449,11 @@ def team_auth_cache_key(email: str, name: str | None) -> str:
 
 
 def team_usage_cache_key(email: str, team: dict[str, Any], start_date: str, end_date: str, source: str) -> str:
-    return f"team-usage:v5:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{start_date}:{end_date}:{source or 'all'}"
+    return f"team-usage:v6:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def team_member_usage_cache_key(email: str, team: dict[str, Any], employee: str, start_date: str, end_date: str, source: str) -> str:
-    return f"team-member-usage:v3:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{employee.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
+    return f"team-member-usage:v4:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{employee.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def team_ref(team: dict[str, Any]) -> str:
@@ -603,7 +603,7 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
         raise manual_refresh_database_unavailable()
 
     upstream_user, mapping_cache = await cached_resolve_user(app_user["email"], app_user.get("name"), refresh)
-    user_ids = upstream_user_ids(upstream_user)
+    user_ids = list(dict.fromkeys(upstream_user_ids(upstream_user)))
     if not user_ids:
         raise HTTPException(status_code=502, detail="上游员工记录缺少 user_id")
     rows = await client().usage_rows_for_user_ids(user_ids, start_date, end_date, source)
@@ -620,6 +620,20 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
     payload = dict(payload)
     payload["cache"] = {"hit": False, "ttlSeconds": 0}
     return payload
+
+
+async def person_usage_rows(email: str, name: str | None, start_date: str, end_date: str, source: str, refresh: bool = False, extra_user_ids: list[str] | None = None) -> tuple[list[dict[str, Any]], list[str]]:
+    payload = await personal_usage_payload({"email": email, "name": name or email}, start_date, end_date, source, refresh)
+    upstream, _ = await cached_resolve_user(email, name, refresh)
+    user_ids = upstream_user_ids(upstream) if upstream.get("matched_accounts") else []
+    user_ids.extend(str(item).strip() for item in (extra_user_ids or []) if str(item).strip())
+    user_ids = list(dict.fromkeys(user_ids or upstream_user_ids(upstream)))
+    if extra_user_ids:
+        resolved = set(upstream_user_ids(upstream))
+        user_ids = [item for item in user_ids if item in resolved or item in {str(value).strip() for value in extra_user_ids}]
+    if not user_ids:
+        raise HTTPException(status_code=502, detail="上游员工记录缺少 user_id")
+    return payload["rows"], user_ids
 
 
 async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: str, source: str, employee: str | None, refresh: bool = False) -> dict[str, Any]:
@@ -782,8 +796,7 @@ async def team_usage_payload(
             raise manual_refresh_database_unavailable()
         payload = dict(await client().team_usage_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source))
     if enrich_member_rankings:
-        if not payload.get("dataFreshness") or payload.get("dataFreshness", {}).get("source") != "database":
-            payload["employees"] = await team_member_rankings_from_accounts(payload.get("employees") or [], start_date, end_date, source, refresh)
+        payload["employees"] = await team_member_rankings_from_accounts(payload.get("employees") or [], start_date, end_date, source, refresh)
     payload["team"] = public_team_from_payload(team, payload.get("team"))
     if enrich_member_rankings:
         team_usage_cache.set(cache_key, payload, env_int("TEAM_USAGE_CACHE_TTL_SECONDS", 300))
@@ -839,21 +852,20 @@ def find_team_employee(payload: dict[str, Any], employee: str) -> dict[str, Any]
 
 
 async def user_ids_for_team_employee(employee: dict[str, Any], refresh: bool) -> list[str]:
-    user_ids = employee.get("userIds")
-    if isinstance(user_ids, list):
-        cleaned = [clean_identifier(item) for item in user_ids if clean_identifier(item)]
-        if cleaned:
-            return cleaned
-
+    resolved_ids: list[str] = []
     email = clean_identifier(employee.get("employeeEmail")).lower()
     if email:
         upstream_user, _ = await cached_resolve_user(email, clean_identifier(employee.get("employeeName")), refresh)
-        resolved = upstream_user_ids(upstream_user)
-        if resolved:
-            return resolved
+        if upstream_user.get("matched_accounts"):
+            resolved_ids.extend(upstream_user_ids(upstream_user))
+    user_ids = employee.get("userIds")
+    if isinstance(user_ids, list):
+        resolved_ids.extend(clean_identifier(item) for item in user_ids if clean_identifier(item))
 
     employee_id = clean_identifier(employee.get("employeeId"))
-    return [employee_id] if employee_id else []
+    if not resolved_ids and employee_id:
+        resolved_ids.append(employee_id)
+    return list(dict.fromkeys(resolved_ids))
 
 
 def team_employee_empty_summary(employee: dict[str, Any]) -> dict[str, Any]:
@@ -902,9 +914,14 @@ async def team_member_rankings_from_accounts(
             continue
         summary = team_employee_empty_summary(employee)
         try:
+            email = clean_identifier(employee.get("employeeEmail"))
             user_ids = await user_ids_for_team_employee(employee, refresh)
             summary["userIds"] = user_ids
-            rows = await litellm.usage_rows_for_user_ids(user_ids, start_date, end_date, source) if user_ids else []
+            if email:
+                rows, user_ids = await person_usage_rows(email, clean_identifier(employee.get("employeeName")), start_date, end_date, source, refresh, user_ids)
+                summary["userIds"] = user_ids
+            else:
+                rows = await litellm.usage_rows_for_user_ids(user_ids, start_date, end_date, source) if user_ids else []
         except HTTPException:
             rows = []
         totals = usage_summary(rows)
@@ -963,7 +980,11 @@ async def team_member_usage_payload(
             logger.exception("local team member usage query failed; falling back to upstream")
     if refresh and rows is None:
         raise manual_refresh_database_unavailable()
-    user_ids = ["stored"] if rows is not None else await user_ids_for_team_employee(selected_employee, refresh)
+    user_ids = await user_ids_for_team_employee(selected_employee, refresh)
+    email = clean_identifier(selected_employee.get("employeeEmail"))
+    if email:
+        rows, user_ids = await person_usage_rows(email, clean_identifier(selected_employee.get("employeeName")), start_date, end_date, source, refresh, user_ids)
+        stored_payload = None
     if not user_ids:
         raise HTTPException(status_code=404, detail="该团队成员缺少可查询的用量账号")
 

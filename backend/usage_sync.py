@@ -215,11 +215,24 @@ class UsageSynchronizer:
                 user_id = _text(member.get("user_id") or member.get("userId"))
                 email = _email(member.get("user_email") or member.get("userEmail") or member.get("email"))
                 info = user_map.get(user_id.lower()) or user_map.get(email) or {}
+                name = _text(member.get("user_alias") or member.get("userAlias") or member.get("name")) or _text(info.get("name")) or user_id or "unknown"
                 candidate_ids = [user_id] if user_id else list(account_by_email.get(email, []))
                 if not candidate_ids:
                     candidate_ids = [str(item) for item in info.get("userIds") or [] if item]
+                if email and hasattr(self.client, "resolve_user"):
+                    try:
+                        resolved = await self.client.resolve_user(email, name)
+                        matched_accounts = resolved.get("matched_accounts") or []
+                        candidate_ids.extend(
+                            _text(item.get("user_id"))
+                            for item in matched_accounts
+                            if isinstance(item, dict) and _text(item.get("backend")) == backend.id and _text(item.get("user_id"))
+                        )
+                    except Exception:
+                        logger.debug("failed to expand team member accounts for %s", email, exc_info=True)
+                candidate_ids = list(dict.fromkeys(candidate_ids))
                 email = email or _email(info.get("email"))
-                name = _text(member.get("user_alias") or member.get("userAlias") or member.get("name")) or _text(info.get("name")) or (candidate_ids[0] if candidate_ids else "unknown")
+                name = name or (candidate_ids[0] if candidate_ids else "unknown")
                 role = _text(member.get("role") or member.get("user_role") or member.get("team_role")) or "user"
                 for candidate_user_id in candidate_ids:
                     assigned_user_ids.add(candidate_user_id)
