@@ -2228,7 +2228,7 @@ async function loadTeamData(forceRefresh = false) {
     if (rankingPayload.truncated) {
       el("teamLimitHint").textContent = "成员排行按团队成员账号用量汇总，当前数据读取达到上限，排行可能不完整";
     } else {
-      el("teamLimitHint").textContent = "成员排行按团队成员账号用量汇总，包含零用量成员";
+      el("teamLimitHint").textContent = "成员排行只统计当前团队归属用量，包含零用量成员";
     }
   } catch (error) {
     if (error.name === "AbortError") return;

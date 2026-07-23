@@ -4,7 +4,6 @@ import hashlib
 import logging
 import os
 import re
-import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from base64 import urlsafe_b64encode
@@ -823,8 +822,11 @@ async def team_usage_payload(
             raise manual_refresh_database_unavailable()
         payload = dict(await client().team_usage_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source))
     if enrich_member_rankings:
-        payload["employees"] = await team_member_rankings_from_accounts(payload.get("employees") or [], start_date, end_date, source, refresh)
-        payload.setdefault("dataQuality", {})["rankingSource"] = "merged_batch"
+        # team_rows/team_usage_rows already aggregate through team membership. Do not
+        # replace that scoped result with an email-wide personal usage query.
+        payload["employees"] = payload.get("employees") or []
+        payload.setdefault("dataQuality", {})["rankingSource"] = "team_membership_database" if store is not None and payload.get("dataQuality", {}).get("summarySource") == "database" else "team_membership_upstream"
+        payload["dataQuality"]["rankingScope"] = "selected_team"
     payload["team"] = public_team_from_payload(team, payload.get("team"))
     if enrich_member_rankings:
         team_usage_cache.set(cache_key, payload, env_int("TEAM_USAGE_CACHE_TTL_SECONDS", 300))
@@ -896,114 +898,6 @@ async def user_ids_for_team_employee(employee: dict[str, Any], refresh: bool) ->
     return list(dict.fromkeys(resolved_ids))
 
 
-def team_employee_empty_summary(employee: dict[str, Any]) -> dict[str, Any]:
-    employee_id = clean_identifier(employee.get("employeeId")) or clean_identifier(employee.get("employeeEmail"))
-    user_ids = employee.get("userIds")
-    clean_user_ids = [clean_identifier(item) for item in user_ids if clean_identifier(item)] if isinstance(user_ids, list) else []
-    return {
-        "employeeId": employee_id,
-        "employeeName": clean_identifier(employee.get("employeeName")) or employee_id or "团队成员",
-        "employeeEmail": clean_identifier(employee.get("employeeEmail")),
-        "bindStatus": clean_identifier(employee.get("bindStatus")) or "未绑定邮箱",
-        "userIds": clean_user_ids,
-        "promptTokens": 0,
-        "completionTokens": 0,
-        "totalTokens": 0,
-        "requestCount": 0,
-        "successCount": 0,
-        "failureCount": 0,
-        "spend": 0.0,
-        "primarySource": "其他",
-        "teamRole": clean_identifier(employee.get("teamRole")) or "user",
-    }
-
-
-def team_employee_sort_key(employee: dict[str, Any]) -> tuple[float, float, float, str]:
-    name = clean_identifier(employee.get("employeeName")) or clean_identifier(employee.get("employeeEmail")) or clean_identifier(employee.get("employeeId"))
-    return (
-        -float(employee.get("totalTokens") or 0),
-        -float(employee.get("spend") or 0),
-        -float(employee.get("requestCount") or 0),
-        name.lower(),
-    )
-
-
-async def team_member_rankings_from_accounts(
-    employees: list[dict[str, Any]],
-    start_date: str,
-    end_date: str,
-    source: str,
-    refresh: bool,
-) -> list[dict[str, Any]]:
-    started = time.perf_counter()
-    rankings: list[dict[str, Any]] = []
-    litellm = client()
-    email_rows = await batched_person_usage_rows(
-        [clean_identifier(item.get("employeeEmail")) for item in employees if isinstance(item, dict)],
-        start_date,
-        end_date,
-        source,
-        refresh,
-    )
-    fallback_count = 0
-    fallback_started = time.perf_counter()
-    fallback_sem = asyncio.Semaphore(max(1, env_int("TEAM_MEMBER_FALLBACK_CONCURRENCY", env_int("LITELLM_MAX_CONCURRENCY", 4))))
-
-    async def fallback_rows(employee: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        async with fallback_sem:
-            try:
-                user_ids = await user_ids_for_team_employee(employee, refresh)
-                rows = await litellm.usage_rows_for_user_ids(user_ids, start_date, end_date, source) if user_ids else []
-                return employee, [{"rows": rows, "userIds": user_ids}]
-            except HTTPException:
-                return employee, [{"rows": [], "userIds": []}]
-
-    pending: list[tuple[dict[str, Any], asyncio.Task[tuple[dict[str, Any], list[dict[str, Any]]]]]] = []
-    for employee in employees:
-        if not isinstance(employee, dict):
-            continue
-        email = clean_identifier(employee.get("employeeEmail"))
-        stored = email_rows.get(email.lower()) if email_rows is not None and email else None
-        if stored is None:
-            pending.append((employee, asyncio.create_task(fallback_rows(employee))))
-
-    fallback_results: dict[int, tuple[list[dict[str, Any]], list[str]]] = {}
-    if pending:
-        for employee, result_task in pending:
-            _, result = await result_task
-            fallback_results[id(employee)] = (result[0]["rows"], result[0]["userIds"])
-        fallback_count = len(pending)
-
-    for employee in employees:
-        if not isinstance(employee, dict):
-            continue
-        summary = team_employee_empty_summary(employee)
-        email = clean_identifier(employee.get("employeeEmail"))
-        stored = email_rows.get(email.lower()) if email_rows is not None and email else None
-        if stored is not None:
-            rows = stored["rows"]
-            summary["userIds"] = stored.get("userIds") or summary["userIds"]
-        else:
-            rows, user_ids = fallback_results.get(id(employee), ([], []))
-            summary["userIds"] = user_ids
-        totals = usage_summary(rows)
-        range_total = totals["rangeTotal"]
-        for field in ("promptTokens", "completionTokens", "totalTokens", "requestCount", "successCount", "failureCount"):
-            summary[field] = range_total[field]
-        summary["spend"] = range_total["spend"]
-        source_breakdown = totals.get("sourceBreakdown") or []
-        if source_breakdown:
-            summary["primarySource"] = source_breakdown[0].get("source") or "其他"
-        rankings.append(summary)
-    logger.info(
-        "team member rankings employees=%d batch=%s fallback=%d fallback_ms=%.0f total_ms=%.0f",
-        len(rankings), bool(email_rows is not None), fallback_count,
-        (time.perf_counter() - fallback_started) * 1000 if fallback_count else 0,
-        (time.perf_counter() - started) * 1000,
-    )
-    return sorted(rankings, key=team_employee_sort_key)
-
-
 async def team_member_usage_payload(
     app_user: dict[str, Any],
     start_date: str,
@@ -1030,25 +924,13 @@ async def team_member_usage_payload(
 
     team_payload = await team_usage_payload(app_user, start_date, end_date, source, refresh, team_ref_value, enrich_member_rankings=False)
     selected_employee = find_team_employee(team_payload, employee)
-    rows: list[dict[str, Any]] | None = None
-    stored_payload: dict[str, Any] | None = None
-    user_ids = await user_ids_for_team_employee(selected_employee, refresh)
-    email = clean_identifier(selected_employee.get("employeeEmail"))
-    if email:
-        batched = await batched_person_usage_rows([email], start_date, end_date, source, refresh)
-        if batched is not None and email.lower() in batched:
-            stored_payload = batched[email.lower()]
-            rows = stored_payload["rows"]
-            user_ids = stored_payload.get("userIds") or user_ids
-        else:
-            if refresh and usage_store() is not None:
-                raise manual_refresh_database_unavailable()
-            rows, user_ids = await person_usage_rows(email, clean_identifier(selected_employee.get("employeeName")), start_date, end_date, source, refresh, user_ids)
+    selected_values = employee_match_values(selected_employee)
+    rows = [row for row in team_payload.get("rows") or [] if employee_match_values(row) & selected_values]
+    user_ids = list(dict.fromkeys(clean_identifier(item) for item in (selected_employee.get("userIds") or []) if clean_identifier(item)))
     if not user_ids:
-        raise HTTPException(status_code=404, detail="该团队成员缺少可查询的用量账号")
-
-    if rows is None:
-        rows = await client().usage_rows_for_user_ids(user_ids, start_date, end_date, source)
+        user_ids = [clean_identifier(selected_employee.get("employeeId"))] if clean_identifier(selected_employee.get("employeeId")) else []
+    if not user_ids:
+        raise HTTPException(status_code=404, detail="该团队成员缺少可查询的团队账号")
     public_user = team_employee_public_user(selected_employee, team)
     payload = {
         "user": public_user,
@@ -1067,9 +949,8 @@ async def team_member_usage_payload(
             "bindStatus": selected_employee.get("bindStatus"),
         },
     }
-    if stored_payload is not None:
-        last_synced = stored_payload.get("lastSyncedAt")
-        payload["dataFreshness"] = usage_data_freshness(last_synced, start_date, end_date)
+    if team_payload.get("dataFreshness"):
+        payload["dataFreshness"] = team_payload["dataFreshness"]
     team_member_usage_cache.set(cache_key, payload, env_int("TEAM_MEMBER_USAGE_CACHE_TTL_SECONDS", 300))
     payload = dict(payload)
     payload["cache"] = {"hit": False, "ttlSeconds": 0}

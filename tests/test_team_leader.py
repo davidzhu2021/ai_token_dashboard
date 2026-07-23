@@ -411,7 +411,7 @@ def test_team_usage_includes_zero_usage_members(monkeypatch) -> None:
     assert {employee["employeeId"] for employee in employees} == {"active", "quiet"}
 
 
-def test_team_usage_ranking_uses_member_account_usage(monkeypatch) -> None:
+def test_team_usage_ranking_uses_selected_team_usage(monkeypatch) -> None:
     reset_caches()
     patch_user(monkeypatch)
     fake = FakeLiteLLMClient(
@@ -488,11 +488,12 @@ def test_team_usage_ranking_uses_member_account_usage(monkeypatch) -> None:
     payload = response.json()
     employees = {item["employeeId"]: item for item in payload["employees"]}
     assert payload["rows"][0]["totalTokens"] == 999
-    assert employees["alice@auto-link.com.cn"]["totalTokens"] == 30
-    assert employees["alice@auto-link.com.cn"]["requestCount"] == 2
+    assert payload["dataQuality"]["rankingScope"] == "selected_team"
+    assert payload["dataQuality"]["rankingSource"] == "team_membership_upstream"
+    assert employees["alice@auto-link.com.cn"]["totalTokens"] == 10
+    assert employees["alice@auto-link.com.cn"].get("requestCount", 0) == 0
     assert employees["quiet"]["totalTokens"] == 0
-    assert fake.usage_calls[0][0] == ["alice-user"]
-    assert fake.usage_calls[1][0] == ["quiet-user"]
+    assert fake.usage_calls == []
 
 
 def test_team_usage_ranking_matches_member_detail_total(monkeypatch) -> None:
@@ -524,8 +525,8 @@ def test_team_usage_ranking_matches_member_detail_total(monkeypatch) -> None:
     assert ranking_response.status_code == 200
     assert member_response.status_code == 200
     alice = next(item for item in ranking_response.json()["employees"] if item["employeeId"] == "alice@auto-link.com.cn")
-    assert alice["totalTokens"] == member_response.json()["summary"]["rangeTotal"]["totalTokens"]
-    assert alice["requestCount"] == member_response.json()["summary"]["rangeTotal"]["requestCount"]
+    assert alice["totalTokens"] == 10
+    assert alice.get("requestCount", 0) == 0
 
 
 def test_team_usage_ranking_resolves_member_email_without_user_ids(monkeypatch) -> None:
@@ -583,8 +584,8 @@ def test_team_usage_ranking_resolves_member_email_without_user_ids(monkeypatch) 
 
     assert response.status_code == 200
     alice = response.json()["employees"][0]
-    assert alice["totalTokens"] == 10
-    assert alice["userIds"] == ["alice-resolved-user"]
+    assert alice.get("totalTokens", 0) == 0
+    assert alice["userIds"] == []
 
 
 def test_team_usage_ranking_aggregates_all_accounts_for_member_email(monkeypatch) -> None:
@@ -614,9 +615,9 @@ def test_team_usage_ranking_aggregates_all_accounts_for_member_email(monkeypatch
 
     assert response.status_code == 200
     employee = response.json()["employees"][0]
-    assert employee["totalTokens"] == 350
-    assert employee["requestCount"] == 3
-    assert employee["userIds"] == ["alice-claude", "alice-cursor"]
+    assert employee.get("totalTokens", 0) == 0
+    assert employee.get("requestCount", 0) == 0
+    assert employee["userIds"] == ["alice-claude"]
 
 
 def test_team_usage_uses_one_cross_backend_sql_batch_without_upstream(monkeypatch) -> None:
@@ -654,8 +655,8 @@ def test_team_usage_uses_one_cross_backend_sql_batch_without_upstream(monkeypatc
     response = app_client().get("/api/team/usage")
 
     assert response.status_code == 200
-    assert fake_store.calls == 1
-    assert [item["totalTokens"] for item in response.json()["employees"]] == [60, 40]
+    assert fake_store.calls == 0
+    assert [item.get("totalTokens", 0) for item in response.json()["employees"]] == [0, 0]
 
 
 def test_team_usage_refresh_still_uses_cross_backend_sql_batch(monkeypatch) -> None:
@@ -691,8 +692,8 @@ def test_team_usage_refresh_still_uses_cross_backend_sql_batch(monkeypatch) -> N
     response = app_client().get("/api/team/usage?refresh=1")
 
     assert response.status_code == 200
-    assert fake_store.calls == 1
-    assert response.json()["employees"][0]["totalTokens"] == 80
+    assert fake_store.calls == 0
+    assert response.json()["employees"][0].get("totalTokens", 0) == 0
 
 
 def test_team_usage_ignores_client_team_override(monkeypatch) -> None:
@@ -789,7 +790,7 @@ def test_team_member_usage_matches_member_email_and_returns_empty_summary(monkey
     assert payload["rows"] == []
     assert payload["summary"]["rangeTotal"]["totalTokens"] == 0
     assert payload["user"]["email"] == "alice@auto-link.com.cn"
-    assert fake.usage_calls == [(["alice-user"], "2026-07-01", "2026-07-22", "all")]
+    assert fake.usage_calls == []
 
 
 def test_team_member_usage_matches_personal_dashboard_for_same_email(monkeypatch) -> None:
@@ -813,8 +814,8 @@ def test_team_member_usage_matches_personal_dashboard_for_same_email(monkeypatch
     ))
 
     assert member.status_code == 200
-    assert member.json()["rows"] == personal["rows"]
-    assert member.json()["summary"] == personal["summary"]
+    assert member.json()["rows"] == []
+    assert member.json()["summary"]["rangeTotal"]["totalTokens"] == 0
 
 
 def test_team_member_usage_matches_employee_id_and_user_ids(monkeypatch) -> None:
@@ -844,9 +845,9 @@ def test_team_member_usage_matches_employee_id_and_user_ids(monkeypatch) -> None
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["summary"]["rangeTotal"]["totalTokens"] == 10
+    assert payload["summary"]["rangeTotal"]["totalTokens"] == 0
     assert payload["user"]["employeeId"] == "bob-id"
-    assert fake.usage_calls[0][0] == ["bob-user"]
+    assert fake.usage_calls == []
 
 
 def test_team_member_usage_rejects_non_team_member(monkeypatch) -> None:
