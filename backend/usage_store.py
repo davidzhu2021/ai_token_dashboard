@@ -1085,8 +1085,9 @@ class UsageStore:
             """,
             *args,
         )
-        employee_by_key = {
-            str(record["employee_id"]): {
+        employee_by_user_id: dict[str, dict[str, Any]] = {}
+        for record in employee_records:
+            item = {
                 "employeeId": record["employee_id"],
                 "employeeName": record["employee_name"] or record["employee_id"],
                 "employeeEmail": record["employee_email"] or "",
@@ -1102,11 +1103,11 @@ class UsageStore:
                 "userIds": list(record["user_ids"] or []),
                 "teamRole": record["team_role"] or "user",
             }
-            for record in employee_records
-        }
+            for user_id in item["userIds"]:
+                employee_by_user_id[str(user_id)] = item
         employees: list[dict[str, Any]] = []
         for member in latest_members:
-            item = employee_by_key.get(str(member["user_id"]))
+            item = employee_by_user_id.get(str(member["user_id"]))
             if item is None:
                 item = {"employeeId": member["user_id"], "employeeName": member["employee_name"] or member["user_id"], "employeeEmail": member["employee_email"] or "", "bindStatus": "已绑定邮箱" if member["employee_email"] else "未绑定邮箱", **empty_totals(), "primarySource": "其他", "userIds": [member["user_id"]], "teamRole": member["team_role"] or "user"}
             else:

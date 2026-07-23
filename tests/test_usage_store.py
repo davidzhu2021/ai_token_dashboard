@@ -184,6 +184,47 @@ def test_usage_schema_is_idempotent_and_uses_aggregate_only_columns() -> None:
     assert "response TEXT" not in USAGE_SCHEMA
 
 
+def test_usage_schema_contains_query_indexes() -> None:
+    from backend.usage_store import USAGE_SCHEMA
+
+    assert "usage_daily_date_backend_user_idx" in USAGE_SCHEMA
+    assert "usage_daily_date_source_model_idx" in USAGE_SCHEMA
+    assert "usage_team_membership_usage_join_idx" in USAGE_SCHEMA
+    assert "usage_team_membership_team_filter_idx" in USAGE_SCHEMA
+
+
+def test_model_usage_counts_uses_complete_database_coverage_and_normalizes_models() -> None:
+    class FakePool:
+        async def fetch(self, query, *_args):
+            if "FROM usage_sync_coverage" in query:
+                return [{"backend_id": "primary"}, {"backend_id": "secondary"}]
+            return [
+                {"model": "chatgpt-acct-1-gpt-4o", "request_count": 2},
+                {"model": "gpt-4o", "request_count": 3},
+            ]
+
+    store = UsageStore("postgresql://unused")
+    store.pool = FakePool()
+
+    result = asyncio.run(store.model_usage_counts("2026-07-01", "2026-07-03", ["primary", "secondary"]))
+
+    assert result == {"gpt-4o": 5}
+
+
+def test_model_usage_counts_returns_none_when_any_backend_lacks_coverage() -> None:
+    class FakePool:
+        async def fetch(self, query, *_args):
+            assert "FROM usage_sync_coverage" in query
+            return [{"backend_id": "primary"}]
+
+    store = UsageStore("postgresql://unused")
+    store.pool = FakePool()
+
+    result = asyncio.run(store.model_usage_counts("2026-07-01", "2026-07-03", ["primary", "secondary"]))
+
+    assert result is None
+
+
 def test_source_detection_falls_back_to_other_without_request_details() -> None:
     assert detect_source({"user": "cursor-alice", "metadata": {}}) == "Cursor"
     assert detect_source({"key_alias": "claude-code-alice"}) == "Claude Code"

@@ -386,6 +386,23 @@ def test_models_deduplicate_trimmed_casefold_names_but_keep_similar_names(monkey
     assert len([item for item in models if item["modelName"].casefold() == "gpt-5.5"]) == 1
 
 
+def test_models_accept_database_usage_counts_without_daily_activity_request() -> None:
+    client = make_client()
+    paths: list[str] = []
+
+    async def fake_request_backend(_backend: LiteLLMBackend, _method: str, path: str, **_kwargs: Any) -> Any:
+        paths.append(path)
+        assert path == "/models"
+        return {"data": [{"id": "gpt-4o"}, {"id": "low"}]}
+
+    client.request_backend = fake_request_backend  # type: ignore[assignment]
+
+    models = asyncio.run(client.models({"gpt-4o": 9, "low": 1}))
+
+    assert [item["modelName"] for item in models] == ["gpt-4o", "low"]
+    assert paths == ["/models", "/models"]
+
+
 def test_models_return_complete_name_sorted_catalog_when_all_usage_sources_fail(monkeypatch: pytest.MonkeyPatch) -> None:
     client = make_client()
     monkeypatch.setattr("backend.litellm_client.usage_today", lambda: date(2026, 7, 30))
