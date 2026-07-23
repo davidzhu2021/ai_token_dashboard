@@ -682,13 +682,14 @@ class LiteLLMClient:
                     continue
                 add_user_id(key.get("user_id"))
 
-        for alias in aliases:
-            await fetch_alias(alias)
-
-        for alias in tool_account_aliases(email_prefix):
-            if alias == email_prefix:
-                continue
-            await fetch_alias(alias, substring_matching=True)
+        # 并行查询所有 alias,包括精确匹配和子串匹配
+        tasks = [fetch_alias(alias) for alias in aliases]
+        tasks.extend([
+            fetch_alias(alias, substring_matching=True)
+            for alias in tool_account_aliases(email_prefix)
+            if alias != email_prefix
+        ])
+        await asyncio.gather(*tasks)
         return user_ids
 
     async def user_ids_from_recent_logs(self, email_prefix: str, backend: LiteLLMBackend | None = None) -> list[str]:
@@ -1511,9 +1512,16 @@ class LiteLLMClient:
         for backend in self.backends:
             if backend.source and _source_filter_applies(source) and source != backend.source:
                 continue
-            users = await self.users(backend)
+            # users 和 her_account_index 相互独立，并行获取
+            if backend.source == "Her":
+                users, account_index = await asyncio.gather(
+                    self.users(backend),
+                    self.her_account_index(backend),
+                )
+            else:
+                users = await self.users(backend)
+                account_index = None
             user_map = self._admin_user_map(users)
-            account_index = await self.her_account_index(backend) if backend.source == "Her" else None
             backend_pages_read = 0
             backend_total_pages = 0
             backend_total_records = 0
@@ -1991,10 +1999,20 @@ class LiteLLMClient:
         for backend in self.backends:
             if backend.source and _source_filter_applies(source) and source != backend.source:
                 continue
-            users = await self.users(backend)
+            # users、team_map、her_account_index 并行获取
+            if backend.source == "Her":
+                users, team_map, account_index = await asyncio.gather(
+                    self.users(backend),
+                    self.team_map(backend),
+                    self.her_account_index(backend),
+                )
+            else:
+                users, team_map = await asyncio.gather(
+                    self.users(backend),
+                    self.team_map(backend),
+                )
+                account_index = None
             user_map = self._admin_user_map(users)
-            team_map = await self.team_map(backend)
-            account_index = await self.her_account_index(backend) if backend.source == "Her" else None
             backend_pages_read = 0
             backend_total_pages = 0
             backend_total_records = 0
@@ -2162,8 +2180,16 @@ class LiteLLMClient:
         if team is None:
             raise HTTPException(status_code=404, detail="未找到当前负责的团队")
 
-        user_map = self._admin_user_map(await self.users(backend))
-        account_index = await self.her_account_index(backend) if backend.source == "Her" else None
+        # users 和 her_account_index 相互独立，并行获取
+        if backend.source == "Her":
+            user_map_users, account_index = await asyncio.gather(
+                self.users(backend),
+                self.her_account_index(backend),
+            )
+        else:
+            user_map_users = await self.users(backend)
+            account_index = None
+        user_map = self._admin_user_map(user_map_users)
         team_info = self._team_summary(team, backend)
         employees: dict[str, dict[str, Any]] = {}
         for member in self._team_members(team):
