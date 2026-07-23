@@ -4,6 +4,7 @@ import hashlib
 import logging
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from base64 import urlsafe_b64encode
@@ -630,7 +631,7 @@ async def batched_person_usage_rows(
     refresh: bool = False,
 ) -> dict[str, dict[str, Any]] | None:
     store = usage_store()
-    if store is None or refresh:
+    if store is None:
         return None
     try:
         await store.connect()
@@ -823,6 +824,7 @@ async def team_usage_payload(
         payload = dict(await client().team_usage_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source))
     if enrich_member_rankings:
         payload["employees"] = await team_member_rankings_from_accounts(payload.get("employees") or [], start_date, end_date, source, refresh)
+        payload.setdefault("dataQuality", {})["rankingSource"] = "merged_batch"
     payload["team"] = public_team_from_payload(team, payload.get("team"))
     if enrich_member_rankings:
         team_usage_cache.set(cache_key, payload, env_int("TEAM_USAGE_CACHE_TTL_SECONDS", 300))
@@ -933,6 +935,7 @@ async def team_member_rankings_from_accounts(
     source: str,
     refresh: bool,
 ) -> list[dict[str, Any]]:
+    started = time.perf_counter()
     rankings: list[dict[str, Any]] = []
     litellm = client()
     email_rows = await batched_person_usage_rows(
@@ -942,26 +945,47 @@ async def team_member_rankings_from_accounts(
         source,
         refresh,
     )
+    fallback_count = 0
+    fallback_started = time.perf_counter()
+    fallback_sem = asyncio.Semaphore(max(1, env_int("TEAM_MEMBER_FALLBACK_CONCURRENCY", env_int("LITELLM_MAX_CONCURRENCY", 4))))
+
+    async def fallback_rows(employee: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        async with fallback_sem:
+            try:
+                user_ids = await user_ids_for_team_employee(employee, refresh)
+                rows = await litellm.usage_rows_for_user_ids(user_ids, start_date, end_date, source) if user_ids else []
+                return employee, [{"rows": rows, "userIds": user_ids}]
+            except HTTPException:
+                return employee, [{"rows": [], "userIds": []}]
+
+    pending: list[tuple[dict[str, Any], asyncio.Task[tuple[dict[str, Any], list[dict[str, Any]]]]]] = []
+    for employee in employees:
+        if not isinstance(employee, dict):
+            continue
+        email = clean_identifier(employee.get("employeeEmail"))
+        stored = email_rows.get(email.lower()) if email_rows is not None and email else None
+        if stored is None:
+            pending.append((employee, asyncio.create_task(fallback_rows(employee))))
+
+    fallback_results: dict[int, tuple[list[dict[str, Any]], list[str]]] = {}
+    if pending:
+        for employee, result_task in pending:
+            _, result = await result_task
+            fallback_results[id(employee)] = (result[0]["rows"], result[0]["userIds"])
+        fallback_count = len(pending)
+
     for employee in employees:
         if not isinstance(employee, dict):
             continue
         summary = team_employee_empty_summary(employee)
-        try:
-            email = clean_identifier(employee.get("employeeEmail"))
-            stored = email_rows.get(email.lower()) if email_rows is not None and email else None
-            if stored is not None:
-                rows = stored["rows"]
-                summary["userIds"] = stored.get("userIds") or summary["userIds"]
-            else:
-                user_ids = await user_ids_for_team_employee(employee, refresh)
-                summary["userIds"] = user_ids
-            if stored is None and email:
-                rows, user_ids = await person_usage_rows(email, clean_identifier(employee.get("employeeName")), start_date, end_date, source, refresh, user_ids)
-                summary["userIds"] = user_ids
-            elif stored is None:
-                rows = await litellm.usage_rows_for_user_ids(user_ids, start_date, end_date, source) if user_ids else []
-        except HTTPException:
-            rows = []
+        email = clean_identifier(employee.get("employeeEmail"))
+        stored = email_rows.get(email.lower()) if email_rows is not None and email else None
+        if stored is not None:
+            rows = stored["rows"]
+            summary["userIds"] = stored.get("userIds") or summary["userIds"]
+        else:
+            rows, user_ids = fallback_results.get(id(employee), ([], []))
+            summary["userIds"] = user_ids
         totals = usage_summary(rows)
         range_total = totals["rangeTotal"]
         for field in ("promptTokens", "completionTokens", "totalTokens", "requestCount", "successCount", "failureCount"):
@@ -971,6 +995,12 @@ async def team_member_rankings_from_accounts(
         if source_breakdown:
             summary["primarySource"] = source_breakdown[0].get("source") or "其他"
         rankings.append(summary)
+    logger.info(
+        "team member rankings employees=%d batch=%s fallback=%d fallback_ms=%.0f total_ms=%.0f",
+        len(rankings), bool(email_rows is not None), fallback_count,
+        (time.perf_counter() - fallback_started) * 1000 if fallback_count else 0,
+        (time.perf_counter() - started) * 1000,
+    )
     return sorted(rankings, key=team_employee_sort_key)
 
 
@@ -1418,11 +1448,12 @@ async def team_usage(
     source: str = Query("all"),
     team_ref: str | None = None,
     refresh: bool = Query(False),
+    include_member_rankings: bool = Query(True),
 ) -> dict[str, Any]:
     app_user = require_user(request)
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
-    payload = await team_usage_payload(app_user, start_date, end_date, source, refresh, team_ref)
+    payload = await team_usage_payload(app_user, start_date, end_date, source, refresh, team_ref, include_member_rankings)
     return {
         "leader": {"email": app_user["email"], "name": app_user["name"]},
         "startDate": start_date,

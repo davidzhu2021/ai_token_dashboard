@@ -39,6 +39,9 @@ let teamMemberUsageData = [];
 let teamMemberUsageSummary = null;
 let selectedTeamEmployee = "";
 let teamMemberUsageRequestId = 0;
+let teamUsageRequestController = null;
+let teamUsageRequestId = 0;
+const teamUsagePayloadCache = new Map();
 let teamMemberUsageFilters = { date: "all", model: "all", status: "all", keyword: "" };
 let leaderTeams = [];
 let selectedTeamRef = "";
@@ -1593,7 +1596,7 @@ function renderTeam() {
   renderTeamBlocked();
   if (!currentUser?.isTeamLeader || !leaderTeams.length) return;
   renderTeamSelector();
-  if (isTeamLoading || isTeamMemberLoading) {
+  if (isTeamMemberLoading || (isTeamLoading && !teamUsageData.length)) {
     renderTeamLoading();
     return;
   }
@@ -2179,30 +2182,66 @@ async function loadTeamData(forceRefresh = false) {
   renderTeam();
   const { startDate, endDate } = selectedDateRange();
   const source = el("sourceSelect").value;
+  const requestId = ++teamUsageRequestId;
+  if (teamUsageRequestController) teamUsageRequestController.abort();
+  teamUsageRequestController = new AbortController();
   const query = new URLSearchParams({ start_date: startDate, end_date: endDate, source });
   if (selectedTeamRef) query.set("team_ref", selectedTeamRef);
+  const cacheKey = `${selectedTeamRef}|${startDate}|${endDate}|${source}`;
+  const cached = !forceRefresh ? teamUsagePayloadCache.get(cacheKey) : null;
+  if (cached) {
+    teamUsageData = cached.rows || [];
+    teamSummaryData = cached.summaryRows || teamUsageData;
+    teamEmployees = cached.employees || [];
+    teamInfo = cached.team || currentUser.team || null;
+    teamDataFreshness = cached.dataFreshness || null;
+    lastTeamUsageCacheHit = true;
+    isTeamLoading = false;
+    renderTeam();
+    return;
+  }
   if (forceRefresh) query.set("refresh", "1");
   try {
-    const payload = await api(`/api/team/usage?${query.toString()}`);
+    // 先加载团队摘要，再后台补齐成员排行，避免首屏被成员聚合阻塞。
+    query.set("include_member_rankings", "false");
+    const payload = await api(`/api/team/usage?${query.toString()}`, { signal: teamUsageRequestController.signal });
+    if (requestId !== teamUsageRequestId) return;
     teamUsageData = payload.rows || [];
     teamSummaryData = payload.summaryRows || teamUsageData;
     teamEmployees = payload.employees || [];
     teamInfo = payload.team || currentUser.team || null;
     teamDataFreshness = payload.dataFreshness || null;
     lastTeamUsageCacheHit = Boolean(payload.cache?.hit);
-    if (payload.truncated) {
+    isTeamLoading = false;
+    renderTeam();
+
+    query.set("include_member_rankings", "true");
+    const rankingPayload = await api(`/api/team/usage?${query.toString()}`, { signal: teamUsageRequestController.signal });
+    if (requestId !== teamUsageRequestId) return;
+    teamUsagePayloadCache.set(cacheKey, rankingPayload);
+    teamUsageData = rankingPayload.rows || teamUsageData;
+    teamSummaryData = rankingPayload.summaryRows || teamSummaryData;
+    teamEmployees = rankingPayload.employees || teamEmployees;
+    teamInfo = rankingPayload.team || teamInfo;
+    teamDataFreshness = rankingPayload.dataFreshness || teamDataFreshness;
+    lastTeamUsageCacheHit = Boolean(rankingPayload.cache?.hit);
+    if (rankingPayload.truncated) {
       el("teamLimitHint").textContent = "成员排行按团队成员账号用量汇总，当前数据读取达到上限，排行可能不完整";
     } else {
       el("teamLimitHint").textContent = "成员排行按团队成员账号用量汇总，包含零用量成员";
     }
   } catch (error) {
+    if (error.name === "AbortError") return;
+    if (requestId !== teamUsageRequestId) return;
     showToast(error.message || "团队数据加载失败");
     teamUsageData = [];
     teamSummaryData = [];
     teamEmployees = [];
   } finally {
-    isTeamLoading = false;
-    renderTeam();
+    if (requestId === teamUsageRequestId) {
+      isTeamLoading = false;
+      renderTeam();
+    }
   }
 }
 

@@ -219,7 +219,7 @@ def test_teams_hydrates_v2_list_with_team_info(monkeypatch) -> None:
     scope = asyncio.run(client.team_leader_scope({"matched_accounts": [{"backend": "primary", "user_id": "leader-user"}]}))
 
     assert teams[0]["members_with_roles"][0]["user_id"] == "leader-user"
-    assert calls == [("GET", "/v2/team/list"), ("GET", "/team/info"), ("GET", "/v2/team/list"), ("GET", "/team/info")]
+    assert calls == [("GET", "/v2/team/list"), ("GET", "/team/info"), ("GET", "/v2/team/list")]
     assert scope["isTeamLeader"] is True
     assert scope["team"]["id"] == "team-a"
 
@@ -656,6 +656,43 @@ def test_team_usage_uses_one_cross_backend_sql_batch_without_upstream(monkeypatc
     assert response.status_code == 200
     assert fake_store.calls == 1
     assert [item["totalTokens"] for item in response.json()["employees"]] == [60, 40]
+
+
+def test_team_usage_refresh_still_uses_cross_backend_sql_batch(monkeypatch) -> None:
+    reset_caches()
+    patch_user(monkeypatch)
+
+    class FakeStore:
+        calls = 0
+
+        async def connect(self):
+            return None
+
+        async def team_rows(self, *_args):
+            return {"rows": [], "summaryRows": [], "employees": [
+                {"employeeId": "alice", "employeeName": "Alice", "employeeEmail": "alice@example.com", "userIds": ["alice-primary"], "teamRole": "user"},
+            ], "team": {"id": "team-a", "name": "Team A", "memberCount": 1}, "lastSyncedAt": None}
+
+        async def rows_by_employee_emails(self, emails, *_args):
+            self.calls += 1
+            return {"alice@example.com": {"rows": [{"source": "Cursor", "totalTokens": 80}], "userIds": ["alice-primary"], "lastSyncedAt": None}}
+
+    fake_store = FakeStore()
+    fake = FakeLiteLLMClient(team_member_scope())
+
+    async def fail_upstream(*_args, **_kwargs):
+        raise AssertionError("refresh must keep using the database batch")
+
+    fake.usage_rows_for_user_ids = fail_upstream
+    monkeypatch.setattr(main, "usage_store", lambda: fake_store)
+    monkeypatch.setattr(main, "usage_backend_ids", lambda: ["primary"])
+    monkeypatch.setattr(main, "client", lambda: fake)
+
+    response = app_client().get("/api/team/usage?refresh=1")
+
+    assert response.status_code == 200
+    assert fake_store.calls == 1
+    assert response.json()["employees"][0]["totalTokens"] == 80
 
 
 def test_team_usage_ignores_client_team_override(monkeypatch) -> None:

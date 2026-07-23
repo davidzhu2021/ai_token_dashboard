@@ -296,6 +296,7 @@ class LiteLLMClient:
         self._model_cache = TTLCache()
         self._model_usage_cache = TTLCache()
         self._account_index_cache = TTLCache()
+        self._team_details_cache = TTLCache()
 
     async def close(self) -> None:
         await self.http_client.aclose()
@@ -1619,34 +1620,41 @@ class LiteLLMClient:
         return mapping
 
     async def team_info(self, backend: LiteLLMBackend, team_id: str) -> dict[str, Any] | None:
+        cache_key = f"{backend.id}:{team_id}"
+        details_cache = getattr(self, "_team_details_cache", None)
+        if details_cache is None:
+            details_cache = self._team_details_cache = TTLCache()
+        hit, cached, _ = details_cache.get(cache_key)
+        if hit:
+            return cached
         payload = await self.request_backend(backend, "GET", "/team/info", params={"team_id": team_id})
         if not isinstance(payload, dict):
             return None
         team_info = payload.get("team_info")
         if isinstance(team_info, dict):
             team_info.setdefault("team_id", payload.get("team_id") or team_id)
+            details_cache.set(cache_key, team_info, _env_int("TEAM_DETAILS_CACHE_TTL_SECONDS", 300))
             return team_info
         if payload.get("team_id") or payload.get("members_with_roles") is not None:
             payload.setdefault("team_id", team_id)
+            details_cache.set(cache_key, payload, _env_int("TEAM_DETAILS_CACHE_TTL_SECONDS", 300))
             return payload
         return None
 
     async def _teams_with_details(self, backend: LiteLLMBackend, teams: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        detailed: list[dict[str, Any]] = []
-        for team in teams:
+        async def resolve(team: dict[str, Any]) -> dict[str, Any]:
             team_id = str(_first(team, "team_id", "id", default="") or "").strip()
             if not team_id:
-                detailed.append(team)
-                continue
+                return team
             if self._team_members(team):
-                detailed.append(team)
-                continue
+                return team
             try:
                 full_team = await self.team_info(backend, team_id)
             except HTTPException:
                 full_team = None
-            detailed.append(full_team or team)
-        return detailed
+            return full_team or team
+
+        return list(await asyncio.gather(*(resolve(team) for team in teams)))
 
     async def teams(self, backend: LiteLLMBackend | None = None, include_details: bool = True) -> list[dict[str, Any]]:
         backend = backend or self.backends[0]
