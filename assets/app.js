@@ -836,6 +836,21 @@ function renderModelBarsTo(containerId, data) {
     : `<div class="model-empty">当前筛选范围暂无模型用量</div>`;
 }
 
+function renderDepartmentBarsTo(containerId, departments) {
+  const container = el(containerId);
+  if (!container) return;
+  const sorted = departments
+    .filter((d) => d.totalTokens > 0)
+    .sort((a, b) => b.totalTokens - a.totalTokens)
+    .slice(0, 10);
+  const max = Math.max(1, ...sorted.map((d) => d.totalTokens));
+  container.innerHTML = sorted.length
+    ? sorted
+        .map((dept) => `<div class="bar-row"><strong>${escapeHtml(dept.departmentName)}</strong><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3, (dept.totalTokens / max) * 100)}%"></div></div><span class="num">${formatTokens(dept.totalTokens)}</span></div>`)
+        .join("")
+    : `<div class="model-empty">当前筛选范围暂无部门用量</div>`;
+}
+
 function uniqueSorted(data, field) {
   return Array.from(new Set(data.map((item) => String(item[field] || "").trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b, "zh-CN"));
 }
@@ -1446,6 +1461,7 @@ function renderDepartmentLoading() {
   renderChartSkeleton("departmentSpendChart");
   renderDonutSkeleton("departmentDonutTotal", "departmentSourceLegend");
   renderBarsSkeleton("departmentModelBars");
+  renderBarsSkeleton("departmentBars");
   renderTableSkeleton("departmentUserTable", "departmentUserCount", 8);
 }
 
@@ -1548,13 +1564,23 @@ function renderDepartment() {
   }
   setDepartmentOverviewVisible(Boolean(selectedDepartment));
   const totalData = departmentSummaryData.length ? departmentSummaryData : departmentUsageData;
+
+  const barsPanel = el("departmentBars")?.closest(".panel");
+
   if (selectedDepartment) {
     renderDepartmentMetrics(totalData);
     renderTrendTo("departmentTrendChart", totalData);
     renderSpendTrendTo("departmentSpendChart", totalData);
     renderDonutTo("departmentSourceDonut", "departmentDonutTotal", "departmentSourceLegend", departmentUsageData);
     renderModelBarsTo("departmentModelBars", departmentUsageData);
+    barsPanel?.classList.add("hidden");
+  } else {
+    renderDepartmentBarsTo("departmentBars", departmentRankings);
+    const count = departmentRankings.filter((d) => d.totalTokens > 0).length;
+    el("departmentBarsCount").textContent = `${count} 个部门`;
+    barsPanel?.classList.remove("hidden");
   }
+
   renderDepartmentUsers();
   renderDepartmentPickerOptions();
 
