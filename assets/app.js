@@ -251,12 +251,22 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
+function normalizeModelKey(model) {
+  // 与后端 normalize_model_display_name 保持一致：
+  // 去掉账号别名前缀（chatgpt-acct-84-）和供应商前缀（anthropic.），使同一模型聚合为一条。
+  let name = String(model ?? "").trim();
+  if (!name) return "";
+  name = name.replace(/^[A-Za-z][A-Za-z0-9]*-acct-\d+-/i, "");
+  name = name.replace(/^[A-Za-z][A-Za-z0-9]*\./i, "");
+  return name;
+}
+
 function displayModelName(model) {
-  const rawName = String(model ?? "").trim();
-  if (!rawName) return "未知模型";
-  const separatorIndex = rawName.lastIndexOf("/");
-  const shortName = separatorIndex >= 0 ? rawName.slice(separatorIndex + 1).trim() : rawName;
-  return shortName || rawName;
+  const normalized = normalizeModelKey(model);
+  if (!normalized) return "未知模型";
+  const separatorIndex = normalized.lastIndexOf("/");
+  const shortName = separatorIndex >= 0 ? normalized.slice(separatorIndex + 1).trim() : normalized;
+  return shortName || normalized;
 }
 
 function renderDailyOverview(config) {
@@ -827,7 +837,12 @@ function renderDonutTo(svgId, totalId, legendId, data) {
 function renderModelBarsTo(containerId, data) {
   const container = el(containerId);
   if (!container) return;
-  const grouped = groupBy(data, "model");
+  // 按规范化后的模型名称聚合，合并带不同供应商/账号前缀的同一模型。
+  const grouped = {};
+  data.forEach((item) => {
+    const key = normalizeModelKey(item.model) || "未知模型";
+    (grouped[key] = grouped[key] || []).push(item);
+  });
   const rows = Object.keys(grouped)
     .map((model) => ({ model, value: sum(grouped[model], "totalTokens") }))
     .sort((a, b) => b.value - a.value)
