@@ -218,6 +218,16 @@ function setText(id, value) {
   if (node) node.textContent = value;
 }
 
+function setDailyTokenValue(id, value) {
+  const node = el(id);
+  if (!node) return;
+
+  const text = String(value);
+  node.textContent = text;
+  node.classList.toggle("is-compact", text.length >= 10 && text.length < 13);
+  node.classList.toggle("is-extra-compact", text.length >= 13);
+}
+
 function setHtml(id, value) {
   const node = el(id);
   if (!node) return false;
@@ -273,7 +283,7 @@ function renderDailyOverview(config) {
   }
 
   setText(`${baseId}TotalLabel`, totalLabel);
-  setText(`${baseId}Total`, formatTokens(rangeTokens));
+  setDailyTokenValue(`${baseId}Total`, formatTokens(rangeTokens));
   setText(`${baseId}Spend`, money.format(rangeSpend));
   setText(`${baseId}Requests`, fmt.format(rangeRequests));
   setText(`${baseId}RequestsSub`, "所选范围累计");
@@ -1294,7 +1304,7 @@ function renderPersonalLoading() {
   const label = rangeLabel();
   const source = sourceText();
   el("personalDailyOverview")?.classList.toggle("personal-single-day", selectedDateRange().days === 1);
-  setText("heroTotal", "加载中");
+  setDailyTokenValue("heroTotal", "加载中");
   setText("heroSpend", "--");
   setText("heroSuccess", "--");
   setText("heroSuccessSub", "-- / -- 次成功");
@@ -1319,7 +1329,7 @@ function renderPersonalLoading() {
 function renderAdminLoading() {
   const label = rangeLabel();
   const source = sourceText();
-  setText("adminHeroTotal", "加载中");
+  setDailyTokenValue("adminHeroTotal", "加载中");
   setText("adminHeroSpend", "--");
   setText("adminHeroTotalLabel", selectedAdminEmployee ? "所选范围员工 Token" : "所选范围全员 Token");
   setText("adminHeroTitle", selectedAdminEmployee ? "所选范围 · 员工视图" : "所选范围 · 管理员视图");
@@ -1353,7 +1363,7 @@ function renderDepartmentLoading() {
   setText("departmentRankingDesc", selectedDepartment
     ? `当前展示 ${scopeLabel} 内员工用量，默认按 Token 从高到低排序。`
     : "点击部门查看该部门用量看板和员工排行。");
-  setText("departmentHeroTotal", "加载中");
+  setDailyTokenValue("departmentHeroTotal", "加载中");
   setText("departmentHeroSpend", "--");
   setText("departmentHeroTotalLabel", "所选范围 Token");
   setText("departmentWelcomeTitle", `所选范围 · ${scopeLabel}`);
@@ -1383,7 +1393,7 @@ function renderTeamLoading() {
   const source = sourceText();
   const scopeLabel = teamScopeLabel();
   const memberLabel = selectedTeamEmployee ? selectedTeamEmployeeLabel() : "";
-  setText("teamHeroTotal", "加载中");
+  setDailyTokenValue("teamHeroTotal", "加载中");
   setText("teamHeroSpend", "--");
   setText("teamHeroTotalLabel", selectedTeamEmployee ? "所选成员 Token" : "所选范围 Token");
   setText("teamHeroRequests", "--");

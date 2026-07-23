@@ -884,7 +884,16 @@
         line-height: 0.95;
         letter-spacing: 0;
         font-weight: 900;
-        overflow-wrap: anywhere;
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .daily-value.is-compact {
+        font-size: clamp(27px, calc(1.4rem + 1.35vw), 46px);
+      }
+
+      .daily-value.is-extra-compact {
+        font-size: clamp(23px, calc(1.2rem + 1.1vw), 38px);
       }
 
       .daily-money {
