@@ -38,6 +38,10 @@ CREATE INDEX IF NOT EXISTS usage_daily_employee_date_idx
     ON usage_daily (employee_email, usage_date);
 CREATE INDEX IF NOT EXISTS usage_daily_date_idx
     ON usage_daily (usage_date);
+CREATE INDEX IF NOT EXISTS usage_daily_date_backend_user_idx
+    ON usage_daily (usage_date, backend_id, user_id);
+CREATE INDEX IF NOT EXISTS usage_daily_date_source_model_idx
+    ON usage_daily (usage_date, source, model);
 
 CREATE TABLE IF NOT EXISTS usage_sync_coverage (
     backend_id TEXT NOT NULL,
@@ -62,6 +66,10 @@ CREATE INDEX IF NOT EXISTS usage_team_membership_lookup_idx
     ON usage_team_membership_daily (backend_id, team_id, snapshot_date);
 CREATE INDEX IF NOT EXISTS usage_team_membership_employee_idx
     ON usage_team_membership_daily (employee_email, snapshot_date);
+CREATE INDEX IF NOT EXISTS usage_team_membership_usage_join_idx
+    ON usage_team_membership_daily (backend_id, snapshot_date, user_id);
+CREATE INDEX IF NOT EXISTS usage_team_membership_team_filter_idx
+    ON usage_team_membership_daily (backend_id, snapshot_date, team_id, user_id);
 
 CREATE TABLE IF NOT EXISTS usage_sync_runs (
     id BIGSERIAL PRIMARY KEY,
@@ -449,6 +457,34 @@ class UsageStore:
         """Return whether every configured backend covers the complete date range."""
         return set(await self.covered_backend_ids(start_date, end_date, backend_ids)) == set(backend_ids)
 
+    async def model_usage_counts(
+        self,
+        start_date: str,
+        end_date: str,
+        backend_ids: list[str],
+    ) -> dict[str, int] | None:
+        """Return model request counts, or None when the snapshot is incomplete."""
+        covered = await self.covered_backend_ids(start_date, end_date, backend_ids)
+        if set(covered) != set(backend_ids):
+            return None
+        records = await self._require_pool().fetch(
+            """
+            SELECT model, SUM(request_count)::bigint AS request_count
+            FROM usage_daily
+            WHERE usage_date BETWEEN $1::date AND $2::date
+              AND backend_id = ANY($3::text[])
+            GROUP BY model
+            """,
+            _as_date(start_date),
+            _as_date(end_date),
+            backend_ids,
+        )
+        counts: dict[str, int] = defaultdict(int)
+        for record in records:
+            model = normalize_model_display_name(record["model"]) or "未知模型"
+            counts[model.casefold()] += _as_int(record["request_count"])
+        return dict(counts)
+
     async def _fetch_usage(self, start_date: str, end_date: str, backend_ids: list[str] | None = None) -> list[dict[str, Any]]:
         backend_filter = ""
         args: list[Any] = [_as_date(start_date), _as_date(end_date)]
@@ -555,39 +591,196 @@ class UsageStore:
         ]
         return {"rows": self._group_rows(rows, ("date", "source", "model")), "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered)}
 
+    @staticmethod
+    def _aggregate_metrics_sql(prefix: str = "") -> str:
+        return ", ".join(
+            f"SUM({prefix}{field})::{('double precision' if field == 'spend' else 'bigint')} AS {field}"
+            for field in (
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+                "request_count",
+                "success_count",
+                "failure_count",
+                "spend",
+            )
+        )
+
+    @staticmethod
+    def _aggregated_usage_row(record: Any, include_identity: bool = True) -> dict[str, Any]:
+        row = {
+            "date": record["usage_date"].isoformat(),
+            "source": record["source"],
+            "model": normalize_model_display_name(record["model_name"]) or "未知模型",
+            "promptTokens": _as_int(record["prompt_tokens"]),
+            "completionTokens": _as_int(record["completion_tokens"]),
+            "totalTokens": _as_int(record["total_tokens"]),
+            "requestCount": _as_int(record["request_count"]),
+            "successCount": _as_int(record["success_count"]),
+            "failureCount": _as_int(record["failure_count"]),
+            "spend": _as_float(record["spend"]),
+        }
+        if include_identity:
+            row.update(
+                {
+                    "_backendId": record["backend_id"],
+                    "_userId": record["user_id"],
+                    "employeeEmail": record["employee_email"] or "",
+                    "employeeName": record["employee_name"] or record["user_id"] or "",
+                }
+            )
+        return row
+
+    async def _query_aggregated_rows(
+        self,
+        start_date: str,
+        end_date: str,
+        source: str,
+        backend_ids: list[str],
+        employee_ids: list[str] | None = None,
+        team_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read already grouped daily rows for a scope without materializing raw records."""
+        conditions = [
+            "u.usage_date BETWEEN $1::date AND $2::date",
+            "u.backend_id = ANY($3::text[])",
+            "($4 = 'all' OR u.source = $4)",
+        ]
+        args: list[Any] = [_as_date(start_date), _as_date(end_date), backend_ids, source or "all"]
+        if employee_ids:
+            args.append(employee_ids)
+            conditions.append(f"u.user_id = ANY(${len(args)}::text[])")
+        if team_id:
+            args.append(team_id)
+            conditions.append(f"m.team_id = ${len(args)}")
+        model_sql = "regexp_replace(u.model, '^[A-Za-z][A-Za-z0-9]*-acct-[0-9]+-', '', 'i')"
+        records = await self._require_pool().fetch(
+            f"""
+            SELECT u.backend_id, u.usage_date, u.user_id,
+                   MAX(u.employee_email) AS employee_email,
+                   MAX(u.employee_name) AS employee_name,
+                   u.source, {model_sql} AS model_name,
+                   {self._aggregate_metrics_sql('u.')}
+            FROM usage_daily u
+            {"JOIN usage_team_membership_daily m ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id" if team_id else ""}
+            WHERE {" AND ".join(conditions)}
+            GROUP BY u.backend_id, u.usage_date, u.user_id, u.source, {model_sql}
+            ORDER BY u.usage_date, MAX(u.employee_name), u.source, model_name
+            """,
+            *args,
+        )
+        return [self._aggregated_usage_row(record) for record in records]
+
     async def admin_rows(self, start_date: str, end_date: str, source: str, employee: str | None, backend_ids: list[str]) -> dict[str, Any] | None:
         covered = await self.covered_backend_ids(start_date, end_date, backend_ids)
         if not covered:
             return None
-        rows = await self._fetch_usage(start_date, end_date, covered)
-        if source and source != "all":
-            rows = [row for row in rows if row["source"] == source]
         employee_filter = (employee or "").strip().lower()
+        conditions = [
+            "usage_date BETWEEN $1::date AND $2::date",
+            "backend_id = ANY($3::text[])",
+            "($4 = 'all' OR source = $4)",
+        ]
+        args: list[Any] = [_as_date(start_date), _as_date(end_date), covered, source or "all"]
         if employee_filter:
-            rows = [
-                row
-                for row in rows
-                if employee_filter in " ".join(
-                    str(row.get(key) or "").lower() for key in ("_userId", "employeeEmail", "employeeName")
-                )
-            ]
+            conditions.append("(position($5 IN lower(user_id)) > 0 OR position($5 IN lower(employee_email)) > 0 OR position($5 IN lower(employee_name)) > 0)")
+            args.append(employee_filter)
+        where_sql = " AND ".join(conditions)
+        pool = self._require_pool()
+        model_sql = "regexp_replace(model, '^[A-Za-z][A-Za-z0-9]*-acct-[0-9]+-', '', 'i')"
+        row_records = await pool.fetch(
+            f"""
+            SELECT backend_id, usage_date, user_id, MAX(employee_email) AS employee_email,
+                   MAX(employee_name) AS employee_name, source, {model_sql} AS model_name,
+                   {self._aggregate_metrics_sql()}
+            FROM usage_daily
+            WHERE {where_sql}
+            GROUP BY backend_id, usage_date, user_id, source, {model_sql}
+            ORDER BY usage_date, MAX(employee_name), source, model_name
+            """,
+            *args,
+        )
         enriched = []
-        for row in rows:
-            item = dict(row)
-            item.update(
+        for record in row_records:
+            row = self._aggregated_usage_row(record)
+            row.update(
                 {
-                    "employeeId": row["_userId"],
-                    "employeeName": row["employeeName"] or row["_userId"],
-                    "employeeEmail": row["employeeEmail"],
-                    "bindStatus": "已绑定邮箱" if row["employeeEmail"] else "未绑定邮箱",
+                    "employeeId": record["user_id"],
+                    "employeeName": record["employee_name"] or record["user_id"],
+                    "employeeEmail": record["employee_email"] or "",
+                    "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱",
                 }
             )
-            enriched.append(item)
-        employees = self._employee_summaries(enriched)
+            enriched.append(row)
+
+        employee_records = await pool.fetch(
+            f"""
+            WITH filtered AS (
+                SELECT *, COALESCE(NULLIF(employee_email, ''), user_id) AS employee_key,
+                       {model_sql} AS model_name
+                FROM usage_daily
+                WHERE {where_sql}
+            ), totals AS (
+                SELECT employee_key, MIN(user_id) AS employee_id,
+                       MAX(NULLIF(employee_email, '')) AS employee_email,
+                       MAX(NULLIF(employee_name, '')) AS employee_name,
+                       {self._aggregate_metrics_sql('')}
+                FROM filtered
+                GROUP BY employee_key
+            ), source_totals AS (
+                SELECT employee_key, source, SUM(total_tokens)::bigint AS source_tokens
+                FROM filtered
+                GROUP BY employee_key, source
+            ), primary_sources AS (
+                SELECT DISTINCT ON (employee_key) employee_key, source AS primary_source
+                FROM source_totals
+                ORDER BY employee_key, source_tokens DESC, source
+            )
+            SELECT totals.*, primary_sources.primary_source,
+                   ARRAY(SELECT DISTINCT user_id FROM filtered f WHERE f.employee_key = totals.employee_key ORDER BY user_id) AS user_ids
+            FROM totals
+            JOIN primary_sources USING (employee_key)
+            ORDER BY totals.total_tokens DESC, totals.spend DESC, lower(COALESCE(totals.employee_name, totals.employee_id))
+            """,
+            *args,
+        )
+        employees = [
+            {
+                "employeeId": record["employee_id"],
+                "employeeName": record["employee_name"] or record["employee_id"],
+                "employeeEmail": record["employee_email"] or "",
+                "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱",
+                **{
+                    "promptTokens": _as_int(record["prompt_tokens"]),
+                    "completionTokens": _as_int(record["completion_tokens"]),
+                    "totalTokens": _as_int(record["total_tokens"]),
+                    "requestCount": _as_int(record["request_count"]),
+                    "successCount": _as_int(record["success_count"]),
+                    "failureCount": _as_int(record["failure_count"]),
+                    "spend": _as_float(record["spend"]),
+                },
+                "primarySource": record["primary_source"] or "其他",
+                "userIds": list(record["user_ids"] or []),
+                "teamRole": "user",
+            }
+            for record in employee_records
+        ]
+
+        summary_records = await pool.fetch(
+            f"""
+            SELECT usage_date, source, {model_sql} AS model_name, {self._aggregate_metrics_sql()}
+            FROM usage_daily
+            WHERE {where_sql}
+            GROUP BY usage_date, source, {model_sql}
+            ORDER BY usage_date, source, model_name
+            """,
+            *args,
+        )
+        summary_rows = [self._aggregated_usage_row(record, include_identity=False) for record in summary_records]
         public_rows = self._public_rows(enriched)
         return {
             "rows": public_rows,
-            "summaryRows": public_rows,
+            "summaryRows": summary_rows,
             "employees": employees,
             "pageLimit": 0,
             "pageSize": 0,
@@ -641,27 +834,36 @@ class UsageStore:
         covered = await self.covered_backend_ids(start_date, end_date, backend_ids)
         if not covered:
             return None
-        records = await self._require_pool().fetch(
-            """
-            SELECT u.*, m.team_id, m.team_name, m.team_role
+        department_filter = (department or "").strip().lower()
+        args: list[Any] = [_as_date(start_date), _as_date(end_date), covered, source or "all", department_filter]
+        where_sql = """
+            u.usage_date BETWEEN $1::date AND $2::date
+            AND u.backend_id = ANY($3::text[])
+            AND ($4 = 'all' OR u.source = $4)
+            AND ($5 = '' OR lower(m.team_id) = $5 OR lower(m.team_name) = $5)
+        """
+        model_sql = "regexp_replace(u.model, '^[A-Za-z][A-Za-z0-9]*-acct-[0-9]+-', '', 'i')"
+        pool = self._require_pool()
+        records = await pool.fetch(
+            f"""
+            SELECT u.backend_id, u.usage_date, u.user_id,
+                   MAX(u.employee_email) AS employee_email,
+                   MAX(u.employee_name) AS employee_name,
+                   m.team_id, MAX(m.team_name) AS team_name, MAX(m.team_role) AS team_role,
+                   u.source, {model_sql} AS model_name,
+                   {self._aggregate_metrics_sql('u.')} 
             FROM usage_daily u
             JOIN usage_team_membership_daily m
               ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
-            WHERE u.usage_date BETWEEN $1::date AND $2::date
-              AND u.backend_id = ANY($3::text[])
-              AND ($4 = 'all' OR u.source = $4)
+            WHERE {where_sql}
+            GROUP BY u.backend_id, u.usage_date, u.user_id, m.team_id, u.source, {model_sql}
+            ORDER BY u.usage_date, MAX(m.team_name), MAX(u.employee_name), u.source, model_name
             """,
-            _as_date(start_date),
-            _as_date(end_date),
-            covered,
-            source or "all",
+            *args,
         )
-        department_filter = (department or "").strip().lower()
         rows = []
         for record in records:
-            if department_filter and department_filter not in {str(record["team_id"]).lower(), str(record["team_name"]).lower()}:
-                continue
-            row = self._usage_row(record)
+            row = self._aggregated_usage_row(record)
             row.update(
                 {
                     "departmentId": record["team_id"],
@@ -674,27 +876,118 @@ class UsageStore:
                 }
             )
             rows.append(row)
-        rows = self._merge_rows_by(rows, ("_backendId", "date", "_userId", "departmentId", "source", "model"))
-        departments = self._group_rows(rows, ("departmentId", "departmentName"))
-        department_sources: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        department_employees: dict[str, set[str]] = defaultdict(set)
-        department_status: dict[str, str] = {}
-        for row in rows:
-            department_id = str(row.get("departmentId") or "")
-            department_sources[department_id][str(row.get("source") or "其他")] += _as_int(row.get("totalTokens"))
-            department_employees[department_id].add(str(row.get("employeeId") or ""))
-            department_status[department_id] = str(row.get("departmentBindStatus") or "已绑定部门")
-        for item in departments:
-            department_id = str(item.get("departmentId") or "")
-            source_values = department_sources.get(department_id, {})
-            item["primarySource"] = max(source_values, key=source_values.get) if source_values else "其他"
-            item["activeEmployees"] = len({value for value in department_employees.get(department_id, set()) if value})
-            item["bindStatus"] = department_status.get(department_id, "已绑定部门")
-        employees = self._employee_summaries(rows)
+
+        employee_records = await pool.fetch(
+            f"""
+            WITH filtered AS (
+                SELECT u.*, m.team_id, m.team_name,
+                       lower(COALESCE(NULLIF(u.employee_email, ''), u.user_id)) AS employee_key,
+                       {model_sql} AS model_name
+                FROM usage_daily u
+                JOIN usage_team_membership_daily m
+                  ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
+                WHERE {where_sql}
+            ), totals AS (
+                SELECT employee_key, MIN(user_id) AS employee_id,
+                       MAX(NULLIF(employee_email, '')) AS employee_email,
+                       MAX(NULLIF(employee_name, '')) AS employee_name,
+                       {self._aggregate_metrics_sql('')}
+                FROM filtered
+                GROUP BY employee_key
+            ), source_totals AS (
+                SELECT employee_key, source, SUM(total_tokens)::bigint AS source_tokens
+                FROM filtered
+                GROUP BY employee_key, source
+            ), primary_sources AS (
+                SELECT DISTINCT ON (employee_key) employee_key, source AS primary_source
+                FROM source_totals
+                ORDER BY employee_key, source_tokens DESC, source
+            )
+            SELECT totals.*, primary_sources.primary_source,
+                   ARRAY(SELECT DISTINCT user_id FROM filtered f WHERE f.employee_key = totals.employee_key ORDER BY user_id) AS user_ids
+            FROM totals JOIN primary_sources USING (employee_key)
+            ORDER BY totals.total_tokens DESC, totals.spend DESC, lower(COALESCE(totals.employee_name, totals.employee_id))
+            """,
+            *args,
+        )
+        employees = [
+            {
+                "employeeId": record["employee_id"],
+                "employeeName": record["employee_name"] or record["employee_id"],
+                "employeeEmail": record["employee_email"] or "",
+                "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱",
+                "promptTokens": _as_int(record["prompt_tokens"]),
+                "completionTokens": _as_int(record["completion_tokens"]),
+                "totalTokens": _as_int(record["total_tokens"]),
+                "requestCount": _as_int(record["request_count"]),
+                "successCount": _as_int(record["success_count"]),
+                "failureCount": _as_int(record["failure_count"]),
+                "spend": _as_float(record["spend"]),
+                "primarySource": record["primary_source"] or "其他",
+                "userIds": list(record["user_ids"] or []),
+                "teamRole": "user",
+            }
+            for record in employee_records
+        ]
+
+        department_records = await pool.fetch(
+            f"""
+            WITH filtered AS (
+                SELECT u.*, m.team_id, m.team_name, {model_sql} AS model_name
+                FROM usage_daily u
+                JOIN usage_team_membership_daily m
+                  ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
+                WHERE {where_sql}
+            ), source_totals AS (
+                SELECT team_id, source, SUM(total_tokens)::bigint AS source_tokens
+                FROM filtered GROUP BY team_id, source
+            ), primary_sources AS (
+                SELECT DISTINCT ON (team_id) team_id, source AS primary_source
+                FROM source_totals ORDER BY team_id, source_tokens DESC, source
+            )
+            SELECT team_id, MAX(team_name) AS team_name,
+                   {self._aggregate_metrics_sql('')}, COUNT(DISTINCT user_id)::bigint AS active_employees,
+                   primary_sources.primary_source
+            FROM filtered JOIN primary_sources USING (team_id)
+            GROUP BY team_id, primary_sources.primary_source
+            ORDER BY total_tokens DESC, spend DESC, lower(MAX(team_name))
+            """,
+            *args,
+        )
+        departments = [
+            {
+                "departmentId": record["team_id"],
+                "departmentName": record["team_name"] or record["team_id"],
+                "bindStatus": "已绑定部门",
+                "promptTokens": _as_int(record["prompt_tokens"]),
+                "completionTokens": _as_int(record["completion_tokens"]),
+                "totalTokens": _as_int(record["total_tokens"]),
+                "requestCount": _as_int(record["request_count"]),
+                "successCount": _as_int(record["success_count"]),
+                "failureCount": _as_int(record["failure_count"]),
+                "spend": _as_float(record["spend"]),
+                "primarySource": record["primary_source"] or "其他",
+                "activeEmployees": _as_int(record["active_employees"]),
+            }
+            for record in department_records
+        ]
+        summary_records = await pool.fetch(
+            f"""
+            SELECT u.usage_date, u.source, {model_sql} AS model_name, {self._aggregate_metrics_sql('u.')}
+            FROM usage_daily u
+            JOIN usage_team_membership_daily m
+              ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
+            WHERE {where_sql}
+            GROUP BY u.usage_date, u.source, {model_sql}
+            ORDER BY u.usage_date, u.source, model_name
+            """,
+            *args,
+        )
+        summary_rows = [self._aggregated_usage_row(record, include_identity=False) for record in summary_records]
         public_rows = self._public_rows(rows)
         return {
             "rows": public_rows,
-            "summaryRows": public_rows,
+            "summaryRows": summary_rows,
             "departments": departments,
             "employees": employees,
             "pageLimit": 0,
@@ -710,65 +1003,138 @@ class UsageStore:
     async def team_rows(self, backend_id: str, team_id: str, start_date: str, end_date: str, source: str) -> dict[str, Any] | None:
         if not await self.has_coverage(start_date, end_date, [backend_id]):
             return None
-        memberships = await self._membership_rows(start_date, end_date, backend_id, team_id)
-        if not memberships:
-            return None
-        records = await self._require_pool().fetch(
+        pool = self._require_pool()
+        latest_members = await pool.fetch(
             """
-            SELECT u.*, m.team_id, m.team_name, m.team_role
+            SELECT DISTINCT ON (user_id) snapshot_date, team_name, user_id,
+                   employee_email, employee_name, team_role
+            FROM usage_team_membership_daily
+            WHERE backend_id = $1 AND team_id = $2
+              AND snapshot_date BETWEEN $3::date AND $4::date
+            ORDER BY user_id, snapshot_date DESC
+            """,
+            backend_id, team_id, _as_date(start_date), _as_date(end_date),
+        )
+        if not latest_members:
+            return None
+        args: list[Any] = [backend_id, team_id, _as_date(start_date), _as_date(end_date), source or "all"]
+        model_sql = "regexp_replace(u.model, '^[A-Za-z][A-Za-z0-9]*-acct-[0-9]+-', '', 'i')"
+        records = await pool.fetch(
+            f"""
+            SELECT u.backend_id, u.usage_date, u.user_id,
+                   MAX(u.employee_email) AS employee_email,
+                   MAX(u.employee_name) AS employee_name,
+                   u.source, {model_sql} AS model_name,
+                   {self._aggregate_metrics_sql('u.')}
             FROM usage_daily u
             JOIN usage_team_membership_daily m
               ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
-            WHERE u.backend_id = $1 AND m.team_id = $2
+             AND m.team_id = $2
+            WHERE u.backend_id = $1
               AND u.usage_date BETWEEN $3::date AND $4::date
               AND ($5 = 'all' OR u.source = $5)
+            GROUP BY u.backend_id, u.usage_date, u.user_id, u.source, {model_sql}
+            ORDER BY u.usage_date, MAX(u.employee_name), u.source, model_name
             """,
-            backend_id,
-            team_id,
-            _as_date(start_date),
-            _as_date(end_date),
-            source or "all",
+            *args,
         )
         rows = []
         for record in records:
-            row = self._usage_row(record)
+            row = self._aggregated_usage_row(record)
             row.update(
                 {
                     "employeeId": record["user_id"],
                     "employeeName": record["employee_name"] or record["user_id"],
-                    "employeeEmail": record["employee_email"],
+                    "employeeEmail": record["employee_email"] or "",
                     "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱",
                 }
             )
             rows.append(row)
-        rows = self._merge_rows_by(rows, ("_backendId", "date", "_userId", "source", "model"))
-        latest_members: dict[str, Any] = {}
-        for member in memberships:
-            key = str(member["user_id"])
-            current = latest_members.get(key)
-            if current is None or member["snapshot_date"] > current["snapshot_date"]:
-                latest_members[key] = member
-        employees: list[dict[str, Any]] = []
-        employee_summaries = self._employee_summaries(rows)
-        by_user_id = {
-            str(user_id): item
-            for item in employee_summaries
-            for user_id in item.get("userIds") or []
+
+        employee_records = await pool.fetch(
+            f"""
+            WITH filtered AS (
+                SELECT u.*, m.team_role,
+                       lower(COALESCE(NULLIF(u.employee_email, ''), u.user_id)) AS employee_key,
+                       {model_sql} AS model_name
+                FROM usage_daily u
+                JOIN usage_team_membership_daily m
+                  ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
+                 AND m.team_id = $2
+                WHERE u.backend_id = $1
+                  AND u.usage_date BETWEEN $3::date AND $4::date
+                  AND ($5 = 'all' OR u.source = $5)
+            ), totals AS (
+                SELECT employee_key, MIN(user_id) AS employee_id,
+                       MAX(NULLIF(employee_email, '')) AS employee_email,
+                       MAX(NULLIF(employee_name, '')) AS employee_name,
+                       MAX(team_role) AS team_role,
+                       {self._aggregate_metrics_sql('')}
+                FROM filtered GROUP BY employee_key
+            ), source_totals AS (
+                SELECT employee_key, source, SUM(total_tokens)::bigint AS source_tokens
+                FROM filtered GROUP BY employee_key, source
+            ), primary_sources AS (
+                SELECT DISTINCT ON (employee_key) employee_key, source AS primary_source
+                FROM source_totals ORDER BY employee_key, source_tokens DESC, source
+            )
+            SELECT totals.*, primary_sources.primary_source,
+                   ARRAY(SELECT DISTINCT user_id FROM filtered f WHERE f.employee_key = totals.employee_key ORDER BY user_id) AS user_ids
+            FROM totals JOIN primary_sources USING (employee_key)
+            ORDER BY totals.total_tokens DESC, totals.spend DESC, lower(COALESCE(totals.employee_name, totals.employee_id))
+            """,
+            *args,
+        )
+        employee_by_key = {
+            str(record["employee_id"]): {
+                "employeeId": record["employee_id"],
+                "employeeName": record["employee_name"] or record["employee_id"],
+                "employeeEmail": record["employee_email"] or "",
+                "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱",
+                "promptTokens": _as_int(record["prompt_tokens"]),
+                "completionTokens": _as_int(record["completion_tokens"]),
+                "totalTokens": _as_int(record["total_tokens"]),
+                "requestCount": _as_int(record["request_count"]),
+                "successCount": _as_int(record["success_count"]),
+                "failureCount": _as_int(record["failure_count"]),
+                "spend": _as_float(record["spend"]),
+                "primarySource": record["primary_source"] or "其他",
+                "userIds": list(record["user_ids"] or []),
+                "teamRole": record["team_role"] or "user",
+            }
+            for record in employee_records
         }
-        for member in latest_members.values():
-            item = by_user_id.get(str(member["user_id"]))
+        employees: list[dict[str, Any]] = []
+        for member in latest_members:
+            item = employee_by_key.get(str(member["user_id"]))
             if item is None:
-                item = {"employeeId": member["user_id"], "employeeName": member["employee_name"] or member["user_id"], "employeeEmail": member["employee_email"], "bindStatus": "已绑定邮箱" if member["employee_email"] else "未绑定邮箱", **empty_totals(), "primarySource": "其他", "userIds": [member["user_id"]], "teamRole": member["team_role"]}
+                item = {"employeeId": member["user_id"], "employeeName": member["employee_name"] or member["user_id"], "employeeEmail": member["employee_email"] or "", "bindStatus": "已绑定邮箱" if member["employee_email"] else "未绑定邮箱", **empty_totals(), "primarySource": "其他", "userIds": [member["user_id"]], "teamRole": member["team_role"] or "user"}
             else:
                 item = dict(item)
-                item["teamRole"] = member["team_role"]
+                item["teamRole"] = member["team_role"] or item.get("teamRole") or "user"
             employees.append(item)
         employees.sort(key=lambda item: (-item["totalTokens"], -item["spend"], str(item["employeeName"]).lower()))
-        team_name = next(iter(latest_members.values()))["team_name"] if latest_members else team_id
+        team_name = latest_members[0]["team_name"] or team_id
+        summary_records = await pool.fetch(
+            f"""
+            SELECT u.usage_date, u.source, {model_sql} AS model_name, {self._aggregate_metrics_sql('u.')}
+            FROM usage_daily u
+            JOIN usage_team_membership_daily m
+              ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
+             AND m.team_id = $2
+            WHERE u.backend_id = $1
+              AND u.usage_date BETWEEN $3::date AND $4::date
+              AND ($5 = 'all' OR u.source = $5)
+            GROUP BY u.usage_date, u.source, {model_sql}
+            ORDER BY u.usage_date, u.source, model_name
+            """,
+            *args,
+        )
+        summary_rows = [self._aggregated_usage_row(record, include_identity=False) for record in summary_records]
         public_rows = self._public_rows(rows)
         return {
             "rows": public_rows,
-            "summaryRows": public_rows,
+            "summaryRows": summary_rows,
             "employees": employees,
             "team": {"id": team_id, "name": team_name or team_id, "memberCount": len(employees), "backend": backend_id},
             "pageLimit": 0,
@@ -782,30 +1148,79 @@ class UsageStore:
         }
 
     async def team_member_rows(self, backend_id: str, team_id: str, employee: str, start_date: str, end_date: str, source: str) -> dict[str, Any] | None:
-        team = await self.team_rows(backend_id, team_id, start_date, end_date, source)
-        if team is None:
+        if not await self.has_coverage(start_date, end_date, [backend_id]):
             return None
+        pool = self._require_pool()
         normalized = employee.strip().lower()
-        selected = next(
-            (
-                item
-                for item in team["employees"]
-                if normalized in {str(item.get("employeeId") or "").lower(), str(item.get("employeeEmail") or "").lower(), str(item.get("employeeName") or "").lower(), *[str(value).lower() for value in item.get("userIds") or []]}
-            ),
-            None,
+        members = await pool.fetch(
+            """
+            SELECT DISTINCT ON (user_id) user_id, employee_email, employee_name, team_role, team_name
+            FROM usage_team_membership_daily
+            WHERE backend_id = $1 AND team_id = $2
+              AND snapshot_date BETWEEN $3::date AND $4::date
+              AND ($5 = lower(user_id) OR $5 = lower(employee_email) OR $5 = lower(employee_name))
+            ORDER BY user_id, snapshot_date DESC
+            """,
+            backend_id, team_id, _as_date(start_date), _as_date(end_date), normalized,
         )
-        if selected is None:
+        if not members:
             return None
-        selected_user_ids = {str(value) for value in selected.get("userIds") or []}
-        if not selected_user_ids:
-            selected_user_ids.add(str(selected.get("employeeId")))
-        rows = [row for row in team["rows"] if str(row.get("employeeId")) in selected_user_ids]
+        selected_user_ids = [str(member["user_id"]) for member in members]
+        args: list[Any] = [backend_id, team_id, _as_date(start_date), _as_date(end_date), source or "all", selected_user_ids]
+        model_sql = "regexp_replace(u.model, '^[A-Za-z][A-Za-z0-9]*-acct-[0-9]+-', '', 'i')"
+        records = await pool.fetch(
+            f"""
+            SELECT u.backend_id, u.usage_date, u.user_id,
+                   MAX(u.employee_email) AS employee_email,
+                   MAX(u.employee_name) AS employee_name,
+                   u.source, {model_sql} AS model_name,
+                   {self._aggregate_metrics_sql('u.')}
+            FROM usage_daily u
+            JOIN usage_team_membership_daily m
+              ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
+             AND m.team_id = $2
+            WHERE u.backend_id = $1
+              AND u.usage_date BETWEEN $3::date AND $4::date
+              AND ($5 = 'all' OR u.source = $5)
+              AND u.user_id = ANY($6::text[])
+            GROUP BY u.backend_id, u.usage_date, u.user_id, u.source, {model_sql}
+            ORDER BY u.usage_date, u.source, model_name
+            """,
+            *args,
+        )
+        rows = []
+        for record in records:
+            row = self._aggregated_usage_row(record)
+            row.update({"employeeId": record["user_id"], "employeeName": record["employee_name"] or record["user_id"], "employeeEmail": record["employee_email"] or "", "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱"})
+            rows.append({key: value for key, value in row.items() if not key.startswith("_")})
+        selected_member = members[0]
+        selected = {
+            "employeeId": selected_user_ids[0],
+            "employeeName": selected_member["employee_name"] or selected_user_ids[0],
+            "employeeEmail": selected_member["employee_email"] or "",
+            "bindStatus": "已绑定邮箱" if selected_member["employee_email"] else "未绑定邮箱",
+            "userIds": selected_user_ids,
+            "teamRole": selected_member["team_role"] or "user",
+            **empty_totals(),
+            "primarySource": "其他",
+        }
+        for member in members:
+            selected["employeeName"] = selected["employeeName"] or member["employee_name"] or selected["employeeId"]
+            selected["employeeEmail"] = selected["employeeEmail"] or member["employee_email"] or ""
+            selected["teamRole"] = member["team_role"] or selected["teamRole"]
+        selected.update(summarize(rows)["rangeTotal"])
+        source_totals: dict[str, int] = defaultdict(int)
+        for row in rows:
+            source_totals[str(row.get("source") or "其他")] += _as_int(row.get("totalTokens"))
+        if source_totals:
+            selected["primarySource"] = max(source_totals.items(), key=lambda item: (item[1], item[0]))[0]
+        team_name = selected_member["team_name"] or team_id
         return {
             "rows": rows,
             "summary": summarize(rows),
             "employee": selected,
-            "team": team["team"],
-            "lastSyncedAt": team.get("lastSyncedAt"),
+            "team": {"id": team_id, "name": team_name, "memberCount": len(members), "backend": backend_id},
+            "lastSyncedAt": await self.latest_sync_at(start_date, end_date, [backend_id]),
         }
 
     async def health(self) -> dict[str, Any]:

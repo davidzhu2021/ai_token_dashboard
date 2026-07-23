@@ -254,7 +254,7 @@ def test_teams_falls_back_to_team_list_when_v2_unavailable(monkeypatch) -> None:
     assert scope["team"]["id"] == "team-a"
 
 
-def test_auth_me_marks_single_team_admin(monkeypatch) -> None:
+def test_auth_me_returns_base_identity_without_resolving_scope(monkeypatch) -> None:
     reset_caches()
     patch_user(monkeypatch)
     fake = FakeLiteLLMClient(
@@ -271,12 +271,37 @@ def test_auth_me_marks_single_team_admin(monkeypatch) -> None:
 
     assert response.status_code == 200
     payload = response.json()
+    assert payload["email"] == "leader@auto-link.com.cn"
+    assert payload["isTeamLeader"] is False
+    assert payload["teamBoardStatus"] == "loading"
+    assert fake.scope
+
+
+def test_auth_scope_returns_team_permissions(monkeypatch) -> None:
+    reset_caches()
+    patch_user(monkeypatch)
+    fake = FakeLiteLLMClient(
+        {
+            "isTeamLeader": True,
+            "teamBoardStatus": "single",
+            "team": {"id": "team-a", "name": "Team A", "memberCount": 2, "backend": "primary"},
+            "leaderTeams": [{"id": "team-a", "name": "Team A", "memberCount": 2, "backend": "primary"}],
+        }
+    )
+    monkeypatch.setattr(main, "client", lambda: fake)
+
+    response = app_client().get("/api/auth/scope")
+
+    assert response.status_code == 200
+    payload = response.json()
     assert payload["isTeamLeader"] is True
-    assert payload["teamBoardStatus"] == "single"
-    assert payload["team"]["id"] == "team-a"
     assert payload["team"]["teamRef"]
     assert "backend" not in payload["team"]
-    assert payload["leaderTeams"][0]["teamRef"] == payload["team"]["teamRef"]
+
+
+def test_auth_scope_requires_login() -> None:
+    response = TestClient(main.app).get("/api/auth/scope")
+    assert response.status_code == 401
 
 
 def test_non_team_admin_cannot_access_team_usage(monkeypatch) -> None:
@@ -306,7 +331,7 @@ def test_multiple_team_admin_gets_selectable_teams(monkeypatch) -> None:
     )
     monkeypatch.setattr(main, "client", lambda: fake)
 
-    me = app_client().get("/api/auth/me")
+    me = app_client().get("/api/auth/scope")
     assert me.json()["teamBoardStatus"] == "multiple"
     assert len(me.json()["leaderTeams"]) == 2
     assert all("teamRef" in team for team in me.json()["leaderTeams"])
@@ -327,7 +352,7 @@ def test_multiple_team_admin_can_request_authorized_team_ref(monkeypatch) -> Non
     fake = FakeLiteLLMClient(scope, {"rows": [], "summaryRows": [], "employees": [], "team": {"id": "team-b", "name": "Team B", "memberCount": 3}})
     monkeypatch.setattr(main, "client", lambda: fake)
 
-    me_payload = app_client().get("/api/auth/me").json()
+    me_payload = app_client().get("/api/auth/scope").json()
     team_b_ref = next(team["teamRef"] for team in me_payload["leaderTeams"] if team["id"] == "team-b")
     response = app_client().get(f"/api/team/usage?team_ref={team_b_ref}")
 

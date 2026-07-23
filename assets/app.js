@@ -2270,11 +2270,12 @@ async function showApp(user) {
   selectedTeamRef = user.team?.teamRef || leaderTeams[0]?.teamRef || "";
   resetTeamMemberSelection();
   ensureSelectedTeamRef();
+  el("authLoadingView").classList.add("hidden");
   el("loginView").classList.add("hidden");
   el("appView").classList.remove("hidden");
-  el("adminTab").classList.toggle("hidden", !user.isAdmin);
-  el("teamTab").classList.toggle("hidden", !user.isTeamLeader);
-  el("departmentTab").classList.toggle("hidden", !user.isAdmin);
+  el("adminTab").classList.add("hidden");
+  el("teamTab").classList.add("hidden");
+  el("departmentTab").classList.add("hidden");
   el("userEmail").textContent = user.email;
   el("userName").textContent = user.name;
   el("avatar").textContent = user.avatar || initials(user.email, user.name);
@@ -2282,7 +2283,25 @@ async function showApp(user) {
   el("departmentWelcomeTitle").textContent = "所选范围 · 全部部门";
   switchView("dashboard");
   render();
+  const scopePromise = loadAuthScope();
   await Promise.all([loadCurrentViewData(), loadModels()]);
+  await scopePromise;
+}
+
+async function loadAuthScope() {
+  try {
+    const scope = await api("/api/auth/scope");
+    Object.assign(currentUser, scope);
+    leaderTeams = normalizeLeaderTeams(currentUser);
+    selectedTeamRef = currentUser.team?.teamRef || leaderTeams[0]?.teamRef || "";
+    el("adminTab").classList.toggle("hidden", !currentUser.isAdmin);
+    el("teamTab").classList.toggle("hidden", !currentUser.isTeamLeader);
+    el("departmentTab").classList.toggle("hidden", !currentUser.isAdmin);
+    el("teamWelcomeTitle").textContent = `所选范围 · ${teamScopeLabel()}`;
+    render();
+  } catch (error) {
+    showToast("部分权限信息加载失败，请刷新重试");
+  }
 }
 
 function showLogin() {
@@ -2329,6 +2348,7 @@ function showLogin() {
   closeDepartmentPicker();
   el("appView").classList.add("hidden");
   el("loginView").classList.remove("hidden");
+  el("authLoadingView").classList.add("hidden");
   el("ssoButton").disabled = false;
   el("devLoginButton").disabled = false;
   el("ssoButton").lastChild.textContent = authConfig.providerName || "飞书扫码登录";
@@ -2774,6 +2794,14 @@ document.addEventListener("visibilitychange", () => {
 window.addEventListener("beforeunload", clearRevealedKeys);
 
 async function init() {
+  const callbackParams = new URLSearchParams(window.location.search);
+  const hasAuthCallback = callbackParams.get("auth_callback") === "success";
+  if (hasAuthCallback) {
+    el("loginView").classList.add("hidden");
+    el("authLoadingView").classList.remove("hidden");
+    callbackParams.delete("auth_callback");
+    window.history.replaceState({}, "", `${window.location.pathname}${callbackParams.toString() ? `?${callbackParams}` : ""}${window.location.hash}`);
+  }
   try {
     authConfig = await api("/api/auth/config");
   } catch {
@@ -2792,6 +2820,7 @@ async function init() {
     const user = await api("/api/auth/me");
     await showApp(user);
   } catch {
+    el("authLoadingView").classList.add("hidden");
     showLogin();
   }
 }

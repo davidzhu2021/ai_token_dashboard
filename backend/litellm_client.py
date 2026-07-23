@@ -2411,7 +2411,7 @@ class LiteLLMClient:
             model_usage_cache.set(cache_key, value, _env_int("MODEL_USAGE_CACHE_TTL_SECONDS", 300))
         return value
 
-    async def models(self) -> list[dict[str, Any]]:
+    async def models(self, usage_counts: dict[str, int] | None = None) -> list[dict[str, Any]]:
         hit, value, _ = self._model_cache.get("models")
         if hit:
             models = value
@@ -2455,7 +2455,9 @@ class LiteLLMClient:
         end_day = usage_today()
         end_date = end_day.isoformat()
         start_date = (end_day - timedelta(days=29)).isoformat()
-        usage = await self.model_usage_counts(start_date, end_date)
+        # The production route supplies database counts. Keep the upstream call as
+        # a compatibility fallback for local deployments without the snapshot DB.
+        usage = usage_counts if usage_counts is not None else await self.model_usage_counts(start_date, end_date)
         return sorted(
             models,
             key=lambda item: (

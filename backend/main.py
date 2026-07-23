@@ -1179,7 +1179,24 @@ async def auth_config() -> dict[str, Any]:
 
 @app.get("/api/auth/me")
 async def auth_me(request: Request) -> dict[str, Any]:
-    return await app_user_with_team_scope(require_user(request))
+    user = dict(require_user(request))
+    user.update({"isTeamLeader": False, "teamBoardStatus": "loading", "team": None, "leaderTeams": []})
+    return user
+
+
+@app.get("/api/auth/scope")
+async def auth_scope(request: Request) -> dict[str, Any]:
+    user = require_user(request)
+    started = asyncio.get_running_loop().time()
+    scope = await team_scope_for_user(user)
+    payload = {
+        "isTeamLeader": bool(scope.get("isTeamLeader")),
+        "teamBoardStatus": scope.get("teamBoardStatus", "none"),
+        "team": public_team(scope.get("team")),
+        "leaderTeams": [team for team in (public_team(item) for item in scope.get("leaderTeams") or []) if team],
+    }
+    logger.info("auth scope resolved email=%s cache=%s duration_ms=%.0f", user.get("email"), scope.get("cache", {}).get("hit"), (asyncio.get_running_loop().time() - started) * 1000)
+    return payload
 
 
 @app.post("/api/auth/dev-login")
@@ -1193,7 +1210,7 @@ async def dev_login(request: Request) -> dict[str, Any]:
     email = validate_company_email(email)
     user = normalize_user(email)
     request.session[SESSION_USER_KEY] = user
-    return await app_user_with_team_scope(user)
+    return user
 
 
 @app.get("/api/auth/sso/start")
@@ -1252,7 +1269,7 @@ async def sso_callback(request: Request):
         name = claim_value(userinfo, "displayName", "display_name", "nickname", "name")
         user = normalize_user(email, name, userinfo)
         request.session[SESSION_USER_KEY] = user
-        return RedirectResponse("/")
+        return RedirectResponse("/?auth_callback=success")
     except OAuthError as exc:
         state_keys = oidc_state_keys(request)
         logger.warning(
@@ -1688,7 +1705,21 @@ async def reveal_my_key(key_id: str, request: Request) -> JSONResponse:
 @app.get("/api/models")
 async def models(request: Request) -> dict[str, Any]:
     require_user(request)
-    return {"models": await client().models()}
+    usage_counts: dict[str, int] | None = None
+    store = usage_store()
+    if store is not None:
+        try:
+            await store.connect()
+            end_day = usage_today()
+            start_day = end_day - timedelta(days=29)
+            usage_counts = await store.model_usage_counts(
+                start_day.isoformat(),
+                end_day.isoformat(),
+                usage_backend_ids(),
+            )
+        except Exception:
+            logger.exception("local model usage query failed; falling back to upstream")
+    return {"models": await client().models(usage_counts)}
 
 
 @app.get("/")
