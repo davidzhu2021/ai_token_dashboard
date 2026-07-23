@@ -1476,8 +1476,11 @@ async def my_keys(request: Request, refresh: bool = Query(False)) -> dict[str, A
     if not user_ids:
         raise HTTPException(status_code=502, detail="上游员工记录缺少 user_id")
     primary_user_id = primary_upstream_user_id(upstream_user)
-    available_models, unrestricted = await client().available_key_models(primary_user_id)
-    keys = await client().keys_for_user_ids(user_ids, refresh)
+    # 两个上游调用相互独立，并行执行
+    (available_models, unrestricted), keys = await asyncio.gather(
+        client().available_key_models(primary_user_id),
+        client().keys_for_user_ids(user_ids, refresh),
+    )
     return {
         "keys": add_revealability(keys),
         "availableModels": [model for model in available_models if model not in {"no-default-models", "all-proxy-models"}],

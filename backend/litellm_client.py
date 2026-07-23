@@ -1231,12 +1231,13 @@ class LiteLLMClient:
         }
 
     async def keys_for_user_ids(self, user_ids: list[str], refresh: bool = False) -> list[dict[str, Any]]:
-        batches = []
+        tasks = []
         for user_id in user_ids:
             backend, raw_user_id = self._decode_account_id(user_id)
             if backend.source:
                 continue
-            batches.append(await self.keys_for_user(raw_user_id, backend, refresh))
+            tasks.append(self.keys_for_user(raw_user_id, backend, refresh))
+        batches = list(await asyncio.gather(*tasks))
         keys: list[dict[str, Any]] = []
         seen: set[str] = set()
         for batch in batches:

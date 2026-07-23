@@ -2836,11 +2836,14 @@ async function init() {
     callbackParams.delete("auth_callback");
     window.history.replaceState({}, "", `${window.location.pathname}${callbackParams.toString() ? `?${callbackParams}` : ""}${window.location.hash}`);
   }
-  try {
-    authConfig = await api("/api/auth/config");
-  } catch {
-    authConfig = { devLoginEnabled: false, oidcConfigured: false, providerName: "飞书扫码登录" };
-  }
+  // 并行发起 config 与 me，减少一个 RTT
+  const [configResult, meResult] = await Promise.allSettled([
+    api("/api/auth/config"),
+    api("/api/auth/me"),
+  ]);
+  authConfig = configResult.status === "fulfilled"
+    ? configResult.value
+    : { devLoginEnabled: false, oidcConfigured: false, providerName: "飞书扫码登录" };
   el("ssoButton").lastChild.textContent = authConfig.providerName || "飞书扫码登录";
   el("devLoginArea").classList.toggle("hidden", !authConfig.devLoginEnabled);
   el("devLoginButton").classList.toggle("hidden", !authConfig.devLoginEnabled);
@@ -2850,10 +2853,9 @@ async function init() {
     : "使用公司飞书账号扫码登录；本页面不会保存真实密码或登录凭据。";
   showLoginCallbackMessage();
   setupModelFilters();
-  try {
-    const user = await api("/api/auth/me");
-    await showApp(user);
-  } catch {
+  if (meResult.status === "fulfilled") {
+    await showApp(meResult.value);
+  } else {
     el("authLoadingView").classList.add("hidden");
     showLogin();
   }
