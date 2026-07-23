@@ -260,9 +260,11 @@ function escapeHtml(value) {
 
 function normalizeModelKey(model) {
   // 与后端 normalize_model_display_name 保持一致：
-  // 去掉账号别名前缀（chatgpt-acct-84-）和供应商前缀（anthropic.），使同一模型聚合为一条。
+  // 去掉路由、账号别名和供应商前缀，使同一模型聚合为一条。
   let name = String(model ?? "").trim();
   if (!name) return "";
+  // LiteLLM provider/model 路由格式（如 bedrock/anthropic.claude-opus-4-8）。
+  name = name.replace(/^[A-Za-z][A-Za-z0-9_-]*\//, "");
   name = name.replace(/^[A-Za-z][A-Za-z0-9]*-acct-\d+-/i, "");
   name = name.replace(/^[A-Za-z][A-Za-z0-9]*\./i, "");
   return name;
