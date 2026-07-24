@@ -87,31 +87,81 @@
         position: relative;
       }
 
-      .login-doc-link {
-        position: fixed;
-        top: 34px;
-        right: 42px;
-        z-index: 5;
+      .global-nav {
+        display: inline-flex;
+        align-items: center;
+        gap: 28px;
+        min-width: 0;
+        white-space: nowrap;
+      }
+
+      .global-nav-item {
+        position: relative;
         display: inline-flex;
         align-items: center;
         justify-content: center;
         min-height: 38px;
-        padding: 0 14px;
-        border-radius: 999px;
-        color: var(--ink);
+        padding: 0;
+        border: 0;
+        color: #4e5968;
+        background: transparent;
         text-decoration: none;
-        font-size: 17px;
-        font-weight: 800;
-        transition:
-          color 160ms ease,
-          background 160ms ease,
-          box-shadow 160ms ease;
+        font-size: 16px;
+        font-weight: 600;
+        line-height: 1;
+        transition: color 160ms ease;
       }
 
-      .login-doc-link:hover {
-        color: var(--brand);
-        background: rgba(255, 255, 255, 0.72);
-        box-shadow: var(--shadow-soft);
+      .global-nav-item::after {
+        content: "";
+        position: absolute;
+        left: 50%;
+        bottom: 1px;
+        width: 0;
+        height: 3px;
+        border-radius: 999px;
+        background: var(--brand);
+        transform: translateX(-50%);
+        transition: width 160ms ease;
+      }
+
+      .global-nav-item:hover,
+      .global-nav-item.active {
+        color: var(--ink);
+      }
+
+      .global-nav-item.active {
+        font-weight: 800;
+      }
+
+      .global-nav-item.active::after {
+        width: 28px;
+      }
+
+      .login-global-nav {
+        position: fixed;
+        top: 34px;
+        right: 42px;
+        z-index: 5;
+      }
+
+      .app-global-nav {
+        flex: 0 0 auto;
+        margin-left: auto;
+      }
+
+      .app-global-nav .global-nav-item {
+        min-height: 36px;
+        font-size: 15px;
+      }
+
+      .login-card.login-attention {
+        animation: login-attention 680ms ease;
+      }
+
+      @keyframes login-attention {
+        0%, 100% { transform: translateY(0); box-shadow: var(--shadow); }
+        42% { transform: translateY(-7px); box-shadow: 0 26px 72px rgba(6, 115, 210, 0.2); }
       }
 
       .login-art {
@@ -491,6 +541,14 @@
         min-height: calc(100vh - 64px);
       }
 
+      .app-shell.models-layout {
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      .app-shell.models-layout .sidebar {
+        display: none;
+      }
+
       .topbar {
         position: sticky;
         top: 0;
@@ -576,6 +634,11 @@
 
       .action-zone > .ghost-btn {
         min-width: 82px;
+      }
+
+      /* Keep the refresh action visually separated from the global navigation. */
+      .action-zone #refreshButton {
+        margin-left: 24px;
       }
 
       .view-tabs {
@@ -2347,6 +2410,10 @@
       }
 
       @media (max-width: 1600px) {
+        .global-nav {
+          gap: 22px;
+        }
+
         .topbar-inner {
           min-height: 60px;
           gap: 12px;
@@ -2429,6 +2496,14 @@
       }
 
       @media (max-width: 1366px) {
+        .global-nav {
+          gap: 18px;
+        }
+
+        .app-global-nav .global-nav-item {
+          font-size: 14px;
+        }
+
         .topbar-inner {
           min-height: 56px;
           gap: 10px;
@@ -2529,6 +2604,14 @@
       }
 
       @media (max-width: 1180px) {
+        .global-nav {
+          gap: 14px;
+        }
+
+        .app-global-nav .global-nav-item {
+          font-size: 13px;
+        }
+
         .topbar-inner {
           min-height: 52px;
           gap: 8px;
@@ -2773,23 +2856,42 @@
           grid-template-columns: 1fr;
         }
 
-        .login-doc-link {
-          top: 24px;
-          right: 24px;
-          min-height: 34px;
-          padding: 0 12px;
-          font-size: 15px;
-          color: #f6faff;
-          background: rgba(255, 255, 255, 0.12);
+        .login-global-nav {
+          top: 18px;
+          right: 20px;
+          left: 20px;
+          justify-content: flex-end;
+          gap: 20px;
+          overflow-x: auto;
+          scrollbar-width: none;
+        }
+
+        .login-global-nav::-webkit-scrollbar,
+        .app-global-nav::-webkit-scrollbar {
+          display: none;
+        }
+
+        .login-global-nav .global-nav-item {
+          color: rgba(246, 250, 255, 0.78);
+          font-size: 14px;
+        }
+
+        .login-global-nav .global-nav-item:hover,
+        .login-global-nav .global-nav-item.active {
+          color: #ffffff;
+        }
+
+        .login-global-nav .global-nav-item::after {
+          background: #ffffff;
         }
 
         .login-art {
           min-height: 430px;
-          padding: 28px;
+          padding: 80px 28px 28px;
         }
 
         .login-art h1 {
-          margin-top: 54px;
+          margin-top: 32px;
         }
 
         .login-facts {
@@ -2805,6 +2907,7 @@
           grid-template-columns: minmax(0, 1fr);
           grid-template-areas:
             "brand"
+            "global-nav"
             "filters"
             "actions";
           align-items: stretch;
@@ -2826,6 +2929,25 @@
 
         .filter-zone {
           grid-area: filters;
+        }
+
+        .app-global-nav {
+          grid-area: global-nav;
+          width: 100%;
+          max-width: 100%;
+          justify-content: flex-start;
+          gap: 24px;
+          margin-left: 0;
+          padding: 2px 0;
+          overflow-x: auto;
+          overscroll-behavior-inline: contain;
+          scrollbar-width: none;
+        }
+
+        .app-global-nav .global-nav-item {
+          min-height: 38px;
+          font-size: 15px;
+          flex: 0 0 auto;
         }
 
         .action-zone {
@@ -2992,6 +3114,10 @@
           gap: 8px;
           padding: 0 16px;
           font-size: inherit;
+        }
+
+        .action-zone #refreshButton {
+          margin-left: 0;
         }
 
         .action-zone .app-icon {
@@ -3171,7 +3297,12 @@
       <symbol id="icon-search" viewBox="0 0 24 24"><path d="M11 18a7 7 0 1 1 0-14 7 7 0 0 1 0 14Z"></path><path d="m16 16 4 4"></path></symbol>
     </svg>
     <section id="loginView" class="login-shell">
-      <a class="login-doc-link" href="https://t83dfrspj4.feishu.cn/wiki/La8twWEToibR9Jk6yZucTz78nDc" target="_blank" rel="noopener noreferrer">文档</a>
+      <nav class="global-nav login-global-nav" aria-label="全局导航">
+        <button class="global-nav-item active" type="button" data-global-page="home" aria-current="page">主页</button>
+        <button class="global-nav-item" type="button" data-global-page="console">控制台</button>
+        <button class="global-nav-item" type="button" data-global-page="models">模型广场</button>
+        <a class="global-nav-item" href="https://t83dfrspj4.feishu.cn/wiki/La8twWEToibR9Jk6yZucTz78nDc" target="_blank" rel="noopener noreferrer">文档</a>
+      </nav>
       <div class="login-art">
         <div class="brand-mark">
           <span class="brand-icon" aria-hidden="true">
@@ -3191,8 +3322,8 @@
       </div>
       <div class="login-panel">
         <form id="loginForm" class="login-card">
-          <h2>飞书扫码登录</h2>
-          <p>使用公司飞书账号完成统一认证，登录后仅展示你的个人 AI 用量与模型。</p>
+          <h2 id="loginTitle">飞书扫码登录</h2>
+          <p id="loginDescription">使用公司飞书账号完成统一认证，登录后仅展示你的个人 AI 用量与模型。</p>
           <div id="devLoginArea" class="field hidden">
             <label for="emailInput">企业邮箱</label>
             <input id="emailInput" class="input" type="email" placeholder="name@auto-link.com.cn" autocomplete="email" />
@@ -3242,6 +3373,12 @@
                 </select>
               </div>
             </div>
+            <nav class="global-nav app-global-nav" aria-label="全局导航">
+              <button class="global-nav-item" type="button" data-global-page="home">主页</button>
+              <button class="global-nav-item active" type="button" data-global-page="console" aria-current="page">控制台</button>
+              <button class="global-nav-item" type="button" data-global-page="models">模型广场</button>
+              <a class="global-nav-item" href="https://t83dfrspj4.feishu.cn/wiki/La8twWEToibR9Jk6yZucTz78nDc" target="_blank" rel="noopener noreferrer">文档</a>
+            </nav>
             <div class="action-zone">
               <button id="refreshButton" class="ghost-btn" type="button">
                 <span class="app-icon"><svg><use href="#icon-refresh"></use></svg></span>
@@ -3263,7 +3400,7 @@
         </div>
       </header>
 
-      <div class="app-shell">
+      <div id="appShell" class="app-shell">
         <aside class="sidebar" aria-label="主导航">
           <p class="sidebar-label">用量导航</p>
           <div class="nav-zone">
@@ -3287,10 +3424,6 @@
               <button class="view-tab" type="button" data-view="keys">
                 <span class="nav-icon"><svg><use href="#icon-key"></use></svg></span>
                 令牌管理
-              </button>
-              <button class="view-tab" type="button" data-view="models">
-                <span class="nav-icon"><svg><use href="#icon-plaza"></use></svg></span>
-                模型广场
               </button>
             </nav>
           </div>
@@ -4103,6 +4236,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260723-model-ranking-provider-prefix"></script>
+    <script src="/assets/app.js?v=20260724-global-navigation"></script>
   </body>
 </html>

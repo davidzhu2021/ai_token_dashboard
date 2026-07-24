@@ -230,6 +230,75 @@ function setText(id, value) {
   if (node) node.textContent = value;
 }
 
+function setGlobalPage(page) {
+  document.querySelectorAll("[data-global-page]").forEach((item) => {
+    const isActive = item.dataset.globalPage === page;
+    item.classList.toggle("active", isActive);
+    if (isActive) item.setAttribute("aria-current", "page");
+    else item.removeAttribute("aria-current");
+  });
+}
+
+function updateHomeCard() {
+  const isLoggedIn = Boolean(currentUser);
+  el("loginTitle").textContent = isLoggedIn ? `欢迎回来，${currentUser.name || currentUser.email}` : "飞书扫码登录";
+  el("loginDescription").textContent = isLoggedIn
+    ? "你已完成企业账号认证，可以继续进入控制台查看个人 AI 用量。"
+    : "使用公司飞书账号完成统一认证，登录后仅展示你的个人 AI 用量与模型。";
+  el("devLoginArea").classList.toggle("hidden", isLoggedIn || !authConfig.devLoginEnabled);
+  el("devLoginButton").classList.toggle("hidden", isLoggedIn || !authConfig.devLoginEnabled);
+  el("emailInput").required = Boolean(!isLoggedIn && authConfig.devLoginEnabled);
+  el("ssoButton").disabled = false;
+  el("devLoginButton").disabled = false;
+  el("ssoButton").lastChild.textContent = isLoggedIn ? "进入控制台" : (authConfig.providerName || "飞书扫码登录");
+  el("loginHint").textContent = isLoggedIn
+    ? `当前登录账号：${currentUser.email}`
+    : authConfig.devLoginEnabled
+      ? `开发登录已启用，仅允许 ${authConfig.allowedEmailDomain || "公司邮箱"} 账号；生产环境请关闭。`
+      : "使用公司飞书账号扫码登录；本页面不会保存真实密码或登录凭据。";
+}
+
+function showHome() {
+  if (currentView === "keys") clearRevealedKeys();
+  el("authLoadingView").classList.add("hidden");
+  el("appView").classList.add("hidden");
+  el("loginView").classList.remove("hidden");
+  updateHomeCard();
+  setGlobalPage("home");
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function promptForLogin() {
+  showHome();
+  showToast("请先登录后访问控制台和模型广场");
+  const loginCard = el("loginForm");
+  loginCard.classList.remove("login-attention");
+  requestAnimationFrame(() => loginCard.classList.add("login-attention"));
+  window.setTimeout(() => loginCard.classList.remove("login-attention"), 720);
+  loginCard.scrollIntoView({ behavior: "smooth", block: "center" });
+  el("ssoButton").focus({ preventScroll: true });
+}
+
+function showAuthenticatedPage(page) {
+  if (!currentUser) {
+    promptForLogin();
+    return;
+  }
+  el("authLoadingView").classList.add("hidden");
+  el("loginView").classList.add("hidden");
+  el("appView").classList.remove("hidden");
+  switchView(page === "models" ? "models" : "dashboard");
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function navigateGlobalPage(page) {
+  if (page === "home") {
+    showHome();
+    return;
+  }
+  showAuthenticatedPage(page);
+}
+
 function setDailyMiniValue(id, value, isTokenValue = false) {
   const node = el(id);
   if (!node) return;
@@ -2136,6 +2205,8 @@ function switchView(view) {
   if (view === "team" && !currentUser?.isTeamLeader) view = "dashboard";
   if (currentView === "keys" && view !== "keys") clearRevealedKeys();
   currentView = view;
+  setGlobalPage(view === "models" ? "models" : "console");
+  el("appShell").classList.toggle("models-layout", view === "models");
   el("dashboardView").classList.toggle("hidden", view !== "dashboard");
   el("adminView").classList.toggle("hidden", view !== "admin");
   el("teamView").classList.toggle("hidden", view !== "team");
@@ -2540,14 +2611,17 @@ function showLogin() {
   el("appView").classList.add("hidden");
   el("loginView").classList.remove("hidden");
   el("authLoadingView").classList.add("hidden");
-  el("ssoButton").disabled = false;
-  el("devLoginButton").disabled = false;
-  el("ssoButton").lastChild.textContent = authConfig.providerName || "飞书扫码登录";
+  updateHomeCard();
+  setGlobalPage("home");
 }
 
 document.addEventListener("submit", async (event) => {
   if (event.target.id !== "loginForm") return;
   event.preventDefault();
+  if (currentUser) {
+    showAuthenticatedPage("console");
+    return;
+  }
   if (!authConfig.devLoginEnabled) {
     startSsoLogin();
     return;
@@ -2561,7 +2635,10 @@ document.addEventListener("submit", async (event) => {
   }
 });
 
-el("ssoButton").addEventListener("click", startSsoLogin);
+el("ssoButton").addEventListener("click", () => {
+  if (currentUser) showAuthenticatedPage("console");
+  else startSsoLogin();
+});
 
 el("logoutButton").addEventListener("click", async () => {
   try {
@@ -2571,6 +2648,7 @@ el("logoutButton").addEventListener("click", async () => {
 });
 
 document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
+document.querySelectorAll("[data-global-page]").forEach((item) => item.addEventListener("click", () => navigateGlobalPage(item.dataset.globalPage)));
 
 async function reloadForFilterChange() {
   // 保留当前下钻选择:切换时间范围/来源时应停留在已下钻的员工/成员/部门,
@@ -3000,20 +3078,13 @@ async function init() {
   authConfig = configResult.status === "fulfilled"
     ? configResult.value
     : { devLoginEnabled: false, oidcConfigured: false, providerName: "飞书扫码登录" };
-  el("ssoButton").lastChild.textContent = authConfig.providerName || "飞书扫码登录";
-  el("devLoginArea").classList.toggle("hidden", !authConfig.devLoginEnabled);
-  el("devLoginButton").classList.toggle("hidden", !authConfig.devLoginEnabled);
-  el("emailInput").required = Boolean(authConfig.devLoginEnabled);
-  el("loginHint").textContent = authConfig.devLoginEnabled
-    ? `开发登录已启用，仅允许 ${authConfig.allowedEmailDomain || "公司邮箱"} 账号；生产环境请关闭。`
-    : "使用公司飞书账号扫码登录；本页面不会保存真实密码或登录凭据。";
-  showLoginCallbackMessage();
   setupModelFilters();
   if (meResult.status === "fulfilled") {
     await showApp(meResult.value);
   } else {
     el("authLoadingView").classList.add("hidden");
     showLogin();
+    showLoginCallbackMessage();
   }
 }
 
