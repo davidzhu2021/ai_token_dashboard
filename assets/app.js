@@ -1185,6 +1185,7 @@ function employeeSummariesFromRows(rows) {
 
 function renderEmployeeRanking(tableId, countId, employees, emptyText) {
   const sorted = sortedAdminEmployees(employees);
+  const isTeamTable = tableId === "teamUserTable";
   el(countId).textContent = `${sorted.length} 人`;
   el(tableId).innerHTML = sorted.length
     ? sorted
@@ -1195,7 +1196,8 @@ function renderEmployeeRanking(tableId, countId, employees, emptyText) {
             <tr class="admin-employee-row ${tableId === "teamUserTable" && selectedTeamEmployee === (item.employeeEmail || item.employeeId) ? "active" : ""}" data-employee="${escapeHtml(item.employeeEmail || item.employeeId)}">
               <td><strong>${item.employeeName || item.employeeId}</strong></td>
               <td>${item.employeeEmail || "未绑定邮箱"}</td>
-              <td>${tableId === "teamUserTable" ? (item.teamRole === "admin" ? "负责人" : "成员") : displaySource(item.primarySource)}</td>
+              <td>${displaySource(item.primarySource || "其他")}</td>
+              ${isTeamTable ? `<td>${item.teamRole === "admin" ? "负责人" : "成员"}</td>` : ""}
               <td class="num">${fmt.format(requests)}</td>
               <td class="num"><strong>${formatTokens(item.totalTokens || 0)}</strong></td>
               <td class="num">${money.format(item.spend || 0)}</td>
@@ -1205,7 +1207,7 @@ function renderEmployeeRanking(tableId, countId, employees, emptyText) {
           `;
         })
         .join("")
-    : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">${emptyText}</td></tr>`;
+    : `<tr><td colspan="${isTeamTable ? 9 : 8}" style="text-align:center;color:var(--muted);padding:26px">${emptyText}</td></tr>`;
 }
 
 function renderDepartmentRanking(tableId, countId, departments, emptyText) {
@@ -1253,7 +1255,7 @@ function renderDepartmentUsers() {
 
 function renderTeamUsers() {
   if (isTeamRankingLoading) {
-    renderTableSkeleton("teamUserTable", "teamUserCount", 8);
+    renderTableSkeleton("teamUserTable", "teamUserCount", 9);
   } else {
     setText("teamLimitHint", teamRankingError || teamRankingHint || "按当前筛选范围统计");
     renderEmployeeRanking("teamUserTable", "teamUserCount", teamEmployees, teamRankingError || "当前团队暂无成员用量");
