@@ -294,6 +294,39 @@ def test_rows_by_employee_emails_requires_all_backends_and_merges_her() -> None:
     assert alice["userIds"] == ["alice-her", "alice-primary"]
 
 
+def test_team_rows_uses_one_cross_backend_query_and_merges_email_identity() -> None:
+    class Record(dict):
+        pass
+
+    class FakePool:
+        calls = 0
+
+        async def fetch(self, query, *args):
+            if "FROM usage_sync_coverage" in query:
+                return [{"backend_id": "primary"}, {"backend_id": "her"}]
+            self.calls += 1
+            assert args[0] == ["primary", "her"]
+            assert args[1] == ["team-a", "team-a"]
+            return [
+                Record(kind="member", backend_id="primary", team_id="team-a", team_name="Team A", user_id="alice-primary", employee_email="alice@example.com", employee_name="Alice", team_role="user", usage_date=None, source=None, model_name=None, prompt_tokens=0, completion_tokens=0, total_tokens=0, request_count=0, success_count=0, failure_count=0, spend=0),
+                Record(kind="member", backend_id="her", team_id="team-a", team_name="Team A", user_id="alice-her", employee_email="alice@example.com", employee_name="Alice", team_role="user", usage_date=None, source=None, model_name=None, prompt_tokens=0, completion_tokens=0, total_tokens=0, request_count=0, success_count=0, failure_count=0, spend=0),
+                Record(kind="usage", backend_id="primary", team_id=None, team_name=None, user_id="alice-primary", employee_email="alice@example.com", employee_name="Alice", team_role=None, usage_date=date(2026, 7, 22), source="Codex", model_name="gpt-5", prompt_tokens=4, completion_tokens=6, total_tokens=10, request_count=1, success_count=1, failure_count=0, spend=0.1),
+                Record(kind="usage", backend_id="her", team_id=None, team_name=None, user_id="alice-her", employee_email="alice@example.com", employee_name="Alice", team_role=None, usage_date=date(2026, 7, 22), source="Her", model_name="gpt-5", prompt_tokens=8, completion_tokens=12, total_tokens=20, request_count=2, success_count=2, failure_count=0, spend=0.2),
+            ]
+
+        async def fetchval(self, *_args):
+            return datetime(2026, 7, 22, tzinfo=timezone.utc)
+
+    store = UsageStore("postgresql://unused")
+    store.pool = FakePool()
+    result = asyncio.run(store.team_rows([{"backend": "primary", "id": "team-a", "name": "Team A"}, {"backend": "her", "id": "team-a", "name": "Team A"}], "2026-07-22", "2026-07-22", "all"))
+
+    assert store.pool.calls == 1
+    assert len(result["employees"]) == 1
+    assert result["employees"][0]["totalTokens"] == 30
+    assert result["dataQuality"]["backends"] == ["her", "primary"]
+
+
 def test_model_usage_counts_returns_none_when_any_backend_lacks_coverage() -> None:
     class FakePool:
         async def fetch(self, query, *_args):

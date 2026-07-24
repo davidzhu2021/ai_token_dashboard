@@ -135,6 +135,19 @@ def _normal_email(value: Any) -> str:
     return text if "@" in text else ""
 
 
+def normalize_team_text(value: Any) -> str:
+    """Normalize team identifiers/names for safe cross-backend matching."""
+    return " ".join(_clean_text(value).split()).casefold()
+
+
+def team_identity_key(team_id: Any, team_name: Any) -> str:
+    return f"{normalize_team_text(team_id)}::{normalize_team_text(team_name)}"
+
+
+def department_key(team_id: Any, team_name: Any) -> str:
+    return team_identity_key(team_id, team_name)
+
+
 def _has_cjk(value: str) -> bool:
     return any("\u4e00" <= char <= "\u9fff" for char in value)
 
@@ -1771,25 +1784,41 @@ class LiteLLMClient:
         accounts_by_backend = self._accounts_by_backend(upstream_user)
         emails_by_backend = self._account_emails_by_backend(upstream_user)
         leader_teams: list[dict[str, Any]] = []
-        seen: set[tuple[str, str]] = set()
-        for backend in self.backends:
-            user_ids = accounts_by_backend.get(backend.id, set())
-            emails = emails_by_backend.get(backend.id, set())
-            if not user_ids and not emails:
+        primary = self.backends[0]
+        primary_user_ids = accounts_by_backend.get(primary.id, set())
+        primary_emails = emails_by_backend.get(primary.id, set())
+        if not primary_user_ids and not primary_emails:
+            return {"isTeamLeader": False, "teamBoardStatus": "none", "team": None, "leaderTeams": []}
+
+        all_teams = await asyncio.gather(*(self.teams(backend) for backend in self.backends))
+        primary_teams = all_teams[0]
+        all_backend_teams = all_teams[1:]
+        for team in primary_teams:
+            team_id = str(_first(team, "team_id", "id", default="") or "").strip()
+            team_name = str(_first(team, "team_alias", "alias", "name", default="") or "").strip() or team_id
+            if not team_id:
                 continue
-            for team in await self.teams(backend):
-                team_id = str(_first(team, "team_id", "id", default="") or "").strip()
-                if not team_id:
-                    continue
-                for member in self._team_members(team):
-                    member_id = self._team_member_user_id(member).lower()
-                    member_email = self._team_member_email(member)
-                    if self._is_team_admin_role(member) and ((member_id and member_id in user_ids) or (member_email and member_email in emails)):
-                        key = (backend.id, team_id)
-                        if key not in seen:
-                            seen.add(key)
-                            leader_teams.append({"backend": backend, "team": team, **self._team_summary(team, backend)})
+            is_admin = any(
+                self._is_team_admin_role(member)
+                and (
+                    self._team_member_user_id(member).lower() in primary_user_ids
+                    or self._team_member_email(member) in primary_emails
+                )
+                for member in self._team_members(team)
+            )
+            if not is_admin:
+                continue
+            scopes = [{"backend": primary, **self._team_summary(team, primary)}]
+            identity = team_identity_key(team_id, team_name)
+            for backend, backend_teams in zip(self.backends[1:], all_backend_teams):
+                for candidate in backend_teams:
+                    candidate_id = str(_first(candidate, "team_id", "id", default="") or "").strip()
+                    candidate_name = str(_first(candidate, "team_alias", "alias", "name", default="") or "").strip() or candidate_id
+                    if candidate_id and team_identity_key(candidate_id, candidate_name) == identity:
+                        scopes.append({"backend": backend, **self._team_summary(candidate, backend)})
                         break
+            anchor = {"backend": primary, "team": team, **self._team_summary(team, primary), "teamScopes": scopes}
+            leader_teams.append(anchor)
 
         if not leader_teams:
             return {"isTeamLeader": False, "teamBoardStatus": "none", "team": None, "leaderTeams": []}
@@ -1825,7 +1854,8 @@ class LiteLLMClient:
         ).strip()
         if team_id:
             known = team_map.get(team_id.lower())
-            return {"id": team_id, "name": known.get("name", team_alias or team_id) if known else team_alias or team_id, "bindStatus": "已绑定部门"}
+            name = known.get("name", team_alias or team_id) if known else team_alias or team_id
+            return {"id": team_id, "name": name, "key": department_key(team_id, name), "bindStatus": "已绑定部门"}
 
         department = str(
             _first(log, "department", "department_name", "departmentName", default="")
@@ -1835,7 +1865,7 @@ class LiteLLMClient:
             or ""
         ).strip()
         if department:
-            return {"id": department, "name": department, "bindStatus": "来自部门字段"}
+            return {"id": department, "name": department, "key": department_key(department, department), "bindStatus": "来自部门字段"}
 
         org_id = str(
             _first(log, "organization_id", "org_id", "organizationId", "orgId", default="")
@@ -1846,8 +1876,8 @@ class LiteLLMClient:
             or ""
         ).strip()
         if org_id:
-            return {"id": org_id, "name": org_id, "bindStatus": "来自组织字段"}
-        return {"id": "unassigned", "name": "未绑定部门", "bindStatus": "未绑定部门"}
+            return {"id": org_id, "name": org_id, "key": department_key(org_id, org_id), "bindStatus": "来自组织字段"}
+        return {"id": "unassigned", "name": "未绑定部门", "key": department_key("unassigned", "未绑定部门"), "bindStatus": "未绑定部门"}
 
     def _department_empty_row(self, day: str, department_info: dict[str, str], source: str, model: str, employee_info: dict[str, Any]) -> dict[str, Any]:
         row = self._admin_empty_row(day, employee_info, source, model)
@@ -1855,6 +1885,7 @@ class LiteLLMClient:
             {
                 "departmentId": department_info["id"],
                 "departmentName": department_info["name"],
+                "departmentKey": department_info.get("key") or department_key(department_info["id"], department_info["name"]),
                 "departmentBindStatus": department_info["bindStatus"],
             }
         )
@@ -1875,12 +1906,15 @@ class LiteLLMClient:
         employees: dict[str, set[str]] = defaultdict(set)
         for row in rows:
             department_id = str(row.get("departmentId") or "unassigned")
-            department = departments.get(department_id, {})
+            department_name = str(row.get("departmentName") or department_id)
+            logical_key = str(row.get("departmentKey") or department_key(department_id, department_name))
+            department = departments.get(logical_key, {})
             summary = grouped.setdefault(
-                department_id,
+                logical_key,
                 {
+                    "departmentKey": logical_key,
                     "departmentId": department_id,
-                    "departmentName": department.get("name") or row.get("departmentName") or department_id,
+                    "departmentName": department.get("name") or department_name,
                     "bindStatus": department.get("bindStatus") or row.get("departmentBindStatus") or "未绑定部门",
                     "promptTokens": 0,
                     "completionTokens": 0,
@@ -1900,10 +1934,10 @@ class LiteLLMClient:
             summary["successCount"] += _as_int(row.get("successCount"))
             summary["failureCount"] += _as_int(row.get("failureCount"))
             summary["spend"] += _as_number(row.get("spend"))
-            source_totals[department_id][str(row.get("source") or "其他")] += _as_int(row.get("totalTokens"))
+            source_totals[logical_key][str(row.get("source") or "其他")] += _as_int(row.get("totalTokens"))
             employee_id = str(row.get("employeeId") or row.get("employeeEmail") or "")
             if employee_id:
-                employees[department_id].add(employee_id)
+                employees[logical_key].add(employee_id)
 
         for department_id, summary in grouped.items():
             sources = source_totals.get(department_id, {})
@@ -2050,7 +2084,7 @@ class LiteLLMClient:
                     break
                 for log in logs:
                     department_info = self._department_info_from_log(log, team_map)
-                    if department_filter and department_filter not in {department_info["id"].lower(), department_info["name"].lower()}:
+                    if department_filter and department_filter not in {department_info["key"], normalize_team_text(department_info["id"]), normalize_team_text(department_info["name"])}:
                         continue
                     detected_source = backend.source or detect_source(log)
                     if source and source != "all" and detected_source != source:
@@ -2058,11 +2092,12 @@ class LiteLLMClient:
 
                     employee_info = self._employee_info_from_log(log, user_map, backend, account_index)
                     department_id = department_info["id"]
-                    departments.setdefault(department_id, department_info)
+                    logical_key = department_info["key"]
+                    departments.setdefault(logical_key, department_info)
                     employees.setdefault(employee_info["id"], employee_info)
                     model = self._usage_model_name(log)
                     day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
-                    key = (day, department_id, employee_info["id"], detected_source, model)
+                    key = (day, logical_key, employee_info["id"], detected_source, model)
                     row = grouped.setdefault(key, self._department_empty_row(day, department_info, detected_source, model, employee_info))
                     self._add_log_to_row(row, log)
 
@@ -2174,7 +2209,7 @@ class LiteLLMClient:
                 summary["teamRole"] = "admin"
         return sorted(summaries.values(), key=self._admin_employee_sort_key)
 
-    async def team_usage_rows(
+    async def _team_usage_rows_single(
         self,
         backend_id: str,
         team_id: str,
@@ -2280,6 +2315,121 @@ class LiteLLMClient:
                 "summarySource": "team_daily_activity" if summary_rows else "spend_logs",
                 "rankingSource": "spend_logs",
                 "timezoneOffsetMinutes": usage_timezone_offset_minutes(),
+            },
+        }
+
+    async def team_usage_rows(
+        self,
+        team_scopes: list[dict[str, Any]] | str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        source: str | None = None,
+        legacy_source: str | None = None,
+    ) -> dict[str, Any]:
+        """Read and merge one logical team across matching backend instances."""
+        if isinstance(team_scopes, str):
+            # Backward-compatible call shape: backend_id, team_id, start, end, source.
+            backend_id = team_scopes
+            team_id = str(start_date or "")
+            start_value = str(end_date or "")
+            end_value = str(source or "")
+            source_value = legacy_source or "all"
+            scopes = [{"backend": backend_id, "id": team_id}]
+            start_date, end_date, source = start_value, end_value, source_value
+        else:
+            scopes = team_scopes
+        if not start_date or not end_date:
+            raise HTTPException(status_code=400, detail="团队用量日期范围无效")
+        payloads = await asyncio.gather(
+            *(self._team_usage_rows_single(str(item.get("backend")), str(item.get("id")), start_date, end_date, source or "all") for item in scopes),
+            return_exceptions=True,
+        )
+        failures = [item for item in payloads if isinstance(item, BaseException)]
+        if failures:
+            first = failures[0]
+            if isinstance(first, HTTPException):
+                raise first
+            raise HTTPException(status_code=502, detail="团队跨实例用量读取失败") from first
+        valid = [item for item in payloads if isinstance(item, dict)]
+        if not valid:
+            for item in payloads:
+                if isinstance(item, HTTPException):
+                    raise item
+            raise HTTPException(status_code=404, detail="未找到当前负责的团队")
+        rows = [row for payload in valid for row in payload.get("rows") or []]
+        summary_rows = [row for payload in valid for row in payload.get("summaryRows") or []]
+        grouped_rows: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for row in summary_rows:
+            key = (str(row.get("date") or ""), str(row.get("source") or ""), str(row.get("model") or ""))
+            current = grouped_rows.setdefault(
+                key,
+                {
+                    **{key_name: row.get(key_name) for key_name in ("date", "source", "model")},
+                    "promptTokens": 0,
+                    "completionTokens": 0,
+                    "totalTokens": 0,
+                    "requestCount": 0,
+                    "successCount": 0,
+                    "failureCount": 0,
+                    "spend": 0.0,
+                },
+            )
+            for field in ("promptTokens", "completionTokens", "totalTokens", "requestCount", "successCount", "failureCount"):
+                current[field] += _as_int(row.get(field))
+            current["spend"] += _as_number(row.get("spend"))
+        employee_groups: dict[str, dict[str, Any]] = {}
+        merged_rows: list[dict[str, Any]] = []
+        for scope, payload in zip(scopes, payloads):
+            if not isinstance(payload, dict):
+                continue
+            backend_id = str(scope.get("backend") or "")
+            for row in payload.get("rows") or []:
+                public_row = dict(row)
+                if not _normal_email(public_row.get("employeeEmail")) and public_row.get("employeeId"):
+                    public_row["employeeId"] = f"{backend_id}:{public_row['employeeId']}"
+                merged_rows.append(public_row)
+            for employee in payload.get("employees") or []:
+                email = _normal_email(employee.get("employeeEmail"))
+                raw_employee_id = str(employee.get("employeeId") or "")
+                identity = f"email:{email}" if email else f"id:{backend_id}:{raw_employee_id}"
+                current = employee_groups.get(identity)
+                if current is None:
+                    current = dict(employee)
+                    if not email:
+                        current["employeeId"] = f"{backend_id}:{raw_employee_id}"
+                    current["userIds"] = [
+                        user_id if str(user_id).startswith(f"{backend_id}:") else f"{backend_id}:{user_id}"
+                        for user_id in current.get("userIds") or []
+                    ]
+                    employee_groups[identity] = current
+                else:
+                    for field in ("promptTokens", "completionTokens", "totalTokens", "requestCount", "successCount", "failureCount", "spend"):
+                        current[field] = _as_number(current.get(field)) + _as_number(employee.get(field))
+                    for user_id in employee.get("userIds") or []:
+                        account_id = user_id if str(user_id).startswith(f"{backend_id}:") else f"{backend_id}:{user_id}"
+                        if account_id not in current["userIds"]:
+                            current["userIds"].append(account_id)
+                    if current.get("teamRole") != "admin" and employee.get("teamRole") == "admin":
+                        current["teamRole"] = "admin"
+        anchor = scopes[0] if scopes else {}
+        team_name = next((payload.get("team", {}).get("name") for payload in valid if payload.get("team")), anchor.get("name") or anchor.get("id") or "团队")
+        return {
+            "rows": merged_rows,
+            "summaryRows": sorted(grouped_rows.values(), key=lambda row: (str(row.get("date")), str(row.get("source")), str(row.get("model")))),
+            "employees": sorted(employee_groups.values(), key=lambda item: (-_as_number(item.get("totalTokens")), -_as_number(item.get("spend")), str(item.get("employeeName") or "").casefold())),
+            "team": {"id": anchor.get("id"), "name": team_name, "memberCount": len(employee_groups), "backend": anchor.get("backend")},
+            "pageLimit": max((_as_int(payload.get("pageLimit")) for payload in valid), default=0),
+            "pageSize": max((_as_int(payload.get("pageSize")) for payload in valid), default=0),
+            "pagesRead": sum(_as_int(payload.get("pagesRead")) for payload in valid),
+            "totalPages": sum(_as_int(payload.get("totalPages")) for payload in valid),
+            "totalRecords": sum(_as_int(payload.get("totalRecords")) for payload in valid),
+            "truncated": any(bool(payload.get("truncated")) for payload in valid),
+            "dataQuality": {
+                "summarySource": "spend_logs",
+                "rankingSource": "spend_logs",
+                "backends": [str(item.get("backend")) for item in scopes],
+                "scopeCount": len(scopes),
+                "memberIdentityMatch": "normalized_email_or_backend_user_id",
             },
         }
 

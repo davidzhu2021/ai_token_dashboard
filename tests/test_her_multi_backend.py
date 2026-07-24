@@ -3,7 +3,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from backend.litellm_client import LiteLLMBackend, LiteLLMClient
+from backend.litellm_client import LiteLLMBackend, LiteLLMClient, department_key, team_identity_key
 
 
 def make_client() -> LiteLLMClient:
@@ -185,6 +185,12 @@ def test_team_usage_with_her_team_ref_only_reads_authorized_team() -> None:
     assert payload["team"]["backend"] == "her"
     assert payload["rows"][0]["source"] == "Her"
     assert payload["employees"][0]["employeeName"] == "Carol"
+
+
+def test_team_identity_requires_matching_id_and_name() -> None:
+    assert team_identity_key("team-a", " Team A ") == team_identity_key("TEAM-A", "team   a")
+    assert team_identity_key("team-a", "Team A") != team_identity_key("team-a", "Other Team")
+    assert department_key("team-a", "Team A") == "team-a::team a"
 
 
 def test_models_merges_multi_backend_and_deduplicates_globally() -> None:

@@ -441,19 +441,35 @@ def admin_usage_cache_key(email: str, start_date: str, end_date: str, source: st
 
 
 def department_usage_cache_key(email: str, start_date: str, end_date: str, source: str, department: str | None) -> str:
-    return f"department-usage:v4:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(department or '').strip().lower()}"
+    return f"department-usage:v5:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(department or '').strip().lower()}"
 
 
 def team_auth_cache_key(email: str, name: str | None) -> str:
-    return f"team-auth:v2:{email.strip().lower()}:{str(name or '').strip()}"
+    return f"team-auth:v3:{email.strip().lower()}:{str(name or '').strip()}"
+
+
+def team_scope_items(team: dict[str, Any]) -> list[dict[str, Any]]:
+    scopes = team.get("teamScopes")
+    if isinstance(scopes, list) and scopes:
+        return [item for item in scopes if isinstance(item, dict) and item.get("backend") and item.get("id")]
+    return [team]
+
+
+def team_scope_fingerprint(team: dict[str, Any]) -> str:
+    return ",".join(
+        sorted(
+            f"{item.get('backend')}:{str(item.get('id') or '').strip().casefold()}:{' '.join(str(item.get('name') or '').split()).casefold()}"
+            for item in team_scope_items(team)
+        )
+    )
 
 
 def team_usage_cache_key(email: str, team: dict[str, Any], start_date: str, end_date: str, source: str) -> str:
-    return f"team-usage:v7:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{start_date}:{end_date}:{source or 'all'}"
+    return f"team-usage:v8:{email.strip().lower()}:{team_scope_fingerprint(team)}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def team_member_usage_cache_key(email: str, team: dict[str, Any], employee: str, start_date: str, end_date: str, source: str) -> str:
-    return f"team-member-usage:v5:{email.strip().lower()}:{team.get('backend')}:{team.get('id')}:{employee.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
+    return f"team-member-usage:v6:{email.strip().lower()}:{team_scope_fingerprint(team)}:{employee.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def team_ref(team: dict[str, Any]) -> str:
@@ -669,6 +685,7 @@ async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: 
         if hit:
             payload = dict(value)
             payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+            logger.info("admin usage cache hit records=%s", len(payload.get("rows") or []))
             return payload
     store = usage_store()
     if store is not None:
@@ -706,6 +723,7 @@ async def department_usage_payload(admin: dict[str, Any], start_date: str, end_d
         if hit:
             payload = dict(value)
             payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+            logger.info("department usage cache hit records=%s", len(payload.get("rows") or []))
             return payload
     store = usage_store()
     if store is not None:
@@ -716,7 +734,15 @@ async def department_usage_payload(admin: dict[str, Any], start_date: str, end_d
             await prepare_usage_refresh(start_date, end_date, refresh)
             stored = await store.department_rows(start_date, end_date, source, department, usage_backend_ids())
             queried_at = asyncio.get_running_loop().time()
-            logger.info("department usage sql refresh=%s connect_ms=%.0f query_ms=%.0f total_ms=%.0f", refresh, (connected_at - db_started) * 1000, (queried_at - connected_at) * 1000, (queried_at - request_started) * 1000)
+            logger.info(
+                "department usage sql refresh=%s connect_ms=%.0f query_ms=%.0f total_ms=%.0f backends=%s records=%s",
+                refresh,
+                (connected_at - db_started) * 1000,
+                (queried_at - connected_at) * 1000,
+                (queried_at - request_started) * 1000,
+                len(stored.get("dataQuality", {}).get("backends") or []) if stored else 0,
+                len(stored.get("rows") or []) if stored else 0,
+            )
             if stored is not None:
                 stored = dict(stored)
                 last_synced = stored.pop("lastSyncedAt", None)
@@ -742,6 +768,11 @@ async def team_scope_for_user(app_user: dict[str, Any], refresh: bool = False) -
         if hit:
             scope = dict(value)
             scope["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+            logger.info(
+                "team auth cache hit teams=%s scopes=%s",
+                len(scope.get("leaderTeams") or []),
+                sum(len(team_scope_items(team)) for team in scope.get("leaderTeams") or [] if isinstance(team, dict)),
+            )
             return scope
     try:
         upstream_user, _ = await cached_resolve_user(app_user["email"], app_user.get("name"), refresh)
@@ -794,6 +825,12 @@ async def team_usage_payload(
         if hit:
             payload = dict(value)
             payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+            logger.info(
+                "team usage cache hit backends=%s scopes=%s records=%s",
+                len({item.get("backend") for item in team_scope_items(team)}),
+                len(team_scope_items(team)),
+                len(payload.get("rows") or []),
+            )
             return payload
     store = usage_store()
     payload = None
@@ -803,24 +840,34 @@ async def team_usage_payload(
             await store.connect()
             connected_at = asyncio.get_running_loop().time()
             await prepare_usage_refresh(start_date, end_date, refresh)
-            if not enrich_member_rankings:
-                payload = await store.team_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source)
-            else:
-                payload = await store.team_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source)
+            payload = await store.team_rows(team_scope_items(team), start_date, end_date, source)
             queried_at = asyncio.get_running_loop().time()
-            logger.info("team usage sql refresh=%s connect_ms=%.0f query_ms=%.0f total_ms=%.0f", refresh, (connected_at - db_started) * 1000, (queried_at - connected_at) * 1000, (queried_at - request_started) * 1000)
+            logger.info(
+                "team usage sql refresh=%s connect_ms=%.0f query_ms=%.0f total_ms=%.0f backends=%s scopes=%s records=%s",
+                refresh,
+                (connected_at - db_started) * 1000,
+                (queried_at - connected_at) * 1000,
+                (queried_at - request_started) * 1000,
+                len({item.get("backend") for item in team_scope_items(team)}),
+                len(team_scope_items(team)),
+                len(payload.get("rows") or []) if payload else 0,
+            )
             if payload is not None:
                 payload = dict(payload)
                 last_synced = payload.pop("lastSyncedAt", None)
                 payload["dataFreshness"] = usage_data_freshness(last_synced, start_date, end_date)
-                payload.setdefault("dataQuality", {})["backends"] = usage_backend_ids()
+                payload.setdefault("dataQuality", {})["backends"] = [item.get("backend") for item in team_scope_items(team)]
         except Exception:
             logger.exception("local team usage query failed; falling back to upstream")
             payload = None
     if payload is None:
         if refresh:
             raise manual_refresh_database_unavailable()
-        payload = dict(await client().team_usage_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source))
+        try:
+            payload = dict(await client().team_usage_rows(team_scope_items(team), start_date, end_date, source))
+        except TypeError:
+            # Keep test doubles and older clients compatible with the legacy signature.
+            payload = dict(await client().team_usage_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source))
     if enrich_member_rankings:
         # team_rows/team_usage_rows already aggregate through team membership. Do not
         # replace that scoped result with an email-wide personal usage query.
@@ -829,8 +876,8 @@ async def team_usage_payload(
         payload["dataQuality"]["rankingScope"] = "selected_team"
         payload["dataQuality"]["memberIdentityMatch"] = "user_id_or_email"
     payload["team"] = public_team_from_payload(team, payload.get("team"))
-    if enrich_member_rankings:
-        team_usage_cache.set(cache_key, payload, env_int("TEAM_USAGE_CACHE_TTL_SECONDS", 300))
+    # 摘要和排行来自同一批结果；首个请求即写缓存，后续排行请求不重复查库。
+    team_usage_cache.set(cache_key, payload, env_int("TEAM_USAGE_CACHE_TTL_SECONDS", 300))
     payload = dict(payload)
     payload["cache"] = {"hit": False, "ttlSeconds": 0}
     return payload
@@ -921,22 +968,47 @@ async def team_member_usage_payload(
         if hit:
             payload = dict(value)
             payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+            logger.info(
+                "team member usage cache hit backends=%s scopes=%s records=%s",
+                len({item.get("backend") for item in team_scope_items(team)}),
+                len(team_scope_items(team)),
+                len(payload.get("rows") or []),
+            )
             return payload
 
-    team_payload = await team_usage_payload(app_user, start_date, end_date, source, refresh, team_ref_value, enrich_member_rankings=False)
-    selected_employee = find_team_employee(team_payload, employee)
     stored_payload: dict[str, Any] | None = None
     store = usage_store()
     if store is not None:
         try:
+            db_started = asyncio.get_running_loop().time()
             await store.connect()
-            stored_payload = await store.team_member_rows(str(team["backend"]), str(team["id"]), employee, start_date, end_date, source)
+            connected_at = asyncio.get_running_loop().time()
+            await prepare_usage_refresh(start_date, end_date, refresh)
+            stored_payload = await store.team_member_rows(team_scope_items(team), employee, start_date, end_date, source)
+            queried_at = asyncio.get_running_loop().time()
+            logger.info(
+                "team member usage sql refresh=%s connect_ms=%.0f query_ms=%.0f total_ms=%.0f backends=%s scopes=%s records=%s",
+                refresh,
+                (connected_at - db_started) * 1000,
+                (queried_at - connected_at) * 1000,
+                (queried_at - request_started) * 1000,
+                len({item.get("backend") for item in team_scope_items(team)}),
+                len(team_scope_items(team)),
+                len(stored_payload.get("rows") or []) if stored_payload else 0,
+            )
         except Exception:
             logger.exception("local team member usage query failed")
     if stored_payload is not None:
         rows = stored_payload.get("rows") or []
-        selected_employee = stored_payload.get("employee") or selected_employee
+        selected_employee = stored_payload.get("employee") or {}
+        if not selected_employee:
+            raise HTTPException(status_code=404, detail="未找到该团队成员")
+        team_payload = {"team": stored_payload.get("team") or {}, "dataQuality": stored_payload.get("dataQuality") or {}}
     else:
+        if refresh:
+            raise manual_refresh_database_unavailable()
+        team_payload = await team_usage_payload(app_user, start_date, end_date, source, False, team_ref_value, enrich_member_rankings=False)
+        selected_employee = find_team_employee(team_payload, employee)
         selected_values = employee_match_values(selected_employee)
         rows = [row for row in team_payload.get("rows") or [] if employee_match_values(row) & selected_values]
     public_user = team_employee_public_user(selected_employee, team)
@@ -956,6 +1028,7 @@ async def team_member_usage_payload(
             "teamRole": selected_employee.get("teamRole"),
             "bindStatus": selected_employee.get("bindStatus"),
         },
+        "dataQuality": stored_payload.get("dataQuality") if stored_payload is not None else team_payload.get("dataQuality", {}),
     }
     if stored_payload is not None:
         payload["dataFreshness"] = usage_data_freshness(stored_payload.get("lastSyncedAt"), start_date, end_date)

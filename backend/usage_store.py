@@ -11,7 +11,7 @@ try:
 except ImportError:  # pragma: no cover - optional for local development
     asyncpg = None  # type: ignore[assignment]
 
-from .litellm_client import normalize_model_display_name
+from .litellm_client import department_key, normalize_model_display_name, normalize_team_text
 
 
 def _model_normalize_sql(column: str) -> str:
@@ -271,6 +271,98 @@ class UsageStore:
             error_message[:2000],
             run_id,
         )
+
+    async def team_rows(self, team_scopes: list[dict[str, Any]], start_date: str, end_date: str, source: str) -> dict[str, Any] | None:
+        """Read one logical team from all covered backend/team pairs in one SQL query."""
+        backend_ids = [str(item.get("backend")) for item in team_scopes if item.get("backend") and item.get("id")]
+        team_ids = [str(item.get("id")) for item in team_scopes if item.get("backend") and item.get("id")]
+        covered = sorted(set(backend_ids))
+        if not backend_ids or not await self.has_complete_coverage(start_date, end_date, covered):
+            return None
+        model_sql = _model_normalize_sql("u.model")
+        records = await self._require_pool().fetch(
+            f"""
+            WITH scope(backend_id, team_id) AS (SELECT * FROM unnest($1::text[], $2::text[])),
+            members AS (
+                SELECT DISTINCT ON (m.backend_id, m.user_id) m.backend_id, m.team_id, m.team_name,
+                       m.user_id, m.employee_email, m.employee_name, m.team_role
+                FROM usage_team_membership_daily m JOIN scope s ON s.backend_id=m.backend_id AND s.team_id=m.team_id
+                WHERE m.snapshot_date BETWEEN $3::date AND $4::date
+                ORDER BY m.backend_id, m.user_id, m.snapshot_date DESC
+            )
+            SELECT 'member' AS kind, m.backend_id, m.team_id, m.team_name, m.user_id, m.employee_email, m.employee_name, m.team_role,
+                   NULL::date AS usage_date, NULL::text AS source, NULL::text AS model_name,
+                   0::bigint AS prompt_tokens, 0::bigint AS completion_tokens, 0::bigint AS total_tokens,
+                   0::bigint AS request_count, 0::bigint AS success_count, 0::bigint AS failure_count, 0::double precision AS spend
+            FROM members m
+            UNION ALL
+            SELECT 'usage', u.backend_id, NULL, NULL, u.user_id, MAX(u.employee_email), MAX(u.employee_name), NULL,
+                   u.usage_date, u.source, {model_sql}, {self._aggregate_metrics_sql('u.')}
+            FROM usage_daily u
+            WHERE u.backend_id = ANY($1::text[])
+              AND u.usage_date BETWEEN $3::date AND $4::date
+              AND ($5 = 'all' OR u.source = $5)
+              AND EXISTS (
+                  SELECT 1 FROM usage_team_membership_daily m JOIN scope s ON s.backend_id=m.backend_id AND s.team_id=m.team_id
+                  WHERE m.backend_id=u.backend_id AND m.snapshot_date=u.usage_date
+                    AND (m.user_id=u.user_id OR (NULLIF(btrim(m.employee_email),'') IS NOT NULL AND lower(btrim(m.employee_email))=lower(btrim(u.employee_email))))
+              )
+            GROUP BY u.backend_id, u.usage_date, u.user_id, u.source, {model_sql}
+            ORDER BY kind, usage_date NULLS FIRST, backend_id, user_id, source, model_name
+            """,
+            backend_ids, team_ids, _as_date(start_date), _as_date(end_date), source or "all",
+        )
+        member_records = [item for item in records if item["kind"] == "member"]
+        if not member_records:
+            anchor = team_scopes[0]
+            return {
+                "rows": [],
+                "summaryRows": [],
+                "employees": [],
+                "team": {"id": anchor["id"], "name": anchor.get("name") or anchor["id"], "memberCount": 0, "backend": anchor["backend"]},
+                "pageLimit": 0,
+                "pageSize": 0,
+                "pagesRead": 0,
+                "totalPages": 0,
+                "totalRecords": 0,
+                "truncated": False,
+                "dataQuality": {"summarySource": "database", "rankingSource": "database", "backends": covered, "scopeCount": len(team_scopes), "memberIdentityMatch": "normalized_email_or_backend_user_id"},
+                "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered),
+            }
+        usage_records = [item for item in records if item["kind"] == "usage"]
+        rows = []
+        for record in usage_records:
+            row = self._aggregated_usage_row(record)
+            row.update(
+                {
+                    "employeeId": record["user_id"],
+                    "employeeName": record["employee_name"] or record["user_id"],
+                    "employeeEmail": record["employee_email"] or "",
+                    "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱",
+                }
+            )
+            rows.append(row)
+        employees_by_identity: dict[str, dict[str, Any]] = {}
+        source_totals: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for row, record in zip(rows, usage_records):
+            email = str(row.get("employeeEmail") or "").strip().lower()
+            identity = f"email:{email}" if email else f"id:{record['backend_id']}:{record['user_id']}"
+            public_id = row["employeeId"] if email else f"{record['backend_id']}:{record['user_id']}"
+            item = employees_by_identity.setdefault(identity, {"employeeId": public_id, "employeeName": row["employeeName"], "employeeEmail": email, "bindStatus": row["bindStatus"], **empty_totals(), "primarySource": "其他", "userIds": [], "teamRole": "user"})
+            add_totals(item, row)
+            source_totals[identity][str(row.get("source") or "其他")] += _as_int(row.get("totalTokens"))
+            account_id = f"{record['backend_id']}:{record['user_id']}"
+            if account_id not in item["userIds"]:
+                item["userIds"].append(account_id)
+        for identity, item in employees_by_identity.items():
+            if source_totals[identity]:
+                item["primarySource"] = max(source_totals[identity].items(), key=lambda pair: (pair[1], pair[0]))[0]
+        latest_members = member_records
+        employees = self._merge_team_members(latest_members, employees_by_identity)
+        employees.sort(key=lambda item: (-item["totalTokens"], -item["spend"], str(item["employeeName"]).casefold()))
+        summary_rows = self._group_rows(rows, ("date", "source", "model"))
+        anchor = team_scopes[0]
+        return {"rows": self._public_rows(rows), "summaryRows": summary_rows, "employees": employees, "team": {"id": anchor["id"], "name": anchor.get("name") or member_records[0]["team_name"] or anchor["id"], "memberCount": len(employees), "backend": anchor["backend"]}, "pageLimit": 0, "pageSize": 0, "pagesRead": 0, "totalPages": 0, "totalRecords": len(rows), "truncated": False, "dataQuality": {"summarySource": "database", "rankingSource": "database", "backends": covered, "scopeCount": len(team_scopes), "memberIdentityMatch": "normalized_email_or_backend_user_id"}, "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered)}
 
     @staticmethod
     def _usage_record(backend_id: str, row: dict[str, Any], collected_at: datetime) -> tuple[Any, ...]:
@@ -895,13 +987,25 @@ class UsageStore:
         covered = await self.covered_backend_ids(start_date, end_date, backend_ids)
         if not covered:
             return None
-        department_filter = (department or "").strip().lower()
+        department_filter = normalize_team_text(department)
         args: list[Any] = [_as_date(start_date), _as_date(end_date), covered, source or "all", department_filter]
-        where_sql = """
+        team_id_sql = "lower(btrim(m.team_id))"
+        team_name_sql = "lower(regexp_replace(btrim(m.team_name), '\\s+', ' ', 'g'))"
+        logical_key_sql = f"{team_id_sql} || '::' || {team_name_sql}"
+        where_sql = f"""
             u.usage_date BETWEEN $1::date AND $2::date
             AND u.backend_id = ANY($3::text[])
             AND ($4 = 'all' OR u.source = $4)
-            AND ($5 = '' OR lower(m.team_id) = $5 OR lower(m.team_name) = $5)
+            AND ($5 = '' OR {logical_key_sql} = $5 OR (
+                ({team_id_sql} = $5 OR {team_name_sql} = $5)
+                AND 1 = (
+                    SELECT COUNT(DISTINCT lower(btrim(mx.team_id)) || '::' || lower(regexp_replace(btrim(mx.team_name), '\\s+', ' ', 'g')))
+                    FROM usage_team_membership_daily mx
+                    WHERE mx.snapshot_date BETWEEN $1::date AND $2::date
+                      AND mx.backend_id = ANY($3::text[])
+                      AND (lower(btrim(mx.team_id)) = $5 OR lower(regexp_replace(btrim(mx.team_name), '\\s+', ' ', 'g')) = $5)
+                )
+            ))
         """
         model_sql = _model_normalize_sql("u.model")
         pool = self._require_pool()
@@ -917,7 +1021,7 @@ class UsageStore:
             JOIN usage_team_membership_daily m
               ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
             WHERE {where_sql}
-            GROUP BY u.backend_id, u.usage_date, u.user_id, m.team_id, u.source, {model_sql}
+            GROUP BY u.backend_id, u.usage_date, u.user_id, m.team_id, m.team_name, u.source, {model_sql}
             ORDER BY u.usage_date, MAX(m.team_name), MAX(u.employee_name), u.source, model_name
             """,
             *args,
@@ -929,6 +1033,7 @@ class UsageStore:
                 {
                     "departmentId": record["team_id"],
                     "departmentName": record["team_name"] or record["team_id"],
+                    "departmentKey": department_key(record["team_id"], record["team_name"] or record["team_id"]),
                     "departmentBindStatus": "已绑定部门",
                     "employeeId": record["user_id"],
                     "employeeName": record["employee_name"] or record["user_id"],
@@ -994,29 +1099,30 @@ class UsageStore:
         department_records = await pool.fetch(
             f"""
             WITH filtered AS (
-                SELECT u.*, m.team_id, m.team_name, {model_sql} AS model_name
+                SELECT u.*, m.team_id, m.team_name, {logical_key_sql} AS department_key, {model_sql} AS model_name
                 FROM usage_daily u
                 JOIN usage_team_membership_daily m
                   ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
                 WHERE {where_sql}
             ), source_totals AS (
-                SELECT team_id, source, SUM(total_tokens)::bigint AS source_tokens
-                FROM filtered GROUP BY team_id, source
+                SELECT department_key, source, SUM(total_tokens)::bigint AS source_tokens
+                FROM filtered GROUP BY department_key, source
             ), primary_sources AS (
-                SELECT DISTINCT ON (team_id) team_id, source AS primary_source
-                FROM source_totals ORDER BY team_id, source_tokens DESC, source
+                SELECT DISTINCT ON (department_key) department_key, source AS primary_source
+                FROM source_totals ORDER BY department_key, source_tokens DESC, source
             )
-            SELECT team_id, MAX(team_name) AS team_name,
+            SELECT MIN(team_id) AS team_id, MIN(team_name) AS team_name, filtered.department_key,
                    {self._aggregate_metrics_sql('')}, COUNT(DISTINCT user_id)::bigint AS active_employees,
                    primary_sources.primary_source
-            FROM filtered JOIN primary_sources USING (team_id)
-            GROUP BY team_id, primary_sources.primary_source
-            ORDER BY total_tokens DESC, spend DESC, lower(MAX(team_name))
+            FROM filtered JOIN primary_sources USING (department_key)
+            GROUP BY filtered.department_key, primary_sources.primary_source
+            ORDER BY total_tokens DESC, spend DESC, lower(MIN(team_name))
             """,
             *args,
         )
         departments = [
             {
+                "departmentKey": record["department_key"],
                 "departmentId": record["team_id"],
                 "departmentName": record["team_name"] or record["team_id"],
                 "bindStatus": "已绑定部门",
@@ -1057,11 +1163,11 @@ class UsageStore:
             "totalPages": 0,
             "totalRecords": len(rows),
             "truncated": False,
-            "dataQuality": {"summarySource": "database", "rankingSource": "database"},
+            "dataQuality": {"summarySource": "database", "rankingSource": "database", "backends": covered, "departmentIdentityMatch": "normalized_team_id_and_name"},
             "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered),
         }
 
-    async def team_rows(self, backend_id: str, team_id: str, start_date: str, end_date: str, source: str) -> dict[str, Any] | None:
+    async def _team_rows_legacy_unused(self, backend_id: str, team_id: str, start_date: str, end_date: str, source: str) -> dict[str, Any] | None:
         if not await self.has_coverage(start_date, end_date, [backend_id]):
             return None
         pool = self._require_pool()
@@ -1222,14 +1328,16 @@ class UsageStore:
         employees_by_identity: dict[str, dict[str, Any]] = {}
         for member in latest_members:
             member_email = str(member["employee_email"] or "").strip().lower()
-            item = employee_by_user_id.get(str(member["user_id"])) or (employee_by_user_id.get(f"email:{member_email}") if member_email else None)
+            backend_id = str(member.get("backend_id") if hasattr(member, "get") else member["backend_id"] if "backend_id" in member else "")
+            item = (employee_by_user_id.get(f"email:{member_email}") if member_email else None) or employee_by_user_id.get(f"id:{backend_id}:{member['user_id']}") or employee_by_user_id.get(str(member["user_id"]))
             if item is None:
-                item = {"employeeId": member["user_id"], "employeeName": member["employee_name"] or member["user_id"], "employeeEmail": member["employee_email"] or "", "bindStatus": "已绑定邮箱" if member["employee_email"] else "未绑定邮箱", **empty_totals(), "primarySource": "其他", "userIds": [member["user_id"]], "teamRole": member["team_role"] or "user"}
+                account_id = f"{backend_id}:{member['user_id']}"
+                item = {"employeeId": member["user_id"] if member_email else account_id, "employeeName": member["employee_name"] or member["user_id"], "employeeEmail": member["employee_email"] or "", "bindStatus": "已绑定邮箱" if member["employee_email"] else "未绑定邮箱", **empty_totals(), "primarySource": "其他", "userIds": [account_id], "teamRole": member["team_role"] or "user"}
             else:
                 item = dict(item)
                 item["teamRole"] = member["team_role"] or item.get("teamRole") or "user"
             email = str(item.get("employeeEmail") or member["employee_email"] or "").strip().lower()
-            identity = email or str(item.get("employeeId") or member["user_id"]).strip().lower()
+            identity = f"email:{email}" if email else f"id:{backend_id}:{str(member['user_id']).strip().lower()}"
             existing = employees_by_identity.get(identity)
             if existing is None:
                 employees_by_identity[identity] = item
@@ -1245,7 +1353,7 @@ class UsageStore:
                 existing["teamRole"] = "admin"
         return list(employees_by_identity.values())
 
-    async def team_member_rows(self, backend_id: str, team_id: str, employee: str, start_date: str, end_date: str, source: str) -> dict[str, Any] | None:
+    async def _team_member_rows_legacy_unused(self, backend_id: str, team_id: str, employee: str, start_date: str, end_date: str, source: str) -> dict[str, Any] | None:
         if not await self.has_coverage(start_date, end_date, [backend_id]):
             return None
         pool = self._require_pool()
@@ -1325,6 +1433,91 @@ class UsageStore:
             "team": {"id": team_id, "name": team_name, "memberCount": len(members), "backend": backend_id},
             "lastSyncedAt": await self.latest_sync_at(start_date, end_date, [backend_id]),
         }
+
+    async def team_member_rows(self, team_scopes: list[dict[str, Any]], employee: str, start_date: str, end_date: str, source: str) -> dict[str, Any] | None:
+        backend_ids = [str(item.get("backend")) for item in team_scopes if item.get("backend") and item.get("id")]
+        team_ids = [str(item.get("id")) for item in team_scopes if item.get("backend") and item.get("id")]
+        covered = sorted(set(backend_ids))
+        if not backend_ids or not await self.has_complete_coverage(start_date, end_date, covered):
+            return None
+        normalized = employee.strip().casefold()
+        selected_backend = ""
+        selected_user = normalized
+        if ":" in normalized:
+            possible_backend, possible_user = normalized.split(":", 1)
+            if possible_backend in covered:
+                selected_backend, selected_user = possible_backend, possible_user
+        model_sql = _model_normalize_sql("u.model")
+        records = await self._require_pool().fetch(
+            f"""
+            WITH scope(backend_id, team_id) AS (SELECT * FROM unnest($1::text[], $2::text[])),
+            selected AS (
+                SELECT DISTINCT ON (m.backend_id, m.user_id) m.backend_id, m.team_id, m.team_name, m.user_id,
+                       m.employee_email, m.employee_name, m.team_role
+                FROM usage_team_membership_daily m JOIN scope s ON s.backend_id=m.backend_id AND s.team_id=m.team_id
+                WHERE m.snapshot_date BETWEEN $3::date AND $4::date
+                  AND (($6<>'' AND m.backend_id=$6 AND $5=lower(btrim(m.user_id)))
+                       OR ($6='' AND ($5=lower(btrim(m.user_id)) OR $5=lower(btrim(m.employee_email)) OR $5=lower(btrim(m.employee_name)))))
+                ORDER BY m.backend_id, m.user_id, m.snapshot_date DESC
+            )
+            SELECT 'member' AS kind, s.backend_id, s.team_id, s.team_name, s.user_id, s.employee_email, s.employee_name, s.team_role,
+                   NULL::date AS usage_date, NULL::text AS source, NULL::text AS model_name,
+                   0::bigint AS prompt_tokens, 0::bigint AS completion_tokens, 0::bigint AS total_tokens,
+                   0::bigint AS request_count, 0::bigint AS success_count, 0::bigint AS failure_count, 0::double precision AS spend
+            FROM selected s
+            UNION ALL
+            SELECT 'usage', u.backend_id, NULL, NULL, u.user_id, MAX(u.employee_email), MAX(u.employee_name), NULL,
+                   u.usage_date, u.source, {model_sql}, {self._aggregate_metrics_sql('u.')}
+            FROM usage_daily u
+            WHERE u.backend_id=ANY($1::text[]) AND u.usage_date BETWEEN $3::date AND $4::date
+              AND ($7='all' OR u.source=$7)
+              AND EXISTS (SELECT 1 FROM selected s WHERE s.backend_id=u.backend_id AND (s.user_id=u.user_id OR (NULLIF(btrim(s.employee_email),'') IS NOT NULL AND lower(btrim(s.employee_email))=lower(btrim(u.employee_email)))))
+              AND EXISTS (SELECT 1 FROM usage_team_membership_daily m JOIN scope sc ON sc.backend_id=m.backend_id AND sc.team_id=m.team_id WHERE m.backend_id=u.backend_id AND m.snapshot_date=u.usage_date AND (m.user_id=u.user_id OR (NULLIF(btrim(m.employee_email),'') IS NOT NULL AND lower(btrim(m.employee_email))=lower(btrim(u.employee_email)))))
+            GROUP BY u.backend_id, u.usage_date, u.user_id, u.source, {model_sql}
+            ORDER BY kind, usage_date NULLS FIRST, backend_id, user_id, source, model_name
+            """,
+            backend_ids, team_ids, _as_date(start_date), _as_date(end_date), selected_user, selected_backend, source or "all",
+        )
+        members = [item for item in records if item["kind"] == "member"]
+        if not members:
+            anchor = team_scopes[0]
+            return {
+                "rows": [],
+                "summary": summarize([]),
+                "employee": None,
+                "team": {"id": anchor["id"], "name": anchor.get("name") or anchor["id"], "memberCount": 0, "backend": anchor["backend"]},
+                "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered),
+                "dataQuality": {"backends": covered, "scopeCount": len(team_scopes), "memberIdentityMatch": "normalized_email_or_backend_user_id"},
+            }
+        rows = []
+        for record in records:
+            if record["kind"] != "usage":
+                continue
+            row = self._aggregated_usage_row(record)
+            row.update(
+                {
+                    "employeeId": record["user_id"],
+                    "employeeName": record["employee_name"] or record["user_id"],
+                    "employeeEmail": record["employee_email"] or "",
+                    "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱",
+                }
+            )
+            rows.append(self._public_rows([row])[0])
+        first = members[0]
+        user_ids = [f"{item['backend_id']}:{item['user_id']}" for item in members]
+        selected = {
+            "employeeId": first["user_id"] if first["employee_email"] else f"{first['backend_id']}:{first['user_id']}",
+            "employeeName": first["employee_name"] or first["user_id"],
+            "employeeEmail": first["employee_email"] or "",
+            "bindStatus": "已绑定邮箱" if first["employee_email"] else "未绑定邮箱",
+            "userIds": user_ids,
+            "teamRole": "admin" if any(item["team_role"] == "admin" for item in members) else first["team_role"] or "user",
+            **empty_totals(),
+            "primarySource": "其他",
+        }
+        selected.update(summarize(rows)["rangeTotal"])
+        anchor = team_scopes[0]
+        return {"rows": rows, "summary": summarize(rows), "employee": selected, "team": {"id": anchor["id"], "name": anchor.get("name") or first["team_name"] or anchor["id"], "memberCount": len(members), "backend": anchor["backend"]}, "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered), "dataQuality": {"backends": covered, "scopeCount": len(team_scopes), "memberIdentityMatch": "normalized_email_or_backend_user_id"}}
 
     async def health(self) -> dict[str, Any]:
         if self.pool is None:

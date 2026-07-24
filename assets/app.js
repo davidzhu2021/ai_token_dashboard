@@ -416,7 +416,7 @@ function rangeLabel() {
 
 function selectedDepartmentInfo() {
   if (!selectedDepartment) return null;
-  const matched = departmentRankings.find((item) => item.departmentId === selectedDepartment || item.departmentName === selectedDepartment);
+  const matched = departmentRankings.find((item) => item.departmentKey === selectedDepartment || item.departmentId === selectedDepartment || item.departmentName === selectedDepartment);
   return {
     id: matched?.departmentId || selectedDepartment,
     name: matched?.departmentName || selectedDepartment,
@@ -1039,7 +1039,7 @@ function sortedDepartments(items) {
 }
 
 function departmentOptionKey(item) {
-  return item.departmentId || item.departmentName || "";
+  return item.departmentKey || item.departmentId || item.departmentName || "";
 }
 
 function departmentOptionName(item) {
@@ -1217,7 +1217,7 @@ function renderDepartmentRanking(tableId, countId, departments, emptyText) {
           const requests = Number(item.requestCount || 0);
           const successRate = requests ? Math.round((Number(item.successCount || 0) / requests) * 1000) / 10 : 0;
           return `
-            <tr class="admin-employee-row" data-department="${item.departmentId}">
+            <tr class="admin-employee-row" data-department="${escapeHtml(departmentOptionKey(item))}">
               <td><strong>${item.departmentName || item.departmentId}</strong></td>
               <td>${item.departmentId || "未绑定部门"}</td>
               <td>${displaySource(item.primarySource)}</td>
@@ -2366,7 +2366,8 @@ async function loadTeamData(forceRefresh = false) {
     applyTeamUsagePayload(payload);
     isTeamLoading = false;
     renderTeam();
-    await loadTeamRankingData(forceRefresh);
+    // 摘要请求已刷新并缓存同一批排名数据，排行请求直接复用，避免重复 SQL。
+    await loadTeamRankingData(false);
   } catch (error) {
     if (error.name === "AbortError") return;
     if (requestId !== teamUsageRequestId) return;

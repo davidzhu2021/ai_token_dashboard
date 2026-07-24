@@ -149,6 +149,47 @@ def test_team_leader_scope_accepts_admin_role_and_email_match(monkeypatch) -> No
     assert scope["team"]["id"] == "team-email"
 
 
+def test_primary_admin_scope_includes_matching_her_team_but_her_admin_alone_does_not(monkeypatch) -> None:
+    client = object.__new__(LiteLLMClient)
+    primary = LiteLLMBackend(id="primary", label="Primary", base_url="https://primary.test", admin_key="key")
+    her = LiteLLMBackend(id="her", label="Her", base_url="https://her.test", admin_key="key", source="Her")
+    client.backends = [primary, her]
+    client._backend_map = {item.id: item for item in client.backends}
+
+    async def fake_teams(backend, include_details=True):
+        if backend.id == "primary":
+            return [{"team_id": "team-a", "team_alias": "Team A", "members_with_roles": [{"user_id": "leader-primary", "role": "admin"}]}]
+        return [
+            {"team_id": "team-a", "team_alias": " Team   A ", "members_with_roles": [{"user_id": "leader-her", "role": "user"}]},
+            {"team_id": "team-b", "team_alias": "Her Only", "members_with_roles": [{"user_id": "leader-her", "role": "admin"}]},
+        ]
+
+    monkeypatch.setattr(client, "teams", fake_teams)
+    scope = asyncio.run(client.team_leader_scope({"matched_accounts": [{"backend": "primary", "user_id": "leader-primary"}, {"backend": "her", "user_id": "leader-her"}]}))
+
+    assert scope["isTeamLeader"] is True
+    assert [(item["backend"], item["id"]) for item in scope["team"]["teamScopes"]] == [("primary", "team-a"), ("her", "team-a")]
+    assert all(item["id"] != "team-b" for item in scope["leaderTeams"])
+
+
+def test_primary_admin_scope_does_not_include_same_id_with_different_name(monkeypatch) -> None:
+    client = object.__new__(LiteLLMClient)
+    primary = LiteLLMBackend(id="primary", label="Primary", base_url="https://primary.test", admin_key="key")
+    her = LiteLLMBackend(id="her", label="Her", base_url="https://her.test", admin_key="key", source="Her")
+    client.backends = [primary, her]
+    client._backend_map = {item.id: item for item in client.backends}
+
+    async def fake_teams(backend, include_details=True):
+        if backend.id == "primary":
+            return [{"team_id": "shared", "team_alias": "Engineering", "members_with_roles": [{"user_id": "leader", "role": "admin"}]}]
+        return [{"team_id": "shared", "team_alias": "Finance", "members_with_roles": []}]
+
+    monkeypatch.setattr(client, "teams", fake_teams)
+    scope = asyncio.run(client.team_leader_scope({"matched_accounts": [{"backend": "primary", "user_id": "leader"}]}))
+
+    assert [(item["backend"], item["id"]) for item in scope["team"]["teamScopes"]] == [("primary", "shared")]
+
+
 def test_team_leader_scope_rejects_noncanonical_team_admin_role(monkeypatch) -> None:
     client = object.__new__(LiteLLMClient)
     backend = LiteLLMBackend(
