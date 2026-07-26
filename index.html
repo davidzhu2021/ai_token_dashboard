@@ -2041,6 +2041,15 @@
         display: none;
         margin-bottom: 18px;
         scroll-margin-top: 82px;
+        overflow: hidden;
+        color: #ffffff;
+        background:
+          linear-gradient(118deg, rgba(255, 255, 255, 0.14), transparent 38%),
+          linear-gradient(90deg, rgba(4, 42, 78, 0.14), rgba(4, 42, 78, 0.34)),
+          linear-gradient(100deg, #07579e 0%, var(--brand) 56%, var(--brand-2) 100%);
+        border-color: rgba(255, 255, 255, 0.5);
+        box-shadow: 0 16px 34px rgba(6, 94, 170, 0.22);
+        backdrop-filter: none;
       }
 
       .admin-detail-card.show {
@@ -2060,14 +2069,67 @@
 
       .admin-detail-head h3 {
         margin: 0;
+        color: #ffffff;
         font-size: 20px;
         overflow-wrap: anywhere;
       }
 
       .admin-detail-head p {
         margin: 6px 0 0;
-        color: var(--muted);
+        color: #eaf5ff;
+        line-height: 1.55;
         overflow-wrap: anywhere;
+      }
+
+      .admin-detail-card .drilldown-back-btn {
+        min-height: 46px;
+        padding: 0 18px;
+        color: #075fae;
+        background: #ffffff;
+        border-color: rgba(255, 255, 255, 0.86);
+        box-shadow: 0 8px 20px rgba(4, 58, 109, 0.18);
+      }
+
+      .admin-detail-card .drilldown-back-btn:hover:not(:disabled) {
+        color: #044f94;
+        background: var(--ice);
+        border-color: #ffffff;
+        box-shadow: 0 11px 24px rgba(4, 58, 109, 0.24);
+        transform: translateY(-1px);
+      }
+
+      .admin-detail-card .drilldown-back-btn:active:not(:disabled) {
+        box-shadow: 0 5px 14px rgba(4, 58, 109, 0.2);
+        transform: translateY(0);
+      }
+
+      .admin-detail-card .drilldown-back-btn:focus-visible {
+        outline-color: rgba(255, 255, 255, 0.94);
+        outline-offset: 4px;
+      }
+
+      .drilldown-back-btn .app-icon {
+        width: 18px;
+        height: 18px;
+        transition: transform 160ms ease;
+      }
+
+      .drilldown-back-btn:hover:not(:disabled) .app-icon {
+        transform: translateX(-2px);
+      }
+
+      @media (min-width: 821px) and (max-width: 960px) {
+        .admin-detail-head {
+          align-items: flex-start;
+        }
+
+        .admin-detail-head > div {
+          flex: 1 1 auto;
+        }
+
+        .admin-detail-card .drilldown-back-btn {
+          align-self: flex-start;
+        }
       }
 
       .admin-employee-row {
@@ -3322,6 +3384,11 @@
           scroll-margin-top: 16px;
         }
 
+        .admin-detail-card .drilldown-back-btn {
+          width: 100%;
+          min-height: 48px;
+        }
+
         .admin-search {
           min-width: 0;
           width: 100%;
@@ -3626,6 +3693,7 @@
       <symbol id="icon-login" viewBox="0 0 24 24"><path d="M14 5h4.5A1.5 1.5 0 0 1 20 6.5v11a1.5 1.5 0 0 1-1.5 1.5H14"></path><path d="M9 8l4 4-4 4"></path><path d="M13 12H4"></path></symbol>
       <symbol id="icon-shield" viewBox="0 0 24 24"><path d="M12 3.5 19 7v5c0 4.3-2.6 7.4-7 8.5-4.4-1.1-7-4.2-7-8.5V7l7-3.5Z"></path><path d="m8.8 12.1 2.1 2.1 4.5-4.6"></path></symbol>
       <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.4-5.7"></path><path d="M20 4v6h-6"></path></symbol>
+      <symbol id="icon-arrow-left" viewBox="0 0 24 24"><path d="m10 5-7 7 7 7"></path><path d="M3 12h18"></path></symbol>
       <symbol id="icon-logout" viewBox="0 0 24 24"><path d="M10 5H6.5A1.5 1.5 0 0 0 5 6.5v11A1.5 1.5 0 0 0 6.5 19H10"></path><path d="M14 8l4 4-4 4"></path><path d="M18 12H9"></path></symbol>
       <symbol id="icon-dashboard" viewBox="0 0 24 24"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v13a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 18.5v-13Z"></path><path d="M8 15v-3"></path><path d="M12 15V8"></path><path d="M16 15v-5"></path></symbol>
       <symbol id="icon-plaza" viewBox="0 0 24 24"><path d="M5 8.5 12 4l7 4.5v7L12 20l-7-4.5v-7Z"></path><path d="M12 4v16"></path><path d="M5 8.5 12 13l7-4.5"></path></symbol>
@@ -4106,7 +4174,7 @@
                 <h3 id="adminDetailTitle">员工详情</h3>
                 <p id="adminDetailSubtitle">点击员工排行中的一行查看个人明细。</p>
               </div>
-              <button id="adminClearEmployee" class="ghost-btn" type="button">返回全员</button>
+              <button id="adminClearEmployee" class="ghost-btn drilldown-back-btn" type="button"><span class="app-icon" aria-hidden="true"><svg><use href="#icon-arrow-left"></use></svg></span><span>返回全员</span></button>
             </div>
           </section>
 
@@ -4255,7 +4323,7 @@
                   <h3 id="teamDetailTitle">成员详情</h3>
                   <p id="teamDetailSubtitle">点击成员排行中的一行查看个人明细。</p>
                 </div>
-                <button id="teamBackButton" class="ghost-btn hidden" type="button">返回团队总览</button>
+                <button id="teamBackButton" class="ghost-btn drilldown-back-btn hidden" type="button"><span class="app-icon" aria-hidden="true"><svg><use href="#icon-arrow-left"></use></svg></span><span>返回团队总览</span></button>
               </div>
             </section>
 
@@ -4439,7 +4507,7 @@
                 <h3 id="departmentDetailTitle">员工详情</h3>
                 <p id="departmentDetailSubtitle">点击部门排行中的一行查看部门明细。</p>
               </div>
-              <button id="departmentClearEmployee" class="ghost-btn" type="button">返回全部部门</button>
+              <button id="departmentClearEmployee" class="ghost-btn drilldown-back-btn" type="button"><span class="app-icon" aria-hidden="true"><svg><use href="#icon-arrow-left"></use></svg></span><span>返回全部部门</span></button>
             </div>
           </section>
 
