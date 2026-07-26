@@ -2055,6 +2055,7 @@ async def sso_callback(request: Request):
             await auth_store_call("revoke_session", server_token)
             clear_server_session(request)
         request.session[SESSION_USER_KEY] = user
+        csrf_token(request)
         return RedirectResponse("/?auth_callback=success")
     except OAuthError as exc:
         state_keys = oidc_state_keys(request)

@@ -92,6 +92,8 @@ let authAccess = "personal";
 let authMode = "login";
 let authSubmitting = false;
 let authCsrfToken = "";
+let csrfRefreshPromise = null;
+let authSessionGeneration = 0;
 let resetPasswordToken = "";
 let verificationCountdown = 0;
 let verificationTimer = null;
@@ -153,10 +155,12 @@ function showLoginCallbackMessage() {
   window.history.replaceState({}, "", cleanUrl);
 }
 
-async function api(path, options = {}) {
+async function api(path, options = {}, requestState = {}) {
   const method = String(options.method || "GET").toUpperCase();
+  const isWriteRequest = !["GET", "HEAD", "OPTIONS"].includes(method);
+  const requestCsrfToken = isWriteRequest ? authCsrfToken : "";
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
-  if (authCsrfToken && !["GET", "HEAD", "OPTIONS"].includes(method)) headers["X-CSRF-Token"] = authCsrfToken;
+  if (requestCsrfToken) headers["X-CSRF-Token"] = requestCsrfToken;
   const response = await fetch(path, {
     credentials: "same-origin",
     ...options,
@@ -170,6 +174,15 @@ async function api(path, options = {}) {
       message = typeof payload.detail === "string" ? payload.detail : payload.detail?.error || payload.error || message;
       code = payload.code || payload.detail?.code || "";
     } catch {}
+    if (
+      isWriteRequest
+      && code === "AUTH_CSRF_INVALID"
+      && !requestState.csrfRetryAttempted
+      && (options.body === undefined || typeof options.body === "string")
+    ) {
+      await recoverCsrfToken(requestCsrfToken);
+      return api(path, options, { csrfRetryAttempted: true });
+    }
     const error = new Error(message);
     error.status = response.status;
     error.code = code;
@@ -181,9 +194,29 @@ async function api(path, options = {}) {
 
 async function ensureCsrfToken() {
   if (authCsrfToken) return authCsrfToken;
-  const payload = await api("/api/auth/csrf");
-  authCsrfToken = payload?.csrfToken || "";
-  return authCsrfToken;
+  if (!csrfRefreshPromise) {
+    const refreshGeneration = authSessionGeneration;
+    let refreshPromise;
+    refreshPromise = (async () => {
+      const payload = await api("/api/auth/csrf");
+      const token = payload?.csrfToken || "";
+      if (!token) throw new Error("页面安全凭证获取失败，请刷新后重试");
+      if (authSessionGeneration === refreshGeneration) authCsrfToken = token;
+      return token;
+    })().finally(() => {
+      if (csrfRefreshPromise === refreshPromise) csrfRefreshPromise = null;
+    });
+    csrfRefreshPromise = refreshPromise;
+  }
+  return csrfRefreshPromise;
+}
+
+async function recoverCsrfToken(invalidToken = "") {
+  // A later response may report the same stale request after another request
+  // has already refreshed the session. Reuse that token instead of rotating it again.
+  if (authCsrfToken && authCsrfToken !== invalidToken) return authCsrfToken;
+  if (!csrfRefreshPromise && authCsrfToken === invalidToken) authCsrfToken = "";
+  return ensureCsrfToken();
 }
 
 function normalizeAuthUser(payload) {
@@ -2971,7 +3004,9 @@ async function loadAuthScope() {
 
 function showLogin() {
   currentUser = null;
+  authSessionGeneration += 1;
   authCsrfToken = "";
+  csrfRefreshPromise = null;
   isSsoRedirecting = false;
   selectedAdminEmployee = "";
   selectedDepartment = "";
@@ -3728,29 +3763,28 @@ async function init() {
     callbackParams.delete("auth_callback");
     replaceCurrentQuery(callbackParams);
   }
-  // 并行发起 config 与 me，减少一个 RTT
-  const [configResult, meResult] = await Promise.allSettled([
-    api("/api/auth/config"),
-    api("/api/auth/me"),
-  ]);
-  authConfig = configResult.status === "fulfilled"
-    ? configResult.value
-    : {
-        devLoginEnabled: false,
-        oidcConfigured: false,
-        providerName: "飞书扫码登录",
-        passwordLoginEnabled: false,
-        publicSignupEnabled: false,
-        emailVerificationRequired: true,
-        turnstileEnabled: false,
-        turnstileConfigured: false,
-        turnstileSiteKey: "",
-      };
+  let configError = null;
+  try {
+    authConfig = await api("/api/auth/config");
+  } catch (error) {
+    configError = error;
+    authConfig = {
+      devLoginEnabled: false,
+      oidcConfigured: false,
+      providerName: "飞书扫码登录",
+      passwordLoginEnabled: false,
+      publicSignupEnabled: false,
+      emailVerificationRequired: true,
+      turnstileEnabled: false,
+      turnstileConfigured: false,
+      turnstileSiteKey: "",
+    };
+  }
   setupModelFilters();
-  if (meResult.status === "fulfilled") {
-    await showApp(meResult.value);
-  } else {
-    const meError = meResult.reason;
+  try {
+    const user = await api("/api/auth/me");
+    await showApp(user);
+  } catch (meError) {
     if (meError?.status !== 401) {
       el("authLoadingView").classList.remove("hidden");
       el("loginView").classList.add("hidden");
@@ -3758,10 +3792,10 @@ async function init() {
       el("authLoadingRetryButton").classList.remove("hidden");
       return;
     }
-    if (configResult.status === "rejected") {
+    if (configError) {
       el("authLoadingView").classList.remove("hidden");
       el("loginView").classList.add("hidden");
-      el("authLoadingHint").textContent = configResult.reason?.message || "登录配置加载失败，请检查网络后重新加载。";
+      el("authLoadingHint").textContent = configError.message || "登录配置加载失败，请检查网络后重新加载。";
       el("authLoadingRetryButton").classList.remove("hidden");
       return;
     }

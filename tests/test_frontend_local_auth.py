@@ -27,7 +27,12 @@ def test_frontend_calls_local_auth_endpoints_and_attaches_csrf() -> None:
     source = APP_JS.read_text(encoding="utf-8")
 
     assert 'api("/api/auth/csrf")' in source
-    assert 'headers["X-CSRF-Token"] = authCsrfToken' in source
+    assert 'let csrfRefreshPromise = null;' in source
+    assert 'headers["X-CSRF-Token"] = requestCsrfToken' in source
+    assert 'code === "AUTH_CSRF_INVALID"' in source
+    assert '(options.body === undefined || typeof options.body === "string")' in source
+    assert 'recoverCsrfToken(requestCsrfToken)' in source
+    assert 'return api(path, options, { csrfRetryAttempted: true });' in source
     assert 'api("/api/auth/verification/request"' in source
     assert 'api("/api/auth/register"' in source
     assert 'api("/api/auth/login"' in source
@@ -36,6 +41,14 @@ def test_frontend_calls_local_auth_endpoints_and_attaches_csrf() -> None:
     assert 'resetPasswordToken = takeResetPasswordTokenFromUrl(callbackParams)' in source
     assert 'params.delete("reset_token")' in source
     assert 'await ensureCsrfToken();\n    await api("/api/auth/logout"' in source
+
+
+def test_frontend_loads_auth_config_before_session_state() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    init_source = source[source.index("async function init()") :]
+
+    assert init_source.index('authConfig = await api("/api/auth/config")') < init_source.index('const user = await api("/api/auth/me")')
+    assert "Promise.allSettled" not in init_source
 
 
 def test_frontend_renders_account_provisioning_and_entitlement_states() -> None:
