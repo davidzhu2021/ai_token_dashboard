@@ -1,12 +1,17 @@
 import base64
 import asyncio
 import hashlib
+import ipaddress
 import logging
 import os
 import re
+import secrets
+import smtplib
+import ssl
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from base64 import urlsafe_b64encode
+from email.message import EmailMessage
 from html import unescape
 from pathlib import Path
 from typing import Any, Literal
@@ -27,13 +32,25 @@ from .auth import (
     allowed_email_domain,
     build_oauth,
     claim_value,
+    clear_server_session,
+    csrf_token,
     env_bool,
+    generate_auth_token,
+    generate_numeric_code,
+    get_server_session_token,
+    hash_auth_token,
+    hash_password,
     normalize_user,
     oidc_configured,
+    password_needs_rehash,
     require_admin,
     require_user,
+    set_server_session,
     validate_company_email,
+    verify_csrf_token,
+    verify_password,
 )
+from .auth_store import AuthStore, DuplicateEmailError
 from .litellm_client import LiteLLMClient, default_date_range, mask_key, usage_today
 from .key_vault import KeyVault, KeyVaultError
 from .usage_store import UsageStore
@@ -52,6 +69,7 @@ OIDC_STATE_PREFIX = "_state_company_"
 
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
+    validate_runtime_auth_config()
     await start_usage_sync()
     try:
         yield
@@ -61,6 +79,27 @@ async def app_lifespan(_app: FastAPI):
 
 app = FastAPI(title="AI 用量中心", lifespan=app_lifespan)
 app.mount("/assets", StaticFiles(directory=ROOT_DIR / "assets"), name="assets")
+
+
+@app.middleware("http")
+async def hydrate_server_session(request: Request, call_next):
+    """Hydrate sync route dependencies from an opaque server-side session."""
+    token = get_server_session_token(request)
+    if token:
+        session = await auth_store_call("get_session", token)
+        user = await auth_store_call("get_user", session["user_id"]) if session else None
+        if user and str(user.get("status") or "active") == "active":
+            request.session[SESSION_USER_KEY] = await auth_user_payload(user)
+        else:
+            clear_server_session(request)
+    try:
+        return await call_next(request)
+    finally:
+        # Do not serialize profile data back into local-auth cookies.
+        if get_server_session_token(request):
+            request.session.pop(SESSION_USER_KEY, None)
+
+
 app.add_middleware(
     SessionMiddleware,
     secret_key=os.getenv("SESSION_SECRET", "dev-session-secret-change-me"),
@@ -79,10 +118,32 @@ team_member_usage_cache = TTLCache()
 _litellm_client: LiteLLMClient | None = None
 _key_vault: KeyVault | None = None
 _usage_store: UsageStore | None = UsageStore.from_environment()
+_auth_store: AuthStore | None = None
+local_entitlement_cache = TTLCache()
 _usage_sync_task: asyncio.Task[Any] | None = None
 _usage_refresh_task: asyncio.Task[Any] | None = None
 _usage_sync_stop: asyncio.Event | None = None
 _usage_sync_status: dict[str, Any] = {"status": "disabled", "lastRun": None}
+
+
+def validate_runtime_auth_config() -> None:
+    """Reject known-unsafe session configuration for HTTPS deployments."""
+    if not os.getenv("APP_BASE_URL", "").strip().lower().startswith("https://"):
+        return
+    secret = os.getenv("SESSION_SECRET", "").strip()
+    weak_values = {"", "dev-session-secret-change-me", "replace-with-a-random-long-string"}
+    if secret in weak_values or len(secret) < 32:
+        raise RuntimeError("HTTPS 部署必须配置至少 32 个字符的随机 SESSION_SECRET")
+    if env_bool("AUTH_EMAIL_DEBUG", False):
+        raise RuntimeError("HTTPS 部署不能启用 AUTH_EMAIL_DEBUG")
+    if env_bool("DEV_LOGIN_ENABLED", False):
+        raise RuntimeError("HTTPS 部署不能启用 DEV_LOGIN_ENABLED")
+    if env_bool("SMTP_SSL", False) and env_bool("SMTP_STARTTLS", True):
+        raise RuntimeError("SMTP_SSL 和 SMTP_STARTTLS 不能同时启用")
+    if local_auth_enabled() and not (turnstile_enabled() and turnstile_configured()):
+        raise RuntimeError("HTTPS 密码登录必须启用并完整配置 Turnstile")
+    if local_signup_enabled() and not local_signup_ready():
+        raise RuntimeError("公开注册需要邮箱验证、域名白名单、SMTP 和 Turnstile 完整配置")
 
 
 def allowed_provider_login_url(url: str) -> str | None:
@@ -241,6 +302,18 @@ def key_vault() -> KeyVault:
 
 def usage_store() -> UsageStore | None:
     return _usage_store
+
+
+def auth_store() -> AuthStore:
+    global _auth_store
+    if _auth_store is None:
+        _auth_store = AuthStore.from_environment(ROOT_DIR)
+    return _auth_store
+
+
+async def auth_store_call(method: str, *args: Any, **kwargs: Any) -> Any:
+    function = getattr(auth_store(), method)
+    return await asyncio.to_thread(function, *args, **kwargs)
 
 
 def usage_backend_ids() -> list[str]:
@@ -420,6 +493,325 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def request_ip(request: Request) -> str:
+    peer = str(request.client.host if request.client else "").strip()
+    if not _trusted_proxy_ip(peer):
+        return peer[:128]
+
+    # Walk from the nearest hop towards the client. This avoids trusting a
+    # spoofed left-most value when a trusted proxy appends to an existing XFF.
+    forwarded = [item.strip() for item in str(request.headers.get("x-forwarded-for") or "").split(",") if item.strip()]
+    for candidate in reversed([*forwarded, peer]):
+        try:
+            normalized = str(ipaddress.ip_address(candidate))
+        except ValueError:
+            continue
+        if not _trusted_proxy_ip(normalized):
+            return normalized[:128]
+    return peer[:128]
+
+
+def _trusted_proxy_ip(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(str(value).strip())
+    except ValueError:
+        return False
+    for item in os.getenv("AUTH_TRUSTED_PROXY_IPS", "").split(","):
+        configured = item.strip()
+        if not configured:
+            continue
+        try:
+            if address in ipaddress.ip_network(configured, strict=False):
+                return True
+        except ValueError:
+            logger.warning("ignoring invalid AUTH_TRUSTED_PROXY_IPS entry")
+    return False
+
+
+def auth_http_error(status_code: int, detail: str, code: str, headers: dict[str, str] | None = None) -> HTTPException:
+    return HTTPException(status_code=status_code, detail={"error": detail, "code": code}, headers=headers)
+
+
+def local_auth_enabled() -> bool:
+    return env_bool("AUTH_ENABLED", False) and env_bool("PASSWORD_LOGIN_ENABLED", False)
+
+
+def local_signup_enabled() -> bool:
+    return local_auth_enabled() and env_bool("PUBLIC_SIGNUP_ENABLED", False)
+
+
+def local_signup_ready() -> bool:
+    # Local development may use AUTH_EMAIL_DEBUG without external email or
+    # challenge services. HTTPS deployments must satisfy every dependency.
+    development_bypass = not os.getenv("APP_BASE_URL", "").strip().lower().startswith("https://")
+    if development_bypass:
+        return local_signup_enabled()
+    return (
+        local_signup_enabled()
+        and env_bool("EMAIL_VERIFICATION_REQUIRED", True)
+        and bool(os.getenv("AUTH_ALLOWED_EMAIL_DOMAINS", "").strip())
+        and bool(os.getenv("SMTP_HOST", "").strip())
+        and bool(os.getenv("SMTP_FROM", "").strip())
+        and turnstile_enabled()
+        and turnstile_configured()
+    )
+
+
+def validate_public_signup_email(email: str) -> str:
+    try:
+        normalized = auth_store().normalize_email(email)
+    except ValueError as exc:
+        raise auth_http_error(400, "请输入有效邮箱", "AUTH_INVALID_EMAIL") from exc
+    allowed_domains = {
+        item.strip().lower().lstrip("@")
+        for item in os.getenv("AUTH_ALLOWED_EMAIL_DOMAINS", "").split(",")
+        if item.strip()
+    }
+    if allowed_domains and normalized.rsplit("@", 1)[1] not in allowed_domains:
+        raise auth_http_error(403, "当前邮箱域暂未开放注册", "AUTH_EMAIL_DOMAIN_NOT_ALLOWED")
+    return normalized
+
+
+def turnstile_enabled() -> bool:
+    return env_bool("TURNSTILE_ENABLED", False)
+
+
+def turnstile_configured() -> bool:
+    return bool(os.getenv("TURNSTILE_SITE_KEY", "").strip() and os.getenv("TURNSTILE_SECRET_KEY", "").strip())
+
+
+async def enforce_csrf(request: Request) -> None:
+    if not verify_csrf_token(request):
+        raise auth_http_error(403, "页面安全凭证已失效，请刷新后重试", "AUTH_CSRF_INVALID")
+    origin = str(request.headers.get("origin") or "").strip()
+    if not origin:
+        return
+    configured = os.getenv("APP_BASE_URL", "").strip()
+    allowed = urlparse(configured).netloc if configured else str(request.headers.get("host") or "")
+    if urlparse(origin).netloc != allowed:
+        raise auth_http_error(403, "请求来源不受信任", "AUTH_ORIGIN_INVALID")
+
+
+async def verify_turnstile(request: Request, token: str) -> None:
+    if not turnstile_enabled():
+        return
+    if not turnstile_configured():
+        raise auth_http_error(503, "人机验证尚未正确配置，请联系管理员", "AUTH_TURNSTILE_MISCONFIGURED")
+    if not token:
+        raise auth_http_error(400, "请完成人机验证", "AUTH_TURNSTILE_REQUIRED")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0)) as http_client:
+            response = await http_client.post(
+                "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+                data={
+                    "secret": os.getenv("TURNSTILE_SECRET_KEY", "").strip(),
+                    "response": token,
+                    "remoteip": request_ip(request),
+                },
+            )
+            payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("turnstile verification unavailable: %s", exc.__class__.__name__)
+        raise auth_http_error(503, "人机验证服务暂时不可用，请稍后重试", "AUTH_TURNSTILE_UNAVAILABLE") from exc
+    if not payload.get("success"):
+        raise auth_http_error(400, "人机验证未通过，请重试", "AUTH_TURNSTILE_FAILED")
+
+
+async def enforce_rate_limit(action: str, key: str, limit: int, window_seconds: int) -> None:
+    result = await auth_store_call("check_rate_limit", action, key, limit, window_seconds)
+    if result.get("limited"):
+        retry_after = max(1, int(result.get("retryAfter") or window_seconds))
+        raise auth_http_error(
+            429,
+            "操作过于频繁，请稍后重试",
+            "AUTH_RATE_LIMITED",
+            {"Retry-After": str(retry_after)},
+        )
+
+
+def send_auth_email_sync(recipient: str, subject: str, body: str) -> None:
+    host = os.getenv("SMTP_HOST", "").strip()
+    sender = os.getenv("SMTP_FROM", "").strip()
+    if not host or not sender:
+        if env_bool("AUTH_EMAIL_DEBUG", False) or env_bool("DEV_LOGIN_ENABLED", False):
+            logger.info("auth email debug recipient=%s subject=%s body=%s", recipient, subject, body)
+            return
+        raise RuntimeError("邮件服务尚未配置")
+    port = env_int("SMTP_PORT", 587)
+    username = os.getenv("SMTP_USERNAME", "").strip()
+    password = os.getenv("SMTP_PASSWORD", "")
+    smtp_ssl = env_bool("SMTP_SSL", False)
+    smtp_starttls = env_bool("SMTP_STARTTLS", True)
+    if smtp_ssl and smtp_starttls:
+        raise RuntimeError("SMTP_SSL 和 SMTP_STARTTLS 不能同时启用")
+    if (username or password) and not (smtp_ssl or smtp_starttls):
+        raise RuntimeError("SMTP 凭据必须通过 TLS 连接发送")
+    message = EmailMessage()
+    message["From"] = sender
+    message["To"] = recipient
+    message["Subject"] = subject
+    message.set_content(body)
+    if smtp_ssl:
+        connection: smtplib.SMTP = smtplib.SMTP_SSL(host, port, timeout=15, context=ssl.create_default_context())
+    else:
+        connection = smtplib.SMTP(host, port, timeout=15)
+    try:
+        if smtp_starttls and not smtp_ssl:
+            connection.starttls(context=ssl.create_default_context())
+        if username:
+            connection.login(username, password)
+        connection.send_message(message)
+    finally:
+        connection.quit()
+
+
+async def send_auth_email(recipient: str, subject: str, body: str) -> None:
+    try:
+        await asyncio.to_thread(send_auth_email_sync, recipient, subject, body)
+    except (OSError, RuntimeError, smtplib.SMTPException) as exc:
+        logger.warning("auth email delivery failed: %s", exc.__class__.__name__)
+        raise auth_http_error(503, "邮件暂时无法发送，请稍后重试", "AUTH_EMAIL_UNAVAILABLE") from exc
+
+
+def upstream_user_owned_by_local_account(info: dict[str, Any], user: dict[str, Any], upstream_user_id: str) -> bool:
+    """Require both stable identity metadata and email before reconciling a duplicate."""
+    if not isinstance(info, dict):
+        return False
+    actual_id = str(info.get("user_id") or "").strip()
+    actual_email = str(info.get("user_email") or info.get("sso_user_id") or "").strip().lower()
+    metadata = info.get("metadata") if isinstance(info.get("metadata"), dict) else {}
+    return bool(
+        actual_id == upstream_user_id
+        and actual_email == str(user.get("email") or "").strip().lower()
+        and str(metadata.get("local_user_id") or "").strip() == upstream_user_id
+        and str(metadata.get("created_via") or "").strip() == "ai-token-dashboard"
+    )
+
+
+async def auth_user_payload(user: dict[str, Any], *, refresh_entitlement: bool = False) -> dict[str, Any]:
+    account = await auth_store_call("get_upstream_account", str(user["id"]), "primary")
+    account_status = str((account or {}).get("status") or "provisioning")
+    entitlement_status = "inactive"
+    upstream_user_id = str((account or {}).get("upstream_user_id") or "")
+    if account_status == "provisioned" and upstream_user_id:
+        cache_key = f"local-entitlement:{upstream_user_id}"
+        hit, cached_status, _ = local_entitlement_cache.get(cache_key)
+        if hit and not refresh_entitlement:
+            entitlement_status = str(cached_status)
+        else:
+            try:
+                info = await client().user_info(upstream_user_id)
+                models = info.get("models") if isinstance(info, dict) else None
+                blocked = bool(info.get("blocked")) if isinstance(info, dict) else False
+                clean_models = [str(item) for item in (models or []) if str(item) != "no-default-models"]
+                # LiteLLM treats an empty model list as unrestricted. The explicit
+                # no-default-models sentinel is the restricted default we create.
+                entitlement_status = "active" if not blocked and (models == [] or bool(clean_models)) else "inactive"
+                local_entitlement_cache.set(
+                    cache_key,
+                    entitlement_status,
+                    max(5, env_int("AUTH_ENTITLEMENT_CACHE_TTL_SECONDS", 30)),
+                )
+            except (HTTPException, RuntimeError):
+                # Entitlements are advisory UI state. A transient upstream lookup
+                # must not invalidate an otherwise valid dashboard login.
+                entitlement_status = "inactive"
+    normalized = normalize_user(str(user["email"]), str(user.get("name") or ""))
+    return {
+        **normalized,
+        "id": str(user["id"]),
+        "emailVerified": bool(user.get("email_verified") or user.get("emailVerified")),
+        "authMethods": ["password"],
+        "accountStatus": account_status,
+        "entitlementStatus": entitlement_status,
+    }
+
+
+async def current_local_auth_user(request: Request) -> dict[str, Any] | None:
+    token = get_server_session_token(request)
+    if not token:
+        return None
+    session = await auth_store_call("get_session", token)
+    if not session:
+        clear_server_session(request)
+        return None
+    user = await auth_store_call("get_user", session["user_id"])
+    if not user or str(user.get("status") or "active") != "active":
+        await auth_store_call("revoke_session", token)
+        clear_server_session(request)
+        return None
+    return user
+
+
+async def create_local_session(request: Request, user: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    old_token = get_server_session_token(request)
+    if old_token:
+        await auth_store_call("revoke_session", old_token)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(300, env_int("AUTH_SESSION_TTL_SECONDS", 1_209_600)))
+    session = await auth_store_call(
+        "create_session",
+        str(user["id"]),
+        expires_at,
+        request_ip(request),
+        str(request.headers.get("user-agent") or "")[:512],
+    )
+    csrf_value = set_server_session(request, str(session["token"]))
+    return await auth_user_payload(user), csrf_value
+
+
+async def provision_local_user(user: dict[str, Any]) -> dict[str, Any]:
+    user_id = str(user["id"])
+    upstream_user_id = f"local-{user_id}"
+    await auth_store_call("set_provisioning_status", user_id, "provisioning", "primary", upstream_user_id, "")
+    try:
+        created = await client().create_internal_user(upstream_user_id, str(user["email"]), str(user.get("name") or ""))
+        actual_id = str(created.get("user_id") or upstream_user_id)
+        account = await auth_store_call("set_provisioning_status", user_id, "provisioned", "primary", actual_id, "")
+        await auth_store_call("complete_provisioning_jobs", user_id, "primary")
+        return account
+    except HTTPException as exc:
+        # A retry may race a prior successful request. Reconcile duplicate-id
+        # responses before placing the account into the retry queue.
+        if exc.status_code in {400, 409}:
+            try:
+                existing = await client().user_info(upstream_user_id)
+                if upstream_user_owned_by_local_account(existing, user, upstream_user_id):
+                    actual_id = str(existing.get("user_id") or upstream_user_id)
+                    account = await auth_store_call("set_provisioning_status", user_id, "provisioned", "primary", actual_id, "")
+                    await auth_store_call("complete_provisioning_jobs", user_id, "primary")
+                    return account
+                logger.error("refusing to bind local account to mismatched upstream user user_id=%s", user_id)
+            except HTTPException:
+                pass
+        await auth_store_call("set_provisioning_status", user_id, "provisioning_failed", "primary", upstream_user_id, str(exc.detail))
+        await auth_store_call("enqueue_provisioning", user_id, "primary", str(exc.detail))
+        logger.warning("local user provisioning deferred user_id=%s status=%s", user_id, exc.status_code)
+        return await auth_store_call("get_upstream_account", user_id, "primary") or {}
+    except Exception as exc:
+        error = f"{exc.__class__.__name__}: {exc}"
+        await auth_store_call("set_provisioning_status", user_id, "provisioning_failed", "primary", upstream_user_id, error)
+        await auth_store_call("enqueue_provisioning", user_id, "primary", error)
+        logger.exception("local user provisioning deferred after unexpected failure user_id=%s", user_id)
+        return await auth_store_call("get_upstream_account", user_id, "primary") or {}
+
+
+async def retry_local_provisioning(user: dict[str, Any]) -> dict[str, Any] | None:
+    account = await auth_store_call("get_upstream_account", str(user["id"]), "primary")
+    if not account or account.get("status") not in {"pending", "provisioning", "provisioning_failed", "failed"}:
+        return account
+    updated_at = str(account.get("updated_at") or account.get("updatedAt") or "")
+    if updated_at:
+        try:
+            parsed = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - parsed).total_seconds() < max(5, env_int("AUTH_PROVISIONING_RETRY_SECONDS", 30)):
+                return account
+        except ValueError:
+            pass
+    return await provision_local_user(user)
+
+
 async def cached_resolve_user(email: str, name: str | None = None, refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
     normalized_email = email.strip().lower()
     normalized_name = str(name or "").strip()
@@ -579,6 +971,23 @@ def feishu_direct_url(casdoor_authorize_url: str) -> str:
 
 
 async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_date: str, source: str, refresh: bool = False) -> dict[str, Any]:
+    if app_user.get("id") and (
+        app_user.get("accountStatus") != "provisioned"
+        or app_user.get("entitlementStatus") != "active"
+    ):
+        rows: list[dict[str, Any]] = []
+        return {
+            "user": app_user,
+            "startDate": start_date,
+            "endDate": end_date,
+            "source": source,
+            "rows": rows,
+            "summary": usage_summary(rows),
+            "accountStatus": app_user.get("accountStatus", "provisioning"),
+            "entitlementStatus": app_user.get("entitlementStatus", "inactive"),
+            "mappingCache": {"hit": True, "ttlSeconds": 0},
+            "cache": {"hit": False, "ttlSeconds": 0},
+        }
     request_started = asyncio.get_running_loop().time()
     cache_key = personal_usage_cache_key(app_user["email"], start_date, end_date, source)
     hit, value, ttl_seconds = personal_usage_cache.get(cache_key)
@@ -1042,6 +1451,23 @@ async def team_member_usage_payload(
 
 async def current_upstream_user(request: Request, refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
     app_user = require_user(request)
+    local_user_id = str(app_user.get("id") or "")
+    if local_user_id:
+        account = await auth_store_call("get_upstream_account", local_user_id, "primary")
+        if not account or account.get("status") != "provisioned" or not account.get("upstream_user_id"):
+            raise auth_http_error(409, "账号仍在开通中，请稍后重试", "AUTH_PROVISIONING_PENDING")
+        upstream_user_id = str(account["upstream_user_id"])
+        return app_user, {
+            "user_id": upstream_user_id,
+            "user_email": app_user["email"],
+            "user_alias": app_user.get("name") or app_user["email"],
+            "matched_user_ids": [upstream_user_id],
+            "matched_accounts": [
+                {"backend": "primary", "source": "AI 用量中心", "user_id": upstream_user_id, "account_id": upstream_user_id, "matchSources": ["local_mapping"]}
+            ],
+            "matched_sources": {upstream_user_id: ["local_mapping"]},
+            "matched_by": "local_mapping",
+        }
     upstream, _ = await cached_resolve_user(app_user["email"], app_user.get("name"), refresh)
     return app_user, upstream
 
@@ -1089,6 +1515,41 @@ class CreatePersonalKeyRequest(BaseModel):
 
 class DisableOldKeyRequest(BaseModel):
     replacementKeyId: str = Field(min_length=1, max_length=128)
+
+
+class VerificationRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    purpose: Literal["signup"] = "signup"
+    turnstileToken: str = Field(default="", max_length=4096)
+
+
+class RegisterRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    name: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=8, max_length=128)
+    verificationCode: str = Field(default="", max_length=12)
+    turnstileToken: str = Field(default="", max_length=4096)
+
+
+class PasswordLoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=128)
+    turnstileToken: str = Field(default="", max_length=4096)
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    turnstileToken: str = Field(default="", max_length=4096)
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=16, max_length=512)
+    newPassword: str = Field(min_length=8, max_length=128)
+
+
+class ChangePasswordRequest(BaseModel):
+    currentPassword: str = Field(min_length=1, max_length=128)
+    newPassword: str = Field(min_length=8, max_length=128)
 
 
 def write_key_audit(event: str, email: str, key_id: str, request: Request, result: str) -> None:
@@ -1246,6 +1707,12 @@ async def debug_admin_usage_compare(
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     result: dict[str, Any] = {"status": "ok", "usageSync": dict(_usage_sync_status)}
+    if local_auth_enabled():
+        result["authDatabase"] = await auth_store_call("health")
+        if result["authDatabase"].get("status") == "error":
+            result["status"] = "degraded"
+    else:
+        result["authDatabase"] = {"enabled": False, "status": "disabled"}
     store = usage_store()
     if store is not None:
         result["usageDatabase"] = await store.health()
@@ -1255,6 +1722,11 @@ async def health() -> dict[str, Any]:
         result["usageDatabase"] = {"enabled": False, "connected": False, "status": "disabled"}
     if result["usageSync"].get("status") in {"error", "failed", "partial"}:
         result["status"] = "degraded"
+    if turnstile_enabled() and not turnstile_configured():
+        result["turnstile"] = {"enabled": True, "configured": False, "status": "error"}
+        result["status"] = "degraded"
+    else:
+        result["turnstile"] = {"enabled": turnstile_enabled(), "configured": turnstile_configured(), "status": "ok" if turnstile_enabled() else "disabled"}
     return result
 
 
@@ -1265,14 +1737,222 @@ async def auth_config() -> dict[str, Any]:
         "oidcConfigured": oidc_configured(),
         "providerName": safe_provider_name(),
         "allowedEmailDomain": allowed_email_domain(),
+        "passwordLoginEnabled": local_auth_enabled(),
+        "publicSignupEnabled": local_signup_ready(),
+        "emailVerificationRequired": env_bool("EMAIL_VERIFICATION_REQUIRED", True),
+        "turnstileEnabled": turnstile_enabled(),
+        "turnstileConfigured": turnstile_configured(),
+        "turnstileSiteKey": os.getenv("TURNSTILE_SITE_KEY", "").strip() if turnstile_configured() else "",
     }
+
+
+@app.get("/api/auth/csrf")
+async def auth_csrf(request: Request) -> dict[str, str]:
+    return {"csrfToken": csrf_token(request)}
 
 
 @app.get("/api/auth/me")
 async def auth_me(request: Request) -> dict[str, Any]:
-    user = dict(require_user(request))
+    local_user = await current_local_auth_user(request)
+    if local_user:
+        await retry_local_provisioning(local_user)
+    user = await auth_user_payload(local_user, refresh_entitlement=True) if local_user else dict(require_user(request))
     user.update({"isTeamLeader": False, "teamBoardStatus": "loading", "team": None, "leaderTeams": []})
+    user["csrfToken"] = csrf_token(request)
     return user
+
+
+@app.post("/api/auth/verification/request")
+async def request_verification(data: VerificationRequest, request: Request) -> dict[str, Any]:
+    if not local_auth_enabled():
+        raise auth_http_error(403, "密码登录暂未启用", "AUTH_PASSWORD_LOGIN_DISABLED")
+    if data.purpose == "signup" and not local_signup_ready():
+        raise auth_http_error(403, "公开注册暂未开放", "AUTH_SIGNUP_DISABLED")
+    await enforce_csrf(request)
+    await verify_turnstile(request, data.turnstileToken)
+    email = validate_public_signup_email(data.email)
+    await enforce_rate_limit("verification_email", email, 5, 3600)
+    await enforce_rate_limit("verification_ip", request_ip(request), 20, 3600)
+    user = await auth_store_call("get_user_by_email", email)
+    expires_in = max(60, env_int("AUTH_VERIFICATION_TTL_SECONDS", 600))
+    if user is None:
+        code = generate_numeric_code(6)
+        subject = "AI 用量中心验证码"
+        body = f"您的验证码是：{code}\n\n验证码 {expires_in // 60} 分钟内有效，请勿转发给他人。"
+        await send_auth_email(email, subject, body)
+        # Persist only after delivery succeeds so an SMTP failure does not
+        # consume the user's previously delivered, still-valid code.
+        await auth_store_call(
+            "create_verification_code",
+            email,
+            data.purpose,
+            hash_auth_token(code),
+            datetime.now(timezone.utc) + timedelta(seconds=expires_in),
+            5,
+        )
+    await auth_store_call(
+        "record_audit_event",
+        "verification_requested",
+        str(user["id"]) if user else None,
+        email,
+        request_ip(request),
+        True,
+        {"purpose": data.purpose},
+    )
+    return {"ok": True, "message": "如果邮箱可以使用，验证码已发送", "expiresIn": expires_in}
+
+
+@app.post("/api/auth/register")
+async def register(data: RegisterRequest, request: Request) -> dict[str, Any]:
+    if not local_signup_ready():
+        raise auth_http_error(403, "公开注册暂未开放", "AUTH_SIGNUP_DISABLED")
+    await enforce_csrf(request)
+    await verify_turnstile(request, data.turnstileToken)
+    email = validate_public_signup_email(data.email)
+    await enforce_rate_limit("register_ip", request_ip(request), 10, 3600)
+    if await auth_store_call("get_user_by_email", email):
+        raise auth_http_error(409, "该邮箱已注册，请直接登录", "AUTH_EMAIL_EXISTS")
+    verification_id: str | None = None
+    if env_bool("EMAIL_VERIFICATION_REQUIRED", True):
+        verification_id = await auth_store_call(
+            "claim_verification_code",
+            email,
+            "signup",
+            hash_auth_token(data.verificationCode.strip()),
+        )
+        if not verification_id:
+            raise auth_http_error(400, "验证码无效或已过期", "AUTH_CODE_INVALID")
+    try:
+        password_hash = await asyncio.to_thread(hash_password, data.password)
+        user = await auth_store_call(
+            "create_user",
+            email,
+            data.name.strip(),
+            password_hash,
+            True,
+            "active",
+        )
+    except DuplicateEmailError as exc:
+        raise auth_http_error(409, "该邮箱已注册，请直接登录", "AUTH_EMAIL_EXISTS") from exc
+    except ValueError as exc:
+        raise auth_http_error(400, str(exc), "AUTH_INVALID_INPUT") from exc
+    if verification_id:
+        await auth_store_call("consume_claimed_verification_code", verification_id)
+    await auth_store_call("set_provisioning_status", str(user["id"]), "provisioning", "primary", f"local-{user['id']}", "")
+    account = await provision_local_user(user)
+    await auth_store_call("record_audit_event", "registered", str(user["id"]), email, request_ip(request), True, {"accountStatus": account.get("status")})
+    payload = await auth_user_payload(user)
+    return {"ok": True, "user": payload, "message": "注册成功，请登录"}
+
+
+@app.post("/api/auth/login")
+async def password_login(data: PasswordLoginRequest, request: Request) -> dict[str, Any]:
+    if not local_auth_enabled():
+        raise auth_http_error(403, "密码登录暂未启用", "AUTH_PASSWORD_LOGIN_DISABLED")
+    await enforce_csrf(request)
+    await verify_turnstile(request, data.turnstileToken)
+    try:
+        email = auth_store().normalize_email(data.email)
+    except ValueError as exc:
+        raise auth_http_error(401, "邮箱或密码不正确", "AUTH_INVALID_CREDENTIALS") from exc
+    await enforce_rate_limit("login_email", email, 10, 60)
+    await enforce_rate_limit("login_ip", request_ip(request), 30, 60)
+    user = await auth_store_call("get_user_by_email", email)
+    valid = bool(user and await asyncio.to_thread(verify_password, data.password, str(user.get("password_hash") or user.get("passwordHash") or "")))
+    if not valid:
+        await auth_store_call("record_audit_event", "login_failed", str(user["id"]) if user else None, email, request_ip(request), False, {})
+        raise auth_http_error(401, "邮箱或密码不正确", "AUTH_INVALID_CREDENTIALS")
+    if str(user.get("status") or "active") != "active":
+        raise auth_http_error(403, "账号当前不可登录，请联系管理员", "AUTH_ACCOUNT_SUSPENDED")
+    if env_bool("EMAIL_VERIFICATION_REQUIRED", True) and not bool(user.get("email_verified") or user.get("emailVerified")):
+        raise auth_http_error(403, "请先完成邮箱验证", "AUTH_EMAIL_UNVERIFIED")
+    stored_hash = str(user.get("password_hash") or user.get("passwordHash") or "")
+    if password_needs_rehash(stored_hash):
+        await auth_store_call("update_password", str(user["id"]), await asyncio.to_thread(hash_password, data.password))
+        user = await auth_store_call("get_user", str(user["id"])) or user
+    await auth_store_call("touch_last_login", str(user["id"]))
+    payload, csrf_value = await create_local_session(request, user)
+    await auth_store_call("record_audit_event", "login_success", str(user["id"]), email, request_ip(request), True, {})
+    return {"user": payload, "csrfToken": csrf_value}
+
+
+@app.post("/api/auth/password/forgot")
+async def forgot_password(data: ForgotPasswordRequest, request: Request) -> dict[str, Any]:
+    if not local_auth_enabled():
+        raise auth_http_error(403, "密码登录暂未启用", "AUTH_PASSWORD_LOGIN_DISABLED")
+    await enforce_csrf(request)
+    await verify_turnstile(request, data.turnstileToken)
+    try:
+        email = auth_store().normalize_email(data.email)
+    except ValueError:
+        email = None
+    rate_limit_key = email or f"invalid:{hashlib.sha256(data.email.strip().casefold().encode('utf-8')).hexdigest()}"
+    await enforce_rate_limit("forgot_email", rate_limit_key, 5, 3600)
+    await enforce_rate_limit("forgot_ip", request_ip(request), 20, 3600)
+    user = await auth_store_call("get_user_by_email", email) if email else None
+    if user:
+        token = generate_auth_token(32)
+        expires_in = max(300, env_int("AUTH_PASSWORD_RESET_TTL_SECONDS", 1800))
+        pending_token = await auth_store_call(
+            "create_password_reset_token",
+            str(user["id"]),
+            hash_auth_token(token),
+            datetime.now(timezone.utc) + timedelta(seconds=expires_in),
+            activate=False,
+        )
+        base_url = os.getenv("APP_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+        reset_url = f"{base_url}/?reset_token={token}"
+        try:
+            await send_auth_email(email, "重置 AI 用量中心密码", f"请在 {expires_in // 60} 分钟内打开以下链接设置新密码：\n\n{reset_url}\n\n如非本人操作，请忽略本邮件。")
+            activated = await auth_store_call("activate_password_reset_token", str(pending_token["id"]), str(user["id"]))
+            if not activated:
+                logger.error("password reset token activation failed user_id=%s", user["id"])
+        except HTTPException:
+            # Password recovery always returns the same public response. Email
+            # delivery failures must not invalidate a previously delivered link.
+            await auth_store_call("delete_password_reset_token", str(pending_token["id"]))
+            logger.warning("password reset email delivery deferred")
+    await auth_store_call("record_audit_event", "password_reset_requested", str(user["id"]) if user else None, email, request_ip(request), True, {})
+    return {"ok": True, "message": "如果账号存在，重置邮件已发送"}
+
+
+@app.post("/api/auth/password/reset")
+async def reset_password(data: ResetPasswordRequest, request: Request) -> dict[str, Any]:
+    if not local_auth_enabled():
+        raise auth_http_error(403, "密码登录暂未启用", "AUTH_PASSWORD_LOGIN_DISABLED")
+    await enforce_csrf(request)
+    try:
+        new_hash = await asyncio.to_thread(hash_password, data.newPassword)
+    except ValueError as exc:
+        raise auth_http_error(400, str(exc), "AUTH_PASSWORD_INVALID") from exc
+    user_id = await auth_store_call("reset_password_with_token", hash_auth_token(data.token), new_hash)
+    if not user_id:
+        raise auth_http_error(400, "重置链接无效或已过期", "AUTH_RESET_TOKEN_INVALID")
+    clear_server_session(request)
+    await auth_store_call("record_audit_event", "password_reset_completed", user_id, None, request_ip(request), True, {})
+    return {"ok": True, "message": "密码已重置，请重新登录"}
+
+
+@app.post("/api/auth/password/change")
+async def change_password(data: ChangePasswordRequest, request: Request) -> dict[str, Any]:
+    await enforce_csrf(request)
+    user = await current_local_auth_user(request)
+    if not user:
+        raise auth_http_error(401, "请先使用密码账号登录", "AUTH_LOGIN_REQUIRED")
+    current_hash = str(user.get("password_hash") or user.get("passwordHash") or "")
+    if not await asyncio.to_thread(verify_password, data.currentPassword, current_hash):
+        raise auth_http_error(400, "当前密码不正确", "AUTH_INVALID_CURRENT_PASSWORD")
+    try:
+        new_hash = await asyncio.to_thread(hash_password, data.newPassword)
+    except ValueError as exc:
+        raise auth_http_error(400, str(exc), "AUTH_PASSWORD_INVALID") from exc
+    user_id = str(user["id"])
+    await auth_store_call("update_password", user_id, new_hash)
+    await auth_store_call("revoke_user_sessions", user_id)
+    updated = await auth_store_call("get_user", user_id) or user
+    payload, csrf_value = await create_local_session(request, updated)
+    await auth_store_call("record_audit_event", "password_changed", user_id, str(user["email"]), request_ip(request), True, {})
+    return {"ok": True, "user": payload, "csrfToken": csrf_value}
 
 
 @app.get("/api/auth/scope")
@@ -1294,12 +1974,23 @@ async def auth_scope(request: Request) -> dict[str, Any]:
 async def dev_login(request: Request) -> dict[str, Any]:
     if not env_bool("DEV_LOGIN_ENABLED", False):
         raise HTTPException(status_code=403, detail="开发登录未启用，请使用企业统一认证")
+    app_base_url = os.getenv("APP_BASE_URL", "http://127.0.0.1:8000").strip()
+    app_host = (urlparse(app_base_url).hostname or "").lower()
+    request_host_name = (request.url.hostname or "").lower()
+    loopback_hosts = {"127.0.0.1", "localhost", "::1"}
+    if urlparse(app_base_url).scheme.lower() == "https" or app_host not in loopback_hosts or request_host_name not in loopback_hosts | {"testserver"}:
+        raise HTTPException(status_code=403, detail="开发登录仅允许在本机开发环境使用")
+    await enforce_csrf(request)
     payload = await request.json()
     email = str(payload.get("email", "")).strip()
     if "@" not in email:
         raise HTTPException(status_code=400, detail="请输入有效的企业邮箱")
     email = validate_company_email(email)
     user = normalize_user(email)
+    token = get_server_session_token(request)
+    if token:
+        await auth_store_call("revoke_session", token)
+        clear_server_session(request)
     request.session[SESSION_USER_KEY] = user
     return user
 
@@ -1359,6 +2050,10 @@ async def sso_callback(request: Request):
         email = validate_company_email(email)
         name = claim_value(userinfo, "displayName", "display_name", "nickname", "name")
         user = normalize_user(email, name, userinfo)
+        server_token = get_server_session_token(request)
+        if server_token:
+            await auth_store_call("revoke_session", server_token)
+            clear_server_session(request)
         request.session[SESSION_USER_KEY] = user
         return RedirectResponse("/?auth_callback=success")
     except OAuthError as exc:
@@ -1386,7 +2081,11 @@ async def sso_callback(request: Request):
 
 @app.post("/api/auth/logout")
 async def logout(request: Request) -> dict[str, bool]:
-    request.session.clear()
+    await enforce_csrf(request)
+    token = get_server_session_token(request)
+    if token:
+        await auth_store_call("revoke_session", token)
+    clear_server_session(request)
     return {"ok": True}
 
 
@@ -1544,7 +2243,15 @@ async def admin_departments_usage(
 
 @app.get("/api/me/keys")
 async def my_keys(request: Request, refresh: bool = Query(False)) -> dict[str, Any]:
-    _, upstream_user = await current_upstream_user(request)
+    app_user, upstream_user = await current_upstream_user(request)
+    if app_user.get("id") and app_user.get("entitlementStatus") != "active":
+        return {
+            "keys": [],
+            "availableModels": [],
+            "unrestrictedModels": False,
+            "accountStatus": app_user.get("accountStatus", "provisioning"),
+            "accessStatus": "inactive",
+        }
     user_ids = upstream_user_ids(upstream_user)
     if not user_ids:
         raise HTTPException(status_code=502, detail="上游员工记录缺少 user_id")
@@ -1563,7 +2270,10 @@ async def my_keys(request: Request, refresh: bool = Query(False)) -> dict[str, A
 
 @app.post("/api/me/keys")
 async def create_my_key(data: CreatePersonalKeyRequest, request: Request) -> JSONResponse:
+    await enforce_csrf(request)
     app_user, upstream_user = await current_upstream_user(request)
+    if app_user.get("id") and app_user.get("entitlementStatus") != "active":
+        raise auth_http_error(403, "当前账号尚未获得模型和额度权限", "AUTH_ENTITLEMENT_INACTIVE")
     primary_user_id = primary_upstream_user_id(upstream_user)
     try:
         created = await client().create_key(
@@ -1587,6 +2297,7 @@ async def create_my_key(data: CreatePersonalKeyRequest, request: Request) -> JSO
 
 @app.post("/api/me/keys/{key_id:path}/regenerate")
 async def regenerate_my_key(key_id: str, request: Request) -> JSONResponse:
+    await enforce_csrf(request)
     app_user, upstream_user = await current_upstream_user(request)
     user_ids = upstream_user_ids(upstream_user)
     if not user_ids:
@@ -1706,6 +2417,7 @@ async def regenerate_my_key(key_id: str, request: Request) -> JSONResponse:
 
 @app.post("/api/me/keys/{old_key_id:path}/disable-old")
 async def disable_old_key(old_key_id: str, data: DisableOldKeyRequest, request: Request) -> JSONResponse:
+    await enforce_csrf(request)
     app_user, upstream_user = await current_upstream_user(request)
     last_error: HTTPException | None = None
     for user_id in upstream_user_ids(upstream_user):
@@ -1742,6 +2454,7 @@ async def disable_old_key(old_key_id: str, data: DisableOldKeyRequest, request: 
 
 @app.delete("/api/me/keys/{key_id:path}")
 async def delete_my_key(key_id: str, request: Request) -> dict[str, Any]:
+    await enforce_csrf(request)
     app_user, upstream_user = await current_upstream_user(request)
     user_ids = upstream_user_ids(upstream_user)
     if not user_ids:
@@ -1775,6 +2488,7 @@ async def delete_my_key(key_id: str, request: Request) -> dict[str, Any]:
 
 @app.post("/api/me/keys/{key_id:path}/reveal")
 async def reveal_my_key(key_id: str, request: Request) -> JSONResponse:
+    await enforce_csrf(request)
     app_user, upstream_user = await current_upstream_user(request)
     keys = await client().keys_for_user_ids(upstream_user_ids(upstream_user), refresh=True)
     owned = next((key for key in keys if str(key.get("id") or "") == key_id), None)
@@ -1819,11 +2533,17 @@ async def models(request: Request) -> dict[str, Any]:
 
 @app.get("/")
 async def index() -> FileResponse:
-    return FileResponse(ROOT_DIR / "index.html", headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+    return FileResponse(
+        ROOT_DIR / "index.html",
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "no-referrer"},
+    )
 
 
 @app.get("/{path:path}")
 async def spa_fallback(path: str) -> FileResponse:
     if path.startswith("api/"):
         raise HTTPException(status_code=404, detail="接口不存在")
-    return FileResponse(ROOT_DIR / "index.html", headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+    return FileResponse(
+        ROOT_DIR / "index.html",
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "no-referrer"},
+    )

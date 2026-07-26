@@ -58,6 +58,7 @@ ALL_PROXY_MODELS = "all-proxy-models"
 NO_DEFAULT_MODELS = "no-default-models"
 DEFAULT_PERSONAL_KEY_MAX_BUDGET = 100
 DEFAULT_PERSONAL_KEY_BUDGET_DURATION = "1d"
+LOCAL_AUTH_UPSTREAM_ROLES = {"internal_user", "internal_user_viewer"}
 
 
 def _as_number(value: Any) -> float:
@@ -326,6 +327,95 @@ class LiteLLMClient:
 
     async def request(self, method: str, path: str, **kwargs: Any) -> Any:
         return await self.request_backend(self.backends[0], method, path, **kwargs)
+
+    async def create_internal_user(
+        self,
+        user_id: str,
+        email: str,
+        name: str | None = None,
+        *,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        """Create a local account's primary LiteLLM user without issuing a key.
+
+        The dashboard owns authentication and entitlements, so newly provisioned
+        upstream users are deliberately restricted to ``no-default-models`` and
+        receive no default model access. A zero user budget is deliberately not
+        set because LiteLLM treats it as already exhausted. Keeping the stable
+        local id in the request makes retries safe to reconcile by the caller.
+        """
+        backend = backend or self.backends[0]
+        local_id = str(user_id).strip()
+        normalized_email = str(email).strip().lower()
+        if not local_id or not normalized_email:
+            raise HTTPException(status_code=400, detail="开户参数不完整")
+        if len(normalized_email) > 254 or normalized_email.count("@") != 1:
+            raise HTTPException(status_code=400, detail="开户邮箱格式无效")
+        local_part, domain = normalized_email.split("@", 1)
+        if (
+            not re.fullmatch(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+", local_part)
+            or len(local_part) > 64
+            or local_part.startswith(".")
+            or local_part.endswith(".")
+            or ".." in local_part
+        ):
+            raise HTTPException(status_code=400, detail="开户邮箱格式无效")
+        try:
+            domain = domain.encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise HTTPException(status_code=400, detail="开户邮箱格式无效") from exc
+        if len(domain) > 253 or not all(
+            label
+            and len(label) <= 63
+            and not label.startswith("-")
+            and not label.endswith("-")
+            and re.fullmatch(r"[a-z0-9-]+", label)
+            for label in domain.split(".")
+        ):
+            raise HTTPException(status_code=400, detail="开户邮箱格式无效")
+        normalized_email = f"{local_part}@{domain}"
+        configured_role = os.getenv("AUTH_DEFAULT_UPSTREAM_ROLE", "internal_user_viewer").strip()
+        user_role = configured_role if configured_role in LOCAL_AUTH_UPSTREAM_ROLES else "internal_user_viewer"
+        if configured_role and configured_role != user_role:
+            logger.warning("ignoring unsafe AUTH_DEFAULT_UPSTREAM_ROLE value")
+        payload: dict[str, Any] = {
+            "user_id": local_id,
+            "user_email": normalized_email,
+            "user_alias": str(name or normalized_email).strip() or normalized_email,
+            "user_role": user_role,
+            "auto_create_key": False,
+            "models": [NO_DEFAULT_MODELS],
+            "metadata": {
+                "created_via": "ai-token-dashboard",
+                "local_user_id": local_id,
+            },
+        }
+        response = await self.request_backend(backend, "POST", "/user/new", json=payload)
+        if isinstance(response, dict):
+            return response
+        return {"user_id": local_id, "user_email": normalized_email}
+
+    async def user_info(
+        self,
+        user_id: str,
+        *,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        """Return one upstream user, primarily for provisioning reconciliation."""
+        backend = backend or self.backends[0]
+        try:
+            payload = await self.request_backend(backend, "GET", "/v2/user/info", params={"user_id": user_id})
+        except HTTPException as exc:
+            if exc.status_code not in {404, 405, 501}:
+                raise
+            payload = await self.request_backend(backend, "GET", "/user/info", params={"user_id": user_id})
+        if isinstance(payload, dict):
+            for key in ("user", "user_info"):
+                data = payload.get(key)
+                if isinstance(data, dict):
+                    return data
+            return payload
+        return {}
 
     async def request_backend(self, backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> Any:
         headers = dict(kwargs.pop("headers", {}))

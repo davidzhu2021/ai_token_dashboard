@@ -11,7 +11,8 @@ def test_index_uses_fresh_app_asset_and_disables_html_cache() -> None:
     assert response.status_code == 200
     assert "Cache-Control" in response.headers
     assert response.headers["Cache-Control"] == "no-store"
-    assert "/assets/app.js?v=20260724-global-navigation" in response.text
+    assert response.headers["Referrer-Policy"] == "no-referrer"
+    assert "/assets/app.js?v=20260726-local-auth" in response.text
     assert "20260720-oidc-login-fix" not in response.text
 
     admin_view = response.text.index('id="adminView"')
@@ -32,3 +33,4 @@ def test_spa_fallback_disables_html_cache() -> None:
 
     assert response.status_code == 200
     assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Referrer-Policy"] == "no-referrer"

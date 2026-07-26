@@ -20,6 +20,11 @@ def make_client() -> tuple[LiteLLMClient, LiteLLMBackend]:
     return client, backend
 
 
+def csrf_headers(client: TestClient) -> dict[str, str]:
+    token = client.get("/api/auth/csrf").json()["csrfToken"]
+    return {"X-CSRF-Token": token}
+
+
 def test_key_list_only_returns_mask_and_hash_identifier(monkeypatch) -> None:
     client, backend = make_client()
     raw_key = "sk-super-secret-ABCD"
@@ -578,7 +583,7 @@ def test_reveal_endpoint_returns_owned_vaulted_key_without_cache(monkeypatch) ->
     monkeypatch.setattr(main, "write_key_audit", lambda event, _email, _key_id, _request, result: audits.append((event, result)))
 
     with TestClient(main.app) as app_client:
-        response = app_client.post(f"/api/me/keys/{key_id}/reveal")
+        response = app_client.post(f"/api/me/keys/{key_id}/reveal", headers=csrf_headers(app_client))
 
     assert response.status_code == 200
     assert response.json() == {"key": plaintext}
@@ -601,7 +606,7 @@ def test_reveal_endpoint_rejects_unowned_key(monkeypatch) -> None:
     monkeypatch.setattr(main, "write_key_audit", lambda *_args: None)
 
     with TestClient(main.app) as app_client:
-        response = app_client.post("/api/me/keys/other-hash/reveal")
+        response = app_client.post("/api/me/keys/other-hash/reveal", headers=csrf_headers(app_client))
 
     assert response.status_code == 403
 
@@ -624,7 +629,7 @@ def test_reveal_endpoint_explains_legacy_key_is_not_stored(monkeypatch) -> None:
     monkeypatch.setattr(main, "write_key_audit", lambda *_args: None)
 
     with TestClient(main.app) as app_client:
-        response = app_client.post("/api/me/keys/owned-hash/reveal")
+        response = app_client.post("/api/me/keys/owned-hash/reveal", headers=csrf_headers(app_client))
 
     assert response.status_code == 404
     assert "再生成后查看" in response.json()["detail"]
@@ -669,7 +674,11 @@ def test_create_endpoint_stores_key_and_reports_revealable(monkeypatch) -> None:
     monkeypatch.setattr(main, "write_key_audit", lambda *_args: None)
 
     with TestClient(main.app) as app_client:
-        response = app_client.post("/api/me/keys", json={"name": "我的密钥", "purpose": "", "duration": "never", "models": []})
+        response = app_client.post(
+            "/api/me/keys",
+            json={"name": "我的密钥", "purpose": "", "duration": "never", "models": []},
+            headers=csrf_headers(app_client),
+        )
 
     assert response.status_code == 200
     assert response.json()["revealable"] is True
@@ -700,7 +709,11 @@ def test_create_endpoint_returns_plaintext_and_warning_when_vault_fails(monkeypa
     monkeypatch.setattr(main, "write_key_audit", lambda *_args: None)
 
     with TestClient(main.app) as app_client:
-        response = app_client.post("/api/me/keys", json={"name": "我的密钥", "purpose": "", "duration": "never", "models": []})
+        response = app_client.post(
+            "/api/me/keys",
+            json={"name": "我的密钥", "purpose": "", "duration": "never", "models": []},
+            headers=csrf_headers(app_client),
+        )
 
     payload = response.json()
     assert response.status_code == 200
@@ -745,7 +758,7 @@ def test_regenerate_endpoint_replaces_old_vault_record(monkeypatch) -> None:
     monkeypatch.setattr(main, "write_key_audit", lambda *_args: None)
 
     with TestClient(main.app) as app_client:
-        response = app_client.post("/api/me/keys/old-hash/regenerate")
+        response = app_client.post("/api/me/keys/old-hash/regenerate", headers=csrf_headers(app_client))
 
     assert response.status_code == 200
     assert response.json()["revealable"] is True
@@ -923,7 +936,7 @@ def test_replacement_endpoint_persists_cleanup_when_old_delete_fails(monkeypatch
     monkeypatch.setattr(main, "write_key_audit", lambda *_args: None)
 
     with TestClient(main.app) as app_client:
-        response = app_client.post("/api/me/keys/old-hash/regenerate")
+        response = app_client.post("/api/me/keys/old-hash/regenerate", headers=csrf_headers(app_client))
 
     assert response.status_code == 200
     assert response.json()["cleanupRequired"] is True
@@ -965,7 +978,7 @@ def test_replacement_endpoint_compensates_new_key_when_vault_fails(monkeypatch) 
     monkeypatch.setattr(main, "write_key_audit", lambda *_args: None)
 
     with TestClient(main.app) as app_client:
-        response = app_client.post("/api/me/keys/old-hash/regenerate")
+        response = app_client.post("/api/me/keys/old-hash/regenerate", headers=csrf_headers(app_client))
 
     assert response.status_code == 503
     assert deleted == ["new-hash"]
@@ -1001,7 +1014,7 @@ def test_replacement_endpoint_returns_plaintext_if_vault_and_compensation_fail(m
     monkeypatch.setattr(main, "write_key_audit", lambda *_args: None)
 
     with TestClient(main.app) as app_client:
-        response = app_client.post("/api/me/keys/old-hash/regenerate")
+        response = app_client.post("/api/me/keys/old-hash/regenerate", headers=csrf_headers(app_client))
 
     payload = response.json()
     assert response.status_code == 200
@@ -1038,7 +1051,11 @@ def test_disable_old_endpoint_uses_persisted_replacement(monkeypatch) -> None:
     monkeypatch.setattr(main, "write_key_audit", lambda *_args: None)
 
     with TestClient(main.app) as app_client:
-        response = app_client.post("/api/me/keys/old-hash/disable-old", json={"replacementKeyId": "new-hash"})
+        response = app_client.post(
+            "/api/me/keys/old-hash/disable-old",
+            json={"replacementKeyId": "new-hash"},
+            headers=csrf_headers(app_client),
+        )
 
     assert response.status_code == 200
     assert response.json()["cleanupRequired"] is False
@@ -1080,7 +1097,7 @@ def test_delete_endpoint_finds_owner_cleans_vault_and_audits(monkeypatch) -> Non
     monkeypatch.setattr(main, "write_key_audit", lambda event, email, key_id, _request, result: audits.append((event, email, key_id, result)))
 
     with TestClient(main.app) as app_client:
-        response = app_client.delete("/api/me/keys/owned-hash")
+        response = app_client.delete("/api/me/keys/owned-hash", headers=csrf_headers(app_client))
 
     assert response.status_code == 200
     assert response.json() == {"deleted": True, "warning": ""}
@@ -1112,7 +1129,7 @@ def test_delete_endpoint_rejects_unowned_key_without_vault_cleanup(monkeypatch) 
     monkeypatch.setattr(main, "write_key_audit", lambda event, _email, _key_id, _request, result: audits.append((event, result)))
 
     with TestClient(main.app) as app_client:
-        response = app_client.delete("/api/me/keys/other-hash")
+        response = app_client.delete("/api/me/keys/other-hash", headers=csrf_headers(app_client))
 
     assert response.status_code == 403
     assert audits == [("delete", "failed")]
@@ -1136,7 +1153,7 @@ def test_delete_endpoint_upstream_failure_does_not_clean_vault(monkeypatch) -> N
     monkeypatch.setattr(main, "write_key_audit", lambda *_args: None)
 
     with TestClient(main.app) as app_client:
-        response = app_client.delete("/api/me/keys/owned-hash")
+        response = app_client.delete("/api/me/keys/owned-hash", headers=csrf_headers(app_client))
 
     assert response.status_code == 502
 
@@ -1164,7 +1181,7 @@ def test_delete_endpoint_reports_vault_cleanup_warning_after_upstream_success(mo
     monkeypatch.setattr(main, "write_key_audit", lambda event, _email, _key_id, _request, result: audits.append((event, result)))
 
     with TestClient(main.app) as app_client:
-        response = app_client.delete("/api/me/keys/owned-hash")
+        response = app_client.delete("/api/me/keys/owned-hash", headers=csrf_headers(app_client))
 
     assert response.status_code == 200
     assert response.json()["deleted"] is True

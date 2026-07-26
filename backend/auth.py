@@ -6,6 +6,131 @@ from fastapi import HTTPException, Request
 
 
 SESSION_USER_KEY = "user"
+SERVER_SESSION_KEY = "server_session_id"
+CSRF_SESSION_KEY = "csrf_token"
+PASSWORD_MIN_LENGTH = 8
+PASSWORD_MAX_LENGTH = 128
+
+
+def validate_password(password: str) -> str:
+    value = str(password or "")
+    if len(value) < PASSWORD_MIN_LENGTH:
+        raise ValueError(f"密码至少需要 {PASSWORD_MIN_LENGTH} 个字符")
+    if len(value) > PASSWORD_MAX_LENGTH:
+        raise ValueError(f"密码不能超过 {PASSWORD_MAX_LENGTH} 个字符")
+    return value
+
+
+def hash_password(password: str) -> str:
+    """Hash with Argon2id when installed, otherwise use PBKDF2-SHA256."""
+    import base64
+    import hashlib
+    import os
+    try:
+        from argon2 import PasswordHasher
+
+        return PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2).hash(validate_password(password))
+    except ImportError:
+        value = validate_password(password)
+        salt = os.urandom(16)
+        rounds = 600_000
+        digest = hashlib.pbkdf2_hmac("sha256", value.encode("utf-8"), salt, rounds)
+        encoded_salt = base64.urlsafe_b64encode(salt).decode("ascii").rstrip("=")
+        encoded_digest = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+        return f"pbkdf2_sha256${rounds}${encoded_salt}${encoded_digest}"
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    import base64
+    import hashlib
+    import hmac
+
+    value = str(password or "")
+    encoded = str(password_hash or "")
+    if not value or not encoded:
+        return False
+    if encoded.startswith("$argon2"):
+        try:
+            from argon2 import PasswordHasher
+            from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
+
+            return bool(PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2).verify(encoded, value))
+        except (ImportError, InvalidHashError, VerificationError, VerifyMismatchError, ValueError):
+            return False
+    if encoded.startswith("pbkdf2_sha256$"):
+        try:
+            _, rounds_text, salt_text, digest_text = encoded.split("$", 3)
+            salt = base64.urlsafe_b64decode(salt_text + "=" * (-len(salt_text) % 4))
+            expected = base64.urlsafe_b64decode(digest_text + "=" * (-len(digest_text) % 4))
+            actual = hashlib.pbkdf2_hmac("sha256", value.encode("utf-8"), salt, int(rounds_text))
+            return hmac.compare_digest(actual, expected)
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
+def password_needs_rehash(password_hash: str) -> bool:
+    if not str(password_hash or "").startswith("$argon2"):
+        return True
+    try:
+        from argon2 import PasswordHasher
+
+        return bool(PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2).check_needs_rehash(password_hash))
+    except (ImportError, ValueError):
+        return False
+
+
+def generate_numeric_code(length: int = 6) -> str:
+    import secrets
+
+    size = max(4, min(int(length), 12))
+    return f"{secrets.randbelow(10**size):0{size}d}"
+
+
+def generate_auth_token(byte_length: int = 32) -> str:
+    import secrets
+
+    return secrets.token_urlsafe(max(16, int(byte_length)))
+
+
+def hash_auth_token(token: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+
+
+def get_server_session_token(request: Request) -> str | None:
+    value = request.session.get(SERVER_SESSION_KEY)
+    return str(value) if value else None
+
+
+def set_server_session(request: Request, token: str, csrf_value: str | None = None) -> str:
+    request.session.clear()
+    request.session[SERVER_SESSION_KEY] = str(token)
+    value = csrf_value or generate_auth_token(24)
+    request.session[CSRF_SESSION_KEY] = value
+    return value
+
+
+def clear_server_session(request: Request) -> None:
+    request.session.clear()
+
+
+def csrf_token(request: Request) -> str:
+    value = request.session.get(CSRF_SESSION_KEY)
+    if value:
+        return str(value)
+    value = generate_auth_token(24)
+    request.session[CSRF_SESSION_KEY] = value
+    return value
+
+
+def verify_csrf_token(request: Request, provided: str | None = None) -> bool:
+    import hmac
+
+    expected = request.session.get(CSRF_SESSION_KEY)
+    candidate = provided if provided is not None else request.headers.get("X-CSRF-Token")
+    return bool(expected and candidate and hmac.compare_digest(str(expected), str(candidate)))
 
 
 def env_bool(name: str, default: bool = False) -> bool:

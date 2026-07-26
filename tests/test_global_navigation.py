@@ -37,7 +37,8 @@ def test_global_navigation_keeps_protected_pages_behind_login() -> None:
 
     assert 'if (!currentUser) {\n    promptForLogin();' in source
     assert 'showToast("请先登录后访问控制台和模型广场")' in source
-    assert 'el("ssoButton").lastChild.textContent = isLoggedIn ? "进入控制台"' in source
+    assert 'setButtonLabel("ssoButton", authConfig.providerName || "飞书扫码登录")' in source
+    assert 'el("enterConsoleButton").addEventListener("click", () => showAuthenticatedPage("console"))' in source
     assert 'if (currentView === "keys") clearRevealedKeys();' in source
     assert 'switchView(page === "models" ? "models" : "dashboard")' in source
     assert 'setGlobalPage(view === "models" ? "models" : "console")' in source

@@ -17,6 +17,7 @@ https://myai.carher.net
 ## 当前能力
 
 - 飞书扫码登录：复用公司 Casdoor + 飞书 SSO 登录链路，并按企业邮箱域名限制访问。
+- 邮箱注册与密码登录：可选启用邮箱验证码注册、密码登录、找回/修改密码和服务端会话；默认安全关闭，不影响现有 SSO。
 - 我的用量：员工登录后只能查看自己的 Token、金额、请求次数、成功率、来源拆分、模型排行和明细。
 - 个人访问密钥：展示本人访问密钥的名称、用途、掩码、状态、最近使用时间和用量，并支持本人密钥再生成。
 - 团队负责人看板：团队负责人可查看自己负责团队的成员用量、趋势、来源占比、模型排行和成员排行。
@@ -128,6 +129,35 @@ HER_KEY_LIST_MAX_PAGES=20
 APP_BASE_URL=https://myai.carher.net
 SESSION_SECRET=replace-with-a-random-long-string
 
+# Optional email/password authentication. Keep disabled until production
+# dependencies and controls are configured.
+AUTH_ENABLED=false
+PASSWORD_LOGIN_ENABLED=false
+PUBLIC_SIGNUP_ENABLED=false
+EMAIL_VERIFICATION_REQUIRED=true
+AUTH_ALLOWED_EMAIL_DOMAINS=auto-link.com.cn
+AUTH_DATABASE_PATH=.data/auth.sqlite3
+AUTH_SESSION_TTL_SECONDS=1209600
+AUTH_VERIFICATION_TTL_SECONDS=600
+AUTH_PASSWORD_RESET_TTL_SECONDS=1800
+AUTH_PROVISIONING_RETRY_SECONDS=30
+AUTH_ENTITLEMENT_CACHE_TTL_SECONDS=30
+
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_FROM=
+SMTP_USERNAME=
+SMTP_PASSWORD=
+SMTP_SSL=false
+SMTP_STARTTLS=true
+
+TURNSTILE_ENABLED=false
+TURNSTILE_SITE_KEY=
+TURNSTILE_SECRET_KEY=
+
+# Comma-separated direct reverse-proxy IPs/CIDRs; empty means XFF is ignored.
+AUTH_TRUSTED_PROXY_IPS=
+
 OIDC_ISSUER_URL=http://10.68.13.198:30882
 OIDC_CLIENT_ID=ai-token-dashboard-client-id
 OIDC_CLIENT_SECRET=ai-token-dashboard-client-secret
@@ -173,12 +203,66 @@ USAGE_TIMEZONE_OFFSET_MINUTES=-480
 - `HER_LITELLM_BASE_URL` 和 `HER_LITELLM_ADMIN_KEY` 同时存在时启用 Her 数据源；留空则不加载 Her。
 - `APP_BASE_URL` 本地开发可改为 `http://127.0.0.1:8000`，生产环境使用正式域名。
 - `SESSION_SECRET` 必须使用随机长字符串，生产环境不要使用示例值。
+- `AUTH_ENABLED`、`PASSWORD_LOGIN_ENABLED`、`PUBLIC_SIGNUP_ENABLED` 在模板中均默认关闭；三个开关应按后文的生产启用顺序逐步打开。
+- `AUTH_ALLOWED_EMAIL_DOMAINS` 是逗号分隔的精确邮箱域名白名单；留空代表不限制域名，生产公开注册不得留空。
+- `AUTH_DATABASE_PATH` 当前指向本地 SQLite 文件。容器部署必须将其放在持久化卷中；当前实现按单应用实例设计，不要让多个副本同时写同一个 SQLite 文件。
+- `SMTP_PASSWORD`、`TURNSTILE_SECRET_KEY` 与 `SESSION_SECRET` 属于部署 Secret，不得写入前端、日志或仓库。
+- `AUTH_TRUSTED_PROXY_IPS` 只填写与应用直接连接的反向代理 IP 或 CIDR。为空时忽略 `X-Forwarded-For`；不得使用 `0.0.0.0/0` 或 `::/0` 这样的全网信任范围。
 - `ADMIN_EMAILS` 是管理员白名单，普通员工不会看到全员或部门看板入口。
 - `USAGE_TIMEZONE_OFFSET_MINUTES=-480` 表示按北京时间统计日期窗口；如果部署环境改用其他业务时区，需要同步调整。
 - `ADMIN_USAGE_PAGE_SIZE` 必须小于等于 100；想扩大日志覆盖范围时增加 `ADMIN_USAGE_LOG_MAX_PAGES`，不要增大单页大小。
 - `USAGE_SYNC_ENABLED=true` 时启用独立 PostgreSQL 聚合快照；数据库只保存按日期、账号、来源和模型聚合的 Token、请求、成功/失败及金额，不保存 API Key、提示词、响应正文或请求明细。
 - `USAGE_DATABASE_URL` 应填写应用容器可访问的 PostgreSQL 地址，例如 `postgresql://ai_dashboard:<password>@usage-db:5432/ai_usage`；`USAGE_DB_PASSWORD` 只用于 Compose 初始化数据库用户密码。
 - 首次启动会异步回填 `USAGE_INITIAL_BACKFILL_DAYS`（默认 90）天，之后按 `USAGE_SYNC_INTERVAL_SECONDS`（默认 1800 秒）刷新最近 `USAGE_SYNC_LOOKBACK_DAYS`（默认 3）天。历史范围优先查询快照库，当前日期超过 `USAGE_LIVE_REFRESH_MAX_AGE_SECONDS` 后后台刷新，手动点击刷新会强制刷新。
+
+## 邮箱注册与密码登录配置
+
+本地认证与现有 Casdoor + 飞书 SSO 可以同时启用。`AUTH_ENABLED` 只控制本地邮箱认证总开关，不会关闭 SSO；OIDC 参数保持有效时，用户仍可继续使用飞书扫码登录。`DEV_LOGIN_ENABLED` 是另一条独立的开发模拟登录链路，生产环境必须始终保持 `false`。
+
+开关含义：
+
+- `AUTH_ENABLED=false`：关闭本地邮箱认证总入口；这是新部署和回滚时的安全状态。
+- `PASSWORD_LOGIN_ENABLED=false`：关闭密码登录、找回密码等密码入口；只有同时设置 `AUTH_ENABLED=true` 才会生效。HTTPS 部署开启后必须同时启用并完整配置 Turnstile，否则应用会拒绝启动。
+- `PUBLIC_SIGNUP_ENABLED=false`：关闭公开注册；建议最后启用，并可在紧急情况下单独关闭注册而保留已有账号登录。
+- `EMAIL_VERIFICATION_REQUIRED=true`：注册必须验证邮箱。生产环境应保持 `true`，不要通过关闭验证来绕过 SMTP 配置。
+
+持久化与有效期：
+
+- `AUTH_DATABASE_PATH=.data/auth.sqlite3`：保存本地用户、密码哈希、服务端会话、验证码、重置令牌、限流和开户状态。Docker Compose 已持久化 `/app/.data`；非 Compose 部署需要提供等效持久化和备份。
+- `AUTH_SESSION_TTL_SECONDS=1209600`：本地登录会话有效期，默认 14 天，代码最小值为 300 秒。
+- `AUTH_VERIFICATION_TTL_SECONDS=600`：邮箱验证码有效期，默认 10 分钟，代码最小值为 60 秒。
+- `AUTH_PASSWORD_RESET_TTL_SECONDS=1800`：密码重置链接有效期，默认 30 分钟，代码最小值为 300 秒。
+- `AUTH_PROVISIONING_RETRY_SECONDS=30`：本地账号向用量系统开户失败后的最短重试间隔，默认 30 秒，代码最小值为 5 秒；它是重试节流时间，不是账号或任务的过期时间。
+- `AUTH_ENTITLEMENT_CACHE_TTL_SECONDS=30`：登录会话读取模型权限状态的短缓存，默认 30 秒；用户点击“重新检查”时会主动刷新。
+
+SMTP 配置：
+
+- `SMTP_HOST`、`SMTP_PORT`、`SMTP_FROM` 指定邮件服务器、端口和发件人；生产密码登录必须配置可用 SMTP，因为注册验证和密码找回都依赖邮件。
+- `SMTP_USERNAME`、`SMTP_PASSWORD` 用于 SMTP 鉴权。账号或密码为空只适用于明确允许匿名投递的内网邮件服务。
+- `SMTP_SSL=true` 表示连接建立时直接使用 TLS，通常配合 465 端口；`SMTP_STARTTLS=true` 表示普通连接后升级 TLS，通常配合 587 端口。不要同时启用两种模式，也不要在生产环境关闭传输加密。
+
+Turnstile 配置：
+
+- 面向互联网开放密码登录或注册时，必须配置 Cloudflare Turnstile，以保护登录、验证码、注册和找回密码入口。后端只有在邮箱验证、域名白名单、SMTP 和 Turnstile 全部就绪时才会真正开放注册接口。
+- 在 Cloudflare 控制台为正式域名创建站点，分别填入 `TURNSTILE_SITE_KEY` 和 `TURNSTILE_SECRET_KEY`，确认前后端验证成功后再设置 `TURNSTILE_ENABLED=true`。
+- `TURNSTILE_SECRET_KEY` 只能保存在后端 Secret 中。若 `TURNSTILE_ENABLED=true` 但任一 key 缺失，健康检查会标记为 degraded，相关认证请求会返回配置错误。
+
+反向代理配置：
+
+- `AUTH_TRUSTED_PROXY_IPS` 接受逗号分隔的单个 IP 或 CIDR，例如 `127.0.0.1,172.20.0.0/16`。仅当请求的直接来源命中此列表时，后端才会使用 `X-Forwarded-For` 计算真实客户端 IP。
+- 只信任实际反向代理所在地址，并确保代理覆盖而不是透传外部传入的客户端 IP 头。直连部署保持空值即可。
+- `APP_BASE_URL` 必须填写用户实际访问的 HTTPS 地址；它同时参与安全 Cookie 和请求来源校验，域名或协议不一致会导致登录请求被拒绝。
+
+生产启用顺序：
+
+1. 首次部署保持三个认证开关均为 `false`，确认 `/api/health` 正常且原有飞书 SSO 登录不受影响。
+2. 设置稳定随机的 `SESSION_SECRET`、持久化 `AUTH_DATABASE_PATH`，完成数据库备份方案，并准确填写 `APP_BASE_URL` 和 `AUTH_TRUSTED_PROXY_IPS`。
+3. 配置并实测 SMTP 的验证码和重置邮件；保持 `EMAIL_VERIFICATION_REQUIRED=true`。
+4. 配置 Turnstile 正式域名、Site Key 和 Secret Key，先验证成功，再设置 `TURNSTILE_ENABLED=true`。
+5. 先设置 `AUTH_ENABLED=true`、`PASSWORD_LOGIN_ENABLED=true`，同时保持 `PUBLIC_SIGNUP_ENABLED=false`，验证页面、CSRF、限流和已有测试账号登录流程。
+6. 设置严格的 `AUTH_ALLOWED_EMAIL_DOMAINS`，最后再开启 `PUBLIC_SIGNUP_ENABLED=true`，完整验证注册、邮箱验证码、登录、退出、找回密码及账号开户状态。
+
+若本地认证出现故障，优先将 `PUBLIC_SIGNUP_ENABLED=false` 停止新注册；需要完全关闭密码入口时，再将 `PASSWORD_LOGIN_ENABLED=false` 或 `AUTH_ENABLED=false`。这些操作不会关闭已配置的 SSO。当前不会自动把同邮箱的本地账号与 SSO 身份合并，上线前应避免为同一员工重复建立两套账号。
 
 ## 飞书扫码登录配置
 
@@ -214,8 +298,15 @@ GET /api/auth/sso/start
 
 认证接口：
 
-- `GET /api/auth/config`：返回登录按钮名称、开发登录开关、OIDC 配置状态和允许邮箱域名。
+- `GET /api/auth/config`：返回 SSO、本地密码登录、公开注册、邮箱验证和 Turnstile 的前端配置状态。
+- `GET /api/auth/csrf`：获取认证写操作所需的 CSRF Token。
 - `GET /api/auth/me`：返回当前登录员工信息、管理员身份和团队负责人权限。
+- `POST /api/auth/verification/request`：发送注册邮箱验证码。
+- `POST /api/auth/register`：使用邮箱验证码创建本地账号。
+- `POST /api/auth/login`：使用邮箱和密码登录。
+- `POST /api/auth/password/forgot`：请求密码重置邮件；无论账号是否存在均返回通用结果。
+- `POST /api/auth/password/reset`：使用一次性重置令牌设置新密码。
+- `POST /api/auth/password/change`：本地登录用户修改密码并轮换会话。
 - `POST /api/auth/dev-login`：开发环境模拟登录，仅 `DEV_LOGIN_ENABLED=true` 时可用。
 - `GET /api/auth/sso/start`：发起飞书扫码登录。
 - `GET /api/auth/callback`：OIDC 登录回调。
@@ -363,7 +454,9 @@ GET /api/auth/sso/start
 - 访问密钥再生成必须先校验当前员工对目标密钥的归属权。
 - 不在日志中打印管理员 key、OIDC token、访问密钥明文、prompt 或 response 内容。
 - `.env` 已加入忽略规则，不应提交到远端仓库。
-- 生产环境必须使用 SSO，并保持 `DEV_LOGIN_ENABLED=false`、`DEBUG_MAPPING_ENABLED=false`、`DEBUG_OIDC_CLAIMS=false`。
+- 生产环境必须保持 `DEV_LOGIN_ENABLED=false`、`DEBUG_MAPPING_ENABLED=false`、`DEBUG_OIDC_CLAIMS=false`；SSO 可以与本地认证并存，并应保留为企业用户的稳定登录与应急入口。
+- 生产公开注册必须同时启用邮箱验证、严格域名白名单、可用 SMTP 和 Turnstile；任一项未准备好时保持 `PUBLIC_SIGNUP_ENABLED=false`。
+- 本地认证数据库和部署 Secret 必须纳入权限控制与备份；不得把 SQLite 文件、SMTP 密码、Turnstile Secret 或 session secret 放入镜像或 Git。
 
 ## 测试与验证
 

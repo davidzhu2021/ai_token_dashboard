@@ -77,7 +77,28 @@ let isDepartmentLoading = false;
 let isTeamLoading = false;
 let isTeamMemberLoading = false;
 let isSsoRedirecting = false;
-let authConfig = { devLoginEnabled: false, oidcConfigured: false, providerName: "飞书扫码登录" };
+let authConfig = {
+  devLoginEnabled: false,
+  oidcConfigured: false,
+  providerName: "飞书扫码登录",
+  passwordLoginEnabled: false,
+  publicSignupEnabled: false,
+  emailVerificationRequired: true,
+  turnstileEnabled: false,
+  turnstileConfigured: false,
+  turnstileSiteKey: "",
+};
+let authAccess = "personal";
+let authMode = "login";
+let authSubmitting = false;
+let authCsrfToken = "";
+let resetPasswordToken = "";
+let verificationCountdown = 0;
+let verificationTimer = null;
+let turnstileLoadPromise = null;
+const turnstileTokens = { login: "", register: "", forgot: "" };
+const turnstileWidgets = { login: null, register: null, forgot: null };
+const turnstileRenderPromises = { login: null, register: null, forgot: null };
 
 const el = (id) => document.getElementById(id);
 const fmt = new Intl.NumberFormat("zh-CN");
@@ -113,8 +134,8 @@ function startSsoLogin() {
   const devLoginButton = el("devLoginButton");
   ssoButton.disabled = true;
   devLoginButton.disabled = true;
-  ssoButton.lastChild.textContent = "正在前往飞书登录";
-  el("loginHint").textContent = "请在新打开的飞书认证页面完成扫码。";
+  setButtonLabel(ssoButton, "正在前往企业登录");
+  el("enterpriseLoginHint").textContent = "请在新打开的企业认证页面完成登录。";
   window.location.href = "/api/auth/sso/start";
 }
 
@@ -123,7 +144,8 @@ function showLoginCallbackMessage() {
   const authError = params.get("auth_error");
   if (!authError) return;
   const message = authError === "state" ? "登录状态已失效，请重新点击飞书扫码登录。" : "登录没有完成，请重新扫码。";
-  el("loginHint").textContent = message;
+  setAuthAccess("enterprise");
+  el("enterpriseLoginHint").textContent = message;
   showToast(message);
   params.delete("auth_error");
   const cleanQuery = params.toString();
@@ -132,23 +154,142 @@ function showLoginCallbackMessage() {
 }
 
 async function api(path, options = {}) {
+  const method = String(options.method || "GET").toUpperCase();
+  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  if (authCsrfToken && !["GET", "HEAD", "OPTIONS"].includes(method)) headers["X-CSRF-Token"] = authCsrfToken;
   const response = await fetch(path, {
     credentials: "same-origin",
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
+    headers,
   });
   if (!response.ok) {
     let message = `请求失败（${response.status}）`;
+    let code = "";
     try {
       const payload = await response.json();
       message = typeof payload.detail === "string" ? payload.detail : payload.detail?.error || payload.error || message;
+      code = payload.code || payload.detail?.code || "";
     } catch {}
     const error = new Error(message);
     error.status = response.status;
+    error.code = code;
     throw error;
   }
   if (response.status === 204) return null;
   return response.json();
+}
+
+async function ensureCsrfToken() {
+  if (authCsrfToken) return authCsrfToken;
+  const payload = await api("/api/auth/csrf");
+  authCsrfToken = payload?.csrfToken || "";
+  return authCsrfToken;
+}
+
+function normalizeAuthUser(payload) {
+  return payload?.user || payload;
+}
+
+function replaceCurrentQuery(params) {
+  const query = params.toString();
+  window.history.replaceState({}, "", `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`);
+}
+
+function takeResetPasswordTokenFromUrl(params = new URLSearchParams(window.location.search)) {
+  const token = params.get("reset_token") || params.get("token") || "";
+  const hadSensitiveParam = params.has("reset_token") || params.has("token");
+  params.delete("reset_token");
+  params.delete("token");
+  if (hadSensitiveParam) replaceCurrentQuery(params);
+  return token;
+}
+
+function clearResetPasswordToken() {
+  resetPasswordToken = "";
+  const params = new URLSearchParams(window.location.search);
+  const hadSensitiveParam = params.has("reset_token") || params.has("token");
+  params.delete("reset_token");
+  params.delete("token");
+  if (hadSensitiveParam) replaceCurrentQuery(params);
+  el("resetPasswordInput").value = "";
+  el("resetConfirmPasswordInput").value = "";
+  el("resetPasswordButton").disabled = true;
+}
+
+function turnstileContainerId(mode) {
+  return `${mode}Turnstile`;
+}
+
+async function loadTurnstile() {
+  if (!authConfig.turnstileEnabled || !authConfig.turnstileConfigured || !authConfig.turnstileSiteKey) return null;
+  if (window.turnstile) return window.turnstile;
+  if (turnstileLoadPromise) return turnstileLoadPromise;
+  turnstileLoadPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+    script.async = true;
+    script.defer = true;
+    script.onload = () => {
+      if (window.turnstile) resolve(window.turnstile);
+      else {
+        script.remove();
+        reject(new Error("安全验证组件初始化失败，请刷新后重试"));
+      }
+    };
+    script.onerror = () => {
+      script.remove();
+      reject(new Error("安全验证组件加载失败，请检查网络后重试"));
+    };
+    document.head.appendChild(script);
+  });
+  return turnstileLoadPromise;
+}
+
+async function renderTurnstile(mode) {
+  if (!authConfig.turnstileEnabled || !authConfig.turnstileConfigured || !authConfig.turnstileSiteKey) return;
+  const container = el(turnstileContainerId(mode));
+  if (!container) return;
+  container.classList.remove("hidden");
+  if (turnstileWidgets[mode] !== null) return;
+  if (turnstileRenderPromises[mode]) return turnstileRenderPromises[mode];
+  turnstileRenderPromises[mode] = (async () => {
+    try {
+      const widget = await loadTurnstile();
+      if (!widget || turnstileWidgets[mode] !== null) return;
+      turnstileWidgets[mode] = widget.render(container, {
+        sitekey: authConfig.turnstileSiteKey,
+        theme: "light",
+        callback: (token) => { turnstileTokens[mode] = token; },
+        "expired-callback": () => { turnstileTokens[mode] = ""; },
+        "error-callback": () => {
+          turnstileTokens[mode] = "";
+          setAuthStatus("安全验证没有完成，请刷新后重试。", "error");
+        },
+      });
+    } catch (error) {
+      turnstileLoadPromise = null;
+      setAuthStatus(error.message || "安全验证组件加载失败", "error");
+    } finally {
+      turnstileRenderPromises[mode] = null;
+    }
+  })();
+  return turnstileRenderPromises[mode];
+}
+
+function resetTurnstile(mode) {
+  turnstileTokens[mode] = "";
+  if (turnstileWidgets[mode] !== null && window.turnstile) window.turnstile.reset(turnstileWidgets[mode]);
+}
+
+function requireTurnstile(mode) {
+  if (!authConfig.turnstileEnabled) return true;
+  if (!authConfig.turnstileConfigured || !authConfig.turnstileSiteKey) {
+    setAuthStatus("安全验证尚未正确配置，请联系管理员。", "error");
+    return false;
+  }
+  if (turnstileTokens[mode]) return true;
+  setAuthStatus("请先完成安全验证。", "error");
+  return false;
 }
 
 function localDate(date) {
@@ -230,6 +371,64 @@ function setText(id, value) {
   if (node) node.textContent = value;
 }
 
+function setButtonLabel(buttonOrId, label) {
+  const button = typeof buttonOrId === "string" ? el(buttonOrId) : buttonOrId;
+  if (!button) return;
+  const labelNode = [...button.children].reverse().find((node) => node.matches("span:not(.app-icon)"));
+  if (labelNode) {
+    labelNode.textContent = label;
+    return;
+  }
+  const textNode = [...button.childNodes].reverse().find((node) => node.nodeType === Node.TEXT_NODE && node.textContent.trim());
+  if (textNode) {
+    textNode.textContent = ` ${label}`;
+    return;
+  }
+  button.textContent = label;
+}
+
+function setButtonLoading(buttonOrId, loading, loadingLabel = "处理中") {
+  const button = typeof buttonOrId === "string" ? el(buttonOrId) : buttonOrId;
+  if (!button) return;
+  if (loading) {
+    button.dataset.idleLabel = button.querySelector(":scope > span:last-child")?.textContent || button.textContent.trim();
+    button.disabled = true;
+    button.classList.add("is-loading");
+    setButtonLabel(button, loadingLabel);
+    return;
+  }
+  button.disabled = false;
+  button.classList.remove("is-loading");
+  setButtonLabel(button, button.dataset.idleLabel || button.textContent.trim());
+  delete button.dataset.idleLabel;
+}
+
+function setAuthStatus(message = "", tone = "info") {
+  const status = el("authStatus");
+  if (!status) return;
+  status.textContent = message;
+  status.className = `auth-status${message ? ` show ${tone}` : ""}`;
+  status.setAttribute("role", tone === "error" ? "alert" : "status");
+  status.setAttribute("aria-live", tone === "error" ? "assertive" : "polite");
+}
+
+function fieldError(fieldId, message = "") {
+  const input = el(fieldId);
+  const errorNode = el(`${fieldId.replace(/Input$/, "")}Error`);
+  if (input) input.setAttribute("aria-invalid", message ? "true" : "false");
+  if (errorNode) errorNode.textContent = message;
+}
+
+function clearAuthErrors() {
+  document.querySelectorAll("#loginForm .field-error").forEach((node) => { node.textContent = ""; });
+  document.querySelectorAll("#loginForm .input[aria-invalid]").forEach((input) => input.setAttribute("aria-invalid", "false"));
+  setAuthStatus();
+}
+
+function validEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 254;
+}
+
 function setGlobalPage(page) {
   document.querySelectorAll("[data-global-page]").forEach((item) => {
     const isActive = item.dataset.globalPage === page;
@@ -239,23 +438,220 @@ function setGlobalPage(page) {
   });
 }
 
+function setAuthAccess(access) {
+  const personalAvailable = Boolean(authConfig.passwordLoginEnabled);
+  const enterpriseAvailable = Boolean(authConfig.oidcConfigured);
+  if (access === "personal" && personalAvailable) authAccess = "personal";
+  else if (access === "enterprise" && enterpriseAvailable) authAccess = "enterprise";
+  else if (personalAvailable) authAccess = "personal";
+  else if (enterpriseAvailable) authAccess = "enterprise";
+  else authAccess = "none";
+  const personal = authAccess === "personal";
+  const enterprise = authAccess === "enterprise";
+  el("personalAuthPanel").classList.toggle("hidden", !personal);
+  el("personalAuthPanel").setAttribute("aria-hidden", String(!personal));
+  el("enterpriseAuthPanel").classList.toggle("hidden", !enterprise);
+  el("enterpriseAuthPanel").setAttribute("aria-hidden", String(!enterprise));
+  document.querySelectorAll("[data-auth-access]").forEach((button) => {
+    const selected = button.dataset.authAccess === authAccess;
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+  });
+  if (!personal && authMode === "reset") {
+    clearResetPasswordToken();
+    setAuthMode("login", { focus: false });
+  }
+  if (enterprise) setAuthStatus();
+  else if (["login", "register", "forgot"].includes(authMode)) renderTurnstile(authMode);
+}
+
+function authScreenForMode(mode) {
+  return {
+    login: "passwordLoginScreen",
+    register: "registerScreen",
+    forgot: "forgotPasswordScreen",
+    reset: "resetPasswordScreen",
+  }[mode] || "passwordLoginScreen";
+}
+
+function setAuthMode(mode, { focus = true } = {}) {
+  const requestedMode = ["login", "register", "forgot", "reset"].includes(mode) ? mode : "login";
+  if (authMode === "reset" && requestedMode !== "reset") clearResetPasswordToken();
+  authMode = requestedMode;
+  clearAuthErrors();
+  ["login", "register", "forgot", "reset"].forEach((candidate) => {
+    const active = candidate === authMode;
+    const screen = el(authScreenForMode(candidate));
+    screen.classList.toggle("hidden", !active);
+    screen.setAttribute("aria-hidden", String(!active));
+  });
+  el("authFlowSwitch").classList.toggle("hidden", ["forgot", "reset"].includes(authMode));
+  document.querySelectorAll("[data-auth-mode]").forEach((button) => {
+    const selected = button.dataset.authMode === authMode;
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+  });
+  if (["login", "register", "forgot"].includes(authMode)) renderTurnstile(authMode);
+  if (!focus) return;
+  const firstField = el(authScreenForMode(authMode)).querySelector("input");
+  requestAnimationFrame(() => firstField?.focus());
+}
+
+function updateAuthAvailability() {
+  const passwordEnabled = Boolean(authConfig.passwordLoginEnabled);
+  const signupEnabled = passwordEnabled && Boolean(authConfig.publicSignupEnabled);
+  const ssoEnabled = Boolean(authConfig.oidcConfigured);
+  const turnstileMisconfigured = Boolean(authConfig.turnstileEnabled) && (!authConfig.turnstileConfigured || !authConfig.turnstileSiteKey);
+  el("personalAccessTab").classList.toggle("hidden", !passwordEnabled);
+  el("personalAccessTab").disabled = !passwordEnabled;
+  el("personalAccessTab").setAttribute("aria-hidden", String(!passwordEnabled));
+  el("registerFlowTab").classList.toggle("hidden", !signupEnabled);
+  el("registerVerificationField").classList.toggle("hidden", !authConfig.emailVerificationRequired);
+  el("registerVerificationInput").required = Boolean(authConfig.emailVerificationRequired);
+  el("authFlowSwitch").style.gridTemplateColumns = signupEnabled ? "repeat(2, minmax(0, 1fr))" : "1fr";
+  if (!signupEnabled && authMode === "register") setAuthMode("login", { focus: false });
+  el("enterpriseAccessTab").classList.toggle("hidden", !ssoEnabled);
+  el("enterpriseAccessTab").disabled = !ssoEnabled;
+  el("enterpriseAccessTab").setAttribute("aria-hidden", String(!ssoEnabled));
+  el("authAccessSwitch").classList.toggle("hidden", !(passwordEnabled && ssoEnabled));
+  el("devLoginArea").classList.toggle("hidden", !authConfig.devLoginEnabled);
+
+  document.querySelectorAll("#personalAuthPanel input, #personalAuthPanel button").forEach((control) => {
+    control.disabled = !passwordEnabled;
+  });
+  el("registerFlowTab").disabled = !signupEnabled;
+  el("registerButton").disabled = !signupEnabled || turnstileMisconfigured;
+  el("sendRegisterCodeButton").disabled = !signupEnabled || turnstileMisconfigured;
+  el("passwordLoginButton").disabled = !passwordEnabled || turnstileMisconfigured;
+  el("forgotSubmitButton").disabled = !passwordEnabled || turnstileMisconfigured;
+  el("resetPasswordButton").disabled = !passwordEnabled || !resetPasswordToken;
+
+  if (!passwordEnabled && resetPasswordToken) clearResetPasswordToken();
+  setAuthAccess(resetPasswordToken && passwordEnabled ? "personal" : (passwordEnabled ? "personal" : "enterprise"));
+  setAuthMode(resetPasswordToken && passwordEnabled ? "reset" : (authMode === "reset" ? "login" : authMode), { focus: false });
+
+  if (passwordEnabled && ssoEnabled) el("guestAuthDescription").textContent = "使用邮箱账号或企业账号进入控制台。";
+  else if (passwordEnabled) el("guestAuthDescription").textContent = "使用邮箱账号进入控制台。";
+  else if (ssoEnabled) el("guestAuthDescription").textContent = "使用企业统一认证进入控制台。";
+  else if (authConfig.devLoginEnabled) el("guestAuthDescription").textContent = "使用下方开发环境邮箱入口登录。";
+  else el("guestAuthDescription").textContent = "当前没有可用的登录方式，请联系管理员。";
+
+  if (turnstileMisconfigured && passwordEnabled) {
+    setAuthStatus("安全验证尚未正确配置，邮箱登录暂时不可用，请联系管理员。", "error");
+  } else if (!passwordEnabled && !ssoEnabled && !authConfig.devLoginEnabled) {
+    setAuthStatus("当前没有可用的登录方式，请联系管理员。", "error");
+  }
+}
+
+function setVerificationCountdown(seconds) {
+  verificationCountdown = Math.max(0, Number(seconds) || 0);
+  if (verificationTimer) window.clearInterval(verificationTimer);
+  const button = el("sendRegisterCodeButton");
+  button.classList.remove("is-loading");
+  delete button.dataset.idleLabel;
+  const update = () => {
+    const active = verificationCountdown > 0;
+    button.disabled = active;
+    button.textContent = active ? `${verificationCountdown} 秒后重发` : "重新发送";
+    if (!active && verificationTimer) {
+      window.clearInterval(verificationTimer);
+      verificationTimer = null;
+    }
+    verificationCountdown -= 1;
+  };
+  update();
+  if (verificationCountdown > 0) verificationTimer = window.setInterval(update, 1000);
+}
+
+function authFieldValues() {
+  return {
+    loginEmail: el("loginEmailInput").value.trim().toLowerCase(),
+    loginPassword: el("loginPasswordInput").value,
+    registerName: el("registerNameInput").value.trim(),
+    registerEmail: el("registerEmailInput").value.trim().toLowerCase(),
+    verificationCode: el("registerVerificationInput").value.trim(),
+    registerPassword: el("registerPasswordInput").value,
+    registerConfirmPassword: el("registerConfirmPasswordInput").value,
+    forgotEmail: el("forgotEmailInput").value.trim().toLowerCase(),
+    resetPassword: el("resetPasswordInput").value,
+    resetConfirmPassword: el("resetConfirmPasswordInput").value,
+  };
+}
+
+function validateAuthMode(mode) {
+  clearAuthErrors();
+  const values = authFieldValues();
+  let valid = true;
+  const reject = (id, message) => { fieldError(id, message); valid = false; };
+  if (mode === "login") {
+    if (!validEmail(values.loginEmail)) reject("loginEmailInput", "请输入有效的邮箱地址");
+    if (values.loginPassword.length < 8) reject("loginPasswordInput", "密码至少需要 8 个字符");
+  }
+  if (mode === "register") {
+    if (values.registerName.length < 2) reject("registerNameInput", "请输入至少 2 个字符的姓名");
+    if (!validEmail(values.registerEmail)) reject("registerEmailInput", "请输入有效的邮箱地址");
+    if (authConfig.emailVerificationRequired && !/^\d{6}$/.test(values.verificationCode)) reject("registerVerificationInput", "请输入邮件中的 6 位验证码");
+    if (values.registerPassword.length < 8) reject("registerPasswordInput", "密码至少需要 8 个字符");
+    if (values.registerPassword !== values.registerConfirmPassword) reject("registerConfirmPasswordInput", "两次输入的密码不一致");
+  }
+  if (mode === "forgot" && !validEmail(values.forgotEmail)) reject("forgotEmailInput", "请输入有效的邮箱地址");
+  if (mode === "reset") {
+    if (!resetPasswordToken) {
+      setAuthStatus("重置链接缺少有效凭据，请重新申请。", "error");
+      valid = false;
+    }
+    if (values.resetPassword.length < 8) reject("resetPasswordInput", "密码至少需要 8 个字符");
+    if (values.resetPassword !== values.resetConfirmPassword) reject("resetConfirmPasswordInput", "两次输入的密码不一致");
+  }
+  return valid;
+}
+
+function accountAccessCopy(user) {
+  const accountStatus = user?.accountStatus || "provisioned";
+  const entitlementStatus = user?.entitlementStatus || "active";
+  if (["provisioning", "pending", "provisioning_failed"].includes(accountStatus)) {
+    return accountStatus === "provisioning_failed"
+      ? { title: "账号开通暂未完成", description: "账号同步遇到问题。你可以稍后重新检查，或联系管理员协助处理。", retry: true }
+      : { title: "账号正在开通", description: "我们正在同步你的个人用量空间，通常只需要一点时间。", retry: true };
+  }
+  if (["inactive", "expired", "suspended"].includes(entitlementStatus)) {
+    return {
+      title: entitlementStatus === "suspended" ? "访问权限已暂停" : "暂未获得使用权限",
+      description: entitlementStatus === "expired" ? "当前访问权限已到期，请联系管理员续期。" : "你的账号已经创建，但还没有可用模型或额度。请联系管理员开通。",
+      retry: false,
+    };
+  }
+  return null;
+}
+
+function renderAccountAccessState() {
+  const state = accountAccessCopy(currentUser);
+  const dashboard = el("dashboardView");
+  const stateNode = el("accountAccessState");
+  dashboard.classList.toggle("account-limited", Boolean(state));
+  stateNode.classList.toggle("hidden", !state);
+  if (!state) return;
+  el("accountAccessTitle").textContent = state.title;
+  el("accountAccessDescription").textContent = state.description;
+  el("accountAccessRetryButton").classList.toggle("hidden", !state.retry);
+}
+
 function updateHomeCard() {
   const isLoggedIn = Boolean(currentUser);
-  el("loginTitle").textContent = isLoggedIn ? `欢迎回来，${currentUser.name || currentUser.email}` : "飞书扫码登录";
-  el("loginDescription").textContent = isLoggedIn
-    ? "你已完成企业账号认证，可以继续进入控制台查看个人 AI 用量。"
-    : "使用公司飞书账号完成统一认证，登录后仅展示你的个人 AI 用量与模型。";
-  el("devLoginArea").classList.toggle("hidden", isLoggedIn || !authConfig.devLoginEnabled);
-  el("devLoginButton").classList.toggle("hidden", isLoggedIn || !authConfig.devLoginEnabled);
-  el("emailInput").required = Boolean(!isLoggedIn && authConfig.devLoginEnabled);
+  el("authenticatedHome").classList.toggle("hidden", !isLoggedIn);
+  el("authGuestContent").classList.toggle("hidden", isLoggedIn);
+  if (isLoggedIn) {
+    el("loginTitle").textContent = `欢迎回来，${currentUser.name || currentUser.email}`;
+    el("loginDescription").textContent = "你已完成账号认证，可以继续进入控制台查看个人 AI 用量。";
+    el("loginHint").textContent = `当前登录账号：${currentUser.email}`;
+    return;
+  }
+  isSsoRedirecting = false;
   el("ssoButton").disabled = false;
   el("devLoginButton").disabled = false;
-  el("ssoButton").lastChild.textContent = isLoggedIn ? "进入控制台" : (authConfig.providerName || "飞书扫码登录");
-  el("loginHint").textContent = isLoggedIn
-    ? `当前登录账号：${currentUser.email}`
-    : authConfig.devLoginEnabled
-      ? `开发登录已启用，仅允许 ${authConfig.allowedEmailDomain || "公司邮箱"} 账号；生产环境请关闭。`
-      : "使用公司飞书账号扫码登录；本页面不会保存真实密码或登录凭据。";
+  setButtonLabel("ssoButton", authConfig.providerName || "飞书扫码登录");
+  el("enterpriseLoginHint").textContent = "本页面不会保存企业登录凭据。";
+  updateAuthAvailability();
 }
 
 function showHome() {
@@ -276,7 +672,14 @@ function promptForLogin() {
   requestAnimationFrame(() => loginCard.classList.add("login-attention"));
   window.setTimeout(() => loginCard.classList.remove("login-attention"), 720);
   loginCard.scrollIntoView({ behavior: "smooth", block: "center" });
-  el("ssoButton").focus({ preventScroll: true });
+  const firstLoginControl = authConfig.passwordLoginEnabled
+    ? el("loginEmailInput")
+    : authConfig.oidcConfigured
+      ? el("ssoButton")
+      : authConfig.devLoginEnabled
+        ? el("emailInput")
+        : null;
+  firstLoginControl?.focus({ preventScroll: true });
 }
 
 function showAuthenticatedPage(page) {
@@ -337,7 +740,7 @@ function normalizeModelKey(model) {
   // 去掉路由、账号别名和供应商前缀，使同一模型聚合为一条。
   let name = String(model ?? "").trim();
   if (!name) return "";
-  // LiteLLM provider/model 路由格式（如 bedrock/anthropic.claude-opus-4-8）。
+  // 上游 provider/model 路由格式（如 bedrock/anthropic.claude-opus-4-8）。
   name = name.replace(/^[A-Za-z][A-Za-z0-9_-]*\//, "");
   name = name.replace(/^[A-Za-z][A-Za-z0-9]*-acct-\d+-/i, "");
   name = name.replace(/^[A-Za-z][A-Za-z0-9]*\./i, "");
@@ -1793,6 +2196,8 @@ function renderTeam() {
 }
 
 function render() {
+  renderAccountAccessState();
+  if (accountAccessCopy(currentUser)) return;
   renderPersonal();
   if (currentUser?.isAdmin) renderAdmin();
   if (currentUser?.isAdmin) renderDepartment();
@@ -1929,6 +2334,7 @@ async function toggleKeyReveal(keyId) {
   revealingKeyIds.add(keyId);
   renderKeys();
   try {
+    await ensureCsrfToken();
     const payload = await api(`/api/me/keys/${encodeURIComponent(keyId)}/reveal`, {
       method: "POST",
       body: JSON.stringify({}),
@@ -2256,6 +2662,10 @@ async function loadCurrentViewData(forceRefresh = false) {
 
 async function loadDashboardData(forceRefresh = false) {
   if (!currentUser || isDashboardLoading) return;
+  if (accountAccessCopy(currentUser)) {
+    renderAccountAccessState();
+    return;
+  }
   isDashboardLoading = true;
   renderPersonal();
   const { startDate, endDate } = selectedDateRange();
@@ -2516,9 +2926,12 @@ async function loadModels() {
 }
 
 async function showApp(user) {
-  currentUser = user;
-  leaderTeams = normalizeLeaderTeams(user);
-  selectedTeamRef = user.team?.teamRef || leaderTeams[0]?.teamRef || "";
+  clearResetPasswordToken();
+  currentUser = normalizeAuthUser(user);
+  if (user?.csrfToken) authCsrfToken = user.csrfToken;
+  if (currentUser?.csrfToken) authCsrfToken = currentUser.csrfToken;
+  leaderTeams = normalizeLeaderTeams(currentUser);
+  selectedTeamRef = currentUser.team?.teamRef || leaderTeams[0]?.teamRef || "";
   resetTeamMemberSelection();
   ensureSelectedTeamRef();
   el("authLoadingView").classList.add("hidden");
@@ -2527,13 +2940,14 @@ async function showApp(user) {
   el("adminTab").classList.add("hidden");
   el("teamTab").classList.add("hidden");
   el("departmentTab").classList.add("hidden");
-  el("userEmail").textContent = user.email;
-  el("userName").textContent = user.name;
-  el("avatar").textContent = user.avatar || initials(user.email, user.name);
+  el("userEmail").textContent = currentUser.email;
+  el("userName").textContent = currentUser.name || currentUser.email;
+  el("avatar").textContent = currentUser.avatar || initials(currentUser.email, currentUser.name);
   el("teamWelcomeTitle").textContent = `所选范围 · ${teamScopeLabel()}`;
   el("departmentWelcomeTitle").textContent = "所选范围 · 全部部门";
   switchView("dashboard");
   render();
+  if (accountAccessCopy(currentUser)) return;
   const scopePromise = loadAuthScope();
   await Promise.all([loadCurrentViewData(), loadModels()]);
   await scopePromise;
@@ -2557,6 +2971,7 @@ async function loadAuthScope() {
 
 function showLogin() {
   currentUser = null;
+  authCsrfToken = "";
   isSsoRedirecting = false;
   selectedAdminEmployee = "";
   selectedDepartment = "";
@@ -2612,7 +3027,181 @@ function showLogin() {
   el("loginView").classList.remove("hidden");
   el("authLoadingView").classList.add("hidden");
   updateHomeCard();
+  setAuthAccess(authConfig.passwordLoginEnabled ? "personal" : "enterprise");
+  setAuthMode(resetPasswordToken ? "reset" : "login", { focus: false });
   setGlobalPage("home");
+}
+
+async function submitPasswordLogin() {
+  if (!authConfig.passwordLoginEnabled) {
+    setAuthStatus("邮箱密码登录暂未启用。", "error");
+    return;
+  }
+  if (!validateAuthMode("login") || !requireTurnstile("login")) return;
+  const values = authFieldValues();
+  const button = el("passwordLoginButton");
+  authSubmitting = true;
+  setButtonLoading(button, true, "正在登录");
+  try {
+    await ensureCsrfToken();
+    const payload = await api("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({
+        email: values.loginEmail,
+        password: values.loginPassword,
+        turnstileToken: turnstileTokens.login || undefined,
+      }),
+    });
+    await showApp(payload);
+  } catch (error) {
+    setAuthStatus(error.message || "登录失败，请检查邮箱和密码。", "error");
+    resetTurnstile("login");
+  } finally {
+    authSubmitting = false;
+    setButtonLoading(button, false);
+  }
+}
+
+async function submitRegistration() {
+  if (!authConfig.passwordLoginEnabled || !authConfig.publicSignupEnabled) {
+    setAuthStatus("公开注册暂未开放。", "error");
+    return;
+  }
+  if (!validateAuthMode("register") || !requireTurnstile("register")) return;
+  const values = authFieldValues();
+  const button = el("registerButton");
+  authSubmitting = true;
+  setButtonLoading(button, true, "正在创建");
+  try {
+    await ensureCsrfToken();
+    await api("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({
+        email: values.registerEmail,
+        name: values.registerName,
+        password: values.registerPassword,
+        verificationCode: values.verificationCode,
+        turnstileToken: turnstileTokens.register || undefined,
+      }),
+    });
+    el("loginEmailInput").value = values.registerEmail;
+    el("loginPasswordInput").value = "";
+    setAuthMode("login");
+    setAuthStatus("账号已创建，请使用刚刚设置的密码登录。", "success");
+    resetTurnstile("register");
+  } catch (error) {
+    setAuthStatus(error.message || "账号创建失败，请检查填写内容后重试。", "error");
+    resetTurnstile("register");
+  } finally {
+    authSubmitting = false;
+    setButtonLoading(button, false);
+  }
+}
+
+async function submitForgotPassword() {
+  if (!authConfig.passwordLoginEnabled) {
+    setAuthStatus("邮箱密码登录暂未启用。", "error");
+    return;
+  }
+  if (!validateAuthMode("forgot") || !requireTurnstile("forgot")) return;
+  const values = authFieldValues();
+  const button = el("forgotSubmitButton");
+  authSubmitting = true;
+  setButtonLoading(button, true, "正在发送");
+  try {
+    await ensureCsrfToken();
+    await api("/api/auth/password/forgot", {
+      method: "POST",
+      body: JSON.stringify({ email: values.forgotEmail, turnstileToken: turnstileTokens.forgot || undefined }),
+    });
+    setAuthStatus("如果该邮箱已注册，你会收到一封重置密码邮件。请同时检查垃圾邮件。", "success");
+    resetTurnstile("forgot");
+  } catch (error) {
+    setAuthStatus(error.message || "重置邮件发送失败，请稍后重试。", "error");
+    resetTurnstile("forgot");
+  } finally {
+    authSubmitting = false;
+    setButtonLoading(button, false);
+  }
+}
+
+async function submitPasswordReset() {
+  if (!validateAuthMode("reset")) return;
+  const values = authFieldValues();
+  const button = el("resetPasswordButton");
+  authSubmitting = true;
+  setButtonLoading(button, true, "正在更新");
+  try {
+    await ensureCsrfToken();
+    await api("/api/auth/password/reset", {
+      method: "POST",
+      body: JSON.stringify({ token: resetPasswordToken, newPassword: values.resetPassword }),
+    });
+    clearResetPasswordToken();
+    setAuthMode("login");
+    setAuthStatus("密码已更新，请使用新密码登录。", "success");
+  } catch (error) {
+    if (error.code === "AUTH_RESET_TOKEN_INVALID") {
+      clearResetPasswordToken();
+      setAuthMode("forgot");
+      setAuthStatus("重置链接已失效，请重新申请。", "error");
+    } else {
+      setAuthStatus(error.message || "密码更新失败，重置链接可能已经失效。", "error");
+    }
+  } finally {
+    authSubmitting = false;
+    setButtonLoading(button, false);
+  }
+}
+
+async function sendRegistrationCode() {
+  clearAuthErrors();
+  const email = el("registerEmailInput").value.trim().toLowerCase();
+  if (!validEmail(email)) {
+    fieldError("registerEmailInput", "请先输入有效的邮箱地址");
+    el("registerEmailInput").focus();
+    return;
+  }
+  const button = el("sendRegisterCodeButton");
+  setButtonLoading(button, true, "正在发送");
+  try {
+    await ensureCsrfToken();
+    if (!requireTurnstile("register")) {
+      setButtonLoading(button, false);
+      return;
+    }
+    const payload = await api("/api/auth/verification/request", {
+      method: "POST",
+      body: JSON.stringify({ email, purpose: "signup", turnstileToken: turnstileTokens.register || undefined }),
+    });
+    setVerificationCountdown(Math.min(Number(payload?.expiresIn) || 60, 60));
+    setAuthStatus(payload?.message || "验证码已发送，请检查邮箱。", "success");
+    resetTurnstile("register");
+  } catch (error) {
+    setAuthStatus(error.message || "验证码发送失败，请稍后重试。", "error");
+    resetTurnstile("register");
+  } finally {
+    if (!verificationTimer) setButtonLoading(button, false);
+  }
+}
+
+async function devLogin() {
+  const email = el("emailInput").value.trim();
+  if (!validEmail(email)) {
+    showToast("请输入有效的开发登录邮箱");
+    el("emailInput").focus();
+    return;
+  }
+  setButtonLoading("devLoginButton", true, "正在登录");
+  try {
+    await ensureCsrfToken();
+    const user = await api("/api/auth/dev-login", { method: "POST", body: JSON.stringify({ email }) });
+    await showApp(user);
+  } catch (error) {
+    showToast(error.message || "登录失败，请确认账号是否存在");
+  } finally {
+    setButtonLoading("devLoginButton", false);
+  }
 }
 
 document.addEventListener("submit", async (event) => {
@@ -2622,18 +3211,60 @@ document.addEventListener("submit", async (event) => {
     showAuthenticatedPage("console");
     return;
   }
-  if (!authConfig.devLoginEnabled) {
-    startSsoLogin();
-    return;
-  }
-  const email = el("emailInput").value.trim();
-  try {
-    const user = await api("/api/auth/dev-login", { method: "POST", body: JSON.stringify({ email }) });
-    await showApp(user);
-  } catch (error) {
-    showToast(error.message || "登录失败，请确认账号是否存在");
-  }
+  if (authSubmitting || authAccess !== "personal") return;
+  if (authMode === "register") await submitRegistration();
+  else if (authMode === "forgot") await submitForgotPassword();
+  else if (authMode === "reset") await submitPasswordReset();
+  else await submitPasswordLogin();
 });
+
+document.querySelectorAll("[data-auth-access]").forEach((button) => {
+  button.addEventListener("click", () => setAuthAccess(button.dataset.authAccess));
+});
+
+document.querySelectorAll("[data-auth-mode]").forEach((button) => {
+  button.addEventListener("click", () => setAuthMode(button.dataset.authMode));
+});
+
+document.querySelectorAll('[role="tablist"]').forEach((tablist) => {
+  tablist.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    const tabs = [...tablist.querySelectorAll('[role="tab"]')].filter((tab) => !tab.hidden && !tab.classList.contains("hidden") && !tab.disabled);
+    if (!tabs.length) return;
+    const currentIndex = Math.max(0, tabs.indexOf(document.activeElement));
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? tabs.length - 1
+        : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    event.preventDefault();
+    tabs[nextIndex].focus();
+    tabs[nextIndex].click();
+  });
+});
+
+document.querySelectorAll("[data-auth-back]").forEach((button) => {
+  button.addEventListener("click", () => setAuthMode(button.dataset.authBack));
+});
+
+document.querySelectorAll("[data-password-toggle]").forEach((button) => {
+  button.addEventListener("click", () => {
+    const input = el(button.dataset.passwordToggle);
+    const isVisible = input.type === "text";
+    input.type = isVisible ? "password" : "text";
+    button.setAttribute("aria-pressed", String(!isVisible));
+    button.setAttribute("aria-label", isVisible ? "显示密码" : "隐藏密码");
+    button.querySelector("use").setAttribute("href", isVisible ? "#icon-eye" : "#icon-eye-off");
+  });
+});
+
+el("forgotPasswordButton").addEventListener("click", () => {
+  el("forgotEmailInput").value = el("loginEmailInput").value;
+  setAuthMode("forgot");
+});
+el("sendRegisterCodeButton").addEventListener("click", sendRegistrationCode);
+el("devLoginButton").addEventListener("click", devLogin);
+el("enterConsoleButton").addEventListener("click", () => showAuthenticatedPage("console"));
 
 el("ssoButton").addEventListener("click", () => {
   if (currentUser) showAuthenticatedPage("console");
@@ -2641,10 +3272,32 @@ el("ssoButton").addEventListener("click", () => {
 });
 
 el("logoutButton").addEventListener("click", async () => {
+  setButtonLoading("logoutButton", true, "正在退出");
   try {
+    // Dev-login sessions do not return a CSRF token; initialize one before logout.
+    await ensureCsrfToken();
     await api("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
-  } catch {}
-  showLogin();
+    clearResetPasswordToken();
+    showLogin();
+  } catch (error) {
+    showToast(error.message || "退出登录失败，请检查网络后重试");
+  } finally {
+    setButtonLoading("logoutButton", false);
+  }
+});
+
+el("authLoadingRetryButton").addEventListener("click", () => window.location.reload());
+
+el("accountAccessRetryButton").addEventListener("click", async () => {
+  setButtonLoading("accountAccessRetryButton", true, "正在检查");
+  try {
+    const user = await api("/api/auth/me");
+    await showApp(user);
+  } catch (error) {
+    showToast(error.message || "账号状态检查失败，请稍后重试");
+  } finally {
+    setButtonLoading("accountAccessRetryButton", false);
+  }
 });
 
 document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
@@ -2847,6 +3500,7 @@ el("createKeyForm").addEventListener("submit", async (event) => {
   el("submitCreateKey").disabled = true;
   el("submitCreateKey").textContent = "创建中...";
   try {
+    await ensureCsrfToken();
     const payload = await api("/api/me/keys", {
       method: "POST",
       body: JSON.stringify({
@@ -2896,6 +3550,7 @@ async function disableOldKey(oldKeyId, replacementKeyId, options = {}) {
     el("retryDisableOldKey").textContent = "停用中...";
   }
   try {
+    await ensureCsrfToken();
     const payload = await api(`/api/me/keys/${encodeURIComponent(normalizedOldKeyId)}/disable-old`, {
       method: "POST",
       body: JSON.stringify({ replacementKeyId: normalizedReplacementKeyId }),
@@ -2975,6 +3630,7 @@ el("deleteKeyForm").addEventListener("submit", async (event) => {
   el("confirmDeleteKey").disabled = true;
   el("confirmDeleteKey").textContent = "删除中...";
   try {
+    await ensureCsrfToken();
     const payload = await api(`/api/me/keys/${encodeURIComponent(keyId)}`, { method: "DELETE" });
     hideRevealedKey(keyId);
     pendingDeleteKeyId = "";
@@ -3003,6 +3659,7 @@ el("confirmRegenerateKey").addEventListener("click", async () => {
   el("confirmRegenerateKey").disabled = true;
   el("confirmRegenerateKey").textContent = "更新中...";
   try {
+    await ensureCsrfToken();
     const payload = await api(`/api/me/keys/${encodeURIComponent(oldKeyId)}/regenerate`, {
       method: "POST",
       body: JSON.stringify({}),
@@ -3063,12 +3720,13 @@ window.addEventListener("beforeunload", clearRevealedKeys);
 
 async function init() {
   const callbackParams = new URLSearchParams(window.location.search);
+  resetPasswordToken = takeResetPasswordTokenFromUrl(callbackParams);
   const hasAuthCallback = callbackParams.get("auth_callback") === "success";
   if (hasAuthCallback) {
     el("loginView").classList.add("hidden");
     el("authLoadingView").classList.remove("hidden");
     callbackParams.delete("auth_callback");
-    window.history.replaceState({}, "", `${window.location.pathname}${callbackParams.toString() ? `?${callbackParams}` : ""}${window.location.hash}`);
+    replaceCurrentQuery(callbackParams);
   }
   // 并行发起 config 与 me，减少一个 RTT
   const [configResult, meResult] = await Promise.allSettled([
@@ -3077,14 +3735,43 @@ async function init() {
   ]);
   authConfig = configResult.status === "fulfilled"
     ? configResult.value
-    : { devLoginEnabled: false, oidcConfigured: false, providerName: "飞书扫码登录" };
+    : {
+        devLoginEnabled: false,
+        oidcConfigured: false,
+        providerName: "飞书扫码登录",
+        passwordLoginEnabled: false,
+        publicSignupEnabled: false,
+        emailVerificationRequired: true,
+        turnstileEnabled: false,
+        turnstileConfigured: false,
+        turnstileSiteKey: "",
+      };
   setupModelFilters();
   if (meResult.status === "fulfilled") {
     await showApp(meResult.value);
   } else {
+    const meError = meResult.reason;
+    if (meError?.status !== 401) {
+      el("authLoadingView").classList.remove("hidden");
+      el("loginView").classList.add("hidden");
+      el("authLoadingHint").textContent = meError?.message || "账号状态检查失败，请检查网络后重新加载。";
+      el("authLoadingRetryButton").classList.remove("hidden");
+      return;
+    }
+    if (configResult.status === "rejected") {
+      el("authLoadingView").classList.remove("hidden");
+      el("loginView").classList.add("hidden");
+      el("authLoadingHint").textContent = configResult.reason?.message || "登录配置加载失败，请检查网络后重新加载。";
+      el("authLoadingRetryButton").classList.remove("hidden");
+      return;
+    }
     el("authLoadingView").classList.add("hidden");
     showLogin();
     showLoginCallbackMessage();
+    if (resetPasswordToken) {
+      setAuthAccess("personal");
+      setAuthMode("reset", { focus: false });
+    }
   }
 }
 
