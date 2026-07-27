@@ -204,7 +204,9 @@ def require_user(request: Request) -> dict[str, Any]:
     user = request.session.get(SESSION_USER_KEY)
     if not user:
         raise HTTPException(status_code=401, detail="请先登录后再查看个人数据")
-    user["isAdmin"] = is_admin_email(str(user.get("email", "")))
+    # A password account with the same email as an enterprise account is a
+    # separate identity. It must not inherit enterprise administrator access.
+    user["isAdmin"] = False if user.get("authType") == "password" else is_admin_email(str(user.get("email", "")))
     return user
 
 

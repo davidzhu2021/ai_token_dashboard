@@ -50,7 +50,7 @@ from .auth import (
     verify_csrf_token,
     verify_password,
 )
-from .auth_store import AuthStore, DuplicateEmailError
+from .auth_store import AuthStore, AuthStoreConfigError, DuplicateEmailError
 from .litellm_client import LiteLLMClient, default_date_range, mask_key, usage_today
 from .key_vault import KeyVault, KeyVaultError
 from .usage_store import UsageStore
@@ -66,6 +66,16 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 SESSION_COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "ai_token_dashboard_session")
 OIDC_STATE_PREFIX = "_state_company_"
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def session_cookie_max_age() -> int:
+    """Keep the signed session cookie lifetime aligned with server sessions."""
+    try:
+        configured = int(os.getenv("AUTH_SESSION_TTL_SECONDS", "1209600"))
+    except ValueError:
+        configured = 1_209_600
+    return max(300, configured)
 
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
@@ -104,8 +114,9 @@ app.add_middleware(
     SessionMiddleware,
     secret_key=os.getenv("SESSION_SECRET", "dev-session-secret-change-me"),
     session_cookie=SESSION_COOKIE_NAME,
+    max_age=session_cookie_max_age(),
     same_site="lax",
-    https_only=os.getenv("APP_BASE_URL", "").startswith("https://"),
+    https_only=urlparse(os.getenv("APP_BASE_URL", "").strip()).scheme.lower() == "https",
 )
 oauth = build_oauth()
 user_mapping_cache = TTLCache()
@@ -127,8 +138,18 @@ _usage_sync_status: dict[str, Any] = {"status": "disabled", "lastRun": None}
 
 
 def validate_runtime_auth_config() -> None:
-    """Reject known-unsafe session configuration for HTTPS deployments."""
-    if not os.getenv("APP_BASE_URL", "").strip().lower().startswith("https://"):
+    """Reject unsafe public deployments while preserving loopback development."""
+    app_base_url = os.getenv("APP_BASE_URL", "").strip()
+    parsed_base_url = urlparse(app_base_url)
+    app_host = (parsed_base_url.hostname or "").lower()
+    auth_requested = any(
+        env_bool(name, False)
+        for name in ("AUTH_ENABLED", "PASSWORD_LOGIN_ENABLED", "PUBLIC_SIGNUP_ENABLED")
+    )
+    loopback_development = parsed_base_url.scheme.lower() == "http" and app_host in LOOPBACK_HOSTS
+    if auth_requested and not loopback_development and parsed_base_url.scheme.lower() != "https":
+        raise RuntimeError("启用邮箱认证时 APP_BASE_URL 必须使用 HTTPS；仅允许本机回环地址使用 HTTP")
+    if parsed_base_url.scheme.lower() != "https":
         return
     secret = os.getenv("SESSION_SECRET", "").strip()
     weak_values = {"", "dev-session-secret-change-me", "replace-with-a-random-long-string"}
@@ -140,10 +161,9 @@ def validate_runtime_auth_config() -> None:
         raise RuntimeError("HTTPS 部署不能启用 DEV_LOGIN_ENABLED")
     if env_bool("SMTP_SSL", False) and env_bool("SMTP_STARTTLS", True):
         raise RuntimeError("SMTP_SSL 和 SMTP_STARTTLS 不能同时启用")
-    if local_auth_enabled() and not (turnstile_enabled() and turnstile_configured()):
-        raise RuntimeError("HTTPS 密码登录必须启用并完整配置 Turnstile")
-    if local_signup_enabled() and not local_signup_ready():
-        raise RuntimeError("公开注册需要邮箱验证、域名白名单、SMTP 和 Turnstile 完整配置")
+    # Missing optional local-auth dependencies must not take the existing SSO
+    # service down. The auth config endpoint and each route expose a precise
+    # unavailable status instead, leaving the email entry points closed.
 
 
 def allowed_provider_login_url(url: str) -> str | None:
@@ -540,21 +560,139 @@ def local_signup_enabled() -> bool:
     return local_auth_enabled() and env_bool("PUBLIC_SIGNUP_ENABLED", False)
 
 
-def local_signup_ready() -> bool:
-    # Local development may use AUTH_EMAIL_DEBUG without external email or
-    # challenge services. HTTPS deployments must satisfy every dependency.
-    development_bypass = not os.getenv("APP_BASE_URL", "").strip().lower().startswith("https://")
-    if development_bypass:
-        return local_signup_enabled()
-    return (
-        local_signup_enabled()
-        and env_bool("EMAIL_VERIFICATION_REQUIRED", True)
-        and bool(os.getenv("AUTH_ALLOWED_EMAIL_DOMAINS", "").strip())
-        and bool(os.getenv("SMTP_HOST", "").strip())
-        and bool(os.getenv("SMTP_FROM", "").strip())
-        and turnstile_enabled()
-        and turnstile_configured()
+def allowed_signup_domains() -> list[str]:
+    return sorted(
+        {
+            item.strip().lower().lstrip("@")
+            for item in os.getenv("AUTH_ALLOWED_EMAIL_DOMAINS", "").split(",")
+            if item.strip()
+        }
     )
+
+
+def auth_database_configured() -> bool:
+    configured_path = os.getenv("AUTH_DATABASE_PATH", "").strip()
+    configured_url = os.getenv("AUTH_DATABASE_URL", "").strip()
+    if configured_path:
+        return True
+    if not configured_url:
+        return False
+    # AuthStore accepts SQLite URLs only. Treat an invalid value as not ready
+    # rather than advertising a login form that will fail on first use.
+    try:
+        AuthStore._sqlite_path_from_url(configured_url)
+    except AuthStoreConfigError:
+        return False
+    return True
+
+
+def is_loopback_development() -> bool:
+    parsed_base_url = urlparse(os.getenv("APP_BASE_URL", "").strip())
+    return parsed_base_url.scheme.lower() == "http" and (parsed_base_url.hostname or "").lower() in LOOPBACK_HOSTS
+
+
+def smtp_configured() -> bool:
+    """Require an authenticated, encrypted SMTP transport for public email."""
+    if is_loopback_development() and (env_bool("AUTH_EMAIL_DEBUG", False) or env_bool("DEV_LOGIN_ENABLED", False)):
+        return True
+    if not os.getenv("SMTP_HOST", "").strip() or not os.getenv("SMTP_FROM", "").strip():
+        return False
+    if not os.getenv("SMTP_USERNAME", "").strip() or not os.getenv("SMTP_PASSWORD", ""):
+        return False
+    return env_bool("SMTP_SSL", False) != env_bool("SMTP_STARTTLS", True)
+
+
+def password_login_unavailable_code() -> str:
+    if not local_auth_enabled():
+        return "AUTH_PASSWORD_LOGIN_DISABLED"
+    if is_loopback_development():
+        return ""
+    parsed_base_url = urlparse(os.getenv("APP_BASE_URL", "").strip())
+    if parsed_base_url.scheme.lower() != "https":
+        return "AUTH_PASSWORD_LOGIN_HTTPS_REQUIRED"
+    if not auth_database_configured():
+        return "AUTH_DATABASE_NOT_CONFIGURED"
+    if not turnstile_enabled() or not turnstile_configured():
+        return "AUTH_TURNSTILE_NOT_CONFIGURED"
+    return ""
+
+
+def password_login_configured() -> bool:
+    """Return whether password login itself is ready, independent of email delivery."""
+    return not password_login_unavailable_code()
+
+
+def signup_unavailable_code() -> str:
+    if not local_auth_enabled():
+        return "AUTH_PASSWORD_LOGIN_DISABLED"
+    if not local_signup_enabled():
+        return "AUTH_SIGNUP_DISABLED"
+    if password_code := password_login_unavailable_code():
+        return password_code
+    # Email verification is mandatory for any public registration endpoint,
+    # including local test environments.
+    if not env_bool("EMAIL_VERIFICATION_REQUIRED", True):
+        return "AUTH_SIGNUP_EMAIL_VERIFICATION_REQUIRED"
+    if not allowed_signup_domains():
+        return "AUTH_SIGNUP_DOMAINS_NOT_CONFIGURED"
+    if not smtp_configured():
+        return "AUTH_SIGNUP_EMAIL_NOT_CONFIGURED"
+    return ""
+
+
+def password_recovery_unavailable_code() -> str:
+    if password_code := password_login_unavailable_code():
+        return password_code
+    if not smtp_configured():
+        return "AUTH_PASSWORD_EMAIL_NOT_CONFIGURED"
+    return ""
+
+
+def password_recovery_configured() -> bool:
+    return not password_recovery_unavailable_code()
+
+
+def password_recovery_enabled() -> bool:
+    """Password recovery is available only to deployments with local passwords."""
+    return local_auth_enabled()
+
+
+def local_auth_unavailable_message(code: str) -> str:
+    return {
+        "AUTH_PASSWORD_LOGIN_DISABLED": "邮箱密码登录暂未开放。",
+        "AUTH_PASSWORD_LOGIN_HTTPS_REQUIRED": "账号服务必须使用 HTTPS，邮箱登录与注册暂时不可用。",
+        "AUTH_DATABASE_NOT_CONFIGURED": "账号服务尚未配置完成，邮箱登录与注册暂时不可用。",
+        "AUTH_PASSWORD_EMAIL_NOT_CONFIGURED": "账号邮件服务尚未配置完成，密码找回暂时不可用。",
+        "AUTH_TURNSTILE_NOT_CONFIGURED": "安全验证尚未配置完成，邮箱登录与注册暂时不可用。",
+        "AUTH_SIGNUP_DISABLED": "邮箱注册暂未开放。",
+        "AUTH_SIGNUP_DOMAINS_NOT_CONFIGURED": "注册邮箱范围尚未配置完成，暂时无法创建账号。",
+        "AUTH_SIGNUP_EMAIL_VERIFICATION_REQUIRED": "生产注册必须启用邮箱验证。",
+        "AUTH_SIGNUP_EMAIL_NOT_CONFIGURED": "注册邮件服务尚未配置完成，暂时无法发送验证码。",
+    }.get(code, "")
+
+
+def local_signup_ready() -> bool:
+    # Explicit loopback debug delivery is considered ready by smtp_configured.
+    return not signup_unavailable_code()
+
+
+def auth_unavailable_status(code: str) -> int:
+    return 403 if code.endswith("_DISABLED") else 503
+
+
+def require_password_login_ready() -> None:
+    if code := password_login_unavailable_code():
+        raise auth_http_error(auth_unavailable_status(code), local_auth_unavailable_message(code), code)
+
+
+def require_signup_ready() -> None:
+    if code := signup_unavailable_code():
+        raise auth_http_error(auth_unavailable_status(code), local_auth_unavailable_message(code), code)
+
+
+def require_password_recovery_ready() -> None:
+    if code := password_recovery_unavailable_code():
+        raise auth_http_error(auth_unavailable_status(code), local_auth_unavailable_message(code), code)
 
 
 def validate_public_signup_email(email: str) -> str:
@@ -562,11 +700,7 @@ def validate_public_signup_email(email: str) -> str:
         normalized = auth_store().normalize_email(email)
     except ValueError as exc:
         raise auth_http_error(400, "请输入有效邮箱", "AUTH_INVALID_EMAIL") from exc
-    allowed_domains = {
-        item.strip().lower().lstrip("@")
-        for item in os.getenv("AUTH_ALLOWED_EMAIL_DOMAINS", "").split(",")
-        if item.strip()
-    }
+    allowed_domains = set(allowed_signup_domains())
     if allowed_domains and normalized.rsplit("@", 1)[1] not in allowed_domains:
         raise auth_http_error(403, "当前邮箱域暂未开放注册", "AUTH_EMAIL_DOMAIN_NOT_ALLOWED")
     return normalized
@@ -587,8 +721,16 @@ async def enforce_csrf(request: Request) -> None:
     if not origin:
         return
     configured = os.getenv("APP_BASE_URL", "").strip()
-    allowed = urlparse(configured).netloc if configured else str(request.headers.get("host") or "")
-    if urlparse(origin).netloc != allowed:
+    configured_origin = urlparse(configured)
+    origin_url = urlparse(origin)
+    if configured:
+        same_origin = (
+            origin_url.scheme.lower() == configured_origin.scheme.lower()
+            and origin_url.netloc.lower() == configured_origin.netloc.lower()
+        )
+    else:
+        same_origin = origin_url.netloc.lower() == str(request.headers.get("host") or "").lower()
+    if not same_origin:
         raise auth_http_error(403, "请求来源不受信任", "AUTH_ORIGIN_INVALID")
 
 
@@ -704,9 +846,11 @@ async def auth_user_payload(user: dict[str, Any], *, refresh_entitlement: bool =
                 models = info.get("models") if isinstance(info, dict) else None
                 blocked = bool(info.get("blocked")) if isinstance(info, dict) else False
                 clean_models = [str(item) for item in (models or []) if str(item) != "no-default-models"]
-                # LiteLLM treats an empty model list as unrestricted. The explicit
-                # no-default-models sentinel is the restricted default we create.
-                entitlement_status = "active" if not blocked and (models == [] or bool(clean_models)) else "inactive"
+                # The dashboard provisions ``no-default-models`` for every
+                # local signup. Treat a missing or empty list as unprovisioned
+                # rather than inheriting LiteLLM's unrestricted-list semantics:
+                # access is opened only by an explicit model grant.
+                entitlement_status = "active" if not blocked and bool(clean_models) else "inactive"
                 local_entitlement_cache.set(
                     cache_key,
                     entitlement_status,
@@ -717,9 +861,13 @@ async def auth_user_payload(user: dict[str, Any], *, refresh_entitlement: bool =
                 # must not invalidate an otherwise valid dashboard login.
                 entitlement_status = "inactive"
     normalized = normalize_user(str(user["email"]), str(user.get("name") or ""))
+    # Password accounts are intentionally separate from SSO identities, even
+    # when they use the same email address. Do not inherit admin privileges.
+    normalized["isAdmin"] = False
     return {
         **normalized,
         "id": str(user["id"]),
+        "authType": "password",
         "emailVerified": bool(user.get("email_verified") or user.get("emailVerified")),
         "authMethods": ["password"],
         "accountStatus": account_status,
@@ -747,7 +895,7 @@ async def create_local_session(request: Request, user: dict[str, Any]) -> tuple[
     old_token = get_server_session_token(request)
     if old_token:
         await auth_store_call("revoke_session", old_token)
-    expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(300, env_int("AUTH_SESSION_TTL_SECONDS", 1_209_600)))
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=session_cookie_max_age())
     session = await auth_store_call(
         "create_session",
         str(user["id"]),
@@ -826,6 +974,10 @@ async def cached_resolve_user(email: str, name: str | None = None, refresh: bool
 
 def personal_usage_cache_key(email: str, start_date: str, end_date: str, source: str) -> str:
     return f"usage:v6:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
+
+
+def local_personal_usage_cache_key(user_id: str, start_date: str, end_date: str, source: str) -> str:
+    return f"usage:local:v1:{user_id}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def admin_usage_cache_key(email: str, start_date: str, end_date: str, source: str, employee: str | None) -> str:
@@ -988,6 +1140,8 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
             "mappingCache": {"hit": True, "ttlSeconds": 0},
             "cache": {"hit": False, "ttlSeconds": 0},
         }
+    if app_user.get("id"):
+        return await local_personal_usage_payload(app_user, start_date, end_date, source, refresh)
     request_started = asyncio.get_running_loop().time()
     cache_key = personal_usage_cache_key(app_user["email"], start_date, end_date, source)
     hit, value, ttl_seconds = personal_usage_cache.get(cache_key)
@@ -1040,6 +1194,44 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
         "rows": rows,
         "summary": usage_summary(rows),
         "mappingCache": mapping_cache,
+    }
+    personal_usage_cache.set(cache_key, payload, env_int("PERSONAL_USAGE_CACHE_TTL_SECONDS", 300))
+    payload = dict(payload)
+    payload["cache"] = {"hit": False, "ttlSeconds": 0}
+    return payload
+
+
+async def local_personal_usage_payload(
+    app_user: dict[str, Any],
+    start_date: str,
+    end_date: str,
+    source: str,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Read password-account usage only from its provisioned upstream identity."""
+    local_user_id = str(app_user["id"])
+    cache_key = local_personal_usage_cache_key(local_user_id, start_date, end_date, source)
+    if not refresh:
+        hit, value, ttl_seconds = personal_usage_cache.get(cache_key)
+        if hit:
+            payload = dict(value)
+            payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+            return payload
+    account = await auth_store_call("get_upstream_account", local_user_id, "primary")
+    upstream_user_id = str((account or {}).get("upstream_user_id") or "")
+    if not account or account.get("status") != "provisioned" or not upstream_user_id:
+        raise auth_http_error(409, "账号仍在开通中，请稍后重试", "AUTH_PROVISIONING_PENDING")
+    if refresh:
+        raise manual_refresh_database_unavailable()
+    rows = await client().usage_rows_for_user_ids([upstream_user_id], start_date, end_date, source)
+    payload = {
+        "user": app_user,
+        "startDate": start_date,
+        "endDate": end_date,
+        "source": source,
+        "rows": rows,
+        "summary": usage_summary(rows),
+        "mappingCache": {"hit": True, "ttlSeconds": 0},
     }
     personal_usage_cache.set(cache_key, payload, env_int("PERSONAL_USAGE_CACHE_TTL_SECONDS", 300))
     payload = dict(payload)
@@ -1171,6 +1363,10 @@ async def department_usage_payload(admin: dict[str, Any], start_date: str, end_d
 
 
 async def team_scope_for_user(app_user: dict[str, Any], refresh: bool = False) -> dict[str, Any]:
+    # Password and enterprise accounts are intentionally not merged by email.
+    # Local signups therefore never inherit a team-leader scope from SSO data.
+    if app_user.get("id"):
+        return {"isTeamLeader": False, "teamBoardStatus": "none", "team": None, "leaderTeams": [], "cache": {"hit": True, "ttlSeconds": 0}}
     cache_key = team_auth_cache_key(app_user["email"], app_user.get("name"))
     if not refresh:
         hit, value, ttl_seconds = team_auth_cache.get(cache_key)
@@ -1453,6 +1649,10 @@ async def current_upstream_user(request: Request, refresh: bool = False) -> tupl
     app_user = require_user(request)
     local_user_id = str(app_user.get("id") or "")
     if local_user_id:
+        local_user = await auth_store_call("get_user", local_user_id)
+        if not local_user or str(local_user.get("status") or "active") != "active":
+            raise auth_http_error(401, "本地登录已失效，请重新登录", "AUTH_LOGIN_REQUIRED")
+        app_user = await auth_user_payload(local_user, refresh_entitlement=True)
         account = await auth_store_call("get_upstream_account", local_user_id, "primary")
         if not account or account.get("status") != "provisioned" or not account.get("upstream_user_id"):
             raise auth_http_error(409, "账号仍在开通中，请稍后重试", "AUTH_PROVISIONING_PENDING")
@@ -1470,6 +1670,15 @@ async def current_upstream_user(request: Request, refresh: bool = False) -> tupl
         }
     upstream, _ = await cached_resolve_user(app_user["email"], app_user.get("name"), refresh)
     return app_user, upstream
+
+
+def local_account_is_active(app_user: dict[str, Any]) -> bool:
+    return bool(app_user.get("id")) and app_user.get("accountStatus") == "provisioned" and app_user.get("entitlementStatus") == "active"
+
+
+def require_active_local_entitlement(app_user: dict[str, Any]) -> None:
+    if app_user.get("id") and not local_account_is_active(app_user):
+        raise auth_http_error(403, "当前账号尚未获得模型和额度权限", "AUTH_ENTITLEMENT_INACTIVE")
 
 
 def upstream_user_ids(upstream_user: dict[str, Any]) -> list[str]:
@@ -1645,6 +1854,8 @@ def store_created_key(user_id: str, created: dict[str, str]) -> str:
 async def debug_me_mapping(request: Request, refresh: bool = Query(False)) -> dict[str, Any]:
     if not env_bool("DEBUG_MAPPING_ENABLED", False):
         raise HTTPException(status_code=404, detail="接口不存在")
+    if require_user(request).get("id"):
+        raise auth_http_error(403, "本地密码账号不能使用调试接口", "AUTH_LOCAL_DEBUG_UNAVAILABLE")
     app_user, upstream_user = await current_upstream_user(request, refresh)
     return {
         "email": app_user["email"],
@@ -1665,6 +1876,8 @@ async def debug_me_usage_compare(
     if not env_bool("DEBUG_MAPPING_ENABLED", False):
         raise HTTPException(status_code=404, detail="接口不存在")
     app_user = require_user(request)
+    if app_user.get("id"):
+        raise auth_http_error(403, "本地密码账号不能使用调试接口", "AUTH_LOCAL_DEBUG_UNAVAILABLE")
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
     upstream, mapping_cache = await cached_resolve_user(app_user["email"], app_user.get("name"))
@@ -1707,10 +1920,33 @@ async def debug_admin_usage_compare(
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     result: dict[str, Any] = {"status": "ok", "usageSync": dict(_usage_sync_status)}
-    if local_auth_enabled():
+    password_unavailable = password_login_unavailable_code()
+    signup_unavailable = signup_unavailable_code()
+    recovery_unavailable = password_recovery_unavailable_code()
+    result["authReadiness"] = {
+        "passwordLogin": {
+            "enabled": local_auth_enabled(),
+            "available": not password_unavailable,
+            "unavailableCode": password_unavailable,
+        },
+        "publicSignup": {
+            "enabled": local_signup_enabled(),
+            "available": not signup_unavailable,
+            "unavailableCode": signup_unavailable,
+        },
+        "passwordRecovery": {
+            "enabled": password_recovery_enabled(),
+            "available": not recovery_unavailable,
+            "unavailableCode": recovery_unavailable,
+        },
+    }
+    if local_auth_enabled() and auth_database_configured():
         result["authDatabase"] = await auth_store_call("health")
         if result["authDatabase"].get("status") == "error":
             result["status"] = "degraded"
+    elif local_auth_enabled():
+        result["authDatabase"] = {"enabled": True, "status": "error", "configured": False}
+        result["status"] = "degraded"
     else:
         result["authDatabase"] = {"enabled": False, "status": "disabled"}
     store = usage_store()
@@ -1727,18 +1963,42 @@ async def health() -> dict[str, Any]:
         result["status"] = "degraded"
     else:
         result["turnstile"] = {"enabled": turnstile_enabled(), "configured": turnstile_configured(), "status": "ok" if turnstile_enabled() else "disabled"}
+    if local_auth_enabled() and password_unavailable:
+        result["status"] = "degraded"
+    if local_signup_enabled() and signup_unavailable:
+        result["status"] = "degraded"
     return result
 
 
 @app.get("/api/auth/config")
 async def auth_config() -> dict[str, Any]:
+    password_unavailable_code = password_login_unavailable_code()
+    signup_unavailable = signup_unavailable_code()
+    recovery_unavailable_code = password_recovery_unavailable_code()
+    password_ready = password_login_configured()
+    signup_ready = local_signup_ready()
+    recovery_ready = password_recovery_configured()
     return {
         "devLoginEnabled": env_bool("DEV_LOGIN_ENABLED", False),
         "oidcConfigured": oidc_configured(),
         "providerName": safe_provider_name(),
         "allowedEmailDomain": allowed_email_domain(),
         "passwordLoginEnabled": local_auth_enabled(),
-        "publicSignupEnabled": local_signup_ready(),
+        "passwordLoginConfigured": password_ready,
+        "passwordLoginAvailable": password_ready,
+        "passwordLoginUnavailableCode": password_unavailable_code,
+        "passwordLoginUnavailableReason": local_auth_unavailable_message(password_unavailable_code),
+        "publicSignupEnabled": local_signup_enabled(),
+        "publicSignupConfigured": signup_ready,
+        "publicSignupAvailable": signup_ready,
+        "publicSignupUnavailableCode": signup_unavailable,
+        "publicSignupUnavailableReason": local_auth_unavailable_message(signup_unavailable),
+        "passwordRecoveryEnabled": password_recovery_enabled(),
+        "passwordRecoveryConfigured": recovery_ready,
+        "passwordRecoveryAvailable": recovery_ready,
+        "passwordRecoveryUnavailableCode": recovery_unavailable_code,
+        "passwordRecoveryUnavailableReason": local_auth_unavailable_message(recovery_unavailable_code),
+        "allowedSignupDomains": allowed_signup_domains(),
         "emailVerificationRequired": env_bool("EMAIL_VERIFICATION_REQUIRED", True),
         "turnstileEnabled": turnstile_enabled(),
         "turnstileConfigured": turnstile_configured(),
@@ -1764,10 +2024,7 @@ async def auth_me(request: Request) -> dict[str, Any]:
 
 @app.post("/api/auth/verification/request")
 async def request_verification(data: VerificationRequest, request: Request) -> dict[str, Any]:
-    if not local_auth_enabled():
-        raise auth_http_error(403, "密码登录暂未启用", "AUTH_PASSWORD_LOGIN_DISABLED")
-    if data.purpose == "signup" and not local_signup_ready():
-        raise auth_http_error(403, "公开注册暂未开放", "AUTH_SIGNUP_DISABLED")
+    require_signup_ready()
     await enforce_csrf(request)
     await verify_turnstile(request, data.turnstileToken)
     email = validate_public_signup_email(data.email)
@@ -1804,40 +2061,40 @@ async def request_verification(data: VerificationRequest, request: Request) -> d
 
 @app.post("/api/auth/register")
 async def register(data: RegisterRequest, request: Request) -> dict[str, Any]:
-    if not local_signup_ready():
-        raise auth_http_error(403, "公开注册暂未开放", "AUTH_SIGNUP_DISABLED")
+    require_signup_ready()
     await enforce_csrf(request)
     await verify_turnstile(request, data.turnstileToken)
     email = validate_public_signup_email(data.email)
     await enforce_rate_limit("register_ip", request_ip(request), 10, 3600)
     if await auth_store_call("get_user_by_email", email):
         raise auth_http_error(409, "该邮箱已注册，请直接登录", "AUTH_EMAIL_EXISTS")
-    verification_id: str | None = None
-    if env_bool("EMAIL_VERIFICATION_REQUIRED", True):
-        verification_id = await auth_store_call(
-            "claim_verification_code",
-            email,
-            "signup",
-            hash_auth_token(data.verificationCode.strip()),
-        )
-        if not verification_id:
-            raise auth_http_error(400, "验证码无效或已过期", "AUTH_CODE_INVALID")
     try:
         password_hash = await asyncio.to_thread(hash_password, data.password)
-        user = await auth_store_call(
-            "create_user",
-            email,
-            data.name.strip(),
-            password_hash,
-            True,
-            "active",
-        )
+        if env_bool("EMAIL_VERIFICATION_REQUIRED", True):
+            user = await auth_store_call(
+                "create_user_from_verification",
+                email,
+                data.name.strip(),
+                password_hash,
+                "signup",
+                hash_auth_token(data.verificationCode.strip()),
+                status="active",
+            )
+            if user is None:
+                raise auth_http_error(400, "验证码无效或已过期", "AUTH_CODE_INVALID")
+        else:
+            user = await auth_store_call(
+                "create_user",
+                email,
+                data.name.strip(),
+                password_hash,
+                True,
+                "active",
+            )
     except DuplicateEmailError as exc:
         raise auth_http_error(409, "该邮箱已注册，请直接登录", "AUTH_EMAIL_EXISTS") from exc
     except ValueError as exc:
         raise auth_http_error(400, str(exc), "AUTH_INVALID_INPUT") from exc
-    if verification_id:
-        await auth_store_call("consume_claimed_verification_code", verification_id)
     await auth_store_call("set_provisioning_status", str(user["id"]), "provisioning", "primary", f"local-{user['id']}", "")
     account = await provision_local_user(user)
     await auth_store_call("record_audit_event", "registered", str(user["id"]), email, request_ip(request), True, {"accountStatus": account.get("status")})
@@ -1847,8 +2104,7 @@ async def register(data: RegisterRequest, request: Request) -> dict[str, Any]:
 
 @app.post("/api/auth/login")
 async def password_login(data: PasswordLoginRequest, request: Request) -> dict[str, Any]:
-    if not local_auth_enabled():
-        raise auth_http_error(403, "密码登录暂未启用", "AUTH_PASSWORD_LOGIN_DISABLED")
+    require_password_login_ready()
     await enforce_csrf(request)
     await verify_turnstile(request, data.turnstileToken)
     try:
@@ -1878,8 +2134,7 @@ async def password_login(data: PasswordLoginRequest, request: Request) -> dict[s
 
 @app.post("/api/auth/password/forgot")
 async def forgot_password(data: ForgotPasswordRequest, request: Request) -> dict[str, Any]:
-    if not local_auth_enabled():
-        raise auth_http_error(403, "密码登录暂未启用", "AUTH_PASSWORD_LOGIN_DISABLED")
+    require_password_recovery_ready()
     await enforce_csrf(request)
     await verify_turnstile(request, data.turnstileToken)
     try:
@@ -1918,8 +2173,7 @@ async def forgot_password(data: ForgotPasswordRequest, request: Request) -> dict
 
 @app.post("/api/auth/password/reset")
 async def reset_password(data: ResetPasswordRequest, request: Request) -> dict[str, Any]:
-    if not local_auth_enabled():
-        raise auth_http_error(403, "密码登录暂未启用", "AUTH_PASSWORD_LOGIN_DISABLED")
+    require_password_login_ready()
     await enforce_csrf(request)
     try:
         new_hash = await asyncio.to_thread(hash_password, data.newPassword)
@@ -1935,6 +2189,7 @@ async def reset_password(data: ResetPasswordRequest, request: Request) -> dict[s
 
 @app.post("/api/auth/password/change")
 async def change_password(data: ChangePasswordRequest, request: Request) -> dict[str, Any]:
+    require_password_login_ready()
     await enforce_csrf(request)
     user = await current_local_auth_user(request)
     if not user:
@@ -1958,6 +2213,13 @@ async def change_password(data: ChangePasswordRequest, request: Request) -> dict
 @app.get("/api/auth/scope")
 async def auth_scope(request: Request) -> dict[str, Any]:
     user = require_user(request)
+    if user.get("id"):
+        return {
+            "isTeamLeader": False,
+            "teamBoardStatus": "none",
+            "team": None,
+            "leaderTeams": [],
+        }
     started = asyncio.get_running_loop().time()
     scope = await team_scope_for_user(user)
     payload = {
@@ -1977,8 +2239,7 @@ async def dev_login(request: Request) -> dict[str, Any]:
     app_base_url = os.getenv("APP_BASE_URL", "http://127.0.0.1:8000").strip()
     app_host = (urlparse(app_base_url).hostname or "").lower()
     request_host_name = (request.url.hostname or "").lower()
-    loopback_hosts = {"127.0.0.1", "localhost", "::1"}
-    if urlparse(app_base_url).scheme.lower() == "https" or app_host not in loopback_hosts or request_host_name not in loopback_hosts | {"testserver"}:
+    if urlparse(app_base_url).scheme.lower() == "https" or app_host not in LOOPBACK_HOSTS or request_host_name not in LOOPBACK_HOSTS | {"testserver"}:
         raise HTTPException(status_code=403, detail="开发登录仅允许在本机开发环境使用")
     await enforce_csrf(request)
     payload = await request.json()
@@ -2099,6 +2360,12 @@ async def my_usage(
     refresh: bool = Query(False),
 ) -> dict[str, Any]:
     app_user = require_user(request)
+    if app_user.get("id"):
+        local_user = await auth_store_call("get_user", str(app_user["id"]))
+        if not local_user:
+            raise auth_http_error(401, "本地登录已失效，请重新登录", "AUTH_LOGIN_REQUIRED")
+        app_user = await auth_user_payload(local_user, refresh_entitlement=True)
+        require_active_local_entitlement(app_user)
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
     return await personal_usage_payload(app_user, start_date, end_date, source, refresh)
@@ -2115,6 +2382,9 @@ async def team_usage(
     include_member_rankings: bool = Query(True),
 ) -> dict[str, Any]:
     app_user = require_user(request)
+    if app_user.get("id"):
+        # Password and enterprise SSO accounts remain separate identities.
+        raise auth_http_error(403, "当前账号还没有团队负责人权限", "AUTH_TEAM_SCOPE_UNAVAILABLE")
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
     payload = await team_usage_payload(app_user, start_date, end_date, source, refresh, team_ref, include_member_rankings)
@@ -2139,6 +2409,9 @@ async def team_member_usage(
     refresh: bool = Query(False),
 ) -> dict[str, Any]:
     app_user = require_user(request)
+    if app_user.get("id"):
+        # Local accounts never inherit team scopes from a same-email SSO user.
+        raise auth_http_error(403, "当前账号还没有团队负责人权限", "AUTH_TEAM_SCOPE_UNAVAILABLE")
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
     if not employee:
@@ -2164,6 +2437,12 @@ async def my_usage_logs(
     page_size: int = Query(50, ge=1, le=100),
 ) -> dict[str, Any]:
     app_user = require_user(request)
+    if app_user.get("id"):
+        local_user = await auth_store_call("get_user", str(app_user["id"]))
+        if not local_user:
+            raise auth_http_error(401, "本地登录已失效，请重新登录", "AUTH_LOGIN_REQUIRED")
+        app_user = await auth_user_payload(local_user, refresh_entitlement=True)
+        require_active_local_entitlement(app_user)
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
     payload = await personal_usage_payload(app_user, start_date, end_date, source)
@@ -2245,14 +2524,7 @@ async def admin_departments_usage(
 @app.get("/api/me/keys")
 async def my_keys(request: Request, refresh: bool = Query(False)) -> dict[str, Any]:
     app_user, upstream_user = await current_upstream_user(request)
-    if app_user.get("id") and app_user.get("entitlementStatus") != "active":
-        return {
-            "keys": [],
-            "availableModels": [],
-            "unrestrictedModels": False,
-            "accountStatus": app_user.get("accountStatus", "provisioning"),
-            "accessStatus": "inactive",
-        }
+    require_active_local_entitlement(app_user)
     user_ids = upstream_user_ids(upstream_user)
     if not user_ids:
         raise HTTPException(status_code=502, detail="上游员工记录缺少 user_id")
@@ -2273,8 +2545,7 @@ async def my_keys(request: Request, refresh: bool = Query(False)) -> dict[str, A
 async def create_my_key(data: CreatePersonalKeyRequest, request: Request) -> JSONResponse:
     await enforce_csrf(request)
     app_user, upstream_user = await current_upstream_user(request)
-    if app_user.get("id") and app_user.get("entitlementStatus") != "active":
-        raise auth_http_error(403, "当前账号尚未获得模型和额度权限", "AUTH_ENTITLEMENT_INACTIVE")
+    require_active_local_entitlement(app_user)
     primary_user_id = primary_upstream_user_id(upstream_user)
     try:
         created = await client().create_key(
@@ -2300,6 +2571,7 @@ async def create_my_key(data: CreatePersonalKeyRequest, request: Request) -> JSO
 async def regenerate_my_key(key_id: str, request: Request) -> JSONResponse:
     await enforce_csrf(request)
     app_user, upstream_user = await current_upstream_user(request)
+    require_active_local_entitlement(app_user)
     user_ids = upstream_user_ids(upstream_user)
     if not user_ids:
         raise HTTPException(status_code=502, detail="上游员工记录缺少 user_id")
@@ -2420,6 +2692,7 @@ async def regenerate_my_key(key_id: str, request: Request) -> JSONResponse:
 async def disable_old_key(old_key_id: str, data: DisableOldKeyRequest, request: Request) -> JSONResponse:
     await enforce_csrf(request)
     app_user, upstream_user = await current_upstream_user(request)
+    require_active_local_entitlement(app_user)
     last_error: HTTPException | None = None
     for user_id in upstream_user_ids(upstream_user):
         backend, raw_user_id = client()._decode_account_id(user_id)
@@ -2457,6 +2730,7 @@ async def disable_old_key(old_key_id: str, data: DisableOldKeyRequest, request: 
 async def delete_my_key(key_id: str, request: Request) -> dict[str, Any]:
     await enforce_csrf(request)
     app_user, upstream_user = await current_upstream_user(request)
+    require_active_local_entitlement(app_user)
     user_ids = upstream_user_ids(upstream_user)
     if not user_ids:
         raise HTTPException(status_code=502, detail="上游员工记录缺少 user_id")
@@ -2491,6 +2765,7 @@ async def delete_my_key(key_id: str, request: Request) -> dict[str, Any]:
 async def reveal_my_key(key_id: str, request: Request) -> JSONResponse:
     await enforce_csrf(request)
     app_user, upstream_user = await current_upstream_user(request)
+    require_active_local_entitlement(app_user)
     keys = await client().keys_for_user_ids(upstream_user_ids(upstream_user), refresh=True)
     owned = next((key for key in keys if str(key.get("id") or "") == key_id), None)
     if owned is None:
@@ -2514,7 +2789,13 @@ async def reveal_my_key(key_id: str, request: Request) -> JSONResponse:
 
 @app.get("/api/models")
 async def models(request: Request) -> dict[str, Any]:
-    require_user(request)
+    app_user = require_user(request)
+    if app_user.get("id"):
+        local_user = await auth_store_call("get_user", str(app_user["id"]))
+        if not local_user:
+            raise auth_http_error(401, "本地登录已失效，请重新登录", "AUTH_LOGIN_REQUIRED")
+        app_user = await auth_user_payload(local_user, refresh_entitlement=True)
+        require_active_local_entitlement(app_user)
     usage_counts: dict[str, int] | None = None
     store = usage_store()
     if store is not None:

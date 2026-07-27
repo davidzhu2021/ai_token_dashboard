@@ -1,6 +1,6 @@
 # AI 用量中心
 
-AI 用量中心是面向公司员工的 AI 工具用量查询系统。项目由 FastAPI 后端和静态前端组成：后端负责企业登录、会话、权限校验、上游用量聚合、访问密钥管理和模型列表查询；前端负责中文看板、图表、团队/部门视图和模型广场。
+AI 用量中心是面向公司员工和获准注册用户的 AI 工具用量查询系统。项目由 FastAPI 后端和静态前端组成：后端负责企业登录、邮箱注册与登录、会话、权限校验、上游用量聚合、访问密钥管理和模型列表查询；前端负责中文看板、图表、团队/部门视图和模型广场。
 
 系统入口由后端统一提供，避免额外的前后端跨域配置：
 
@@ -17,7 +17,8 @@ https://myai.carher.net
 ## 当前能力
 
 - 飞书扫码登录：复用公司 Casdoor + 飞书 SSO 登录链路，并按企业邮箱域名限制访问。
-- 邮箱注册与密码登录：可选启用邮箱验证码注册、密码登录、找回/修改密码和服务端会话；默认安全关闭，不影响现有 SSO。
+- 邮箱注册与密码登录：可选为 `auto-link.com.cn`、`gmail.com`、`qq.com`、`163.com` 开放邮箱验证码注册、密码登录、找回/修改密码和服务端会话；默认安全关闭，不影响现有 SSO。
+- 注册权限隔离：新注册账号默认没有模型访问权限，不自动创建访问密钥；充值能力属于后续阶段，本期需由管理员另行开通权限。
 - 我的用量：员工登录后只能查看自己的 Token、金额、请求次数、成功率、来源拆分、模型排行和明细。
 - 个人访问密钥：展示本人访问密钥的名称、用途、掩码、状态、最近使用时间和用量，并支持本人密钥再生成。
 - 团队负责人看板：团队负责人可查看自己负责团队的成员用量、趋势、来源占比、模型排行和成员排行。
@@ -135,19 +136,20 @@ AUTH_ENABLED=false
 PASSWORD_LOGIN_ENABLED=false
 PUBLIC_SIGNUP_ENABLED=false
 EMAIL_VERIFICATION_REQUIRED=true
-AUTH_ALLOWED_EMAIL_DOMAINS=auto-link.com.cn
+AUTH_ALLOWED_EMAIL_DOMAINS=auto-link.com.cn,gmail.com,qq.com,163.com
 AUTH_DATABASE_PATH=.data/auth.sqlite3
+AUTH_DEFAULT_UPSTREAM_ROLE=internal_user_viewer
 AUTH_SESSION_TTL_SECONDS=1209600
 AUTH_VERIFICATION_TTL_SECONDS=600
 AUTH_PASSWORD_RESET_TTL_SECONDS=1800
 AUTH_PROVISIONING_RETRY_SECONDS=30
 AUTH_ENTITLEMENT_CACHE_TTL_SECONDS=30
 
-SMTP_HOST=
+SMTP_HOST=<transactional-smtp-host>
 SMTP_PORT=587
-SMTP_FROM=
-SMTP_USERNAME=
-SMTP_PASSWORD=
+SMTP_FROM=no-reply@notify.carher.net
+SMTP_USERNAME=<smtp-username>
+SMTP_PASSWORD=<smtp-password>
 SMTP_SSL=false
 SMTP_STARTTLS=true
 
@@ -204,8 +206,9 @@ USAGE_TIMEZONE_OFFSET_MINUTES=-480
 - `APP_BASE_URL` 本地开发可改为 `http://127.0.0.1:8000`，生产环境使用正式域名。
 - `SESSION_SECRET` 必须使用随机长字符串，生产环境不要使用示例值。
 - `AUTH_ENABLED`、`PASSWORD_LOGIN_ENABLED`、`PUBLIC_SIGNUP_ENABLED` 在模板中均默认关闭；三个开关应按后文的生产启用顺序逐步打开。
-- `AUTH_ALLOWED_EMAIL_DOMAINS` 是逗号分隔的精确邮箱域名白名单；留空代表不限制域名，生产公开注册不得留空。
+- `AUTH_ALLOWED_EMAIL_DOMAINS` 是逗号分隔的精确邮箱域名白名单；ToC 首期固定为 `auto-link.com.cn,gmail.com,qq.com,163.com`，不匹配子域名或后缀相似域名。留空代表不限制域名，生产公开注册不得留空。
 - `AUTH_DATABASE_PATH` 当前指向本地 SQLite 文件。容器部署必须将其放在持久化卷中；当前实现按单应用实例设计，不要让多个副本同时写同一个 SQLite 文件。
+- `AUTH_DEFAULT_UPSTREAM_ROLE=internal_user_viewer` 将新注册账号限制为只读角色；代码同时使用 `no-default-models` 禁止默认模型访问且不会自动创建访问密钥。不要将该变量设置为管理员角色。
 - `SMTP_PASSWORD`、`TURNSTILE_SECRET_KEY` 与 `SESSION_SECRET` 属于部署 Secret，不得写入前端、日志或仓库。
 - `AUTH_TRUSTED_PROXY_IPS` 只填写与应用直接连接的反向代理 IP 或 CIDR。为空时忽略 `X-Forwarded-For`；不得使用 `0.0.0.0/0` 或 `::/0` 这样的全网信任范围。
 - `ADMIN_EMAILS` 是管理员白名单，普通员工不会看到全员或部门看板入口。
@@ -237,15 +240,24 @@ USAGE_TIMEZONE_OFFSET_MINUTES=-480
 
 SMTP 配置：
 
-- `SMTP_HOST`、`SMTP_PORT`、`SMTP_FROM` 指定邮件服务器、端口和发件人；生产密码登录必须配置可用 SMTP，因为注册验证和密码找回都依赖邮件。
+- `SMTP_HOST`、`SMTP_PORT`、`SMTP_FROM` 指定邮件服务器、端口和发件人；生产使用专用事务邮件服务，默认发件人示例为 `no-reply@notify.carher.net`，不使用个人 QQ、163 或 Gmail 邮箱账号。注册验证和密码找回都依赖可用 SMTP。
 - `SMTP_USERNAME`、`SMTP_PASSWORD` 用于 SMTP 鉴权。账号或密码为空只适用于明确允许匿名投递的内网邮件服务。
 - `SMTP_SSL=true` 表示连接建立时直接使用 TLS，通常配合 465 端口；`SMTP_STARTTLS=true` 表示普通连接后升级 TLS，通常配合 587 端口。不要同时启用两种模式，也不要在生产环境关闭传输加密。
+- 上线前必须按事务邮件服务商要求为 `notify.carher.net` 添加并验证 SPF/DKIM 记录；SMTP 账号和 DNS 配置属于部署外部依赖，仓库不能生成这些凭据。
 
 Turnstile 配置：
 
 - 面向互联网开放密码登录或注册时，必须配置 Cloudflare Turnstile，以保护登录、验证码、注册和找回密码入口。后端只有在邮箱验证、域名白名单、SMTP 和 Turnstile 全部就绪时才会真正开放注册接口。
 - 在 Cloudflare 控制台为正式域名创建站点，分别填入 `TURNSTILE_SITE_KEY` 和 `TURNSTILE_SECRET_KEY`，确认前后端验证成功后再设置 `TURNSTILE_ENABLED=true`。
 - `TURNSTILE_SECRET_KEY` 只能保存在后端 Secret 中。若 `TURNSTILE_ENABLED=true` 但任一 key 缺失，健康检查会标记为 degraded，相关认证请求会返回配置错误。
+- Turnstile 站点必须限制为 `myai.carher.net`。Site Key 可以由配置接口提供给浏览器，Secret Key 只能保存在生产服务器；仓库不能代替 Cloudflare 创建有效 Key。
+
+注册后的权限策略：
+
+- 注册成功会创建本地账号并尝试创建受限的用量系统账号；开户请求不自动创建访问密钥，模型范围使用 `no-default-models`，默认角色为 `internal_user_viewer`。
+- 即使开户成功，新用户的 `entitlementStatus` 仍为 `inactive`，在管理员开通权限前不能查询个人用量、创建访问密钥或调用模型。
+- 本期不包含支付订单、充值回调、余额扣减或充值后自动激活。后续充值功能以 `entitlementStatus` 为接入点；在此之前只能由管理员人工开通。
+- 飞书 SSO 与本地密码账号并存，但不会因为邮箱相同而自动合并身份。
 
 反向代理配置：
 
@@ -256,13 +268,16 @@ Turnstile 配置：
 生产启用顺序：
 
 1. 首次部署保持三个认证开关均为 `false`，确认 `/api/health` 正常且原有飞书 SSO 登录不受影响。
-2. 设置稳定随机的 `SESSION_SECRET`、持久化 `AUTH_DATABASE_PATH`，完成数据库备份方案，并准确填写 `APP_BASE_URL` 和 `AUTH_TRUSTED_PROXY_IPS`。
-3. 配置并实测 SMTP 的验证码和重置邮件；保持 `EMAIL_VERIFICATION_REQUIRED=true`。
+2. 设置稳定随机的 `SESSION_SECRET`，确认 `/app/.data/auth.sqlite3` 位于持久化卷，保持单应用实例并完成定期备份与恢复演练；同时准确填写 `APP_BASE_URL` 和 `AUTH_TRUSTED_PROXY_IPS`。
+3. 准备专用事务邮件账号，完成 `notify.carher.net` 的 SPF/DKIM 配置并实测验证码和重置邮件；保持 `EMAIL_VERIFICATION_REQUIRED=true`。
 4. 配置 Turnstile 正式域名、Site Key 和 Secret Key，先验证成功，再设置 `TURNSTILE_ENABLED=true`。
 5. 先设置 `AUTH_ENABLED=true`、`PASSWORD_LOGIN_ENABLED=true`，同时保持 `PUBLIC_SIGNUP_ENABLED=false`，验证页面、CSRF、限流和已有测试账号登录流程。
-6. 设置严格的 `AUTH_ALLOWED_EMAIL_DOMAINS`，最后再开启 `PUBLIC_SIGNUP_ENABLED=true`，完整验证注册、邮箱验证码、登录、退出、找回密码及账号开户状态。
+6. 设置 `AUTH_ALLOWED_EMAIL_DOMAINS=auto-link.com.cn,gmail.com,qq.com,163.com` 和 `AUTH_DEFAULT_UPSTREAM_ROLE=internal_user_viewer`，用指定测试邮箱确认开户成功且权限为 `inactive`。
+7. 最后开启 `PUBLIC_SIGNUP_ENABLED=true`，完整验证注册、邮箱验证码、登录、退出、找回密码及账号开户状态。
 
 若本地认证出现故障，优先将 `PUBLIC_SIGNUP_ENABLED=false` 停止新注册；需要完全关闭密码入口时，再将 `PASSWORD_LOGIN_ENABLED=false` 或 `AUTH_ENABLED=false`。这些操作不会关闭已配置的 SSO。当前不会自动把同邮箱的本地账号与 SSO 身份合并，上线前应避免为同一员工重复建立两套账号。
+
+生产开放注册的外部阻塞项是有效的事务邮件 SMTP 账号、`notify.carher.net` 的 SPF/DKIM、绑定 `myai.carher.net` 的 Turnstile Site/Secret Key，以及可恢复的 SQLite 备份方案。任一项未完成时都应保持 `PUBLIC_SIGNUP_ENABLED=false`；不要通过强制显示表单或关闭安全校验来假开启注册。
 
 ## 飞书扫码登录配置
 
@@ -456,7 +471,7 @@ GET /api/auth/sso/start
 - `.env` 已加入忽略规则，不应提交到远端仓库。
 - 生产环境必须保持 `DEV_LOGIN_ENABLED=false`、`DEBUG_MAPPING_ENABLED=false`、`DEBUG_OIDC_CLAIMS=false`；SSO 可以与本地认证并存，并应保留为企业用户的稳定登录与应急入口。
 - 生产公开注册必须同时启用邮箱验证、严格域名白名单、可用 SMTP 和 Turnstile；任一项未准备好时保持 `PUBLIC_SIGNUP_ENABLED=false`。
-- 本地认证数据库和部署 Secret 必须纳入权限控制与备份；不得把 SQLite 文件、SMTP 密码、Turnstile Secret 或 session secret 放入镜像或 Git。
+- 本地认证数据库和部署 Secret 必须纳入权限控制与备份；SQLite 部署保持单实例，并定期备份 `/app/.data/auth.sqlite3`。不得把 SQLite 文件、SMTP 密码、Turnstile Secret 或 session secret 放入镜像或 Git。
 
 ## 测试与验证
 

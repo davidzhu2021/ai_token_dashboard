@@ -87,6 +87,20 @@ let authConfig = {
   turnstileEnabled: false,
   turnstileConfigured: false,
   turnstileSiteKey: "",
+  passwordLoginConfigured: false,
+  passwordLoginAvailable: false,
+  passwordLoginUnavailableCode: "",
+  passwordLoginUnavailableReason: "",
+  publicSignupConfigured: false,
+  publicSignupAvailable: false,
+  publicSignupUnavailableCode: "",
+  publicSignupUnavailableReason: "",
+  passwordRecoveryEnabled: false,
+  passwordRecoveryConfigured: false,
+  passwordRecoveryAvailable: false,
+  passwordRecoveryUnavailableCode: "",
+  passwordRecoveryUnavailableReason: "",
+  allowedSignupDomains: [],
 };
 let authAccess = "personal";
 let authMode = "login";
@@ -462,6 +476,97 @@ function validEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 254;
 }
 
+function signupDomains() {
+  if (!Array.isArray(authConfig.allowedSignupDomains)) return [];
+  return [...new Set(authConfig.allowedSignupDomains
+    .map((domain) => String(domain || "").trim().toLowerCase().replace(/^@/, ""))
+    .filter(Boolean))];
+}
+
+function formatSignupDomains(domains = signupDomains()) {
+  return domains.join("、");
+}
+
+function signupEmailAllowed(email) {
+  const domains = signupDomains();
+  if (!domains.length || !validEmail(email)) return true;
+  return domains.includes(email.slice(email.lastIndexOf("@") + 1).toLowerCase());
+}
+
+function localAuthUnavailableMessage(code) {
+  return {
+    AUTH_PASSWORD_LOGIN_DISABLED: "邮箱密码登录暂未开放。",
+    AUTH_PASSWORD_LOGIN_NOT_CONFIGURED: "邮箱登录服务尚未配置完成，暂时不可用。",
+    AUTH_PASSWORD_EMAIL_NOT_CONFIGURED: "账号邮件服务尚未配置完成，密码找回暂时不可用。",
+    AUTH_TURNSTILE_NOT_CONFIGURED: "安全验证尚未配置完成，邮箱登录与注册暂时不可用。",
+    AUTH_DATABASE_NOT_CONFIGURED: "账号服务尚未配置完成，邮箱登录与注册暂时不可用。",
+    AUTH_SIGNUP_DISABLED: "邮箱注册暂未开放。",
+    AUTH_SIGNUP_NOT_CONFIGURED: "注册服务尚未配置完成，暂时无法创建账号。",
+    AUTH_SIGNUP_EMAIL_NOT_CONFIGURED: "注册邮件服务尚未配置完成，暂时无法发送验证码。",
+    AUTH_SIGNUP_DOMAINS_NOT_CONFIGURED: "注册邮箱范围尚未配置完成，暂时无法创建账号。",
+    AUTH_SIGNUP_EMAIL_VERIFICATION_REQUIRED: "生产注册必须启用邮箱验证。",
+  }[String(code || "").trim()] || "";
+}
+
+function configuredLocalAuthMessage(fallback = "") {
+  return localAuthUnavailableMessage(authConfig.passwordLoginUnavailableCode)
+    || String(authConfig.passwordLoginUnavailableReason || "").trim()
+    || fallback;
+}
+
+function configuredSignupMessage(fallback = "") {
+  return localAuthUnavailableMessage(authConfig.publicSignupUnavailableCode)
+    || String(authConfig.publicSignupUnavailableReason || "").trim()
+    || fallback;
+}
+
+function configuredPasswordRecoveryMessage(fallback = "") {
+  return localAuthUnavailableMessage(authConfig.passwordRecoveryUnavailableCode)
+    || String(authConfig.passwordRecoveryUnavailableReason || "").trim()
+    || fallback;
+}
+
+function turnstileMisconfigured() {
+  return Boolean(authConfig.turnstileEnabled) && (!authConfig.turnstileConfigured || !authConfig.turnstileSiteKey);
+}
+
+function passwordLoginAvailable() {
+  return Boolean(authConfig.passwordLoginEnabled)
+    && authConfig.passwordLoginAvailable !== false
+    && authConfig.passwordLoginConfigured !== false
+    && !turnstileMisconfigured();
+}
+
+function publicSignupAvailable() {
+  return passwordLoginAvailable()
+    && Boolean(authConfig.publicSignupEnabled)
+    && authConfig.publicSignupAvailable !== false
+    && authConfig.publicSignupConfigured !== false;
+}
+
+function passwordRecoveryAvailable() {
+  return passwordLoginAvailable()
+    && authConfig.passwordRecoveryEnabled !== false
+    && authConfig.passwordRecoveryAvailable !== false
+    && authConfig.passwordRecoveryConfigured !== false;
+}
+
+function setAuthAvailabilityNotice(message = "", tone = "info") {
+  const notice = el("authAvailabilityNotice");
+  if (!notice) return;
+  notice.textContent = message;
+  notice.className = `auth-status${message ? ` show ${tone}` : ""}`;
+  notice.setAttribute("role", tone === "error" ? "alert" : "status");
+  notice.setAttribute("aria-live", tone === "error" ? "assertive" : "polite");
+}
+
+function updateSignupPolicyCopy() {
+  const domains = signupDomains();
+  const domainCopy = domains.length ? `支持 ${formatSignupDomains(domains)} 邮箱注册。` : "";
+  const note = el("registerPolicyNote");
+  if (note) note.textContent = `${domainCopy}账号创建后，充值或由管理员开通后方可使用模型和额度。`;
+}
+
 function setGlobalPage(page) {
   document.querySelectorAll("[data-global-page]").forEach((item) => {
     const isActive = item.dataset.globalPage === page;
@@ -472,7 +577,7 @@ function setGlobalPage(page) {
 }
 
 function setAuthAccess(access) {
-  const personalAvailable = Boolean(authConfig.passwordLoginEnabled);
+  const personalAvailable = passwordLoginAvailable();
   const enterpriseAvailable = Boolean(authConfig.oidcConfigured);
   if (access === "personal" && personalAvailable) authAccess = "personal";
   else if (access === "enterprise" && enterpriseAvailable) authAccess = "enterprise";
@@ -508,7 +613,10 @@ function authScreenForMode(mode) {
 }
 
 function setAuthMode(mode, { focus = true } = {}) {
-  const requestedMode = ["login", "register", "forgot", "reset"].includes(mode) ? mode : "login";
+  let requestedMode = ["login", "register", "forgot", "reset"].includes(mode) ? mode : "login";
+  if (requestedMode === "register" && !publicSignupAvailable()) requestedMode = "login";
+  if (requestedMode === "forgot" && !passwordRecoveryAvailable()) requestedMode = "login";
+  if (requestedMode === "reset" && !passwordLoginAvailable()) requestedMode = "login";
   if (authMode === "reset" && requestedMode !== "reset") clearResetPasswordToken();
   authMode = requestedMode;
   clearAuthErrors();
@@ -531,10 +639,11 @@ function setAuthMode(mode, { focus = true } = {}) {
 }
 
 function updateAuthAvailability() {
-  const passwordEnabled = Boolean(authConfig.passwordLoginEnabled);
-  const signupEnabled = passwordEnabled && Boolean(authConfig.publicSignupEnabled);
+  const passwordEnabled = passwordLoginAvailable();
+  const signupEnabled = publicSignupAvailable();
+  const recoveryEnabled = passwordRecoveryAvailable();
   const ssoEnabled = Boolean(authConfig.oidcConfigured);
-  const turnstileMisconfigured = Boolean(authConfig.turnstileEnabled) && (!authConfig.turnstileConfigured || !authConfig.turnstileSiteKey);
+  const securityUnavailable = turnstileMisconfigured();
   el("personalAccessTab").classList.toggle("hidden", !passwordEnabled);
   el("personalAccessTab").disabled = !passwordEnabled;
   el("personalAccessTab").setAttribute("aria-hidden", String(!passwordEnabled));
@@ -552,11 +661,17 @@ function updateAuthAvailability() {
   document.querySelectorAll("#personalAuthPanel input, #personalAuthPanel button").forEach((control) => {
     control.disabled = !passwordEnabled;
   });
+  document.querySelectorAll("#registerScreen input, #registerScreen button").forEach((control) => {
+    control.disabled = !signupEnabled;
+  });
   el("registerFlowTab").disabled = !signupEnabled;
-  el("registerButton").disabled = !signupEnabled || turnstileMisconfigured;
-  el("sendRegisterCodeButton").disabled = !signupEnabled || turnstileMisconfigured;
-  el("passwordLoginButton").disabled = !passwordEnabled || turnstileMisconfigured;
-  el("forgotSubmitButton").disabled = !passwordEnabled || turnstileMisconfigured;
+  el("registerButton").disabled = !signupEnabled;
+  el("sendRegisterCodeButton").disabled = !signupEnabled;
+  el("passwordLoginButton").disabled = !passwordEnabled;
+  el("forgotPasswordButton").classList.toggle("hidden", !recoveryEnabled);
+  el("forgotPasswordButton").disabled = !recoveryEnabled;
+  el("forgotPasswordButton").setAttribute("aria-hidden", String(!recoveryEnabled));
+  el("forgotSubmitButton").disabled = !recoveryEnabled;
   el("resetPasswordButton").disabled = !passwordEnabled || !resetPasswordToken;
 
   if (!passwordEnabled && resetPasswordToken) clearResetPasswordToken();
@@ -569,10 +684,24 @@ function updateAuthAvailability() {
   else if (authConfig.devLoginEnabled) el("guestAuthDescription").textContent = "使用下方开发环境邮箱入口登录。";
   else el("guestAuthDescription").textContent = "当前没有可用的登录方式，请联系管理员。";
 
-  if (turnstileMisconfigured && passwordEnabled) {
-    setAuthStatus("安全验证尚未正确配置，邮箱登录暂时不可用，请联系管理员。", "error");
+  updateSignupPolicyCopy();
+  const passwordReason = configuredLocalAuthMessage();
+  const signupReason = configuredSignupMessage();
+  const recoveryReason = configuredPasswordRecoveryMessage();
+  if (passwordReason && !passwordEnabled) {
+    setAuthAvailabilityNotice(passwordReason, "error");
+  } else if (securityUnavailable && authConfig.passwordLoginEnabled) {
+    setAuthAvailabilityNotice("安全验证尚未正确配置，邮箱登录与注册暂时不可用，请联系管理员。", "error");
+  } else if (passwordEnabled && !signupEnabled && !recoveryEnabled) {
+    setAuthAvailabilityNotice(`邮箱登录仍可用。${signupReason || "邮箱注册暂未开放。"}${recoveryReason || "密码找回暂不可用。"}`, "info");
+  } else if (passwordEnabled && !signupEnabled) {
+    setAuthAvailabilityNotice(`邮箱登录和密码找回仍可用。${signupReason || "邮箱注册暂未开放。"}`, "info");
+  } else if (passwordEnabled && !recoveryEnabled) {
+    setAuthAvailabilityNotice(`邮箱登录仍可用。${recoveryReason || "密码找回暂不可用。"}`, "info");
   } else if (!passwordEnabled && !ssoEnabled && !authConfig.devLoginEnabled) {
-    setAuthStatus("当前没有可用的登录方式，请联系管理员。", "error");
+    setAuthAvailabilityNotice("当前没有可用的登录方式，请联系管理员。", "error");
+  } else {
+    setAuthAvailabilityNotice();
   }
 }
 
@@ -584,7 +713,7 @@ function setVerificationCountdown(seconds) {
   delete button.dataset.idleLabel;
   const update = () => {
     const active = verificationCountdown > 0;
-    button.disabled = active;
+    button.disabled = active || !publicSignupAvailable();
     button.textContent = active ? `${verificationCountdown} 秒后重发` : "重新发送";
     if (!active && verificationTimer) {
       window.clearInterval(verificationTimer);
@@ -623,6 +752,7 @@ function validateAuthMode(mode) {
   if (mode === "register") {
     if (values.registerName.length < 2) reject("registerNameInput", "请输入至少 2 个字符的姓名");
     if (!validEmail(values.registerEmail)) reject("registerEmailInput", "请输入有效的邮箱地址");
+    else if (!signupEmailAllowed(values.registerEmail)) reject("registerEmailInput", `当前仅支持 ${formatSignupDomains()} 邮箱注册`);
     if (authConfig.emailVerificationRequired && !/^\d{6}$/.test(values.verificationCode)) reject("registerVerificationInput", "请输入邮件中的 6 位验证码");
     if (values.registerPassword.length < 8) reject("registerPasswordInput", "密码至少需要 8 个字符");
     if (values.registerPassword !== values.registerConfirmPassword) reject("registerConfirmPasswordInput", "两次输入的密码不一致");
@@ -648,9 +778,16 @@ function accountAccessCopy(user) {
       : { title: "账号正在开通", description: "我们正在同步你的个人用量空间，通常只需要一点时间。", retry: true };
   }
   if (["inactive", "expired", "suspended"].includes(entitlementStatus)) {
+    if (entitlementStatus === "inactive") {
+      return {
+        title: "账号已创建，等待开通",
+        description: "充值或由管理员开通后方可使用模型和额度。",
+        retry: false,
+      };
+    }
     return {
       title: entitlementStatus === "suspended" ? "访问权限已暂停" : "暂未获得使用权限",
-      description: entitlementStatus === "expired" ? "当前访问权限已到期，请联系管理员续期。" : "你的账号已经创建，但还没有可用模型或额度。请联系管理员开通。",
+      description: entitlementStatus === "expired" ? "当前访问权限已到期，请联系管理员续期。" : "当前访问权限已暂停，请联系管理员确认后续安排。",
       retry: false,
     };
   }
@@ -675,7 +812,9 @@ function updateHomeCard() {
   el("authGuestContent").classList.toggle("hidden", isLoggedIn);
   if (isLoggedIn) {
     el("loginTitle").textContent = `欢迎回来，${currentUser.name || currentUser.email}`;
-    el("loginDescription").textContent = "你已完成账号认证，可以继续进入控制台查看个人 AI 用量。";
+    el("loginDescription").textContent = accountAccessCopy(currentUser)
+      ? "账号已完成认证。进入控制台可查看当前开通状态。"
+      : "你已完成账号认证，可以继续进入控制台查看个人 AI 用量。";
     el("loginHint").textContent = `当前登录账号：${currentUser.email}`;
     return;
   }
@@ -705,7 +844,7 @@ function promptForLogin() {
   requestAnimationFrame(() => loginCard.classList.add("login-attention"));
   window.setTimeout(() => loginCard.classList.remove("login-attention"), 720);
   loginCard.scrollIntoView({ behavior: "smooth", block: "center" });
-  const firstLoginControl = authConfig.passwordLoginEnabled
+  const firstLoginControl = passwordLoginAvailable()
     ? el("loginEmailInput")
     : authConfig.oidcConfigured
       ? el("ssoButton")
@@ -3062,14 +3201,14 @@ function showLogin() {
   el("loginView").classList.remove("hidden");
   el("authLoadingView").classList.add("hidden");
   updateHomeCard();
-  setAuthAccess(authConfig.passwordLoginEnabled ? "personal" : "enterprise");
+  setAuthAccess(passwordLoginAvailable() ? "personal" : "enterprise");
   setAuthMode(resetPasswordToken ? "reset" : "login", { focus: false });
   setGlobalPage("home");
 }
 
 async function submitPasswordLogin() {
-  if (!authConfig.passwordLoginEnabled) {
-    setAuthStatus("邮箱密码登录暂未启用。", "error");
+  if (!passwordLoginAvailable()) {
+    setAuthStatus(configuredLocalAuthMessage("邮箱密码登录暂未启用。"), "error");
     return;
   }
   if (!validateAuthMode("login") || !requireTurnstile("login")) return;
@@ -3098,8 +3237,8 @@ async function submitPasswordLogin() {
 }
 
 async function submitRegistration() {
-  if (!authConfig.passwordLoginEnabled || !authConfig.publicSignupEnabled) {
-    setAuthStatus("公开注册暂未开放。", "error");
+  if (!publicSignupAvailable()) {
+    setAuthStatus(configuredSignupMessage("公开注册暂未开放。"), "error");
     return;
   }
   if (!validateAuthMode("register") || !requireTurnstile("register")) return;
@@ -3122,7 +3261,7 @@ async function submitRegistration() {
     el("loginEmailInput").value = values.registerEmail;
     el("loginPasswordInput").value = "";
     setAuthMode("login");
-    setAuthStatus("账号已创建，请使用刚刚设置的密码登录。", "success");
+    setAuthStatus("账号已创建，请使用刚刚设置的密码登录；充值或由管理员开通后方可使用模型和额度。", "success");
     resetTurnstile("register");
   } catch (error) {
     setAuthStatus(error.message || "账号创建失败，请检查填写内容后重试。", "error");
@@ -3134,8 +3273,8 @@ async function submitRegistration() {
 }
 
 async function submitForgotPassword() {
-  if (!authConfig.passwordLoginEnabled) {
-    setAuthStatus("邮箱密码登录暂未启用。", "error");
+  if (!passwordRecoveryAvailable()) {
+    setAuthStatus(configuredPasswordRecoveryMessage("密码找回暂未开放。"), "error");
     return;
   }
   if (!validateAuthMode("forgot") || !requireTurnstile("forgot")) return;
@@ -3191,9 +3330,18 @@ async function submitPasswordReset() {
 
 async function sendRegistrationCode() {
   clearAuthErrors();
+  if (!publicSignupAvailable()) {
+    setAuthStatus(configuredSignupMessage("公开注册暂未开放。"), "error");
+    return;
+  }
   const email = el("registerEmailInput").value.trim().toLowerCase();
   if (!validEmail(email)) {
     fieldError("registerEmailInput", "请先输入有效的邮箱地址");
+    el("registerEmailInput").focus();
+    return;
+  }
+  if (!signupEmailAllowed(email)) {
+    fieldError("registerEmailInput", `当前仅支持 ${formatSignupDomains()} 邮箱注册`);
     el("registerEmailInput").focus();
     return;
   }
@@ -3778,6 +3926,20 @@ async function init() {
       turnstileEnabled: false,
       turnstileConfigured: false,
       turnstileSiteKey: "",
+      passwordLoginConfigured: false,
+      passwordLoginAvailable: false,
+      passwordLoginUnavailableCode: "AUTH_PASSWORD_LOGIN_DISABLED",
+      passwordLoginUnavailableReason: "邮箱密码登录暂未开放。",
+      publicSignupConfigured: false,
+      publicSignupAvailable: false,
+      publicSignupUnavailableCode: "AUTH_SIGNUP_DISABLED",
+      publicSignupUnavailableReason: "邮箱注册暂未开放。",
+      passwordRecoveryEnabled: false,
+      passwordRecoveryConfigured: false,
+      passwordRecoveryAvailable: false,
+      passwordRecoveryUnavailableCode: "AUTH_PASSWORD_LOGIN_DISABLED",
+      passwordRecoveryUnavailableReason: "密码找回暂未开放。",
+      allowedSignupDomains: [],
     };
   }
   setupModelFilters();

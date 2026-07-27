@@ -21,6 +21,8 @@ def test_auth_page_exposes_password_registration_and_recovery_flows() -> None:
     assert 'data-password-toggle="loginPasswordInput"' in response.text
     assert 'id="ssoButton"' in response.text
     assert 'id="devLoginButton"' in response.text
+    assert 'id="authLoadingView" class="login-shell"' in response.text
+    assert 'id="loginView" class="login-shell hidden"' in response.text
 
 
 def test_frontend_calls_local_auth_endpoints_and_attaches_csrf() -> None:
@@ -76,13 +78,35 @@ def test_frontend_keeps_session_state_on_transient_auth_failures() -> None:
 
 def test_frontend_disables_unavailable_auth_methods_and_handles_turnstile_config() -> None:
     source = APP_JS.read_text(encoding="utf-8")
+    markup = INDEX_HTML.read_text(encoding="utf-8")
 
     assert 'else authAccess = "none"' in source
     assert 'control.disabled = !passwordEnabled' in source
-    assert 'if (!authConfig.passwordLoginEnabled)' in source
+    assert 'if (!passwordLoginAvailable())' in source
+    assert 'function publicSignupAvailable()' in source
+    assert 'function passwordRecoveryAvailable()' in source
+    assert 'passwordRecoveryAvailable: false' in source
     assert 'turnstileConfigured: false' in source
     assert '!authConfig.turnstileConfigured || !authConfig.turnstileSiteKey' in source
-    assert '安全验证尚未正确配置，邮箱登录暂时不可用' in source
+    assert '安全验证尚未正确配置，邮箱登录与注册暂时不可用' in source
+    assert 'id="authAvailabilityNotice"' in markup
+    assert 'if (!publicSignupAvailable()) {' in source
+    assert 'forgotPasswordButton").classList.toggle("hidden", !recoveryEnabled)' in source
+    assert '邮箱登录仍可用。' in source
+
+
+def test_frontend_explains_signup_domains_and_inactive_access_policy() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+
+    assert 'allowedSignupDomains: []' in source
+    assert 'function signupEmailAllowed(email)' in source
+    assert '当前仅支持 ${formatSignupDomains()} 邮箱注册' in source
+    assert 'id="registerPolicyNote"' in markup
+    assert "gmail.com、qq.com、163.com 和 auto-link.com.cn" in markup
+    assert "账号已创建，请使用刚刚设置的密码登录；充值或由管理员开通后方可使用模型和额度。" in source
+    assert 'title: "账号已创建，等待开通"' in source
+    assert 'description: "充值或由管理员开通后方可使用模型和额度。"' in source
 
 
 def test_frontend_clears_reset_tokens_and_exposes_accessible_tabs() -> None:

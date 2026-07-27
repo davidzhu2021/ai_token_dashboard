@@ -3678,11 +3678,11 @@
     </style>
   </head>
   <body>
-    <section id="authLoadingView" class="login-shell hidden" aria-live="polite">
+    <section id="authLoadingView" class="login-shell" aria-live="polite">
       <div class="login-panel" style="margin:auto;max-width:460px">
         <div class="login-card">
-          <h2>正在完成登录</h2>
-          <p id="authLoadingHint" class="hint">正在确认账号并加载个人用量，请稍候…</p>
+          <h2>正在加载登录方式</h2>
+          <p id="authLoadingHint" class="hint">正在检查可用的登录方式和账号状态，请稍候…</p>
           <div class="loading-bar" aria-hidden="true"><span></span></div>
           <button id="authLoadingRetryButton" class="ghost-btn hidden" type="button">重新加载</button>
         </div>
@@ -3718,7 +3718,7 @@
       <symbol id="icon-warning" viewBox="0 0 24 24"><path d="M12 4 21 20H3L12 4Z"></path><path d="M12 9v5"></path><path d="M12 17.5h.1"></path></symbol>
       <symbol id="icon-search" viewBox="0 0 24 24"><path d="M11 18a7 7 0 1 1 0-14 7 7 0 0 1 0 14Z"></path><path d="m16 16 4 4"></path></symbol>
     </svg>
-    <section id="loginView" class="login-shell">
+    <section id="loginView" class="login-shell hidden">
       <nav class="global-nav login-global-nav" aria-label="全局导航">
         <button class="global-nav-item active" type="button" data-global-page="home" aria-current="page">主页</button>
         <button class="global-nav-item" type="button" data-global-page="console">控制台</button>
@@ -3759,6 +3759,7 @@
           <div id="authGuestContent">
             <h2 id="guestAuthTitle">登录 AI 用量中心</h2>
             <p id="guestAuthDescription">使用邮箱账号或企业账号进入控制台。</p>
+            <p id="authAvailabilityNotice" class="auth-status" role="status" aria-live="polite"></p>
 
             <div id="authAccessSwitch" class="auth-access-switch" role="tablist" aria-label="登录方式">
               <button id="personalAccessTab" class="auth-access-tab" type="button" role="tab" aria-selected="true" aria-controls="personalAuthPanel" tabindex="0" data-auth-access="personal">邮箱账号</button>
@@ -3798,7 +3799,7 @@
               </section>
 
               <section id="registerScreen" class="auth-screen hidden" role="tabpanel" aria-labelledby="registerFlowTab" aria-hidden="true">
-                <p class="auth-screen-note">注册后将为你开通个人用量空间。账号权限可能需要短暂同步。</p>
+                <p id="registerPolicyNote" class="auth-screen-note">支持 gmail.com、qq.com、163.com 和 auto-link.com.cn 邮箱注册。账号创建后，充值或由管理员开通后方可使用模型和额度。</p>
                 <div class="field">
                   <label for="registerNameInput">姓名</label>
                   <input id="registerNameInput" class="input" name="name" type="text" placeholder="你的姓名" autocomplete="name" minlength="2" maxlength="50" />
@@ -4823,6 +4824,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260726-csrf-recovery"></script>
+    <script src="/assets/app.js?v=20260727-toc-auth"></script>
   </body>
 </html>

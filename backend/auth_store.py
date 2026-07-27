@@ -201,6 +201,7 @@ class AuthStore:
                 attempts INTEGER NOT NULL DEFAULT 0,
                 max_attempts INTEGER NOT NULL DEFAULT 5,
                 consumed_at TEXT,
+                claimed_at TEXT,
                 created_at TEXT NOT NULL
             )
             """,
@@ -295,6 +296,12 @@ class AuthStore:
                         connection.execute(
                             "UPDATE auth_password_reset_tokens SET activated_at = created_at WHERE activated_at IS NULL"
                         )
+                    verification_columns = {
+                        str(row["name"])
+                        for row in connection.execute("PRAGMA table_info(auth_verification_codes)").fetchall()
+                    }
+                    if "claimed_at" not in verification_columns:
+                        connection.execute("ALTER TABLE auth_verification_codes ADD COLUMN claimed_at TEXT")
                     connection.execute("COMMIT")
             except sqlite3.Error as exc:
                 raise AuthStoreError("无法初始化认证数据库") from exc
@@ -518,15 +525,16 @@ class AuthStore:
             return valid
 
     def claim_verification_code(self, email: str, purpose: str, code_or_hash: str) -> str | None:
-        """Validate a code without consuming it before account creation succeeds."""
+        """Atomically reserve one verification code for a registration attempt."""
         normalized = self.normalize_email(email)
         candidates = self._candidate_hashes(code_or_hash)
+        now = self._now().isoformat()
         with self._lock, self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
                 SELECT * FROM auth_verification_codes
-                WHERE email = ? AND purpose = ? AND consumed_at IS NULL
+                WHERE email = ? AND purpose = ? AND consumed_at IS NULL AND claimed_at IS NULL
                 ORDER BY created_at DESC LIMIT 1
                 """,
                 (normalized, str(purpose)),
@@ -536,7 +544,13 @@ class AuthStore:
                 return None
             attempts = int(row["attempts"]) + 1
             valid = any(secrets.compare_digest(str(row["code_hash"]), candidate) for candidate in candidates)
-            connection.execute("UPDATE auth_verification_codes SET attempts = ? WHERE id = ?", (attempts, row["id"]))
+            if valid:
+                connection.execute(
+                    "UPDATE auth_verification_codes SET attempts = ?, claimed_at = ? WHERE id = ? AND claimed_at IS NULL",
+                    (attempts, now, row["id"]),
+                )
+            else:
+                connection.execute("UPDATE auth_verification_codes SET attempts = ? WHERE id = ?", (attempts, row["id"]))
             connection.execute("COMMIT")
             return str(row["id"]) if valid else None
 
@@ -544,10 +558,75 @@ class AuthStore:
         now = self._now().isoformat()
         with self._lock, self._connection() as connection:
             cursor = connection.execute(
-                "UPDATE auth_verification_codes SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL",
+                "UPDATE auth_verification_codes SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL AND claimed_at IS NOT NULL",
                 (now, str(code_id)),
             )
         return cursor.rowcount == 1
+
+    def release_claimed_verification_code(self, code_id: str) -> bool:
+        """Release a failed registration attempt without reviving consumed codes."""
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE auth_verification_codes SET claimed_at = NULL WHERE id = ? AND consumed_at IS NULL AND claimed_at IS NOT NULL",
+                (str(code_id),),
+            )
+        return cursor.rowcount == 1
+
+    def create_user_from_verification(
+        self,
+        email: str,
+        name: str | None,
+        password_hash: str,
+        purpose: str,
+        code_or_hash: str,
+        *,
+        status: str = "active",
+        user_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Create one user and consume one valid code in the same transaction."""
+        normalized = self.normalize_email(email)
+        if not password_hash:
+            raise ValueError("密码哈希不能为空")
+        candidates = self._candidate_hashes(code_or_hash)
+        now = self._now().isoformat()
+        identifier = user_id or str(uuid.uuid4())
+        display = (name or normalized.split("@", 1)[0]).strip() or normalized.split("@", 1)[0]
+        try:
+            with self._lock, self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT * FROM auth_verification_codes
+                    WHERE email = ? AND purpose = ? AND consumed_at IS NULL AND claimed_at IS NULL
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (normalized, str(purpose)),
+                ).fetchone()
+                if row is None or self._is_expired(row["expires_at"]) or int(row["attempts"]) >= int(row["max_attempts"]):
+                    connection.execute("COMMIT")
+                    return None
+                attempts = int(row["attempts"]) + 1
+                valid = any(secrets.compare_digest(str(row["code_hash"]), candidate) for candidate in candidates)
+                if not valid:
+                    connection.execute("UPDATE auth_verification_codes SET attempts = ? WHERE id = ?", (attempts, row["id"]))
+                    connection.execute("COMMIT")
+                    return None
+                connection.execute(
+                    "UPDATE auth_verification_codes SET attempts = ?, consumed_at = ? WHERE id = ? AND consumed_at IS NULL",
+                    (attempts, now, row["id"]),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO auth_users
+                        (id, email, name, password_hash, email_verified, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (identifier, normalized, display, password_hash, 1, status, now, now),
+                )
+                connection.execute("COMMIT")
+        except sqlite3.IntegrityError as exc:
+            raise DuplicateEmailError("该邮箱已注册") from exc
+        return self.get_user(identifier)
 
     def verify_verification_code(self, email: str, purpose: str, code_or_hash: str) -> bool:
         return self.consume_verification_code(email, purpose, code_or_hash)

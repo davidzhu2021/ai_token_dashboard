@@ -79,6 +79,26 @@ def test_claimed_verification_code_is_consumed_after_followup_succeeds(tmp_path)
     assert store.claim_verification_code("person@example.com", "signup", hash_auth_token("123456")) is None
 
 
+def test_registration_code_can_create_only_one_user_across_threads(tmp_path) -> None:
+    store = AuthStore(tmp_path / "auth.sqlite3")
+    store.create_verification_code("person@example.com", "signup", hash_auth_token("123456"), future())
+
+    def register(index: int):
+        return store.create_user_from_verification(
+            "person@example.com",
+            f"Person {index}",
+            hash_password("password-123"),
+            "signup",
+            hash_auth_token("123456"),
+        )
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(register, range(4)))
+
+    assert sum(result is not None for result in results) == 1
+    assert store.get_user_by_email("person@example.com") is not None
+
+
 def test_expired_verification_code_is_rejected(tmp_path) -> None:
     store = AuthStore(tmp_path / "auth.sqlite3")
     store.create_verification_code(

@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 
 from backend import main
-from backend.auth import hash_auth_token
+from backend.auth import hash_auth_token, hash_password
 from backend.auth_store import AuthStore
 
 
@@ -13,6 +13,7 @@ class FakeProvisioningClient:
     def __init__(self) -> None:
         self.created: list[dict] = []
         self.user_models: list[str] = ["no-default-models"]
+        self.key_or_model_calls: list[str] = []
 
     async def create_internal_user(self, user_id, email, name=None):
         self.created.append({"user_id": user_id, "email": email, "name": name})
@@ -20,6 +21,29 @@ class FakeProvisioningClient:
 
     async def user_info(self, user_id):
         return {"user_id": user_id, "models": self.user_models, "max_budget": None}
+
+    async def usage_rows_for_user_ids(self, *_args, **_kwargs):
+        self.key_or_model_calls.append("usage_rows_for_user_ids")
+        return []
+
+    def __getattr__(self, name: str):
+        if name in {
+            "available_key_models",
+            "keys_for_user_ids",
+            "create_key",
+            "supports_atomic_key_regeneration",
+            "regenerate_key",
+            "create_replacement_key",
+            "disable_pending_old_key",
+            "delete_key",
+            "models",
+        }:
+            async def blocked(*_args, **_kwargs):
+                self.key_or_model_calls.append(name)
+                raise AssertionError(f"inactive local user reached upstream {name}")
+
+            return blocked
+        raise AttributeError(name)
 
 
 def auth_client(tmp_path, monkeypatch, *, signup=True):
@@ -72,7 +96,32 @@ def test_local_runtime_allows_development_session_secret(monkeypatch) -> None:
     main.validate_runtime_auth_config()
 
 
-def test_https_runtime_rejects_incomplete_public_signup(monkeypatch) -> None:
+def test_public_http_runtime_rejects_local_auth(monkeypatch) -> None:
+    monkeypatch.setenv("APP_BASE_URL", "http://dashboard.example.com")
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    monkeypatch.setenv("PASSWORD_LOGIN_ENABLED", "true")
+
+    try:
+        main.validate_runtime_auth_config()
+    except RuntimeError as exc:
+        assert "APP_BASE_URL" in str(exc)
+        assert "HTTPS" in str(exc)
+    else:
+        raise AssertionError("public password authentication must require HTTPS")
+
+
+def test_session_cookie_max_age_uses_auth_session_ttl(monkeypatch) -> None:
+    monkeypatch.setenv("AUTH_SESSION_TTL_SECONDS", "900")
+    assert main.session_cookie_max_age() == 900
+
+    monkeypatch.setenv("AUTH_SESSION_TTL_SECONDS", "30")
+    assert main.session_cookie_max_age() == 300
+
+    monkeypatch.setenv("AUTH_SESSION_TTL_SECONDS", "invalid")
+    assert main.session_cookie_max_age() == 1_209_600
+
+
+def test_https_runtime_keeps_sso_available_when_public_signup_is_not_ready(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("APP_BASE_URL", "https://dashboard.example.com")
     monkeypatch.setenv("SESSION_SECRET", "x" * 64)
     monkeypatch.setenv("AUTH_ENABLED", "true")
@@ -80,6 +129,7 @@ def test_https_runtime_rejects_incomplete_public_signup(monkeypatch) -> None:
     monkeypatch.setenv("PUBLIC_SIGNUP_ENABLED", "true")
     monkeypatch.setenv("EMAIL_VERIFICATION_REQUIRED", "true")
     monkeypatch.setenv("AUTH_ALLOWED_EMAIL_DOMAINS", "example.com")
+    monkeypatch.setenv("AUTH_DATABASE_PATH", str(tmp_path / "auth.sqlite3"))
     monkeypatch.setenv("TURNSTILE_ENABLED", "true")
     monkeypatch.setenv("TURNSTILE_SITE_KEY", "site-key")
     monkeypatch.setenv("TURNSTILE_SECRET_KEY", "secret-key")
@@ -87,30 +137,60 @@ def test_https_runtime_rejects_incomplete_public_signup(monkeypatch) -> None:
     monkeypatch.delenv("AUTH_EMAIL_DEBUG", raising=False)
     monkeypatch.delenv("DEV_LOGIN_ENABLED", raising=False)
 
-    try:
-        main.validate_runtime_auth_config()
-    except RuntimeError as exc:
-        assert "公开注册" in str(exc)
-    else:
-        raise AssertionError("HTTPS deployment must reject incomplete public signup configuration")
+    main.validate_runtime_auth_config()
+    assert main.password_login_unavailable_code() == ""
+    assert main.signup_unavailable_code() == "AUTH_SIGNUP_EMAIL_NOT_CONFIGURED"
 
 
-def test_https_runtime_rejects_password_login_without_turnstile(monkeypatch) -> None:
+def test_https_password_login_reports_unavailable_without_turnstile(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("APP_BASE_URL", "https://dashboard.example.com")
     monkeypatch.setenv("SESSION_SECRET", "x" * 64)
     monkeypatch.setenv("AUTH_ENABLED", "true")
     monkeypatch.setenv("PASSWORD_LOGIN_ENABLED", "true")
     monkeypatch.setenv("PUBLIC_SIGNUP_ENABLED", "false")
+    monkeypatch.setenv("AUTH_DATABASE_PATH", str(tmp_path / "auth.sqlite3"))
+    monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("SMTP_FROM", "noreply@example.com")
     monkeypatch.setenv("TURNSTILE_ENABLED", "false")
     monkeypatch.delenv("AUTH_EMAIL_DEBUG", raising=False)
     monkeypatch.delenv("DEV_LOGIN_ENABLED", raising=False)
 
-    try:
-        main.validate_runtime_auth_config()
-    except RuntimeError as exc:
-        assert "Turnstile" in str(exc)
-    else:
-        raise AssertionError("HTTPS password login must require Turnstile")
+    main.validate_runtime_auth_config()
+    assert main.password_login_unavailable_code() == "AUTH_TURNSTILE_NOT_CONFIGURED"
+
+
+def test_https_password_login_reports_unavailable_without_explicit_auth_database(monkeypatch) -> None:
+    monkeypatch.setenv("APP_BASE_URL", "https://dashboard.example.com")
+    monkeypatch.setenv("SESSION_SECRET", "x" * 64)
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    monkeypatch.setenv("PASSWORD_LOGIN_ENABLED", "true")
+    monkeypatch.setenv("PUBLIC_SIGNUP_ENABLED", "false")
+    monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("SMTP_FROM", "noreply@example.com")
+    monkeypatch.setenv("TURNSTILE_ENABLED", "true")
+    monkeypatch.setenv("TURNSTILE_SITE_KEY", "site-key")
+    monkeypatch.setenv("TURNSTILE_SECRET_KEY", "secret-key")
+    monkeypatch.delenv("AUTH_DATABASE_PATH", raising=False)
+    monkeypatch.delenv("AUTH_DATABASE_URL", raising=False)
+    monkeypatch.delenv("AUTH_EMAIL_DEBUG", raising=False)
+    monkeypatch.delenv("DEV_LOGIN_ENABLED", raising=False)
+
+    main.validate_runtime_auth_config()
+    assert main.password_login_unavailable_code() == "AUTH_DATABASE_NOT_CONFIGURED"
+
+
+def test_https_password_login_rejects_unsupported_auth_database_url(monkeypatch) -> None:
+    monkeypatch.setenv("APP_BASE_URL", "https://dashboard.example.com")
+    monkeypatch.setenv("SESSION_SECRET", "x" * 64)
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    monkeypatch.setenv("PASSWORD_LOGIN_ENABLED", "true")
+    monkeypatch.setenv("TURNSTILE_ENABLED", "true")
+    monkeypatch.setenv("TURNSTILE_SITE_KEY", "site-key")
+    monkeypatch.setenv("TURNSTILE_SECRET_KEY", "secret-key")
+    monkeypatch.delenv("AUTH_DATABASE_PATH", raising=False)
+    monkeypatch.setenv("AUTH_DATABASE_URL", "postgresql://not-supported")
+
+    assert main.password_login_unavailable_code() == "AUTH_DATABASE_NOT_CONFIGURED"
 
 
 def test_https_runtime_rejects_dev_login(monkeypatch) -> None:
@@ -149,6 +229,49 @@ def test_signup_disabled_blocks_verification_email(tmp_path, monkeypatch) -> Non
     assert response.json()["detail"]["code"] == "AUTH_SIGNUP_DISABLED"
     with sqlite3.connect(store.database_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM auth_verification_codes").fetchone()[0] == 0
+
+
+def test_signup_disabled_keeps_password_login_and_recovery_available(tmp_path, monkeypatch) -> None:
+    client, _, _ = auth_client(tmp_path, monkeypatch, signup=False)
+
+    config = client.get("/api/auth/config")
+
+    assert config.status_code == 200
+    assert config.json()["passwordLoginEnabled"] is True
+    assert config.json()["passwordLoginAvailable"] is True
+    assert config.json()["publicSignupEnabled"] is False
+    assert config.json()["publicSignupAvailable"] is False
+    assert config.json()["publicSignupUnavailableCode"] == "AUTH_SIGNUP_DISABLED"
+    assert config.json()["passwordRecoveryEnabled"] is True
+    assert config.json()["passwordRecoveryAvailable"] is True
+
+
+def test_https_password_login_remains_available_without_smtp(tmp_path, monkeypatch) -> None:
+    client, store, _ = auth_client(tmp_path, monkeypatch)
+    monkeypatch.setenv("APP_BASE_URL", "https://dashboard.example.com")
+    monkeypatch.setenv("SESSION_SECRET", "x" * 64)
+    monkeypatch.setenv("AUTH_DATABASE_PATH", str(tmp_path / "auth.sqlite3"))
+    monkeypatch.delenv("SMTP_HOST", raising=False)
+    monkeypatch.delenv("SMTP_FROM", raising=False)
+    monkeypatch.delenv("SMTP_USERNAME", raising=False)
+    monkeypatch.delenv("SMTP_PASSWORD", raising=False)
+    monkeypatch.delenv("AUTH_EMAIL_DEBUG", raising=False)
+    store.create_user("person@example.com", "Person", hash_password("password-123"), email_verified=True)
+
+    config = client.get("/api/auth/config")
+    logged_in = client.post(
+        "/api/auth/login",
+        json={"email": "person@example.com", "password": "password-123"},
+        headers=csrf(client),
+    )
+
+    assert config.status_code == 200
+    assert config.json()["passwordLoginAvailable"] is True
+    assert config.json()["publicSignupAvailable"] is False
+    assert config.json()["publicSignupUnavailableCode"] == "AUTH_SIGNUP_EMAIL_NOT_CONFIGURED"
+    assert config.json()["passwordRecoveryAvailable"] is False
+    assert config.json()["passwordRecoveryUnavailableCode"] == "AUTH_PASSWORD_EMAIL_NOT_CONFIGURED"
+    assert logged_in.status_code == 200
 
 
 def test_register_login_session_and_entitlement_refresh(tmp_path, monkeypatch) -> None:
@@ -195,6 +318,118 @@ def test_register_login_session_and_entitlement_refresh(tmp_path, monkeypatch) -
     assert client.get("/api/auth/me").status_code == 401
 
 
+def test_empty_upstream_model_list_does_not_activate_local_signup(tmp_path, monkeypatch) -> None:
+    client, store, upstream = auth_client(tmp_path, monkeypatch)
+    user = store.create_user("person@example.com", "Person", hash_auth_token("password"), email_verified=True)
+    store.set_provisioning_status(user["id"], "provisioned", "primary", f"local-{user['id']}")
+    upstream.user_models = []
+
+    payload = asyncio.run(main.auth_user_payload(user, refresh_entitlement=True))
+
+    assert payload["accountStatus"] == "provisioned"
+    assert payload["entitlementStatus"] == "inactive"
+
+
+def test_inactive_local_user_cannot_query_or_manage_keys_or_models(tmp_path, monkeypatch) -> None:
+    client, store, upstream = auth_client(tmp_path, monkeypatch)
+    user = store.create_user("person@example.com", "Person", hash_password("password-123"), email_verified=True)
+    store.set_provisioning_status(user["id"], "provisioned", "primary", f"local-{user['id']}")
+    logged_in = client.post(
+        "/api/auth/login",
+        json={"email": "person@example.com", "password": "password-123"},
+        headers=csrf(client),
+    )
+    assert logged_in.status_code == 200
+    headers = {"X-CSRF-Token": logged_in.json()["csrfToken"]}
+    requests = [
+        ("get", "/api/me/keys", {}),
+        ("post", "/api/me/keys", {"json": {"name": "test key", "purpose": "", "duration": "never", "models": []}}),
+        ("post", "/api/me/keys/key-1/regenerate", {}),
+        ("post", "/api/me/keys/key-1/disable-old", {"json": {"replacementKeyId": "key-2"}}),
+        ("delete", "/api/me/keys/key-1", {}),
+        ("post", "/api/me/keys/key-1/reveal", {}),
+        ("get", "/api/models", {}),
+        ("get", "/api/me/usage", {}),
+        ("get", "/api/me/usage/logs", {}),
+    ]
+
+    for method, path, kwargs in requests:
+        response = getattr(client, method)(path, headers=headers if method != "get" else None, **kwargs)
+        assert response.status_code == 403, path
+        assert response.json()["detail"]["code"] == "AUTH_ENTITLEMENT_INACTIVE", path
+
+    assert upstream.key_or_model_calls == []
+
+
+def test_local_password_account_never_inherits_same_email_sso_team_or_debug_scope(tmp_path, monkeypatch) -> None:
+    client, store, upstream = auth_client(tmp_path, monkeypatch)
+    user = store.create_user("leader@example.com", "Leader", hash_password("password-123"), email_verified=True)
+    store.set_provisioning_status(user["id"], "provisioned", "primary", f"local-{user['id']}")
+    upstream.user_models = ["gpt-5"]
+    logged_in = client.post(
+        "/api/auth/login",
+        json={"email": "leader@example.com", "password": "password-123"},
+        headers=csrf(client),
+    )
+    assert logged_in.status_code == 200
+
+    mapping_attempts = 0
+
+    async def must_not_resolve_same_email(*_args, **_kwargs):
+        nonlocal mapping_attempts
+        mapping_attempts += 1
+        raise AssertionError("local password account must not resolve the matching SSO identity")
+
+    monkeypatch.setattr(main, "cached_resolve_user", must_not_resolve_same_email)
+    monkeypatch.setenv("DEBUG_MAPPING_ENABLED", "true")
+
+    scope = client.get("/api/auth/scope")
+    team_usage = client.get("/api/team/usage")
+    mapping = client.get("/api/debug/me-mapping")
+    usage_debug = client.get("/api/debug/me-usage-compare")
+
+    assert scope.status_code == 200
+    assert scope.json() == {
+        "isTeamLeader": False,
+        "teamBoardStatus": "none",
+        "team": None,
+        "leaderTeams": [],
+    }
+    for response in (team_usage,):
+        assert response.status_code == 403
+        assert response.json()["detail"]["code"] == "AUTH_TEAM_SCOPE_UNAVAILABLE"
+    for response in (mapping, usage_debug):
+        assert response.status_code == 403
+        assert response.json()["detail"]["code"] == "AUTH_LOCAL_DEBUG_UNAVAILABLE"
+    assert mapping_attempts == 0
+
+
+def test_active_local_user_usage_uses_its_local_mapping_not_same_email_sso_identity(tmp_path, monkeypatch) -> None:
+    client, store, upstream = auth_client(tmp_path, monkeypatch)
+    user = store.create_user("person@example.com", "Person", hash_password("password-123"), email_verified=True)
+    store.set_provisioning_status(user["id"], "provisioned", "primary", f"local-{user['id']}")
+    upstream.user_models = ["gpt-5"]
+    logged_in = client.post(
+        "/api/auth/login",
+        json={"email": "person@example.com", "password": "password-123"},
+        headers=csrf(client),
+    )
+    assert logged_in.status_code == 200
+
+    async def must_not_resolve_same_email(*_args, **_kwargs):
+        raise AssertionError("active local account must use its provisioned local mapping")
+
+    monkeypatch.setattr(main, "cached_resolve_user", must_not_resolve_same_email)
+    monkeypatch.setattr(main, "_usage_store", None)
+
+    usage = client.get("/api/me/usage")
+    logs = client.get("/api/me/usage/logs")
+
+    assert usage.status_code == logs.status_code == 200
+    assert upstream.key_or_model_calls == ["usage_rows_for_user_ids"]
+    assert logs.json()["cache"]["hit"] is True
+
+
 def test_registration_domain_allowlist_restricts_public_signup(tmp_path, monkeypatch) -> None:
     client, store, _ = auth_client(tmp_path, monkeypatch)
     monkeypatch.setenv("AUTH_ALLOWED_EMAIL_DOMAINS", "example.com")
@@ -221,7 +456,11 @@ def test_public_signup_stays_closed_until_production_dependencies_are_ready(tmp_
     client, _, _ = auth_client(tmp_path, monkeypatch)
     monkeypatch.setenv("APP_BASE_URL", "https://dashboard.example.com")
     monkeypatch.setenv("SESSION_SECRET", "x" * 64)
+    monkeypatch.setenv("AUTH_DATABASE_PATH", str(tmp_path / "auth.sqlite3"))
     monkeypatch.delenv("SMTP_HOST", raising=False)
+    monkeypatch.delenv("SMTP_FROM", raising=False)
+    monkeypatch.delenv("SMTP_USERNAME", raising=False)
+    monkeypatch.delenv("SMTP_PASSWORD", raising=False)
     monkeypatch.delenv("AUTH_EMAIL_DEBUG", raising=False)
 
     config = client.get("/api/auth/config")
@@ -231,12 +470,18 @@ def test_public_signup_stays_closed_until_production_dependencies_are_ready(tmp_
         headers=csrf(client),
     )
 
-    assert config.json()["publicSignupEnabled"] is False
-    assert blocked.status_code == 403
-    assert blocked.json()["detail"]["code"] == "AUTH_SIGNUP_DISABLED"
+    assert config.json()["publicSignupEnabled"] is True
+    assert config.json()["passwordLoginAvailable"] is True
+    assert config.json()["publicSignupConfigured"] is False
+    assert config.json()["publicSignupUnavailableCode"] == "AUTH_SIGNUP_EMAIL_NOT_CONFIGURED"
+    assert config.json()["passwordRecoveryEnabled"] is True
+    assert config.json()["passwordRecoveryAvailable"] is False
+    assert config.json()["passwordRecoveryUnavailableCode"] == "AUTH_PASSWORD_EMAIL_NOT_CONFIGURED"
+    assert blocked.status_code == 503
+    assert blocked.json()["detail"]["code"] == "AUTH_SIGNUP_EMAIL_NOT_CONFIGURED"
 
 
-def test_forgot_password_does_not_reveal_email_delivery_failure(tmp_path, monkeypatch) -> None:
+def test_forgot_password_missing_smtp_is_equally_unavailable_for_existing_and_missing_email(tmp_path, monkeypatch) -> None:
     client, store, _ = auth_client(tmp_path, monkeypatch)
     store.create_user("person@example.com", "Person", "pbkdf2_sha256$1$bad$bad", email_verified=True)
     monkeypatch.delenv("AUTH_EMAIL_DEBUG", raising=False)
@@ -256,8 +501,9 @@ def test_forgot_password_does_not_reveal_email_delivery_failure(tmp_path, monkey
         headers=headers,
     )
 
-    assert existing.status_code == missing.status_code == 200
+    assert existing.status_code == missing.status_code == 503
     assert existing.json() == missing.json()
+    assert existing.json()["detail"]["code"] == "AUTH_PASSWORD_EMAIL_NOT_CONFIGURED"
 
 
 def test_forgot_password_invalid_email_keeps_generic_response(tmp_path, monkeypatch) -> None:
@@ -328,6 +574,7 @@ def test_turnstile_enabled_without_keys_degrades_health_and_blocks_auth(tmp_path
     client, _, _ = auth_client(tmp_path, monkeypatch)
     monkeypatch.setenv("APP_BASE_URL", "https://dashboard.example.com")
     monkeypatch.setenv("SESSION_SECRET", "x" * 64)
+    monkeypatch.setenv("AUTH_DATABASE_PATH", str(tmp_path / "auth.sqlite3"))
     monkeypatch.delenv("AUTH_EMAIL_DEBUG", raising=False)
     monkeypatch.setenv("TURNSTILE_ENABLED", "true")
     monkeypatch.delenv("TURNSTILE_SITE_KEY", raising=False)
@@ -342,8 +589,35 @@ def test_turnstile_enabled_without_keys_degrades_health_and_blocks_auth(tmp_path
         json={"email": "person@example.com", "purpose": "signup"},
         headers=csrf(client),
     )
-    assert blocked.status_code == 403
-    assert blocked.json()["detail"]["code"] == "AUTH_SIGNUP_DISABLED"
+    assert blocked.status_code == 503
+    assert blocked.json()["detail"]["code"] == "AUTH_TURNSTILE_NOT_CONFIGURED"
+
+
+def test_health_exposes_closed_signup_readiness_without_advertising_a_broken_form(tmp_path, monkeypatch) -> None:
+    client, _, _ = auth_client(tmp_path, monkeypatch)
+    monkeypatch.setenv("APP_BASE_URL", "https://dashboard.example.com")
+    monkeypatch.setenv("SESSION_SECRET", "x" * 64)
+    monkeypatch.setenv("AUTH_DATABASE_PATH", str(tmp_path / "auth.sqlite3"))
+    monkeypatch.setenv("PUBLIC_SIGNUP_ENABLED", "true")
+    monkeypatch.delenv("SMTP_HOST", raising=False)
+    monkeypatch.delenv("SMTP_FROM", raising=False)
+    monkeypatch.delenv("SMTP_USERNAME", raising=False)
+    monkeypatch.delenv("SMTP_PASSWORD", raising=False)
+
+    health = client.get("/api/health")
+
+    assert health.status_code == 200
+    assert health.json()["status"] == "degraded"
+    assert health.json()["authReadiness"]["passwordLogin"] == {
+        "enabled": True,
+        "available": True,
+        "unavailableCode": "",
+    }
+    assert health.json()["authReadiness"]["publicSignup"] == {
+        "enabled": True,
+        "available": False,
+        "unavailableCode": "AUTH_SIGNUP_EMAIL_NOT_CONFIGURED",
+    }
 
 
 def test_verification_delivery_failure_preserves_previous_code(tmp_path, monkeypatch) -> None:
@@ -379,7 +653,7 @@ def test_smtp_credentials_require_tls(monkeypatch) -> None:
         raise AssertionError("SMTP credentials must not be sent without TLS")
 
 
-def test_registration_does_not_require_code_when_verification_is_disabled(tmp_path, monkeypatch) -> None:
+def test_production_signup_requires_email_verification(tmp_path, monkeypatch) -> None:
     client, _, _ = auth_client(tmp_path, monkeypatch)
     monkeypatch.setenv("EMAIL_VERIFICATION_REQUIRED", "false")
 
@@ -393,8 +667,8 @@ def test_registration_does_not_require_code_when_verification_is_disabled(tmp_pa
         headers=csrf(client),
     )
 
-    assert response.status_code == 200
-    assert response.json()["user"]["email"] == "person@example.com"
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "AUTH_SIGNUP_EMAIL_VERIFICATION_REQUIRED"
 
 
 def test_password_reset_routes_are_disabled_with_password_login(tmp_path, monkeypatch) -> None:
@@ -410,6 +684,20 @@ def test_password_reset_routes_are_disabled_with_password_login(tmp_path, monkey
 
     assert forgot.status_code == reset.status_code == 403
     assert forgot.json()["detail"]["code"] == reset.json()["detail"]["code"] == "AUTH_PASSWORD_LOGIN_DISABLED"
+
+
+def test_csrf_origin_must_match_configured_scheme_and_host(tmp_path, monkeypatch) -> None:
+    client, _, _ = auth_client(tmp_path, monkeypatch)
+    monkeypatch.setenv("APP_BASE_URL", "https://dashboard.example.com")
+    headers = {
+        **csrf(client),
+        "Origin": "http://dashboard.example.com",
+    }
+
+    response = client.post("/api/auth/logout", json={}, headers=headers)
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "AUTH_ORIGIN_INVALID"
 
 
 def test_provisioning_conflict_does_not_bind_mismatched_upstream_account(tmp_path, monkeypatch) -> None:
@@ -445,16 +733,16 @@ def test_provisioning_unexpected_failure_is_queued(tmp_path, monkeypatch) -> Non
     assert len(store.pending_provisioning()) == 1
 
 
-def test_registration_keeps_valid_code_when_user_creation_fails(tmp_path, monkeypatch) -> None:
+def test_registration_consumes_valid_code_only_with_atomic_user_creation(tmp_path, monkeypatch) -> None:
     client, store, _ = auth_client(tmp_path, monkeypatch)
     put_signup_code(store, "person@example.com")
-    original_create_user = store.create_user
+    original_create_user = store.create_user_from_verification
 
     def fail_once(*args, **kwargs):
-        monkeypatch.setattr(store, "create_user", original_create_user)
+        monkeypatch.setattr(store, "create_user_from_verification", original_create_user)
         raise ValueError("临时写入失败")
 
-    monkeypatch.setattr(store, "create_user", fail_once)
+    monkeypatch.setattr(store, "create_user_from_verification", fail_once)
     headers = csrf(client)
     failed = client.post(
         "/api/auth/register",
