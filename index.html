@@ -80,10 +80,12 @@
         to { transform: translateX(245%); }
       }
 
+      /* 登录页与加载页共用的单栏居中容器（原双栏布局已移除）。 */
       .login-shell {
         min-height: 100vh;
-        display: grid;
-        grid-template-columns: minmax(0, 1.05fr) minmax(360px, 0.75fr);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
         position: relative;
       }
 
@@ -138,13 +140,6 @@
         width: 28px;
       }
 
-      .login-global-nav {
-        position: fixed;
-        top: 34px;
-        right: 42px;
-        z-index: 5;
-      }
-
       .app-global-nav {
         flex: 0 0 auto;
         margin-left: auto;
@@ -153,40 +148,6 @@
       .app-global-nav .global-nav-item {
         min-height: 36px;
         font-size: 15px;
-      }
-
-      .login-card.login-attention {
-        animation: login-attention 680ms ease;
-      }
-
-      @keyframes login-attention {
-        0%, 100% { transform: translateY(0); box-shadow: var(--shadow); }
-        42% { transform: translateY(-7px); box-shadow: 0 26px 72px rgba(6, 115, 210, 0.2); }
-      }
-
-      .login-art {
-        padding: 64px;
-        display: flex;
-        flex-direction: column;
-        justify-content: space-between;
-        background:
-          linear-gradient(140deg, rgba(10, 21, 36, 0.95), rgba(8, 66, 124, 0.84)),
-          #0b1524;
-        color: #f6faff;
-        position: relative;
-        overflow: hidden;
-      }
-
-      .login-art::after {
-        content: "";
-        position: absolute;
-        inset: auto 8% -18% 16%;
-        height: 46%;
-        background:
-          linear-gradient(180deg, rgba(255, 255, 255, 0.18), transparent),
-          repeating-linear-gradient(90deg, transparent 0 34px, rgba(255, 255, 255, 0.1) 34px 35px);
-        border-radius: 999px 999px 0 0;
-        transform: rotate(-4deg);
       }
 
       .brand-mark {
@@ -342,52 +303,6 @@
       .key-icon svg {
         width: 20px;
         height: 20px;
-      }
-
-      .login-art h1 {
-        position: relative;
-        z-index: 1;
-        max-width: 760px;
-        margin: 88px 0 20px;
-        font-size: clamp(42px, 7vw, 82px);
-        line-height: 1;
-        letter-spacing: 0;
-      }
-
-      .login-art p {
-        position: relative;
-        z-index: 1;
-        max-width: 640px;
-        color: rgba(246, 250, 255, 0.82);
-        font-size: 18px;
-        line-height: 1.8;
-      }
-
-      .login-facts {
-        position: relative;
-        z-index: 1;
-        display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 16px;
-      }
-
-      .fact {
-        border: 1px solid rgba(255, 255, 255, 0.24);
-        padding: 18px;
-        background: rgba(255, 255, 255, 0.11);
-        border-radius: 16px;
-        backdrop-filter: blur(16px);
-      }
-
-      .fact strong {
-        display: block;
-        font-size: 24px;
-        margin-bottom: 4px;
-      }
-
-      .fact span {
-        color: rgba(246, 250, 255, 0.74);
-        font-size: 13px;
       }
 
       /* ===== 营销首页（landing）===== */
@@ -835,32 +750,101 @@
         text-align: center;
       }
 
-      .login-panel {
-        padding: 40px;
-        display: grid;
-        align-content: center;
-      }
+      /* ===== 登录页（单栏居中）===== */
 
-      .login-card {
-        width: min(100%, 440px);
-        margin: auto;
-        padding: 34px;
-        background: var(--panel);
-        border: 1px solid var(--line);
-        box-shadow: var(--shadow);
-        border-radius: var(--radius);
+      .login-topbar {
+        width: 100%;
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.86);
         backdrop-filter: blur(18px);
       }
 
+      .login-topbar-inner {
+        width: min(100%, 1180px);
+        margin: 0 auto;
+        padding: 14px 32px;
+        display: flex;
+        align-items: center;
+        gap: 28px;
+      }
+
+      .login-topbar .brand-mark {
+        flex: 0 0 auto;
+        font-size: 18px;
+      }
+
+      .login-topbar .brand-icon {
+        width: 36px;
+        height: 36px;
+        border-radius: 11px;
+      }
+
+      .login-topbar .brand-icon svg {
+        width: 20px;
+        height: 20px;
+      }
+
+      .login-global-nav {
+        margin-left: auto;
+        flex: 0 0 auto;
+      }
+
+      .login-global-nav .global-nav-item {
+        font-size: 15px;
+      }
+
+      .login-panel {
+        width: 100%;
+        flex: 1 1 auto;
+        padding: 48px 24px 56px;
+        display: grid;
+        align-content: center;
+        justify-items: center;
+      }
+
+      .login-card {
+        width: min(100%, 420px);
+        padding: 32px;
+        background: var(--panel-strong);
+        border: 1px solid var(--line);
+        box-shadow: var(--shadow-soft);
+        border-radius: var(--radius);
+      }
+
       .login-card h2 {
-        margin: 0 0 10px;
-        font-size: 28px;
+        margin: 0 0 8px;
+        font-size: 24px;
       }
 
       .login-card p {
         color: var(--muted);
-        margin: 0 0 26px;
+        margin: 0 0 24px;
         line-height: 1.7;
+      }
+
+      /* 只有卡片顶部的标题与副标题居中，表单内文案保持左对齐。 */
+      .login-card-head {
+        text-align: center;
+        margin-bottom: 22px;
+      }
+
+      .login-card-head h2 {
+        margin: 0 0 8px;
+      }
+
+      .login-card-head p {
+        margin: 0;
+        font-size: 14px;
+      }
+
+      .login-foot-note {
+        margin-top: 22px;
+        padding-top: 18px;
+        border-top: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.7;
+        text-align: center;
       }
 
       .field {
@@ -3675,10 +3659,6 @@
           position: static;
         }
 
-        .login-shell {
-          grid-template-columns: 1fr;
-        }
-
         .landing-shell,
         .landing-topbar-inner {
           padding-left: 20px;
@@ -3728,11 +3708,16 @@
           padding: 22px 20px;
         }
 
+        .login-topbar-inner {
+          flex-wrap: wrap;
+          gap: 12px 18px;
+          padding: 14px 20px;
+        }
+
         .login-global-nav {
-          top: 18px;
-          right: 20px;
-          left: 20px;
-          justify-content: flex-end;
+          order: 3;
+          width: 100%;
+          margin-left: 0;
           gap: 20px;
           overflow-x: auto;
           scrollbar-width: none;
@@ -3744,34 +3729,11 @@
         }
 
         .login-global-nav .global-nav-item {
-          color: rgba(246, 250, 255, 0.78);
           font-size: 14px;
         }
 
-        .login-global-nav .global-nav-item:hover,
-        .login-global-nav .global-nav-item.active {
-          color: #ffffff;
-        }
-
-        .login-global-nav .global-nav-item::after {
-          background: #ffffff;
-        }
-
-        .login-art {
-          min-height: 430px;
-          padding: 80px 28px 28px;
-        }
-
-        .login-art h1 {
-          margin-top: 32px;
-        }
-
-        .login-facts {
-          grid-template-columns: 1fr;
-        }
-
         .login-panel {
-          padding: 20px;
+          padding: 32px 20px 40px;
         }
 
         .login-card {
@@ -4148,14 +4110,6 @@
       }
 
       @media (max-width: 480px) {
-        .login-art {
-          min-height: 390px;
-        }
-
-        .login-facts {
-          display: none;
-        }
-
         .landing-user-email {
           display: none;
         }
@@ -4211,10 +4165,12 @@
   </head>
   <body>
     <section id="authLoadingView" class="login-shell" aria-live="polite">
-      <div class="login-panel" style="margin:auto;max-width:460px">
+      <div class="login-panel">
         <div class="login-card">
-          <h2>正在加载登录方式</h2>
-          <p id="authLoadingHint" class="hint">正在检查可用的登录方式和账号状态，请稍候…</p>
+          <div class="login-card-head">
+            <h2>正在加载登录方式</h2>
+            <p id="authLoadingHint" class="hint">正在检查可用的登录方式和账号状态，请稍候…</p>
+          </div>
           <div class="loading-bar" aria-hidden="true"><span></span></div>
           <button id="authLoadingRetryButton" class="ghost-btn hidden" type="button">重新加载</button>
         </div>
@@ -4401,34 +4357,29 @@
     </section>
 
     <section id="loginView" class="login-shell hidden">
-      <nav class="global-nav login-global-nav" aria-label="全局导航">
-        <button class="global-nav-item" type="button" data-global-page="home">首页</button>
-        <button class="global-nav-item" type="button" data-global-page="console">控制台</button>
-        <button class="global-nav-item" type="button" data-global-page="models">模型广场</button>
-        <a class="global-nav-item" href="https://t83dfrspj4.feishu.cn/wiki/La8twWEToibR9Jk6yZucTz78nDc" target="_blank" rel="noopener noreferrer">文档</a>
-      </nav>
-      <div class="login-art">
-        <button class="brand-mark brand-mark-button" type="button" data-global-page="home">
-          <span class="brand-icon" aria-hidden="true">
-            <svg><use href="#icon-brand"></use></svg>
-          </span>
-          <span>CarHer API</span>
-        </button>
-        <div>
-          <h1>看清每一次智能工具消耗</h1>
-          <p>统一查看个人每日 Token、Codex 与 Claude Code 使用趋势，帮助你及时发现异常消耗。</p>
+      <header class="login-topbar">
+        <div class="login-topbar-inner">
+          <button class="brand-mark brand-mark-button" type="button" data-global-page="home">
+            <span class="brand-icon" aria-hidden="true">
+              <svg><use href="#icon-brand"></use></svg>
+            </span>
+            <span>CarHer API</span>
+          </button>
+          <nav class="global-nav login-global-nav" aria-label="全局导航">
+            <button class="global-nav-item" type="button" data-global-page="home">首页</button>
+            <button class="global-nav-item" type="button" data-global-page="console">控制台</button>
+            <button class="global-nav-item" type="button" data-global-page="models">模型广场</button>
+            <a class="global-nav-item" href="https://t83dfrspj4.feishu.cn/wiki/La8twWEToibR9Jk6yZucTz78nDc" target="_blank" rel="noopener noreferrer">文档</a>
+          </nav>
         </div>
-        <div class="login-facts">
-          <div class="fact"><strong>每日</strong><span>自动聚合用量趋势</span></div>
-          <div class="fact"><strong>个人</strong><span>仅查看自己的数据</span></div>
-          <div class="fact"><strong>安全</strong><span>仅展示个人用量数据</span></div>
-        </div>
-      </div>
+      </header>
       <div class="login-panel">
         <form id="loginForm" class="login-card">
           <div id="authenticatedHome" class="hidden">
-            <h2 id="loginTitle">欢迎回来</h2>
-            <p id="loginDescription">你已登录，可以继续进入控制台查看个人 AI 用量。</p>
+            <div class="login-card-head">
+              <h2 id="loginTitle">欢迎回来</h2>
+              <p id="loginDescription">你已登录，可以继续进入控制台查看个人 AI 用量。</p>
+            </div>
             <div class="authenticated-home-actions">
               <button id="enterConsoleButton" class="primary-btn" type="button">
                 <span class="app-icon"><svg><use href="#icon-dashboard"></use></svg></span>
@@ -4439,8 +4390,10 @@
           </div>
 
           <div id="authGuestContent">
-            <h2 id="guestAuthTitle">登录 CarHer API</h2>
-            <p id="guestAuthDescription">使用邮箱账号或企业账号进入控制台。</p>
+            <div class="login-card-head">
+              <h2 id="guestAuthTitle">登录 CarHer API</h2>
+              <p id="guestAuthDescription">使用邮箱账号或企业账号进入控制台。</p>
+            </div>
             <p id="authAvailabilityNotice" class="auth-status" role="status" aria-live="polite"></p>
 
             <div id="authAccessSwitch" class="auth-access-switch" role="tablist" aria-label="登录方式">
@@ -4600,6 +4553,8 @@
                 开发环境邮箱登录
               </button>
             </div>
+
+            <p class="login-foot-note">登录即表示同意按公司内部规范使用 AI 服务</p>
           </div>
         </form>
       </div>
