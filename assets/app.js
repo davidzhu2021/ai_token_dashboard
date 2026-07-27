@@ -160,6 +160,8 @@ function showLoginCallbackMessage() {
   const authError = params.get("auth_error");
   if (!authError) return;
   const message = authError === "state" ? "登录状态已失效，请重新点击飞书扫码登录。" : "登录没有完成，请重新扫码。";
+  // SSO 回调失败时提示挂在登录页上，需要切到登录页，否则用户停在营销首页看不到提示。
+  showAuthPage("login");
   setAuthAccess("enterprise");
   el("enterpriseLoginHint").textContent = message;
   showToast(message);
@@ -826,26 +828,46 @@ function updateHomeCard() {
   updateAuthAvailability();
 }
 
-function showHome() {
+// 首页顶栏按登录态切换：未登录显示登录/注册入口，已登录显示账号与进入控制台。
+function updateLandingAuthState() {
+  const isLoggedIn = Boolean(currentUser);
+  el("landingGuestActions").classList.toggle("hidden", isLoggedIn);
+  el("landingUserActions").classList.toggle("hidden", !isLoggedIn);
+  el("landingUserEmail").textContent = isLoggedIn ? currentUser.email || "" : "";
+  el("landingPrimaryCta").textContent = isLoggedIn ? "进入控制台" : "立即开始使用";
+  el("landingGuestRegisterButton").classList.toggle("hidden", !publicSignupAvailable());
+}
+
+function showLanding() {
   if (currentView === "keys") clearRevealedKeys();
   el("authLoadingView").classList.add("hidden");
   el("appView").classList.add("hidden");
-  el("loginView").classList.remove("hidden");
-  updateHomeCard();
+  el("loginView").classList.add("hidden");
+  el("landingView").classList.remove("hidden");
+  updateLandingAuthState();
   setGlobalPage("home");
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
-function promptForLogin() {
-  showHome();
-  showToast("请先登录后访问控制台和模型广场");
-  const loginCard = el("loginForm");
-  loginCard.classList.remove("login-attention");
-  requestAnimationFrame(() => loginCard.classList.add("login-attention"));
-  window.setTimeout(() => loginCard.classList.remove("login-attention"), 720);
-  loginCard.scrollIntoView({ behavior: "smooth", block: "center" });
+function showHome() {
+  showLanding();
+}
+
+// 打开独立登录页；mode 决定落在登录还是注册 tab。
+function showAuthPage(mode = "login") {
+  el("authLoadingView").classList.add("hidden");
+  el("appView").classList.add("hidden");
+  el("landingView").classList.add("hidden");
+  el("loginView").classList.remove("hidden");
+  updateHomeCard();
+  setGlobalPage("");
+  if (!currentUser) {
+    setAuthAccess(passwordLoginAvailable() ? "personal" : "enterprise");
+    setAuthMode(mode, { focus: false });
+  }
+  window.scrollTo({ top: 0, behavior: "smooth" });
   const firstLoginControl = passwordLoginAvailable()
-    ? el("loginEmailInput")
+    ? el(mode === "register" ? "registerEmailInput" : "loginEmailInput")
     : authConfig.oidcConfigured
       ? el("ssoButton")
       : authConfig.devLoginEnabled
@@ -854,12 +876,18 @@ function promptForLogin() {
   firstLoginControl?.focus({ preventScroll: true });
 }
 
+function promptForLogin() {
+  showAuthPage("login");
+  showToast("请先登录后访问控制台和模型广场");
+}
+
 function showAuthenticatedPage(page) {
   if (!currentUser) {
     promptForLogin();
     return;
   }
   el("authLoadingView").classList.add("hidden");
+  el("landingView").classList.add("hidden");
   el("loginView").classList.add("hidden");
   el("appView").classList.remove("hidden");
   switchView(page === "models" ? "models" : "dashboard");
@@ -868,7 +896,7 @@ function showAuthenticatedPage(page) {
 
 function navigateGlobalPage(page) {
   if (page === "home") {
-    showHome();
+    showLanding();
     return;
   }
   showAuthenticatedPage(page);
@@ -3107,6 +3135,7 @@ async function showApp(user) {
   resetTeamMemberSelection();
   ensureSelectedTeamRef();
   el("authLoadingView").classList.add("hidden");
+  el("landingView").classList.add("hidden");
   el("loginView").classList.add("hidden");
   el("appView").classList.remove("hidden");
   el("adminTab").classList.add("hidden");
@@ -3198,12 +3227,18 @@ function showLogin() {
   el("departmentEmployeeSearch").value = "";
   closeDepartmentPicker();
   el("appView").classList.add("hidden");
-  el("loginView").classList.remove("hidden");
   el("authLoadingView").classList.add("hidden");
   updateHomeCard();
   setAuthAccess(passwordLoginAvailable() ? "personal" : "enterprise");
   setAuthMode(resetPasswordToken ? "reset" : "login", { focus: false });
-  setGlobalPage("home");
+  // 带重置密码 token 时直接停在登录页的重置态，其余情况（含退出登录）回到营销首页。
+  if (resetPasswordToken) {
+    el("landingView").classList.add("hidden");
+    el("loginView").classList.remove("hidden");
+    setGlobalPage("");
+    return;
+  }
+  showLanding();
 }
 
 async function submitPasswordLogin() {
@@ -3485,6 +3520,30 @@ el("accountAccessRetryButton").addEventListener("click", async () => {
 
 document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
 document.querySelectorAll("[data-global-page]").forEach((item) => item.addEventListener("click", () => navigateGlobalPage(item.dataset.globalPage)));
+document.querySelectorAll("[data-auth-entry]").forEach((item) => item.addEventListener("click", () => showAuthPage(item.dataset.authEntry)));
+
+// 首页 Hero 主按钮：已登录进控制台，未登录按是否开放注册决定落在注册或登录。
+el("landingPrimaryCta").addEventListener("click", () => {
+  if (currentUser) {
+    showAuthenticatedPage("console");
+    return;
+  }
+  showAuthPage(publicSignupAvailable() ? "register" : "login");
+});
+
+el("landingLogoutButton").addEventListener("click", async () => {
+  setButtonLoading("landingLogoutButton", true, "正在退出");
+  try {
+    await ensureCsrfToken();
+    await api("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
+    clearResetPasswordToken();
+    showLogin();
+  } catch (error) {
+    showToast(error.message || "退出登录失败，请检查网络后重试");
+  } finally {
+    setButtonLoading("landingLogoutButton", false);
+  }
+});
 
 async function reloadForFilterChange() {
   // 保留当前下钻选择:切换时间范围/来源时应停留在已下钻的员工/成员/部门,
@@ -3906,6 +3965,7 @@ async function init() {
   resetPasswordToken = takeResetPasswordTokenFromUrl(callbackParams);
   const hasAuthCallback = callbackParams.get("auth_callback") === "success";
   if (hasAuthCallback) {
+    el("landingView").classList.add("hidden");
     el("loginView").classList.add("hidden");
     el("authLoadingView").classList.remove("hidden");
     callbackParams.delete("auth_callback");
@@ -3949,6 +4009,7 @@ async function init() {
   } catch (meError) {
     if (meError?.status !== 401) {
       el("authLoadingView").classList.remove("hidden");
+      el("landingView").classList.add("hidden");
       el("loginView").classList.add("hidden");
       el("authLoadingHint").textContent = meError?.message || "账号状态检查失败，请检查网络后重新加载。";
       el("authLoadingRetryButton").classList.remove("hidden");
@@ -3956,6 +4017,7 @@ async function init() {
     }
     if (configError) {
       el("authLoadingView").classList.remove("hidden");
+      el("landingView").classList.add("hidden");
       el("loginView").classList.add("hidden");
       el("authLoadingHint").textContent = configError.message || "登录配置加载失败，请检查网络后重新加载。";
       el("authLoadingRetryButton").classList.remove("hidden");

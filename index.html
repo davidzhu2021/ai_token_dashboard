@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>AI 用量中心</title>
+    <title>CarHer API</title>
     <style>
       :root {
         --ink: #16212e;
@@ -198,6 +198,16 @@
         letter-spacing: 0;
       }
 
+      .brand-mark-button {
+        position: relative;
+        z-index: 1;
+        padding: 0;
+        border: 0;
+        background: transparent;
+        color: inherit;
+        font-size: inherit;
+      }
+
       .brand-icon {
         width: 42px;
         height: 42px;
@@ -378,6 +388,451 @@
       .fact span {
         color: rgba(246, 250, 255, 0.74);
         font-size: 13px;
+      }
+
+      /* ===== 营销首页（landing）===== */
+
+      .landing {
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .landing-shell {
+        width: min(100%, 1180px);
+        margin: 0 auto;
+        padding: 0 32px;
+      }
+
+      .landing-topbar {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.86);
+        backdrop-filter: blur(18px);
+      }
+
+      .landing-topbar-inner {
+        width: min(100%, 1180px);
+        margin: 0 auto;
+        padding: 14px 32px;
+        display: flex;
+        align-items: center;
+        gap: 28px;
+      }
+
+      .landing-brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        flex: 0 0 auto;
+        font-size: 18px;
+        letter-spacing: 0;
+      }
+
+      .landing-brand .brand-icon {
+        width: 36px;
+        height: 36px;
+        border-radius: 11px;
+      }
+
+      .landing-brand .brand-icon svg {
+        width: 20px;
+        height: 20px;
+      }
+
+      .landing-nav {
+        margin-left: 12px;
+        flex: 1 1 auto;
+      }
+
+      .landing-topbar-actions {
+        flex: 0 0 auto;
+        margin-left: auto;
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .landing-user-email {
+        max-width: 190px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .landing-ghost-btn,
+      .landing-solid-btn {
+        min-height: 38px;
+        padding: 0 18px;
+        border-radius: 999px;
+        font-size: 14px;
+        font-weight: 700;
+        transition: transform 160ms ease, box-shadow 160ms ease, background 160ms ease;
+      }
+
+      .landing-ghost-btn {
+        border: 1px solid var(--line);
+        background: #ffffff;
+        color: var(--ink);
+      }
+
+      .landing-ghost-btn:hover {
+        border-color: var(--brand);
+        color: var(--brand);
+      }
+
+      .landing-solid-btn {
+        border: 0;
+        color: #ffffff;
+        background: linear-gradient(120deg, var(--brand), var(--brand-2));
+        box-shadow: 0 10px 24px rgba(6, 115, 210, 0.24);
+      }
+
+      .landing-solid-btn:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 14px 30px rgba(6, 115, 210, 0.3);
+      }
+
+      .landing-hero {
+        position: relative;
+        isolation: isolate;
+        overflow: hidden;
+        padding: 92px 0 84px;
+        text-align: center;
+      }
+
+      .landing-hero::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        z-index: -1;
+        pointer-events: none;
+        background:
+          radial-gradient(ellipse 58% 46% at 18% 6%, rgba(63, 160, 234, 0.26), transparent 70%),
+          radial-gradient(ellipse 52% 44% at 84% 12%, rgba(14, 140, 156, 0.2), transparent 72%),
+          repeating-linear-gradient(90deg, transparent 0 46px, rgba(22, 33, 46, 0.045) 46px 47px),
+          repeating-linear-gradient(0deg, transparent 0 46px, rgba(22, 33, 46, 0.045) 46px 47px);
+      }
+
+      .landing-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 16px;
+        border: 1px solid rgba(6, 115, 210, 0.22);
+        border-radius: 999px;
+        background: var(--ice);
+        color: var(--brand);
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .landing-badge::before {
+        content: "";
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--blue);
+      }
+
+      .landing-hero h1 {
+        margin: 26px 0 0;
+        font-size: clamp(40px, 6.4vw, 76px);
+        line-height: 1.1;
+        letter-spacing: -0.02em;
+      }
+
+      .landing-gradient-text {
+        background: linear-gradient(96deg, var(--brand) 8%, #3f7fe0 46%, var(--blue) 92%);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+
+      .landing-hero-desc {
+        max-width: 660px;
+        margin: 24px auto 0;
+        color: var(--muted);
+        font-size: 18px;
+        line-height: 1.85;
+      }
+
+      .landing-hero-actions {
+        margin-top: 36px;
+        display: flex;
+        justify-content: center;
+        flex-wrap: wrap;
+        gap: 16px;
+      }
+
+      .landing-cta {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 52px;
+        padding: 0 32px;
+        border-radius: 999px;
+        font-size: 16px;
+        font-weight: 700;
+        text-decoration: none;
+        transition: transform 160ms ease, box-shadow 160ms ease;
+      }
+
+      .landing-cta-primary {
+        border: 0;
+        color: #ffffff;
+        background: linear-gradient(120deg, #0a86e0, var(--brand) 58%, #0a4f94);
+        box-shadow: 0 16px 34px rgba(6, 115, 210, 0.3);
+      }
+
+      .landing-cta-ghost {
+        border: 1px solid var(--line);
+        background: #ffffff;
+        color: var(--ink);
+      }
+
+      .landing-cta:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 20px 38px rgba(20, 40, 68, 0.16);
+      }
+
+      .landing-prov-label {
+        margin: 52px 0 20px;
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0.14em;
+      }
+
+      .landing-prov-grid {
+        display: flex;
+        justify-content: center;
+        flex-wrap: wrap;
+        gap: 14px;
+      }
+
+      .landing-tag {
+        min-width: 120px;
+        padding: 12px 26px;
+        border: 1px solid rgba(255, 255, 255, 0.9);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.72);
+        box-shadow: var(--shadow-soft);
+        color: #4a5c72;
+        font-size: 15px;
+        font-weight: 700;
+      }
+
+      .landing-tag-more {
+        background: transparent;
+        border-style: dashed;
+        border-color: rgba(22, 33, 46, 0.16);
+        box-shadow: none;
+        color: var(--muted);
+      }
+
+      .landing-section {
+        padding: 76px 0;
+      }
+
+      .landing-section h2 {
+        margin: 0;
+        text-align: center;
+        font-size: clamp(26px, 3.2vw, 36px);
+        letter-spacing: -0.02em;
+      }
+
+      .landing-section-desc {
+        margin: 14px auto 46px;
+        max-width: 660px;
+        text-align: center;
+        color: var(--muted);
+        font-size: 16px;
+        line-height: 1.8;
+      }
+
+      .landing-feats {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 20px;
+      }
+
+      .landing-feat {
+        padding: 30px 28px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--panel);
+        box-shadow: var(--shadow-soft);
+        text-align: left;
+        transition: transform 180ms ease, box-shadow 180ms ease;
+      }
+
+      .landing-feat:hover {
+        transform: translateY(-3px);
+        box-shadow: var(--shadow);
+      }
+
+      .landing-feat-icon {
+        width: 46px;
+        height: 46px;
+        display: grid;
+        place-items: center;
+        border: 1px solid rgba(6, 115, 210, 0.16);
+        border-radius: 14px;
+        background: var(--ice);
+        color: var(--brand);
+      }
+
+      .landing-feat-icon svg {
+        width: 22px;
+        height: 22px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.7;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      .landing-feat h3 {
+        margin: 20px 0 10px;
+        font-size: 18px;
+      }
+
+      .landing-feat p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.8;
+      }
+
+      .landing-code {
+        width: min(100%, 720px);
+        margin: 0 auto;
+        border: 1px solid rgba(22, 33, 46, 0.14);
+        border-radius: var(--radius);
+        overflow: hidden;
+        background: #0f1b2b;
+        box-shadow: var(--shadow);
+        text-align: left;
+      }
+
+      .landing-code-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 13px 18px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        background: rgba(255, 255, 255, 0.05);
+        color: rgba(246, 250, 255, 0.62);
+        font-size: 13px;
+      }
+
+      .landing-code-head i {
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
+      }
+
+      .landing-code-head span {
+        margin-left: 10px;
+      }
+
+      .landing-code-body {
+        padding: 24px 26px;
+        overflow-x: auto;
+        color: #dce6f3;
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+        font-size: 14px;
+        line-height: 1.9;
+      }
+
+      .landing-code-body p {
+        margin: 0;
+        white-space: pre;
+      }
+
+      .landing-code-gap {
+        margin-top: 16px !important;
+      }
+
+      .landing-indent-1 {
+        padding-left: 20px;
+      }
+
+      .landing-indent-2 {
+        padding-left: 40px;
+      }
+
+      .landing-kw {
+        color: #ff9ecb;
+      }
+
+      .landing-fn {
+        color: #7fd6ff;
+      }
+
+      .landing-str {
+        color: #a8e6a3;
+      }
+
+      .landing-cm {
+        color: #7f92a8;
+      }
+
+      .landing-steps-section {
+        padding-bottom: 92px;
+      }
+
+      .landing-steps {
+        display: grid;
+        gap: 18px;
+      }
+
+      .landing-step {
+        display: flex;
+        align-items: flex-start;
+        gap: 22px;
+        padding: 26px 28px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--panel);
+        box-shadow: var(--shadow-soft);
+      }
+
+      .landing-step-n {
+        flex: 0 0 auto;
+        font-size: 30px;
+        font-weight: 800;
+        line-height: 1;
+        background: linear-gradient(140deg, var(--brand), var(--blue));
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+
+      .landing-step h3 {
+        margin: 0 0 8px;
+        font-size: 18px;
+      }
+
+      .landing-step p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.8;
+      }
+
+      .landing-footer {
+        margin-top: auto;
+        padding: 28px 0;
+        border-top: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 13px;
+        text-align: center;
       }
 
       .login-panel {
@@ -3224,6 +3679,55 @@
           grid-template-columns: 1fr;
         }
 
+        .landing-shell,
+        .landing-topbar-inner {
+          padding-left: 20px;
+          padding-right: 20px;
+        }
+
+        .landing-topbar-inner {
+          flex-wrap: wrap;
+          gap: 12px 18px;
+        }
+
+        .landing-nav {
+          order: 3;
+          width: 100%;
+          margin-left: 0;
+          gap: 20px;
+          overflow-x: auto;
+          scrollbar-width: none;
+        }
+
+        .landing-nav::-webkit-scrollbar {
+          display: none;
+        }
+
+        .landing-hero {
+          padding: 56px 0;
+        }
+
+        .landing-prov-label {
+          margin-top: 40px;
+        }
+
+        .landing-section {
+          padding: 52px 0;
+        }
+
+        .landing-section-desc {
+          margin-bottom: 32px;
+        }
+
+        .landing-feats {
+          grid-template-columns: 1fr;
+        }
+
+        .landing-step {
+          gap: 16px;
+          padding: 22px 20px;
+        }
+
         .login-global-nav {
           top: 18px;
           right: 20px;
@@ -3652,6 +4156,34 @@
           display: none;
         }
 
+        .landing-user-email {
+          display: none;
+        }
+
+        .landing-hero-actions {
+          flex-direction: column;
+        }
+
+        .landing-cta {
+          width: 100%;
+        }
+
+        .landing-tag {
+          min-width: 0;
+          padding: 10px 20px;
+          font-size: 14px;
+        }
+
+        .landing-code-body {
+          padding: 18px 16px;
+          font-size: 13px;
+        }
+
+        .landing-step {
+          flex-direction: column;
+          gap: 10px;
+        }
+
         .verification-field {
           grid-template-columns: minmax(0, 1fr);
         }
@@ -3718,20 +4250,170 @@
       <symbol id="icon-warning" viewBox="0 0 24 24"><path d="M12 4 21 20H3L12 4Z"></path><path d="M12 9v5"></path><path d="M12 17.5h.1"></path></symbol>
       <symbol id="icon-search" viewBox="0 0 24 24"><path d="M11 18a7 7 0 1 1 0-14 7 7 0 0 1 0 14Z"></path><path d="m16 16 4 4"></path></symbol>
     </svg>
+    <section id="landingView" class="landing hidden">
+      <header class="landing-topbar">
+        <div class="landing-topbar-inner">
+          <div class="landing-brand">
+            <span class="brand-icon" aria-hidden="true">
+              <svg><use href="#icon-brand"></use></svg>
+            </span>
+            <strong>CarHer API</strong>
+          </div>
+          <nav class="global-nav landing-nav" aria-label="全局导航">
+            <button class="global-nav-item active" type="button" data-global-page="home" aria-current="page">首页</button>
+            <button class="global-nav-item" type="button" data-global-page="console">控制台</button>
+            <button class="global-nav-item" type="button" data-global-page="models">模型广场</button>
+            <a class="global-nav-item" href="https://t83dfrspj4.feishu.cn/wiki/La8twWEToibR9Jk6yZucTz78nDc" target="_blank" rel="noopener noreferrer">文档</a>
+          </nav>
+          <div id="landingGuestActions" class="landing-topbar-actions">
+            <button class="landing-ghost-btn" type="button" data-auth-entry="login">登录</button>
+            <button id="landingGuestRegisterButton" class="landing-solid-btn" type="button" data-auth-entry="register">注册</button>
+          </div>
+          <div id="landingUserActions" class="landing-topbar-actions hidden">
+            <span id="landingUserEmail" class="landing-user-email"></span>
+            <button class="landing-solid-btn" type="button" data-global-page="console">进入控制台</button>
+            <button id="landingLogoutButton" class="landing-ghost-btn" type="button">退出</button>
+          </div>
+        </div>
+      </header>
+
+      <section class="landing-hero">
+        <div class="landing-shell">
+          <span class="landing-badge">Claude / Codex 核心接口已接入</span>
+          <h1>统一的<br /><span class="landing-gradient-text">大模型接入网关</span></h1>
+          <p class="landing-hero-desc">面向内部团队的统一模型入口：一处接入多家模型，用量、额度与访问密钥全程可见。</p>
+          <div class="landing-hero-actions">
+            <button id="landingPrimaryCta" class="landing-cta landing-cta-primary" type="button">立即开始使用</button>
+            <a class="landing-cta landing-cta-ghost" href="https://t83dfrspj4.feishu.cn/wiki/La8twWEToibR9Jk6yZucTz78nDc" target="_blank" rel="noopener noreferrer">查看使用文档</a>
+          </div>
+          <p class="landing-prov-label">已接入的模型与来源</p>
+          <div class="landing-prov-grid">
+            <span class="landing-tag">Claude</span>
+            <span class="landing-tag">Codex</span>
+            <span class="landing-tag">Her</span>
+            <span class="landing-tag landing-tag-more">及更多…</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="landing-section">
+        <div class="landing-shell">
+          <h2>为什么选择 CarHer API</h2>
+          <p class="landing-section-desc">统一入口、统一计量，让每一次模型调用都可查可控。</p>
+          <div class="landing-feats">
+            <div class="landing-feat">
+              <div class="landing-feat-icon" aria-hidden="true"><svg><use href="#icon-refresh"></use></svg></div>
+              <h3>协议无缝兼容</h3>
+              <p>兼容主流模型接口协议，仅需替换接入地址与密钥，现有工具无需改代码即可切换。</p>
+            </div>
+            <div class="landing-feat">
+              <div class="landing-feat-icon" aria-hidden="true"><svg><use href="#icon-trend"></use></svg></div>
+              <h3>用量全程可见</h3>
+              <p>按天聚合 Token 与请求趋势，随时回看不同时间范围的消耗变化，及时发现异常。</p>
+            </div>
+            <div class="landing-feat">
+              <div class="landing-feat-icon" aria-hidden="true"><svg><use href="#icon-cost"></use></svg></div>
+              <h3>按量计费透明</h3>
+              <p>每一笔消耗都有明细可查，额度按天自动重置，不必为闲置的包月方案付费。</p>
+            </div>
+            <div class="landing-feat">
+              <div class="landing-feat-icon" aria-hidden="true"><svg><use href="#icon-source"></use></svg></div>
+              <h3>多来源统一归集</h3>
+              <p>Codex、Claude Code 等工具的调用统一归集到同一账号下，按来源拆分查看占比。</p>
+            </div>
+            <div class="landing-feat">
+              <div class="landing-feat-icon" aria-hidden="true"><svg><use href="#icon-key"></use></svg></div>
+              <h3>密钥自助管理</h3>
+              <p>自助创建、更新与停用访问密钥，可限定模型范围与有效期，密钥加密保管。</p>
+            </div>
+            <div class="landing-feat">
+              <div class="landing-feat-icon" aria-hidden="true"><svg><use href="#icon-team"></use></svg></div>
+              <h3>团队与部门看板</h3>
+              <p>负责人可查看团队与部门的整体用量排行，掌握资源分布，无需逐个收集数据。</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="landing-section">
+        <div class="landing-shell">
+          <h2>只需替换一行代码</h2>
+          <p class="landing-section-desc">把接口地址换成本站接入地址，并使用你在「令牌管理」创建的访问密钥即可。</p>
+          <div class="landing-code">
+            <div class="landing-code-head">
+              <i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i>
+              <span>request.py</span>
+            </div>
+            <div class="landing-code-body">
+              <p><span class="landing-kw">import</span> openai</p>
+              <p class="landing-code-gap">client = openai.<span class="landing-fn">OpenAI</span>(</p>
+              <p class="landing-indent-1"><span class="landing-cm"># 接入地址与密钥请在「令牌管理」或使用文档中获取</span></p>
+              <p class="landing-indent-1">base_url=<span class="landing-str">"&lt;你的接入地址&gt;"</span>,</p>
+              <p class="landing-indent-1">api_key=<span class="landing-str">"&lt;你的访问密钥&gt;"</span>,</p>
+              <p>)</p>
+              <p class="landing-code-gap">response = client.chat.completions.<span class="landing-fn">create</span>(</p>
+              <p class="landing-indent-1">model=<span class="landing-str">"&lt;模型名称&gt;"</span>,</p>
+              <p class="landing-indent-1">messages=[{</p>
+              <p class="landing-indent-2"><span class="landing-str">"role"</span>: <span class="landing-str">"user"</span>,</p>
+              <p class="landing-indent-2"><span class="landing-str">"content"</span>: <span class="landing-str">"Hello!"</span></p>
+              <p class="landing-indent-1">}]</p>
+              <p>)</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="landing-section landing-steps-section">
+        <div class="landing-shell">
+          <h2>三步开始使用</h2>
+          <p class="landing-section-desc">完成三步，即可在日常工具中调用已授权的模型。</p>
+          <div class="landing-steps">
+            <div class="landing-step">
+              <div class="landing-step-n">01</div>
+              <div>
+                <h3>登录账号</h3>
+                <p>使用邮箱账号或企业账号登录，首次使用可先注册邮箱账号。</p>
+              </div>
+            </div>
+            <div class="landing-step">
+              <div class="landing-step-n">02</div>
+              <div>
+                <h3>创建访问密钥</h3>
+                <p>进入控制台「令牌管理」创建密钥，可设置用途、有效期与模型范围。</p>
+              </div>
+            </div>
+            <div class="landing-step">
+              <div class="landing-step-n">03</div>
+              <div>
+                <h3>配置到工具中</h3>
+                <p>把接入地址与密钥填入 Codex、Claude Code 或其他工具，随后即可在控制台查看用量。</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <footer class="landing-footer">
+        <div class="landing-shell">
+          <span>CarHer API · 企业内部大模型接入网关</span>
+        </div>
+      </footer>
+    </section>
+
     <section id="loginView" class="login-shell hidden">
       <nav class="global-nav login-global-nav" aria-label="全局导航">
-        <button class="global-nav-item active" type="button" data-global-page="home" aria-current="page">主页</button>
+        <button class="global-nav-item" type="button" data-global-page="home">首页</button>
         <button class="global-nav-item" type="button" data-global-page="console">控制台</button>
         <button class="global-nav-item" type="button" data-global-page="models">模型广场</button>
         <a class="global-nav-item" href="https://t83dfrspj4.feishu.cn/wiki/La8twWEToibR9Jk6yZucTz78nDc" target="_blank" rel="noopener noreferrer">文档</a>
       </nav>
       <div class="login-art">
-        <div class="brand-mark">
+        <button class="brand-mark brand-mark-button" type="button" data-global-page="home">
           <span class="brand-icon" aria-hidden="true">
             <svg><use href="#icon-brand"></use></svg>
           </span>
-          <span>AI 用量中心</span>
-        </div>
+          <span>CarHer API</span>
+        </button>
         <div>
           <h1>看清每一次智能工具消耗</h1>
           <p>统一查看个人每日 Token、Codex 与 Claude Code 使用趋势，帮助你及时发现异常消耗。</p>
@@ -3757,7 +4439,7 @@
           </div>
 
           <div id="authGuestContent">
-            <h2 id="guestAuthTitle">登录 AI 用量中心</h2>
+            <h2 id="guestAuthTitle">登录 CarHer API</h2>
             <p id="guestAuthDescription">使用邮箱账号或企业账号进入控制台。</p>
             <p id="authAvailabilityNotice" class="auth-status" role="status" aria-live="polite"></p>
 
@@ -3931,7 +4613,7 @@
               <svg><use href="#icon-brand"></use></svg>
             </span>
             <div>
-              <strong>AI 用量中心</strong>
+              <strong>CarHer API</strong>
               <span>个人 Token 用量管理</span>
             </div>
           </div>
@@ -3954,7 +4636,7 @@
               </div>
             </div>
             <nav class="global-nav app-global-nav" aria-label="全局导航">
-              <button class="global-nav-item" type="button" data-global-page="home">主页</button>
+              <button class="global-nav-item" type="button" data-global-page="home">首页</button>
               <button class="global-nav-item active" type="button" data-global-page="console" aria-current="page">控制台</button>
               <button class="global-nav-item" type="button" data-global-page="models">模型广场</button>
               <a class="global-nav-item" href="https://t83dfrspj4.feishu.cn/wiki/La8twWEToibR9Jk6yZucTz78nDc" target="_blank" rel="noopener noreferrer">文档</a>
@@ -4824,6 +5506,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260727-toc-auth"></script>
+    <script src="/assets/app.js?v=20260727-carher-landing"></script>
   </body>
 </html>
