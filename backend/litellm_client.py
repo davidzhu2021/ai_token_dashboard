@@ -1596,6 +1596,111 @@ class LiteLLMClient:
                 break
         return users
 
+    async def sync_rows_from_logs(
+        self,
+        start_date: str,
+        end_date: str,
+        backend: LiteLLMBackend | None = None,
+    ) -> tuple[dict[str, list[dict[str, Any]]], bool]:
+        """按北京时间日界扫描全量日志，返回 {user_id: usage rows} 与是否完整覆盖。
+
+        上游 /user/daily/activity 的 date 是 UTC 日期（写入时直接切 startTime），
+        忽略我们传入的 timezone 参数，因此北京时间 00:00-08:00 的用量会被归到前一天。
+        这里改为拉原始日志、按 usage timezone 自行归日，消除 8 小时错位。
+
+        一次全局扫描覆盖所有账号，避免按账号逐个查询导致的请求放大。
+        """
+        backend = backend or self.backends[0]
+        utc_start, utc_end = _local_date_window_as_utc_text(start_date, end_date)
+        # 上游 /spend/logs/v2 限制 page_size <= 100，单日约 800+ 页，需并发拉取。
+        page_size = max(1, min(100, _env_int("USAGE_SYNC_LOG_PAGE_SIZE", 100)))
+        max_pages = max(1, _env_int("USAGE_SYNC_LOG_MAX_PAGES", 5000))
+        concurrency = max(1, _env_int("USAGE_SYNC_LOG_CONCURRENCY", 8))
+
+        async def fetch_page(page: int) -> tuple[list[dict[str, Any]], int]:
+            payload = await self.request_backend(
+                backend,
+                "GET",
+                "/spend/logs/v2",
+                params={
+                    "start_date": utc_start,
+                    "end_date": utc_end,
+                    "page": page,
+                    "page_size": page_size,
+                    "sort_by": "startTime",
+                    "sort_order": "asc",
+                },
+            )
+            total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=0)) if isinstance(payload, dict) else 0
+            return _records(payload), total_pages
+
+        first_logs, total_pages = await fetch_page(1)
+        pages_to_fetch = min(total_pages or 1, max_pages)
+        truncated = bool(total_pages and total_pages > max_pages)
+
+        grouped: dict[str, dict[tuple[str, str, str], dict[str, Any]]] = defaultdict(dict)
+
+        def absorb(logs: list[dict[str, Any]]) -> None:
+            for log in logs:
+                user_id = self._log_raw_user(log)
+                if not user_id:
+                    continue
+                day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
+                # 并发分页取回的记录可能落在窗口外，按本地日界二次校验。
+                if day < start_date or day > end_date:
+                    continue
+                source = backend.source or detect_source(log)
+                model = self._usage_model_name(log)
+                key = (day, source, model)
+                bucket = grouped[user_id]
+                row = bucket.get(key)
+                if row is None:
+                    row = self._empty_usage_row(day, source, model)
+                    bucket[key] = row
+                self._add_log_to_row(row, log)
+
+        absorb(first_logs)
+
+        if pages_to_fetch > 1:
+            semaphore = asyncio.Semaphore(concurrency)
+
+            async def load(page: int) -> list[dict[str, Any]]:
+                async with semaphore:
+                    try:
+                        logs, _ = await fetch_page(page)
+                        return logs
+                    except HTTPException:
+                        logger.exception("usage log page %s failed backend=%s", page, backend.id)
+                        raise
+
+            batches = await asyncio.gather(*(load(page) for page in range(2, pages_to_fetch + 1)))
+            for batch in batches:
+                absorb(batch)
+
+        logger.info(
+            "usage log scan backend=%s pages=%s/%s users=%s start=%s end=%s truncated=%s",
+            backend.id,
+            pages_to_fetch,
+            total_pages,
+            len(grouped),
+            start_date,
+            end_date,
+            truncated,
+        )
+        if truncated:
+            logger.warning(
+                "usage log scan truncated backend=%s total_pages=%s max_pages=%s; "
+                "raise USAGE_SYNC_LOG_MAX_PAGES to cover the full window",
+                backend.id,
+                total_pages,
+                max_pages,
+            )
+        result = {
+            user_id: sorted(bucket.values(), key=lambda item: (item["date"], item["source"], item["model"]))
+            for user_id, bucket in grouped.items()
+        }
+        return result, not truncated
+
     async def admin_daily_activity_rows(self, start_date: str, end_date: str, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
         backend = backend or self.backends[0]
         payload = await self.request_backend(

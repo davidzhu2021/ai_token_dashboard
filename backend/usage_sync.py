@@ -22,6 +22,15 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    import os
+
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _text(value: Any) -> str:
     return str(value or "").strip()
 
@@ -134,13 +143,45 @@ class UsageSynchronizer:
             }
             account_users[user_id] = {**info, "userId": user_id}
 
+        # 优先按北京时间日界扫描原始日志：上游 daily activity 按 UTC 归日，会把
+        # 本地 00:00-08:00 的用量算进前一天。日志扫描失败时退回原有逐账号聚合。
+        #
+        # 扫描单日约需 3 分钟（全局 8 万条日志、每页上限 100 条），因此只对增量同步的
+        # 短窗口启用；初始回填这类长窗口仍走 daily activity，避免一次同步跑上数小时。
+        log_rows: dict[str, list[dict[str, Any]]] | None = None
+        window_days = (date.fromisoformat(end_date) - date.fromisoformat(start_date)).days + 1
+        max_window = max(1, _env_int("USAGE_SYNC_LOG_MAX_WINDOW_DAYS", 3))
+        if _env_bool("USAGE_SYNC_LOG_TIMEZONE_ENABLED", True) and not backend.source:
+            if window_days > max_window:
+                logger.info(
+                    "usage log scan skipped backend=%s window=%s days exceeds %s; using daily activity",
+                    backend.id,
+                    window_days,
+                    max_window,
+                )
+            else:
+                try:
+                    scanned, complete = await self.client.sync_rows_from_logs(start_date, end_date, backend)
+                    if complete:
+                        log_rows = scanned
+                    else:
+                        logger.warning(
+                            "usage log scan incomplete for backend %s; falling back to daily activity",
+                            backend.id,
+                        )
+                except Exception:
+                    logger.exception("usage log scan failed for backend %s; falling back to daily activity", backend.id)
+
         semaphore = asyncio.Semaphore(max(1, _env_int("USAGE_SYNC_USER_CONCURRENCY", 4)))
 
         async def collect_user(user_id: str, info: dict[str, Any]) -> list[dict[str, Any]]:
-            async with semaphore:
-                encoder = getattr(self.client, "_encode_account_id", None)
-                routed_user_id = encoder(backend, user_id) if encoder else user_id
-                rows = await self.client.usage_rows(routed_user_id, start_date, end_date, "all")
+            if log_rows is not None:
+                rows = log_rows.get(user_id, [])
+            else:
+                async with semaphore:
+                    encoder = getattr(self.client, "_encode_account_id", None)
+                    routed_user_id = encoder(backend, user_id) if encoder else user_id
+                    rows = await self.client.usage_rows(routed_user_id, start_date, end_date, "all")
             result: list[dict[str, Any]] = []
             for row in rows:
                 item = dict(row)
