@@ -46,7 +46,7 @@ Frontend JavaScript uses plain browser APIs, camelCase names, `const`/`let`, and
 
 ## Frontend Product Boundary
 
-Do not expose any LiteLLM branding or implementation details in user-facing frontend UI. The frontend must not display `LiteLLM`, `Proxy`, `Virtual Key`, upstream gateway names, admin-key terminology, or other backend-provider traces. Treat LiteLLM as an internal backend integration only; employee-facing copy should use product terms such as AI 用量中心, 模型, 来源, Token, Codex, Claude Code, and 访问权限 where appropriate.
+Do not expose any LiteLLM branding or implementation details in user-facing frontend UI. The frontend must not display `LiteLLM`, `Proxy`, `Virtual Key`, upstream gateway names, admin-key terminology, or other backend-provider traces. Treat LiteLLM as an internal backend integration only; employee-facing copy should use product terms such as 通衢 API, 模型, 来源, Token, Codex, Claude Code, and 访问权限 where appropriate.
 
 ## LiteLLM Reference Requirement
 

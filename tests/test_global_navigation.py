@@ -9,15 +9,18 @@ DOCUMENT_URL = "https://t83dfrspj4.feishu.cn/wiki/La8twWEToibR9Jk6yZucTz78nDc"
 APP_JS = Path(__file__).parents[1] / "assets" / "app.js"
 
 
-def test_global_navigation_is_available_on_home_and_console() -> None:
+def test_global_navigation_is_available_on_landing_login_and_console() -> None:
     response = TestClient(main.app).get("/")
 
     assert response.status_code == 200
-    assert response.text.count('aria-label="全局导航"') == 2
-    assert response.text.count('data-global-page="home"') == 2
-    assert response.text.count('data-global-page="console"') == 2
-    assert response.text.count('data-global-page="models"') == 2
-    assert response.text.count(f'href="{DOCUMENT_URL}"') == 2
+    # 营销首页、登录页、控制台各有一组全局导航。
+    assert response.text.count('aria-label="全局导航"') == 3
+    assert response.text.count('data-global-page="models"') == 3
+    # 首页与控制台入口除导航项外，还分别出现在登录页品牌按钮和首页顶栏按钮上。
+    assert response.text.count('data-global-page="home"') == 4
+    assert response.text.count('data-global-page="console"') == 4
+    # 文档链接除三组导航外，首页主视觉还有一个「查看使用文档」入口。
+    assert response.text.count(f'href="{DOCUMENT_URL}"') == 4
 
 
 def test_model_plaza_is_removed_from_sidebar_navigation() -> None:

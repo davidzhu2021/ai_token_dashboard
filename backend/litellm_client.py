@@ -302,7 +302,7 @@ class LiteLLMClient:
         if not base_url or not admin_key:
             raise RuntimeError("请先在 .env 中配置 LITELLM_BASE_URL 和 LITELLM_ADMIN_KEY")
         self.backends = [
-            LiteLLMBackend(id="primary", label="CarHer API", base_url=base_url, admin_key=admin_key),
+            LiteLLMBackend(id="primary", label="通衢 API", base_url=base_url, admin_key=admin_key),
         ]
         her_base_url = os.getenv("HER_LITELLM_BASE_URL", "").strip().rstrip("/")
         her_admin_key = os.getenv("HER_LITELLM_ADMIN_KEY", "").strip()

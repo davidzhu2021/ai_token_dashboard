@@ -87,7 +87,7 @@ async def app_lifespan(_app: FastAPI):
         await close_litellm_client()
 
 
-app = FastAPI(title="CarHer API", lifespan=app_lifespan)
+app = FastAPI(title="通衢 API", lifespan=app_lifespan)
 app.mount("/assets", StaticFiles(directory=ROOT_DIR / "assets"), name="assets")
 
 
@@ -1663,7 +1663,7 @@ async def current_upstream_user(request: Request, refresh: bool = False) -> tupl
             "user_alias": app_user.get("name") or app_user["email"],
             "matched_user_ids": [upstream_user_id],
             "matched_accounts": [
-                {"backend": "primary", "source": "CarHer API", "user_id": upstream_user_id, "account_id": upstream_user_id, "matchSources": ["local_mapping"]}
+                {"backend": "primary", "source": "通衢 API", "user_id": upstream_user_id, "account_id": upstream_user_id, "matchSources": ["local_mapping"]}
             ],
             "matched_sources": {upstream_user_id: ["local_mapping"]},
             "matched_by": "local_mapping",
@@ -2034,7 +2034,7 @@ async def request_verification(data: VerificationRequest, request: Request) -> d
     expires_in = max(60, env_int("AUTH_VERIFICATION_TTL_SECONDS", 600))
     if user is None:
         code = generate_numeric_code(6)
-        subject = "CarHer API 验证码"
+        subject = "通衢 API 验证码"
         body = f"您的验证码是：{code}\n\n验证码 {expires_in // 60} 分钟内有效，请勿转发给他人。"
         await send_auth_email(email, subject, body)
         # Persist only after delivery succeeds so an SMTP failure does not
@@ -2158,7 +2158,7 @@ async def forgot_password(data: ForgotPasswordRequest, request: Request) -> dict
         base_url = os.getenv("APP_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
         reset_url = f"{base_url}/?reset_token={token}"
         try:
-            await send_auth_email(email, "重置 CarHer API 密码", f"请在 {expires_in // 60} 分钟内打开以下链接设置新密码：\n\n{reset_url}\n\n如非本人操作，请忽略本邮件。")
+            await send_auth_email(email, "重置通衢 API 密码", f"请在 {expires_in // 60} 分钟内打开以下链接设置新密码：\n\n{reset_url}\n\n如非本人操作，请忽略本邮件。")
             activated = await auth_store_call("activate_password_reset_token", str(pending_token["id"]), str(user["id"]))
             if not activated:
                 logger.error("password reset token activation failed user_id=%s", user["id"])
