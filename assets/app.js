@@ -614,6 +614,17 @@ function authScreenForMode(mode) {
   }[mode] || "passwordLoginScreen";
 }
 
+function syncVerificationRequired() {
+  // Every auth screen shares one <form>, so native validation also inspects the
+  // fields of whichever screens are hidden. A required control inside a hidden
+  // screen can never be focused, and the browser then aborts submission with
+  // "An invalid form control is not focusable" without firing a submit event --
+  // which silently breaks login and password reset. Mark the code required only
+  // while the register screen is the active one.
+  const field = el("registerVerificationInput");
+  if (field) field.required = Boolean(authConfig.emailVerificationRequired) && authMode === "register";
+}
+
 function setAuthMode(mode, { focus = true } = {}) {
   let requestedMode = ["login", "register", "forgot", "reset"].includes(mode) ? mode : "login";
   if (requestedMode === "register" && !publicSignupAvailable()) requestedMode = "login";
@@ -629,6 +640,7 @@ function setAuthMode(mode, { focus = true } = {}) {
     screen.setAttribute("aria-hidden", String(!active));
   });
   el("authFlowSwitch").classList.toggle("hidden", ["forgot", "reset"].includes(authMode));
+  syncVerificationRequired();
   document.querySelectorAll("[data-auth-mode]").forEach((button) => {
     const selected = button.dataset.authMode === authMode;
     button.setAttribute("aria-selected", String(selected));
@@ -651,7 +663,7 @@ function updateAuthAvailability() {
   el("personalAccessTab").setAttribute("aria-hidden", String(!passwordEnabled));
   el("registerFlowTab").classList.toggle("hidden", !signupEnabled);
   el("registerVerificationField").classList.toggle("hidden", !authConfig.emailVerificationRequired);
-  el("registerVerificationInput").required = Boolean(authConfig.emailVerificationRequired);
+  syncVerificationRequired();
   el("authFlowSwitch").style.gridTemplateColumns = signupEnabled ? "repeat(2, minmax(0, 1fr))" : "1fr";
   if (!signupEnabled && authMode === "register") setAuthMode("login", { focus: false });
   el("enterpriseAccessTab").classList.toggle("hidden", !ssoEnabled);

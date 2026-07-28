@@ -120,3 +120,23 @@ def test_frontend_clears_reset_tokens_and_exposes_accessible_tabs() -> None:
     assert 'role="tabpanel" aria-labelledby="personalAccessTab" aria-hidden="false"' in markup
     assert 'role="tabpanel" aria-labelledby="loginFlowTab" aria-hidden="false"' in markup
     assert 'tablist.addEventListener("keydown"' in source
+
+
+def test_verification_code_is_required_only_while_register_screen_is_active() -> None:
+    """A required control on a hidden screen would silently break every submit.
+
+    All four auth screens live inside one <form>, so native validation also
+    inspects hidden screens. A required-but-unfocusable control makes the
+    browser abort submission with "An invalid form control ... is not focusable"
+    and never fire the submit event, which broke login and password reset once
+    EMAIL_VERIFICATION_REQUIRED was turned on in production.
+    """
+    source = APP_JS.read_text(encoding="utf-8")
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+
+    assert 'field.required = Boolean(authConfig.emailVerificationRequired) && authMode === "register"' in source
+    # setAuthMode must resync on every screen switch, not just on config load.
+    assert source.count("syncVerificationRequired()") >= 3
+    # The static markup must not ship a required attribute of its own.
+    verification_input = next(line for line in markup.splitlines() if 'id="registerVerificationInput"' in line)
+    assert "required" not in verification_input
