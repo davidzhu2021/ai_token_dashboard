@@ -15,6 +15,40 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # Self-hosted outbound MTA. Listens only on the internal compose network --
+  # no host port is published, so nothing on the internet can use it as a relay.
+  # It delivers straight to each recipient's MX on port 25 and signs with DKIM.
+  mail-relay:
+    image: boky/postfix:latest
+    container_name: ai-token-dashboard-mail
+    hostname: ${MAIL_RELAY_HELO_NAME:-mail.notify.carher.net}
+    environment:
+      ALLOWED_SENDER_DOMAINS: ${MAIL_RELAY_SENDER_DOMAINS:?MAIL_RELAY_SENDER_DOMAINS must be set}
+      # HELO name. Must be a host name distinct from the sender domain: if it
+      # equals the sender domain, Postfix considers itself the final
+      # destination for that domain and bounce reports fail with
+      # "mail ... loops back to myself".
+      POSTFIX_myhostname: ${MAIL_RELAY_HELO_NAME:-mail.notify.carher.net}
+      POSTFIX_mydestination: localhost
+      # Deliver over IPv4 only; the host has no outbound IPv6 mail reputation.
+      POSTFIX_inet_protocols: ipv4
+      POSTFIX_smtp_tls_security_level: may
+      DKIM_SELECTOR: ${MAIL_RELAY_DKIM_SELECTOR:-mail}
+      # Generate a DKIM keypair per sender domain on first start. Without this
+      # the image runs OpenDKIM but signs nothing, and Gmail rejects with
+      # "550-5.7.26 ... DKIM = did not pass".
+      DKIM_AUTOGENERATE: "true"
+    volumes:
+      - mail-relay-dkim:/etc/opendkim/keys
+      - mail-relay-spool:/var/spool/postfix
+    healthcheck:
+      test: ["CMD-SHELL", "postfix status || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
   ai-token-dashboard:
     build:
       context: .
@@ -27,6 +61,8 @@ services:
     depends_on:
       usage-db:
         condition: service_healthy
+      mail-relay:
+        condition: service_started
     ports:
       - "8000:8000"
     restart: unless-stopped
@@ -34,3 +70,5 @@ services:
 volumes:
   key-vault-data:
   usage-db-data:
+  mail-relay-dkim:
+  mail-relay-spool:

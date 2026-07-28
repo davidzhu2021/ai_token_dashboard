@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import smtplib
+import socket
 import ssl
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -591,15 +592,64 @@ def is_loopback_development() -> bool:
     return parsed_base_url.scheme.lower() == "http" and (parsed_base_url.hostname or "").lower() in LOOPBACK_HOSTS
 
 
+def smtp_host_is_private_relay() -> bool:
+    """Return whether SMTP_HOST resolves only to private, non-routable addresses.
+
+    A self-hosted MTA reached over the container network needs neither
+    credentials nor TLS, because the hop never leaves the host. Resolving the
+    name and requiring every answer to be private is what makes that safe: if
+    the name resolves anywhere public, credentials or message bodies would
+    cross the internet in the clear, so such a host is not treated as local.
+    """
+    host = os.getenv("SMTP_HOST", "").strip()
+    if not host:
+        return False
+    try:
+        candidates = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError):
+        return False
+    addresses = {str(entry[4][0]) for entry in candidates}
+    if not addresses:
+        return False
+    for address in addresses:
+        try:
+            parsed = ipaddress.ip_address(address)
+        except ValueError:
+            return False
+        if parsed.is_global or not (parsed.is_private or parsed.is_loopback or parsed.is_link_local):
+            return False
+    return True
+
+
+def smtp_local_relay_enabled() -> bool:
+    """Allow an unauthenticated, cleartext hop to a self-hosted MTA."""
+    return env_bool("SMTP_LOCAL_RELAY", False) and smtp_host_is_private_relay()
+
+
 def smtp_configured() -> bool:
     """Require an authenticated, encrypted SMTP transport for public email."""
     if is_loopback_development() and (env_bool("AUTH_EMAIL_DEBUG", False) or env_bool("DEV_LOGIN_ENABLED", False)):
         return True
     if not os.getenv("SMTP_HOST", "").strip() or not os.getenv("SMTP_FROM", "").strip():
         return False
+    # A private-only relay carries no credentials, so the TLS and username
+    # requirements below do not apply to it.
+    if smtp_local_relay_enabled():
+        return True
     if not os.getenv("SMTP_USERNAME", "").strip() or not os.getenv("SMTP_PASSWORD", ""):
         return False
     return env_bool("SMTP_SSL", False) != env_bool("SMTP_STARTTLS", True)
+
+
+def bot_protection_opt_out() -> bool:
+    """Allow internet-facing password auth without Turnstile, by explicit choice.
+
+    Turnstile is the only bot protection in front of the public signup and
+    verification-code endpoints. Opting out means scripted clients can burn the
+    per-email and per-IP rate-limit budget and the outbound mail quota, so this
+    must be set deliberately rather than defaulted on.
+    """
+    return env_bool("AUTH_ALLOW_NO_BOT_PROTECTION", False)
 
 
 def password_login_unavailable_code() -> str:
@@ -612,7 +662,7 @@ def password_login_unavailable_code() -> str:
         return "AUTH_PASSWORD_LOGIN_HTTPS_REQUIRED"
     if not auth_database_configured():
         return "AUTH_DATABASE_NOT_CONFIGURED"
-    if not turnstile_enabled() or not turnstile_configured():
+    if (not turnstile_enabled() or not turnstile_configured()) and not bot_protection_opt_out():
         return "AUTH_TURNSTILE_NOT_CONFIGURED"
     return ""
 
@@ -784,6 +834,14 @@ def send_auth_email_sync(recipient: str, subject: str, body: str) -> None:
     password = os.getenv("SMTP_PASSWORD", "")
     smtp_ssl = env_bool("SMTP_SSL", False)
     smtp_starttls = env_bool("SMTP_STARTTLS", True)
+    if smtp_local_relay_enabled():
+        # The self-hosted MTA is reachable only on the private container
+        # network and accepts no credentials, so skip TLS on this hop and let
+        # the MTA negotiate STARTTLS with each recipient's server itself.
+        smtp_ssl = False
+        smtp_starttls = False
+        username = ""
+        password = ""
     if smtp_ssl and smtp_starttls:
         raise RuntimeError("SMTP_SSL 和 SMTP_STARTTLS 不能同时启用")
     if (username or password) and not (smtp_ssl or smtp_starttls):
