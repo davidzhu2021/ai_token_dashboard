@@ -54,6 +54,7 @@ let selectedDepartment = "";
 let departmentPickerOpen = false;
 let departmentPickerOptions = [];
 let modelCatalog = [];
+let modelViewMode = "card";
 let personalKeys = [];
 let availableKeyModels = [];
 let unrestrictedKeyModels = false;
@@ -2416,58 +2417,163 @@ function render() {
   if (currentUser?.isTeamLeader) renderTeam();
 }
 
-function uniqueValues(items, getter) {
-  return [...new Set(items.flatMap((item) => getter(item)).filter(Boolean))].sort((a, b) => a.localeCompare(b, "zh-CN"));
+const VENDOR_ICON_KEYS = new Set(["openai", "anthropic", "google", "deepseek", "zhipu", "moonshot", "qwen", "minimax", "baai", "other"]);
+
+function modelFamilyLabel(model) {
+  return model.familyLabel || model.provider || "其他";
+}
+
+function vendorIconMarkup(model, extraClass = "") {
+  const key = VENDOR_ICON_KEYS.has(model.familyKey) ? model.familyKey : "other";
+  return `<span class="vendor-icon vendor-${key}${extraClass ? ` ${extraClass}` : ""}" aria-hidden="true">${icon(`vendor-${key}`)}</span>`;
+}
+
+// 后端已把每 token 单价换算成每百万 Token 单价；无价格的档位不展示。
+function formatPricePerMillion(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount <= 0) return "";
+  return `$${amount.toFixed(4)} / 1M Tokens`;
+}
+
+function modelContextText(model) {
+  const tokens = Number(model.contextWindow);
+  if (!Number.isFinite(tokens) || tokens <= 0) return "未标注";
+  if (tokens >= 1000) return `${Math.round(tokens / 1000)}K`;
+  return fmt.format(tokens);
+}
+
+function modelPriceRows(model) {
+  return [
+    ["输入价格", model.inputPricePerMillion],
+    ["补全价格", model.outputPricePerMillion],
+    ["缓存读取", model.cacheReadPricePerMillion],
+    ["缓存写入", model.cacheWritePricePerMillion],
+  ]
+    .map(([label, value]) => [label, formatPricePerMillion(value)])
+    .filter(([, text]) => text);
+}
+
+function filterOptionsMarkup(values, allLabel, selected) {
+  const options = [`<option value="all">${escapeHtml(allLabel)}</option>`];
+  values.forEach(([value, count]) => {
+    options.push(`<option value="${escapeHtml(value)}"${value === selected ? " selected" : ""}>${escapeHtml(value)}（${fmt.format(count)}）</option>`);
+  });
+  return options.join("");
+}
+
+function countedValues(items, getter) {
+  const counts = new Map();
+  items.forEach((item) => {
+    const value = getter(item);
+    if (!value) return;
+    counts.set(value, (counts.get(value) || 0) + 1);
+  });
+  return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-CN"));
 }
 
 function setupModelFilters() {
-  const providers = uniqueValues(modelCatalog, (item) => [item.provider]);
-  const capabilities = uniqueValues(modelCatalog, (item) => item.capabilities || []);
+  const providers = countedValues(modelCatalog, (item) => modelFamilyLabel(item));
+  const billingTypes = countedValues(modelCatalog, (item) => item.billingType);
   const currentProvider = el("providerFilter").value || "all";
-  const currentCapability = el("capabilityFilter").value || "all";
-  el("providerFilter").innerHTML = [`<option value="all">全部供应商</option>`, ...providers.map((provider) => `<option value="${provider}">${provider}</option>`)].join("");
-  el("capabilityFilter").innerHTML = [`<option value="all">全部能力</option>`, ...capabilities.map((capability) => `<option value="${capability}">${capability}</option>`)].join("");
-  el("providerFilter").value = providers.includes(currentProvider) ? currentProvider : "all";
-  el("capabilityFilter").value = capabilities.includes(currentCapability) ? currentCapability : "all";
+  const currentBilling = el("billingFilter").value || "all";
+  const keepProvider = providers.some(([value]) => value === currentProvider) ? currentProvider : "all";
+  const keepBilling = billingTypes.some(([value]) => value === currentBilling) ? currentBilling : "all";
+  el("providerFilter").innerHTML = filterOptionsMarkup(providers, "全部厂商", keepProvider);
+  el("billingFilter").innerHTML = filterOptionsMarkup(billingTypes, "全部计费类型", keepBilling);
 }
 
 function filteredModels() {
   const keyword = el("modelSearch").value.trim().toLowerCase();
   const provider = el("providerFilter").value;
-  const capability = el("capabilityFilter").value;
+  const billingType = el("billingFilter").value;
   return modelCatalog.filter((model) => {
-    const matchesKeyword = !keyword || model.modelName.toLowerCase().includes(keyword) || model.provider.toLowerCase().includes(keyword) || String(model.recommendedFor || "").toLowerCase().includes(keyword);
-    const matchesProvider = provider === "all" || model.provider === provider;
-    const matchesCapability = capability === "all" || (model.capabilities || []).includes(capability);
-    return matchesKeyword && matchesProvider && matchesCapability;
+    const matchesKeyword = !keyword || model.modelName.toLowerCase().includes(keyword) || modelFamilyLabel(model).toLowerCase().includes(keyword);
+    const matchesProvider = provider === "all" || modelFamilyLabel(model) === provider;
+    const matchesBilling = billingType === "all" || model.billingType === billingType;
+    return matchesKeyword && matchesProvider && matchesBilling;
   });
+}
+
+function setModelViewMode(mode) {
+  modelViewMode = mode === "table" ? "table" : "card";
+  document.querySelectorAll("[data-model-view]").forEach((button) => {
+    const isActive = button.dataset.modelView === modelViewMode;
+    button.classList.toggle("active", isActive);
+    button.setAttribute("aria-pressed", String(isActive));
+  });
+  renderModels();
+}
+
+function renderModelCards(models) {
+  el("modelGrid").innerHTML = models
+    .map((model) => {
+      const name = escapeHtml(model.modelName);
+      const priceRows = modelPriceRows(model);
+      const priceMarkup = priceRows.length
+        ? priceRows.map(([label, text]) => `<div class="model-price-row"><span>${escapeHtml(label)}</span><strong>${escapeHtml(text)}</strong></div>`).join("")
+        : `<div class="model-price-row"><span>价格</span><strong>未标注</strong></div>`;
+      return `
+        <article class="model-card">
+          <div class="model-card-head">
+            <div class="model-identity">
+              ${vendorIconMarkup(model)}
+              <div>
+                <h3 class="model-name">${name}</h3>
+                <div class="provider">${escapeHtml(modelFamilyLabel(model))}</div>
+              </div>
+            </div>
+            <button class="model-copy-btn" type="button" data-copy-model="${name}" title="复制模型名称" aria-label="复制模型名称 ${name}">${icon("copy")}</button>
+          </div>
+          <div class="model-price-list">${priceMarkup}</div>
+          <div class="model-card-foot">
+            <span class="chip blue">${escapeHtml(model.billingType || "按量计费")}</span>
+            <span class="provider">上下文 ${escapeHtml(modelContextText(model))}</span>
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function renderModelTable(models) {
+  el("modelTableBody").innerHTML = models
+    .map((model) => {
+      const name = escapeHtml(model.modelName);
+      const price = (value) => escapeHtml(formatPricePerMillion(value) || "-");
+      return `
+        <tr>
+          <td><div class="model-table-name">${vendorIconMarkup(model, "vendor-icon-sm")}<code>${name}</code></div></td>
+          <td>${escapeHtml(modelFamilyLabel(model))}</td>
+          <td><span class="chip blue">${escapeHtml(model.billingType || "按量计费")}</span></td>
+          <td class="num">${price(model.inputPricePerMillion)}</td>
+          <td class="num">${price(model.outputPricePerMillion)}</td>
+          <td class="num">${price(model.cacheReadPricePerMillion)}</td>
+          <td class="num">${escapeHtml(modelContextText(model))}</td>
+          <td><button class="model-copy-btn" type="button" data-copy-model="${name}" title="复制模型名称" aria-label="复制模型名称 ${name}">${icon("copy")}</button></td>
+        </tr>
+      `;
+    })
+    .join("");
 }
 
 function renderModels() {
   const models = filteredModels();
   el("modelCount").textContent = fmt.format(models.length);
+  const isTable = modelViewMode === "table";
+  el("modelTablePanel").classList.toggle("hidden", !isTable || !models.length);
+  el("modelGrid").classList.toggle("hidden", isTable && Boolean(models.length));
   if (!models.length) {
     el("modelGrid").innerHTML = `<article class="panel model-empty">没有找到匹配的模型，请调整筛选条件。</article>`;
+    el("modelTableBody").innerHTML = "";
     return;
   }
-  el("modelGrid").innerHTML = models
-    .map(
-      (model) => `
-        <article class="model-card">
-          <div class="model-card-head">
-            <div class="key-title">
-              <span class="key-icon">${icon("model")}</span>
-              <div><h3 class="model-name">${model.modelName}</h3><div class="provider">${model.provider}</div></div>
-            </div>
-            <span class="chip ${model.status === "推荐" || model.status === "默认" ? "" : "blue"}">${model.status || "可用"}</span>
-          </div>
-          <p class="model-desc">${model.description || "当前账号可用模型。"}</p>
-          <div class="tag-row">${(model.capabilities || ["通用"]).map((capability) => `<span class="chip blue">${capability}</span>`).join("")}</div>
-          <button class="copy-btn" type="button" data-copy-model="${model.modelName}"><span class="app-icon">${icon("copy")}</span>复制模型名称</button>
-        </article>
-      `,
-    )
-    .join("");
+  if (isTable) {
+    renderModelTable(models);
+    el("modelGrid").innerHTML = "";
+    return;
+  }
+  renderModelCards(models);
+  el("modelTableBody").innerHTML = "";
 }
 
 function keyStatusClass(status) {
@@ -3720,10 +3826,15 @@ el("teamMemberUsageDetailReset").addEventListener("click", resetTeamMemberUsageF
 
 el("modelSearch").addEventListener("input", renderModels);
 el("providerFilter").addEventListener("change", renderModels);
-el("capabilityFilter").addEventListener("change", renderModels);
-el("modelGrid").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-copy-model]");
-  if (button) copyText(button.dataset.copyModel, "模型名称已复制");
+el("billingFilter").addEventListener("change", renderModels);
+el("modelsView").addEventListener("click", (event) => {
+  const viewButton = event.target.closest("[data-model-view]");
+  if (viewButton) {
+    setModelViewMode(viewButton.dataset.modelView);
+    return;
+  }
+  const copyButton = event.target.closest("[data-copy-model]");
+  if (copyButton) copyText(copyButton.dataset.copyModel, "模型名称已复制");
 });
 
 el("addKeyButton").addEventListener("click", openCreateKeyModal);

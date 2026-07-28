@@ -372,8 +372,10 @@ def test_models_deduplicate_trimmed_casefold_names_but_keep_similar_names(monkey
     async def fake_request_backend(backend: LiteLLMBackend, _method: str, path: str, **_kwargs: Any) -> Any:
         if path == "/models":
             if backend.id == "primary":
-                return {"data": [{"id": "primary", "model_name": " GPT-5.5 "}, {"id": "chatgpt-gpt-5.5"}]}
+                return {"data": [{"id": "primary", "model_name": " GPT-5.5 "}, {"id": "gpt-5.5-mini"}]}
             return {"data": [{"id": "secondary", "model_name": "gpt-5.5"}]}
+        if path == "/model/info":
+            return {"data": []}
         if path == "/user/daily/activity/aggregated":
             return {"results": []}
         raise AssertionError(f"unexpected path: {path}")
@@ -382,7 +384,7 @@ def test_models_deduplicate_trimmed_casefold_names_but_keep_similar_names(monkey
 
     models = asyncio.run(client.models())
 
-    assert [item["modelName"] for item in models] == ["chatgpt-gpt-5.5", "GPT-5.5"]
+    assert [item["modelName"] for item in models] == ["GPT-5.5", "gpt-5.5-mini"]
     assert len([item for item in models if item["modelName"].casefold() == "gpt-5.5"]) == 1
 
 
@@ -392,6 +394,8 @@ def test_models_accept_database_usage_counts_without_daily_activity_request() ->
 
     async def fake_request_backend(_backend: LiteLLMBackend, _method: str, path: str, **_kwargs: Any) -> Any:
         paths.append(path)
+        if path == "/model/info":
+            return {"data": []}
         assert path == "/models"
         return {"data": [{"id": "gpt-4o"}, {"id": "low"}]}
 
@@ -400,7 +404,8 @@ def test_models_accept_database_usage_counts_without_daily_activity_request() ->
     models = asyncio.run(client.models({"gpt-4o": 9, "low": 1}))
 
     assert [item["modelName"] for item in models] == ["gpt-4o", "low"]
-    assert paths == ["/models", "/models"]
+    # 目录与计费信息各查一次，且不触发按日用量接口（用量由数据库提供）。
+    assert paths == ["/models", "/models", "/model/info", "/model/info"]
 
 
 def test_models_return_complete_name_sorted_catalog_when_all_usage_sources_fail(monkeypatch: pytest.MonkeyPatch) -> None:

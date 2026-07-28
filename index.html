@@ -3149,9 +3149,41 @@
 
       .model-controls {
         display: grid;
-        grid-template-columns: minmax(220px, 1fr) 180px 180px;
+        grid-template-columns: minmax(220px, 1fr) 190px 170px auto;
         gap: 12px;
+        align-items: center;
         margin-bottom: 18px;
+      }
+
+      .model-view-toggle {
+        display: inline-flex;
+        padding: 3px;
+        gap: 3px;
+        border-radius: var(--radius-sm);
+        background: rgba(22, 33, 46, 0.05);
+        border: 1px solid var(--line);
+      }
+
+      .model-view-toggle button {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 7px 14px;
+        border: 0;
+        border-radius: 9px;
+        color: var(--muted);
+        background: transparent;
+        font-size: 13px;
+        font-weight: 600;
+        transition:
+          color 150ms ease,
+          background 150ms ease;
+      }
+
+      .model-view-toggle button.active {
+        color: var(--brand);
+        background: var(--panel-strong);
+        box-shadow: var(--shadow-soft);
       }
 
       .model-grid {
@@ -3162,13 +3194,24 @@
 
       .model-card {
         min-width: 0;
-        padding: 20px;
+        padding: 18px 20px;
         border-radius: var(--radius);
         background: var(--panel);
         border: 1px solid var(--line);
         box-shadow: var(--shadow-soft);
         display: grid;
-        gap: 16px;
+        gap: 14px;
+        align-content: start;
+        transition:
+          border-color 160ms ease,
+          box-shadow 160ms ease,
+          transform 160ms ease;
+      }
+
+      .model-card:hover {
+        transform: translateY(-2px);
+        border-color: rgba(6, 115, 210, 0.24);
+        box-shadow: 0 18px 40px rgba(20, 40, 68, 0.11);
       }
 
       .model-card-head {
@@ -3178,17 +3221,103 @@
         gap: 12px;
       }
 
+      .model-identity {
+        display: flex;
+        align-items: flex-start;
+        gap: 11px;
+        min-width: 0;
+      }
+
+      /* 厂商标识是填充式品牌色图形，与描边式功能图标体系分开。 */
+      .vendor-icon {
+        display: inline-grid;
+        place-items: center;
+        flex: 0 0 auto;
+        width: 38px;
+        height: 38px;
+        border-radius: 12px;
+        background: var(--panel-strong);
+        border: 1px solid var(--line);
+        box-shadow: var(--shadow-soft);
+      }
+
+      .vendor-icon svg {
+        width: 21px;
+        height: 21px;
+        fill: currentColor;
+        stroke: none;
+      }
+
+      /* 少数厂商图形以描边呈现更贴近原标识。 */
+      .vendor-icon svg .vs {
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.7;
+      }
+
+      .vendor-icon.vendor-openai {
+        color: #0f9d76;
+      }
+
+      .vendor-icon.vendor-anthropic {
+        color: #d97757;
+      }
+
+      .vendor-icon.vendor-google {
+        color: #3f7ff0;
+      }
+
+      .vendor-icon.vendor-deepseek {
+        color: #3d6bf5;
+      }
+
+      .vendor-icon.vendor-zhipu {
+        color: #2f66f5;
+      }
+
+      .vendor-icon.vendor-moonshot {
+        color: #12203a;
+      }
+
+      .vendor-icon.vendor-qwen {
+        color: #6a4df4;
+      }
+
+      .vendor-icon.vendor-minimax {
+        color: #e8563f;
+      }
+
+      .vendor-icon.vendor-baai {
+        color: #1a7fb5;
+      }
+
+      .vendor-icon.vendor-other {
+        color: var(--muted);
+      }
+
+      .vendor-icon-sm {
+        width: 26px;
+        height: 26px;
+        border-radius: 9px;
+      }
+
+      .vendor-icon-sm svg {
+        width: 15px;
+        height: 15px;
+      }
+
       .model-name {
         margin: 0;
         font-family: Consolas, "Courier New", monospace;
-        font-size: 18px;
+        font-size: 16px;
+        font-weight: 700;
         word-break: break-word;
       }
 
       .provider {
-        margin-top: 5px;
+        margin-top: 4px;
         color: var(--muted);
-        font-size: 13px;
+        font-size: 12px;
       }
 
       .model-desc {
@@ -3196,6 +3325,93 @@
         line-height: 1.7;
         font-size: 13px;
         margin: 0;
+      }
+
+      .model-price-list {
+        display: grid;
+        gap: 7px;
+      }
+
+      .model-price-row {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 10px;
+        font-size: 13px;
+      }
+
+      .model-price-row span {
+        color: var(--muted);
+        flex: 0 0 auto;
+      }
+
+      .model-price-row strong {
+        font-family: Consolas, "Courier New", monospace;
+        font-weight: 700;
+        text-align: right;
+        overflow-wrap: anywhere;
+      }
+
+      .model-card-foot {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .model-copy-btn {
+        display: inline-grid;
+        place-items: center;
+        width: 30px;
+        height: 30px;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        color: var(--muted);
+        background: var(--panel-strong);
+        transition:
+          color 150ms ease,
+          border-color 150ms ease;
+      }
+
+      .model-copy-btn:hover {
+        color: var(--brand);
+        border-color: rgba(6, 115, 210, 0.3);
+      }
+
+      .model-copy-btn svg {
+        width: 15px;
+        height: 15px;
+        stroke: currentColor;
+        stroke-width: 1.9;
+        fill: none;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      .model-table-panel {
+        padding: 0;
+        overflow: hidden;
+      }
+
+      /* 与密钥表格一致：给足最小宽度，窄屏由 .table-wrap 横向滚动，
+         避免 8 列价格被挤压到无法阅读。 */
+      .model-table-panel table {
+        min-width: 1020px;
+      }
+
+      .model-table-name {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        min-width: 0;
+      }
+
+      .model-table-name code {
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 13px;
+        font-weight: 700;
+        overflow-wrap: anywhere;
       }
 
       .tag-row {
@@ -3540,6 +3756,15 @@
         .key-grid,
         .model-grid {
           grid-template-columns: 1fr 1fr;
+        }
+
+        .model-controls {
+          grid-template-columns: minmax(180px, 1fr) 160px 150px;
+        }
+
+        .model-view-toggle {
+          grid-column: 1 / -1;
+          justify-self: start;
         }
       }
 
@@ -4041,6 +4266,15 @@
           grid-template-columns: 1fr;
         }
 
+        .model-view-toggle {
+          justify-self: stretch;
+        }
+
+        .model-view-toggle button {
+          flex: 1;
+          justify-content: center;
+        }
+
         .source-grid,
         .daily-source-card .source-grid {
           grid-template-columns: 1fr;
@@ -4205,6 +4439,18 @@
       <symbol id="icon-eye-off" viewBox="0 0 24 24"><path d="m4 4 16 16"></path><path d="M9.4 6.4A9.8 9.8 0 0 1 12 6c5.9 0 9.2 6 9.2 6a15.2 15.2 0 0 1-2.2 3"></path><path d="M6.2 7.6A15.4 15.4 0 0 0 2.8 12s3.3 6 9.2 6c1 0 1.9-.2 2.7-.5"></path><path d="M10.1 10.1a2.7 2.7 0 0 0 3.8 3.8"></path></symbol>
       <symbol id="icon-warning" viewBox="0 0 24 24"><path d="M12 4 21 20H3L12 4Z"></path><path d="M12 9v5"></path><path d="M12 17.5h.1"></path></symbol>
       <symbol id="icon-search" viewBox="0 0 24 24"><path d="M11 18a7 7 0 1 1 0-14 7 7 0 0 1 0 14Z"></path><path d="m16 16 4 4"></path></symbol>
+      <!-- 模型广场厂商标识。与上方描边式功能图标不同，这里是填充式品牌色图形；
+           需要描边呈现的图形单独标记 class="vs"（见 .vendor-icon 样式）。 -->
+      <symbol id="icon-vendor-openai" viewBox="0 0 24 24"><ellipse class="vs" cx="12" cy="12" rx="4.1" ry="9.2"></ellipse><ellipse class="vs" cx="12" cy="12" rx="4.1" ry="9.2" transform="rotate(60 12 12)"></ellipse><ellipse class="vs" cx="12" cy="12" rx="4.1" ry="9.2" transform="rotate(120 12 12)"></ellipse></symbol>
+      <symbol id="icon-vendor-anthropic" viewBox="0 0 24 24"><g><rect x="11.1" y="1.8" width="1.8" height="20.4" rx=".9"></rect><rect x="11.1" y="1.8" width="1.8" height="20.4" rx=".9" transform="rotate(45 12 12)"></rect><rect x="11.1" y="1.8" width="1.8" height="20.4" rx=".9" transform="rotate(90 12 12)"></rect><rect x="11.1" y="1.8" width="1.8" height="20.4" rx=".9" transform="rotate(135 12 12)"></rect><rect x="11.1" y="4.2" width="1.8" height="15.6" rx=".9" transform="rotate(22.5 12 12)"></rect><rect x="11.1" y="4.2" width="1.8" height="15.6" rx=".9" transform="rotate(67.5 12 12)"></rect><rect x="11.1" y="4.2" width="1.8" height="15.6" rx=".9" transform="rotate(112.5 12 12)"></rect><rect x="11.1" y="4.2" width="1.8" height="15.6" rx=".9" transform="rotate(157.5 12 12)"></rect></g></symbol>
+      <symbol id="icon-vendor-google" viewBox="0 0 24 24"><path d="M12 1.6c.7 5.1 2.2 8.1 10.4 10.4-8.2 2.3-9.7 5.3-10.4 10.4-.7-5.1-2.2-8.1-10.4-10.4C9.8 9.7 11.3 6.7 12 1.6Z"></path></symbol>
+      <symbol id="icon-vendor-deepseek" viewBox="0 0 24 24"><path d="M2.6 12.6c3.2-4.6 7.7-6.7 13.4-6.2-1.2 1.5-1.7 3-1.4 4.5 1.9-.8 3.6-.4 5.1 1-1.3.4-2.2 1.2-2.6 2.4 1.3.3 2.3 1 3 2.1-4.6 2.9-9.4 3.2-14.3 1-1.5-.7-2.6-1.9-3.2-3.4Z"></path><circle cx="7.6" cy="12.1" r="1.1"></circle></symbol>
+      <symbol id="icon-vendor-zhipu" viewBox="0 0 24 24"><path d="M5 3.6h14v3.2l-8 9.6h8v4H5v-3.2l8-9.6H5Z"></path></symbol>
+      <symbol id="icon-vendor-moonshot" viewBox="0 0 24 24"><path d="M15.4 2.6a9.6 9.6 0 1 0 0 18.8 7.7 7.7 0 0 1 0-18.8Z"></path><circle cx="17.8" cy="7.4" r="1.5"></circle></symbol>
+      <symbol id="icon-vendor-qwen" viewBox="0 0 24 24"><circle class="vs" cx="12" cy="12" r="8.4"></circle><path d="M12 6.4c2.1 2 3.2 3.9 3.2 5.6a3.2 3.2 0 0 1-6.4 0c0-1.7 1.1-3.6 3.2-5.6Z"></path></symbol>
+      <symbol id="icon-vendor-minimax" viewBox="0 0 24 24"><path d="M2.4 19.6 7.6 4.4l4.4 8.6 4.4-8.6 5.2 15.2h-3.8l-2.4-7.4-3.4 6.4-3.4-6.4-2.4 7.4Z"></path></symbol>
+      <symbol id="icon-vendor-baai" viewBox="0 0 24 24"><path class="vs" d="M12 2.8 20 7.4v9.2L12 21.2 4 16.6V7.4Z"></path><circle cx="12" cy="12" r="2.6"></circle></symbol>
+      <symbol id="icon-vendor-other" viewBox="0 0 24 24"><path d="M12 2.6 20.6 7.4v9.2L12 21.4 3.4 16.6V7.4Zm0 3.1L7.2 8.4l4.8 2.7 4.8-2.7Z"></path></symbol>
     </svg>
     <section id="landingView" class="landing hidden">
       <header class="landing-topbar">
@@ -5333,22 +5579,45 @@
             <div class="hero-copy">
               <span class="eyebrow">模型广场</span>
               <h2>选择适合当前任务的模型</h2>
-              <p>复制模型名称后，可在 Codex、Claude Code 或其他工具配置中切换使用。正式接入后，这里会按你的账号权限展示可用模型。</p>
+              <p>复制模型名称后，可在 Codex、Claude Code 或其他工具配置中切换使用。价格按每百万 Token 计算，随模型配置实时更新。</p>
             </div>
             <div class="model-stat-card">
               <span>当前可用模型</span>
               <strong id="modelCount">0</strong>
-              <p class="hint" style="color: rgba(255,255,255,.72)">模型名称来自后端接口，并按当前账号权限展示。</p>
+              <p class="hint" style="color: rgba(255,255,255,.72)">模型与价格来自后端接口，并按当前账号权限展示。</p>
             </div>
           </section>
 
           <section class="model-controls">
-            <input id="modelSearch" class="input" type="search" placeholder="搜索模型名称或供应商" aria-label="搜索模型" />
-            <select id="providerFilter" class="select" aria-label="供应商筛选"></select>
-            <select id="capabilityFilter" class="select" aria-label="能力筛选"></select>
+            <input id="modelSearch" class="input" type="search" placeholder="搜索模型名称或厂商" aria-label="搜索模型" />
+            <select id="providerFilter" class="select" aria-label="厂商筛选"></select>
+            <select id="billingFilter" class="select" aria-label="计费类型筛选"></select>
+            <div class="model-view-toggle" role="group" aria-label="模型展示方式">
+              <button type="button" class="active" data-model-view="card" aria-pressed="true">卡片视图</button>
+              <button type="button" data-model-view="table" aria-pressed="false">表格视图</button>
+            </div>
           </section>
 
           <section id="modelGrid" class="model-grid"></section>
+          <section id="modelTablePanel" class="panel model-table-panel hidden">
+            <div class="table-wrap">
+              <table aria-label="模型价格列表">
+                <thead>
+                  <tr>
+                    <th>模型</th>
+                    <th>厂商</th>
+                    <th>计费类型</th>
+                    <th>输入价格</th>
+                    <th>补全价格</th>
+                    <th>缓存读取</th>
+                    <th>上下文</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="modelTableBody"></tbody>
+              </table>
+            </div>
+          </section>
         </section>
         </main>
       </div>
@@ -5460,6 +5729,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260728-auth-required-fix"></script>
+    <script src="/assets/app.js?v=20260728-model-plaza-pricing"></script>
   </body>
 </html>

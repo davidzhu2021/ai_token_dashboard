@@ -295,6 +295,67 @@ def provider_from_model(model_name: str) -> str:
     return "其他"
 
 
+# 模型广场展示用的厂商归类。匹配顺序刻意从具体厂商词根开始：内部把
+# 第三方模型挂在 claude-*/gpt-* 兼容别名下（如 claude-code-glm-5.1 实际是
+# 智谱 GLM），若先匹配 claude/gpt 会把它们全部错归为 Anthropic/OpenAI。
+_MODEL_FAMILY_RULES: tuple[tuple[str, str, str], ...] = (
+    ("glm", "zhipu", "智谱 GLM"),
+    ("kimi", "moonshot", "月之暗面"),
+    ("deepseek", "deepseek", "DeepSeek"),
+    ("qwen", "qwen", "通义千问"),
+    ("minimax", "minimax", "MiniMax"),
+    ("gemini", "google", "Google"),
+    ("bge", "baai", "BAAI"),
+    ("claude", "anthropic", "Anthropic"),
+    ("gpt", "openai", "OpenAI"),
+    ("codex", "openai", "OpenAI"),
+    ("image", "openai", "OpenAI"),
+)
+
+
+def model_family(model_name: str) -> tuple[str, str]:
+    """返回模型所属厂商的 (图标标识, 中文展示名)。"""
+    name = _clean_text(model_name).lower()
+    for token, key, label in _MODEL_FAMILY_RULES:
+        if token in name:
+            return key, label
+    return "other", "其他"
+
+
+# 上游把同一模型按账号/线路配了多份部署别名（wangsu-、zerokey-、kuaihui- 等）。
+# 这些是内部网关代号，按前端产品边界不得展示给员工，模型广场只保留主名。
+_INTERNAL_ALIAS_TOKENS = frozenset(
+    {
+        "wangsu",
+        "wangsu5",
+        "wangsu7",
+        "zerokey",
+        "zai",
+        "local",
+        "openrouter",
+        "kuaihui",
+        "chatgpt",
+        "liuguoxian",
+        "cheliantianxia1",
+    }
+)
+# 词元必须足够具体：`max`/`pool` 只出现在 zai-max-*、zerokey-pool-* 这类别名里，
+# 而它们已被 zai/zerokey 拦下，单独列会误杀 qwen3.7-max 这样的正常主名。
+# 供应商前缀形如 `anthropic.claude-opus-4-8`。要求点号后紧跟字母，否则
+# `gpt-5.2` 这类带小数点的正常模型名会被误判成别名。
+_VENDOR_DOT_PREFIX_RE = re.compile(r"^[a-z][a-z0-9]*\.[a-z]", re.IGNORECASE)
+
+
+def is_internal_model_alias(model_name: str) -> bool:
+    """判断模型名是否为内部网关部署别名（不在模型广场展示）。"""
+    name = _clean_text(model_name).lower()
+    if not name:
+        return True
+    if "/" in name or _VENDOR_DOT_PREFIX_RE.match(name):
+        return True
+    return bool(_INTERNAL_ALIAS_TOKENS.intersection(name.split("-")))
+
+
 class LiteLLMClient:
     def __init__(self) -> None:
         base_url = os.getenv("LITELLM_BASE_URL", "").strip().rstrip("/")
@@ -2824,6 +2885,81 @@ class LiteLLMClient:
             model_usage_cache.set(cache_key, value, _env_int("MODEL_USAGE_CACHE_TTL_SECONDS", 300))
         return value
 
+    @staticmethod
+    def _price_per_million(value: Any) -> float | None:
+        """把上游的「每 token 单价」换算成展示用的「每百万 token 单价」。"""
+        if value is None:
+            return None
+        amount = _as_number(value)
+        if amount <= 0:
+            return None
+        return round(amount * 1_000_000, 4)
+
+    async def _model_pricing(self) -> dict[str, dict[str, Any]]:
+        """按模型名聚合上游计费信息。
+
+        同一模型名在不同线路/后端上会有多份部署，单价并不一致。这里沿用
+        LiteLLM 自身 `_set_model_group_info`（litellm/router.py）的口径：取同名
+        部署中输入单价最高的那一份，既与上游聚合一致，也不会低报成本。
+        """
+        hit, value, _ = self._model_cache.get("model_pricing")
+        if hit:
+            return value
+
+        pricing: dict[str, dict[str, Any]] = {}
+        successful_backends = 0
+        for backend in self.backends:
+            try:
+                payload = await self.request_backend(backend, "GET", "/model/info")
+            except HTTPException:
+                continue
+            except Exception:
+                logger.warning("model pricing query failed for backend %s", backend.id)
+                continue
+            successful_backends += 1
+            for item in _records(payload):
+                normalized_name = self._normalized_model_name(_first(item, "model_name", "model", "id"))
+                if not normalized_name:
+                    continue
+                info = item.get("model_info") if isinstance(item.get("model_info"), dict) else {}
+                input_price = self._price_per_million(info.get("input_cost_per_token"))
+                output_price = self._price_per_million(info.get("output_cost_per_token"))
+                if input_price is None and output_price is None:
+                    continue
+                current = pricing.get(normalized_name)
+                if current is not None and (current.get("inputPricePerMillion") or 0) >= (input_price or 0):
+                    continue
+                max_input_tokens = _as_int(info.get("max_input_tokens"))
+                pricing[normalized_name] = {
+                    "billingType": "按次计费" if _clean_text(info.get("mode")) == "image_generation" else "按量计费",
+                    "inputPricePerMillion": input_price,
+                    "outputPricePerMillion": output_price,
+                    "cacheReadPricePerMillion": self._price_per_million(info.get("cache_read_input_token_cost")),
+                    "cacheWritePricePerMillion": self._price_per_million(info.get("cache_creation_input_token_cost")),
+                    "contextWindow": max_input_tokens if max_input_tokens > 0 else None,
+                    "supportsVision": bool(info.get("supports_vision")),
+                    "supportsReasoning": bool(info.get("supports_reasoning")),
+                    "supportsFunctionCalling": bool(info.get("supports_function_calling")),
+                    "isEmbedding": _clean_text(info.get("mode")) == "embedding",
+                }
+
+        if successful_backends:
+            self._model_cache.set("model_pricing", pricing, _env_int("MODEL_CACHE_TTL_SECONDS", 1800))
+        return pricing
+
+    @staticmethod
+    def _pricing_capabilities(pricing: dict[str, Any]) -> list[str]:
+        capabilities: list[str] = []
+        if pricing.get("isEmbedding"):
+            capabilities.append("向量化")
+        if pricing.get("supportsVision"):
+            capabilities.append("视觉")
+        if pricing.get("supportsReasoning"):
+            capabilities.append("推理")
+        if pricing.get("supportsFunctionCalling"):
+            capabilities.append("函数调用")
+        return capabilities or ["通用"]
+
     async def models(self, usage_counts: dict[str, int] | None = None) -> list[dict[str, Any]]:
         hit, value, _ = self._model_cache.get("models")
         if hit:
@@ -2865,6 +3001,8 @@ class LiteLLMClient:
                     )
             self._model_cache.set("models", models, _env_int("MODEL_CACHE_TTL_SECONDS", 1800))
 
+        catalog = await self._priced_catalog(models)
+
         end_day = usage_today()
         end_date = end_day.isoformat()
         start_date = (end_day - timedelta(days=29)).isoformat()
@@ -2872,12 +3010,48 @@ class LiteLLMClient:
         # a compatibility fallback for local deployments without the snapshot DB.
         usage = usage_counts if usage_counts is not None else await self.model_usage_counts(start_date, end_date)
         return sorted(
-            models,
+            catalog,
             key=lambda item: (
                 -usage.get(self._normalized_model_name(item.get("modelName")), 0),
                 self._normalized_model_name(item.get("modelName")),
             ),
         )
+
+    async def _priced_catalog(self, models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """给模型目录补上厂商与计费信息，并剔除不该展示的条目。
+
+        剔除两类：内部网关部署别名，以及在任何部署上都查不到有效单价的模型
+        （单价缺失时展示成免费会误导员工）。上游计费接口整体不可用时不做剔除，
+        退化为不带价格的目录，避免模型广场直接变空。
+        """
+        pricing = await self._model_pricing()
+        catalog: list[dict[str, Any]] = []
+        for model in models:
+            model_name = _clean_text(model.get("modelName"))
+            if is_internal_model_alias(model_name):
+                continue
+            family_key, family_label = model_family(model_name)
+            entry = {**model, "familyKey": family_key, "familyLabel": family_label}
+            price = pricing.get(self._normalized_model_name(model_name))
+            if price is None:
+                if pricing:
+                    continue
+                catalog.append(entry)
+                continue
+            entry.update(
+                {
+                    "billingType": price["billingType"],
+                    "inputPricePerMillion": price["inputPricePerMillion"],
+                    "outputPricePerMillion": price["outputPricePerMillion"],
+                    "cacheReadPricePerMillion": price["cacheReadPricePerMillion"],
+                    "cacheWritePricePerMillion": price["cacheWritePricePerMillion"],
+                    "capabilities": self._pricing_capabilities(price),
+                }
+            )
+            if price["contextWindow"]:
+                entry["contextWindow"] = str(price["contextWindow"])
+            catalog.append(entry)
+        return catalog
 
 
 def default_date_range(days: int = 30) -> tuple[str, str]:
