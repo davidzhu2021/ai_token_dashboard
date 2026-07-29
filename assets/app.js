@@ -78,6 +78,18 @@ let isDepartmentLoading = false;
 let isTeamLoading = false;
 let isTeamMemberLoading = false;
 let isSsoRedirecting = false;
+let billingConfig = null;
+let billingAccount = null;
+let billingOrders = [];
+let billingOrderTotal = 0;
+let isBillingLoading = false;
+let isCreatingTopup = false;
+let isSubmittingManualPay = false;
+let billingLoadError = "";
+let billingAvailable = false;
+let selectedTopupAmount = 0;
+let pendingTopupTradeNo = "";
+let topupPollTimer = null;
 let authConfig = {
   devLoginEnabled: false,
   oidcConfigured: false,
@@ -798,6 +810,7 @@ function accountAccessCopy(user) {
         title: "账号已创建，等待开通",
         description: "充值或由管理员开通后方可使用模型和额度。",
         retry: false,
+        topup: true,
       };
     }
     return {
@@ -819,6 +832,8 @@ function renderAccountAccessState() {
   el("accountAccessTitle").textContent = state.title;
   el("accountAccessDescription").textContent = state.description;
   el("accountAccessRetryButton").classList.toggle("hidden", !state.retry);
+  // 只有充值真的开放时才给出这个入口，否则等于把用户引到死路。
+  el("accountAccessTopupButton").classList.toggle("hidden", !(state.topup && billingAvailable));
 }
 
 function updateHomeCard() {
@@ -2915,6 +2930,705 @@ async function loadKeys(forceRefresh = false) {
   }
 }
 
+// ---- 充值中心 ----
+
+async function refreshEntitlementAfterTopup() {
+  // 首次充值会解除模型权限限制，重新拉一次身份让受限提示立即消失。
+  try {
+    currentUser = await api("/api/auth/me");
+    renderAccountAccessState();
+    updateHomeCard();
+  } catch {
+    // 刷新失败不影响充值结果，下次进页面会自然纠正。
+  }
+}
+
+const BILLING_CHANNEL_LABELS = {
+  redemption: "兑换码",
+  epay: "在线支付",
+  manual_qr: "扫码转账",
+  manual: "人工补单",
+};
+const BILLING_STATUS_LABELS = { success: "已到账", pending: "待支付", failed: "已失败", expired: "已过期" };
+const BILLING_METHOD_LABELS = { alipay: "支付宝", wxpay: "微信支付" };
+
+function billingManualConfig() {
+  const manual = billingConfig?.manualPay;
+  return manual && typeof manual === "object" ? manual : { enabled: false, methods: [] };
+}
+
+function billingManualMethods() {
+  const methods = billingManualConfig().methods;
+  return Array.isArray(methods) ? methods : [];
+}
+
+function billingChannel() {
+  // 有自动支付就优先用，否则退到收款码转账。
+  const channels = Array.isArray(billingConfig?.channels) ? billingConfig.channels : [];
+  if (channels.includes("epay")) return "epay";
+  if (channels.includes("manual_qr")) return "manual_qr";
+  return "";
+}
+
+function billingExchangeRate() {
+  const rate = Number(billingConfig?.exchangeRate || 0);
+  return rate > 0 ? rate : 7.3;
+}
+
+function formatCny(value) {
+  return `¥${Number(value || 0).toFixed(2)}`;
+}
+
+function topupPayableAmount() {
+  const raw = Number(el("topupAmount")?.value || 0);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return raw * billingExchangeRate();
+}
+
+function setFieldError(id, message) {
+  const node = el(id);
+  if (node) node.textContent = message || "";
+}
+
+function updateTopupPayable() {
+  const payable = topupPayableAmount();
+  setText("topupPayable", payable > 0 ? `应付 ${formatCny(payable)}` : "应付 ¥0.00");
+}
+
+function renderTopupOptions() {
+  const container = el("topupOptions");
+  if (!container) return;
+  const options = Array.isArray(billingConfig?.amountOptions) ? billingConfig.amountOptions : [];
+  container.innerHTML = options
+    .map(
+      (amount) =>
+        `<button type="button" class="billing-amount-option${
+          Number(amount) === Number(selectedTopupAmount) ? " active" : ""
+        }" data-topup-amount="${escapeHtml(amount)}">$${escapeHtml(Number(amount).toFixed(0))}</button>`,
+    )
+    .join("");
+}
+
+function renderBillingOrders() {
+  const body = el("billingOrderBody");
+  if (!body) return;
+  setText("billingOrderCount", `${billingOrderTotal} 条`);
+  if (billingLoadError) {
+    body.innerHTML = `<tr><td colspan="6" class="empty">${escapeHtml(billingLoadError)}</td></tr>`;
+    return;
+  }
+  if (isBillingLoading && !billingOrders.length) {
+    body.innerHTML = '<tr><td colspan="6" class="empty">正在加载充值记录…</td></tr>';
+    return;
+  }
+  if (!billingOrders.length) {
+    body.innerHTML = '<tr><td colspan="6" class="empty">暂无充值记录</td></tr>';
+    return;
+  }
+  body.innerHTML = billingOrders
+    .map((order) => {
+      const status = String(order.status || "");
+      const statusClass = status === "success" ? "success" : status === "pending" ? "pending" : "failed";
+      const channel = BILLING_CHANNEL_LABELS[order.channel] || order.channel || "-";
+      const method = BILLING_METHOD_LABELS[order.paymentMethod] || "";
+      const methodText = method ? `${channel} · ${method}` : channel;
+      const paid = Number(order.moneyCny || 0) > 0 ? formatCny(order.moneyCny) : "-";
+      // 已提交凭证的待付订单实际在等人工确认，直接说"待支付"会让用户以为没提交成功。
+      const statusText =
+        status === "pending" && order.submittedAt
+          ? "待确认"
+          : BILLING_STATUS_LABELS[status] || status || "-";
+      const note = status === "failed" && order.reviewNote ? order.reviewNote : "";
+      return `<tr>
+        <td>${escapeHtml(formatBillingTime(order.createdAt))}</td>
+        <td>${escapeHtml(order.tradeNo || "-")}</td>
+        <td>${escapeHtml(methodText)}</td>
+        <td class="num">${escapeHtml(money.format(order.amountUsd || 0))}</td>
+        <td class="num">${escapeHtml(paid)}</td>
+        <td><span class="billing-order-status ${statusClass}">${escapeHtml(statusText)}</span>${
+          note ? `<span class="billing-review-note">${escapeHtml(note)}</span>` : ""
+        }</td>
+      </tr>`;
+    })
+    .join("");
+}
+
+function formatBillingTime(value) {
+  if (!value) return "-";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "-";
+  const pad = (input) => String(input).padStart(2, "0");
+  return `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(
+    parsed.getHours(),
+  )}:${pad(parsed.getMinutes())}`;
+}
+
+function renderTopupMethods() {
+  const row = el("topupMethodRow");
+  if (!row) return;
+  const channel = billingChannel();
+  const methods =
+    channel === "manual_qr"
+      ? billingManualMethods()
+      : [
+          { method: "alipay", label: "支付宝" },
+          { method: "wxpay", label: "微信支付" },
+        ];
+  const current = row.querySelector('input[name="paymentMethod"]:checked')?.value;
+  const selected = methods.some((item) => item.method === current) ? current : methods[0]?.method;
+  row.innerHTML = methods
+    .map(
+      (item) =>
+        `<label class="billing-method"><input type="radio" name="paymentMethod" value="${escapeHtml(
+          item.method,
+        )}"${item.method === selected ? " checked" : ""} /><span>${escapeHtml(
+          item.label || item.method,
+        )}</span></label>`,
+    )
+    .join("");
+}
+
+function renderBilling() {
+  const balance = Number(billingAccount?.balanceUsd || 0);
+  const topupTotal = Number(billingAccount?.topupTotalUsd || 0);
+  setText("billingBalance", money.format(balance));
+  setText("billingBalanceChip", `余额 ${money.format(balance)}`);
+  setText("billingTopupTotal", money.format(topupTotal));
+  setText("billingSpent", money.format(Math.max(0, topupTotal - balance)));
+  setText("billingRateChip", `汇率 ${formatCny(billingExchangeRate())} / $1`);
+
+  const channel = billingChannel();
+  const onlinePanel = el("billingOnlinePanel");
+  // 没有任何可用支付渠道时整卡隐藏，避免给出走不通的入口。
+  if (onlinePanel) onlinePanel.classList.toggle("hidden", !channel);
+  setText(
+    "billingOnlineDesc",
+    channel === "manual_qr"
+      ? "选择额度后扫码付款，提交凭证后由管理员确认到账。"
+      : "选择额度后完成支付，额度到账即可使用。",
+  );
+  setButtonLabel("topupSubmit", channel === "manual_qr" ? "生成付款二维码" : "立即充值");
+
+  const minTopup = Number(billingConfig?.minTopupUsd || 0);
+  const amountInput = el("topupAmount");
+  if (amountInput && minTopup > 0) amountInput.min = String(minTopup);
+  const minHint = minTopup > 0 ? `单笔最低 ${money.format(minTopup)}。` : "";
+  setText(
+    "topupHint",
+    channel === "manual_qr"
+      ? `${minHint}扫码付款后请提交凭证，管理员核对收款后额度即到账。`
+      : `${minHint}支付完成后请返回本页，系统会自动确认到账结果。`,
+  );
+
+  renderTopupMethods();
+  renderTopupOptions();
+  updateTopupPayable();
+  renderBillingOrders();
+}
+
+async function loadBillingData() {
+  if (!currentUser || isBillingLoading) return;
+  isBillingLoading = true;
+  billingLoadError = "";
+  renderBillingOrders();
+  try {
+    const payload = await api("/api/me/billing");
+    billingConfig = payload.config || null;
+    billingAccount = payload.account || null;
+    billingOrders = Array.isArray(payload.orders?.items) ? payload.orders.items : [];
+    billingOrderTotal = Number(payload.orders?.total || 0);
+  } catch (error) {
+    billingOrders = [];
+    billingOrderTotal = 0;
+    billingLoadError = error.message || "充值信息加载失败，请稍后重试。";
+    if (error.status !== 404) showToast(billingLoadError);
+  } finally {
+    isBillingLoading = false;
+    renderBilling();
+  }
+}
+
+async function refreshBillingAvailability() {
+  // 后端未开放充值时接口返回 404，据此决定导航项是否出现。
+  if (!currentUser?.id) {
+    billingAvailable = false;
+    updateBillingNav();
+    return;
+  }
+  try {
+    const payload = await api("/api/me/billing");
+    billingConfig = payload.config || null;
+    billingAccount = payload.account || null;
+    billingOrders = Array.isArray(payload.orders?.items) ? payload.orders.items : [];
+    billingOrderTotal = Number(payload.orders?.total || 0);
+    billingAvailable = Boolean(billingConfig?.enabled);
+  } catch {
+    billingAvailable = false;
+  }
+  updateBillingNav();
+  if (billingAvailable) renderBilling();
+}
+
+function updateBillingNav() {
+  const tab = el("billingTab");
+  if (tab) tab.classList.toggle("hidden", !billingAvailable);
+  // 受限提示里的"前往充值"依赖 billingAvailable，可用性变化后要重渲染。
+  renderAccountAccessState();
+  renderAdminBilling();
+}
+
+function showManualPayPanel(payload) {
+  const panel = el("billingPayPanel");
+  if (!panel) return;
+  const qr = el("billingPayQr");
+  if (qr) {
+    qr.src = String(payload.qrUrl || "");
+    qr.alt = `${payload.methodLabel || "收款"}二维码`;
+  }
+  setText("billingPayMethod", payload.methodLabel || "");
+  setText("billingPayMoney", formatCny(payload.moneyCny));
+  setText("billingPayAmount", money.format(payload.amountUsd || 0));
+  setText("billingPayTradeNo", payload.tradeNo || "-");
+  const contact = String(payload.contact || "");
+  setText(
+    "billingPayNotice",
+    [payload.notice || "", contact ? `如有疑问请联系 ${contact}` : ""].filter(Boolean).join(" "),
+  );
+  setText(
+    "manualPayHint",
+    `提交后管理员会在约 ${Number(payload.reviewMinutes || 30)} 分钟内核对到账，额度确认后自动开通。`,
+  );
+  setFieldError("manualPayError", "");
+  const note = el("manualPayNote");
+  if (note) note.value = "";
+  const submit = el("manualPaySubmit");
+  if (submit) {
+    submit.disabled = false;
+    setButtonLabel("manualPaySubmit", "我已付款，提交确认");
+  }
+  panel.classList.remove("hidden");
+  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function hideManualPayPanel() {
+  el("billingPayPanel")?.classList.add("hidden");
+  pendingTopupTradeNo = "";
+  stopTopupPolling();
+}
+
+async function submitManualPayment(event) {
+  event?.preventDefault();
+  if (isSubmittingManualPay || !pendingTopupTradeNo) return;
+  const payerNote = String(el("manualPayNote")?.value || "").trim();
+  setFieldError("manualPayError", "");
+  isSubmittingManualPay = true;
+  setButtonLabel("manualPaySubmit", "正在提交");
+  el("manualPaySubmit").disabled = true;
+  try {
+    const payload = await api(
+      `/api/me/billing/orders/${encodeURIComponent(pendingTopupTradeNo)}/submit`,
+      { method: "POST", body: JSON.stringify({ payerNote }) },
+    );
+    showToast(
+      `已提交，管理员将在约 ${Number(payload.reviewMinutes || 30)} 分钟内确认到账`,
+    );
+    el("billingPayPanel")?.classList.add("hidden");
+    await loadBillingData();
+    // 保持轮询：管理员确认后前端能自动感知到账。
+    startTopupPolling();
+  } catch (error) {
+    setFieldError("manualPayError", error.message || "提交失败，请稍后重试");
+  } finally {
+    isSubmittingManualPay = false;
+    setButtonLabel("manualPaySubmit", "我已付款，提交确认");
+    el("manualPaySubmit").disabled = false;
+  }
+}
+
+async function submitTopup(event) {
+  event?.preventDefault();
+  if (isCreatingTopup) return;
+  const amount = Number(el("topupAmount")?.value || 0);
+  setFieldError("topupError", "");
+  if (!Number.isFinite(amount) || amount <= 0) {
+    setFieldError("topupError", "请输入有效的充值额度");
+    return;
+  }
+  const minTopup = Number(billingConfig?.minTopupUsd || 0);
+  if (minTopup > 0 && amount < minTopup) {
+    setFieldError("topupError", `单笔充值额度不得低于 ${money.format(minTopup)}`);
+    return;
+  }
+  const channel = billingChannel();
+  if (!channel) {
+    setFieldError("topupError", "当前暂无可用支付方式，请联系管理员");
+    return;
+  }
+  const methodRow = el("topupMethodRow");
+  const method =
+    methodRow?.querySelector('input[name="paymentMethod"]:checked')?.value || "alipay";
+  const originalLabel = channel === "manual_qr" ? "生成付款二维码" : "立即充值";
+  isCreatingTopup = true;
+  setButtonLabel("topupSubmit", "正在创建订单");
+  el("topupSubmit").disabled = true;
+  try {
+    const payload = await api("/api/me/billing/orders", {
+      method: "POST",
+      body: JSON.stringify({ amount, paymentMethod: method, channel }),
+    });
+    pendingTopupTradeNo = String(payload.tradeNo || "");
+    if (payload.channel === "manual_qr") {
+      showManualPayPanel(payload);
+    } else {
+      // 用表单 POST 跳转收银台：部分网关不接受 GET 携带全部参数。
+      submitGatewayForm(payload.submitUrl, payload.params);
+    }
+    startTopupPolling();
+    await loadBillingData();
+  } catch (error) {
+    setFieldError("topupError", error.message || "创建充值订单失败，请稍后重试");
+  } finally {
+    isCreatingTopup = false;
+    setButtonLabel("topupSubmit", originalLabel);
+    el("topupSubmit").disabled = false;
+  }
+}
+
+function submitGatewayForm(submitUrl, params) {
+  if (!submitUrl || !params) return;
+  const form = document.createElement("form");
+  form.method = "POST";
+  form.action = submitUrl;
+  form.target = "_blank";
+  form.rel = "noopener";
+  Object.entries(params).forEach(([name, value]) => {
+    const field = document.createElement("input");
+    field.type = "hidden";
+    field.name = name;
+    field.value = String(value ?? "");
+    form.appendChild(field);
+  });
+  document.body.appendChild(form);
+  form.submit();
+  form.remove();
+}
+
+function stopTopupPolling() {
+  if (topupPollTimer) {
+    window.clearInterval(topupPollTimer);
+    topupPollTimer = null;
+  }
+}
+
+function startTopupPolling() {
+  stopTopupPolling();
+  if (!pendingTopupTradeNo) return;
+  let attempts = 0;
+  topupPollTimer = window.setInterval(async () => {
+    attempts += 1;
+    // 自动支付在新标签完成、收款码转账等管理员确认，这里统一轮询到账结果；
+    // 五分钟未见结果即停止，避免页面长期空转（用户刷新页面会看到最新状态）。
+    if (attempts > 100 || !pendingTopupTradeNo) {
+      stopTopupPolling();
+      return;
+    }
+    try {
+      const payload = await api(`/api/me/billing/orders/${encodeURIComponent(pendingTopupTradeNo)}`);
+      if (payload.order?.status === "success") {
+        stopTopupPolling();
+        pendingTopupTradeNo = "";
+        el("billingPayPanel")?.classList.add("hidden");
+        showToast(`充值成功，到账 ${money.format(payload.order.amountUsd || 0)}`);
+        await loadBillingData();
+        await refreshEntitlementAfterTopup();
+      } else if (["failed", "expired"].includes(String(payload.order?.status || ""))) {
+        stopTopupPolling();
+        pendingTopupTradeNo = "";
+        el("billingPayPanel")?.classList.add("hidden");
+        showToast(payload.order?.reviewNote || "本次支付未完成，如已付款请联系管理员");
+        await loadBillingData();
+      }
+    } catch {
+      // 轮询失败不打扰用户，下一次继续尝试。
+    }
+  }, 3000);
+}
+
+// ---- 充值管理（仅管理员） ----
+
+let adminRedemptions = [];
+let adminRedemptionTotal = 0;
+let adminBillingOrders = [];
+let adminBillingReviews = [];
+let adminBillingPendingSync = 0;
+let adminBillingPendingReview = 0;
+let adminBillingKeyword = "";
+let isAdminBillingLoading = false;
+let isGeneratingRedemptions = false;
+
+function adminBillingVisible() {
+  return Boolean(currentUser?.isAdmin && billingAvailable);
+}
+
+function renderAdminRedemptions() {
+  const body = el("adminRedemptionBody");
+  if (!body) return;
+  setText("adminRedemptionCount", `${adminRedemptionTotal} 张`);
+  if (!adminRedemptions.length) {
+    body.innerHTML = `<tr><td colspan="7" class="empty">${
+      isAdminBillingLoading ? "正在加载兑换码…" : "暂无兑换码"
+    }</td></tr>`;
+    return;
+  }
+  const statusLabels = { enabled: "可用", used: "已使用", disabled: "已停用" };
+  body.innerHTML = adminRedemptions
+    .map((item) => {
+      const status = String(item.status || "");
+      const statusClass = status === "enabled" ? "pending" : status === "used" ? "success" : "failed";
+      const action =
+        status === "enabled"
+          ? `<button class="ghost-btn" type="button" data-disable-redemption="${escapeHtml(
+              item.id,
+            )}">停用</button>`
+          : "-";
+      return `<tr>
+        <td>${escapeHtml(formatBillingTime(item.createdAt))}</td>
+        <td>${escapeHtml(item.name || "-")}</td>
+        <td>••••${escapeHtml(item.codeHint || "")}</td>
+        <td class="num">${escapeHtml(money.format(item.amountUsd || 0))}</td>
+        <td><span class="billing-order-status ${statusClass}">${escapeHtml(
+          statusLabels[status] || status,
+        )}</span></td>
+        <td>${escapeHtml(item.usedBy || "-")}</td>
+        <td>${action}</td>
+      </tr>`;
+    })
+    .join("");
+}
+
+function renderAdminBillingReviews() {
+  const body = el("adminBillingReviewBody");
+  if (!body) return;
+  setText("adminBillingPendingReview", `${adminBillingPendingReview} 笔待确认`);
+  if (!adminBillingReviews.length) {
+    body.innerHTML = `<tr><td colspan="8" class="empty">${
+      isAdminBillingLoading ? "正在加载待确认订单…" : "暂无待确认订单"
+    }</td></tr>`;
+    return;
+  }
+  body.innerHTML = adminBillingReviews
+    .map((order) => {
+      const method = BILLING_METHOD_LABELS[order.paymentMethod] || order.paymentMethod || "-";
+      const tradeNo = escapeHtml(order.tradeNo || "");
+      return `<tr>
+        <td>${escapeHtml(formatBillingTime(order.submittedAt))}</td>
+        <td>${tradeNo}</td>
+        <td>${escapeHtml(order.userId || "-")}</td>
+        <td>${escapeHtml(method)}</td>
+        <td class="num">${escapeHtml(money.format(order.amountUsd || 0))}</td>
+        <td class="num">${escapeHtml(formatCny(order.moneyCny))}</td>
+        <td>${escapeHtml(order.payerNote || "-")}</td>
+        <td>
+          <button class="ghost-btn" type="button" data-complete-order="${tradeNo}">确认到账</button>
+          <button class="ghost-btn" type="button" data-reject-order="${tradeNo}">驳回</button>
+        </td>
+      </tr>`;
+    })
+    .join("");
+}
+
+function renderAdminBillingOrders() {
+  const body = el("adminBillingOrderBody");
+  if (!body) return;
+  const pendingChip = el("adminBillingPendingSync");
+  const retryButton = el("adminBillingRetrySync");
+  if (pendingChip) {
+    pendingChip.textContent = `${adminBillingPendingSync} 笔待同步`;
+    pendingChip.classList.toggle("hidden", adminBillingPendingSync <= 0);
+  }
+  if (retryButton) retryButton.classList.toggle("hidden", adminBillingPendingSync <= 0);
+
+  if (!adminBillingOrders.length) {
+    body.innerHTML = `<tr><td colspan="8" class="empty">${
+      isAdminBillingLoading ? "正在加载充值订单…" : "暂无充值订单"
+    }</td></tr>`;
+    return;
+  }
+  body.innerHTML = adminBillingOrders
+    .map((order) => {
+      const status = String(order.status || "");
+      const statusClass = status === "success" ? "success" : status === "pending" ? "pending" : "failed";
+      const channel = BILLING_CHANNEL_LABELS[order.channel] || order.channel || "-";
+      const paid = Number(order.moneyCny || 0) > 0 ? formatCny(order.moneyCny) : "-";
+      const action =
+        status === "pending"
+          ? `<button class="ghost-btn" type="button" data-complete-order="${escapeHtml(
+              order.tradeNo,
+            )}">补单</button>`
+          : order.syncState === "pending"
+            ? '<span class="hint">额度待同步</span>'
+            : "-";
+      return `<tr>
+        <td>${escapeHtml(formatBillingTime(order.createdAt))}</td>
+        <td>${escapeHtml(order.tradeNo || "-")}</td>
+        <td>${escapeHtml(order.userId || "-")}</td>
+        <td>${escapeHtml(channel)}</td>
+        <td class="num">${escapeHtml(money.format(order.amountUsd || 0))}</td>
+        <td class="num">${escapeHtml(paid)}</td>
+        <td><span class="billing-order-status ${statusClass}">${escapeHtml(
+          BILLING_STATUS_LABELS[status] || status || "-",
+        )}</span></td>
+        <td>${action}</td>
+      </tr>`;
+    })
+    .join("");
+}
+
+function renderAdminBilling() {
+  const section = el("adminBillingSection");
+  if (section) section.classList.toggle("hidden", !adminBillingVisible());
+  renderAdminBillingReviews();
+  renderAdminRedemptions();
+  renderAdminBillingOrders();
+}
+
+async function loadAdminBillingData() {
+  if (!adminBillingVisible() || isAdminBillingLoading) return;
+  isAdminBillingLoading = true;
+  renderAdminBilling();
+  try {
+    const [redemptions, orders] = await Promise.all([
+      api("/api/admin/billing/redemptions?limit=50"),
+      api(`/api/admin/billing/orders?limit=50&keyword=${encodeURIComponent(adminBillingKeyword)}`),
+    ]);
+    adminRedemptions = Array.isArray(redemptions.items) ? redemptions.items : [];
+    adminRedemptionTotal = Number(redemptions.total || 0);
+    adminBillingOrders = Array.isArray(orders.items) ? orders.items : [];
+    adminBillingReviews = Array.isArray(orders.pendingReviews) ? orders.pendingReviews : [];
+    adminBillingPendingSync = Number(orders.pendingSyncCount || 0);
+    adminBillingPendingReview = Number(orders.pendingReviewCount || 0);
+  } catch (error) {
+    adminRedemptions = [];
+    adminBillingOrders = [];
+    adminBillingReviews = [];
+    showToast(error.message || "充值管理数据加载失败");
+  } finally {
+    isAdminBillingLoading = false;
+    renderAdminBilling();
+  }
+}
+
+async function generateRedemptions(event) {
+  event?.preventDefault();
+  if (isGeneratingRedemptions) return;
+  const amount = Number(el("adminRedemptionAmount")?.value || 0);
+  const count = Number(el("adminRedemptionCount2")?.value || 0);
+  const name = String(el("adminRedemptionName")?.value || "").trim();
+  const expiresInDays = Number(el("adminRedemptionExpiry")?.value || 0);
+  setFieldError("adminRedemptionError", "");
+  if (!Number.isFinite(amount) || amount <= 0) {
+    setFieldError("adminRedemptionError", "请输入有效的单张额度");
+    return;
+  }
+  if (!Number.isInteger(count) || count < 1 || count > 200) {
+    setFieldError("adminRedemptionError", "生成数量需在 1 到 200 之间");
+    return;
+  }
+  isGeneratingRedemptions = true;
+  setButtonLabel("adminRedemptionSubmit", "正在生成");
+  el("adminRedemptionSubmit").disabled = true;
+  try {
+    const payload = await api("/api/admin/billing/redemptions", {
+      method: "POST",
+      body: JSON.stringify({ count, amount, name, expiresInDays }),
+    });
+    renderGeneratedCodes(Array.isArray(payload.items) ? payload.items : []);
+    showToast(`已生成 ${payload.count || 0} 张兑换码`);
+    await loadAdminBillingData();
+  } catch (error) {
+    setFieldError("adminRedemptionError", error.message || "生成兑换码失败");
+  } finally {
+    isGeneratingRedemptions = false;
+    setButtonLabel("adminRedemptionSubmit", "生成兑换码");
+    el("adminRedemptionSubmit").disabled = false;
+  }
+}
+
+function renderGeneratedCodes(items) {
+  const node = el("adminRedemptionResult");
+  if (!node) return;
+  if (!items.length) {
+    node.classList.add("hidden");
+    node.innerHTML = "";
+    return;
+  }
+  // 明文兑换码只在这次响应里存在，刷新后无法再次取回，必须提示保存。
+  node.classList.remove("hidden");
+  node.innerHTML = `
+    <p>以下兑换码仅显示这一次，请立即复制保存。刷新页面后将无法再次查看。</p>
+    <ul class="billing-code-list">${items
+      .map((item) => `<li>${escapeHtml(item.code)} · ${escapeHtml(money.format(item.amountUsd || 0))}</li>`)
+      .join("")}</ul>
+    <button class="ghost-btn" type="button" data-copy-codes="1">复制全部</button>
+  `;
+  node.dataset.codes = items.map((item) => item.code).join("\n");
+}
+
+async function disableRedemption(redemptionId) {
+  if (!redemptionId) return;
+  try {
+    await api(`/api/admin/billing/redemptions/${encodeURIComponent(redemptionId)}/disable`, {
+      method: "POST",
+    });
+    showToast("兑换码已停用");
+    await loadAdminBillingData();
+  } catch (error) {
+    showToast(error.message || "停用兑换码失败");
+  }
+}
+
+async function completeBillingOrder(tradeNo) {
+  if (!tradeNo) return;
+  // 确认即等于放款，务必先核对收款流水，所以这里保留一道二次确认。
+  if (!window.confirm(`已在收款账户中核对到该笔款项？确认后将立即为订单 ${tradeNo} 发放额度。`)) return;
+  try {
+    const payload = await api(`/api/admin/billing/orders/${encodeURIComponent(tradeNo)}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ note: "" }),
+    });
+    showToast(payload.entitlementSynced ? "已确认到账，额度已发放" : "已确认到账，额度同步待重试");
+    await loadAdminBillingData();
+  } catch (error) {
+    showToast(error.message || "确认到账失败");
+  }
+}
+
+async function rejectBillingOrder(tradeNo) {
+  if (!tradeNo) return;
+  const note = window.prompt(`驳回订单 ${tradeNo}，请填写原因（用户可见）`, "未查到该笔付款");
+  if (note === null) return;
+  try {
+    await api(`/api/admin/billing/orders/${encodeURIComponent(tradeNo)}/reject`, {
+      method: "POST",
+      body: JSON.stringify({ note: String(note).trim().slice(0, 500) }),
+    });
+    showToast("已驳回该笔订单");
+    await loadAdminBillingData();
+  } catch (error) {
+    showToast(error.message || "驳回失败");
+  }
+}
+
+async function retryBillingSync() {
+  try {
+    const payload = await api("/api/admin/billing/sync/retry", { method: "POST" });
+    showToast(`已重试 ${payload.repaired || 0} 笔额度同步`);
+    await loadAdminBillingData();
+  } catch (error) {
+    showToast(error.message || "重试同步失败");
+  }
+}
+
 async function copyText(text, successMessage) {
   try {
     await navigator.clipboard.writeText(text);
@@ -2937,7 +3651,10 @@ function switchView(view) {
   if (view === "admin" && !currentUser?.isAdmin) view = "dashboard";
   if (view === "department" && !currentUser?.isAdmin) view = "dashboard";
   if (view === "team" && !currentUser?.isTeamLeader) view = "dashboard";
+  if (view === "billing" && !billingAvailable) view = "dashboard";
   if (currentView === "keys" && view !== "keys") clearRevealedKeys();
+  // 离开充值页就停掉支付轮询与二维码，避免后台空转和收款码久留在页面上。
+  if (currentView === "billing" && view !== "billing") hideManualPayPanel();
   currentView = view;
   setGlobalPage(view === "models" ? "models" : "console");
   el("appShell").classList.toggle("models-layout", view === "models");
@@ -2946,8 +3663,9 @@ function switchView(view) {
   el("teamView").classList.toggle("hidden", view !== "team");
   el("departmentView").classList.toggle("hidden", view !== "department");
   el("keysView").classList.toggle("hidden", view !== "keys");
+  el("billingView").classList.toggle("hidden", view !== "billing");
   el("modelsView").classList.toggle("hidden", view !== "models");
-  el("dashboardFilters").classList.toggle("hidden", view === "models" || view === "keys");
+  el("dashboardFilters").classList.toggle("hidden", view === "models" || view === "keys" || view === "billing");
   let activeButton = null;
   document.querySelectorAll("[data-view]").forEach((button) => {
     const isActive = button.dataset.view === view;
@@ -2973,14 +3691,23 @@ function switchView(view) {
     renderKeys();
     if (!personalKeys.length && !isKeysLoading) loadKeys();
   }
+  if (view === "billing") {
+    renderBilling();
+    if (!isBillingLoading) loadBillingData();
+  }
   if (view === "dashboard" && !usageData.length) loadDashboardData();
-  if (view === "admin" && !adminUsageData.length) loadAdminData();
+  if (view === "admin") {
+    renderAdminBilling();
+    if (!adminUsageData.length) loadAdminData();
+    if (adminBillingVisible() && !adminRedemptions.length && !adminBillingOrders.length) loadAdminBillingData();
+  }
   if (view === "team" && currentUser?.isTeamLeader && !teamUsageData.length) loadTeamData();
   if (view === "department" && !departmentUsageData.length) loadDepartmentData();
 }
 
 async function loadCurrentViewData(forceRefresh = false) {
   if (currentView === "keys") return loadKeys();
+  if (currentView === "billing") return loadBillingData();
   if (currentView === "models") return loadModels();
   if (currentView === "admin") return loadAdminData(forceRefresh);
   if (currentView === "team") return loadTeamData(forceRefresh);
@@ -3269,6 +3996,7 @@ async function showApp(user) {
   el("adminTab").classList.add("hidden");
   el("teamTab").classList.add("hidden");
   el("departmentTab").classList.add("hidden");
+  el("billingTab").classList.add("hidden");
   el("userEmail").textContent = currentUser.email;
   el("userName").textContent = currentUser.name || currentUser.email;
   el("avatar").textContent = currentUser.avatar || initials(currentUser.email, currentUser.name);
@@ -3276,8 +4004,14 @@ async function showApp(user) {
   el("departmentWelcomeTitle").textContent = "所选范围 · 全部部门";
   switchView("dashboard");
   render();
-  if (accountAccessCopy(currentUser)) return;
+  // 充值入口要在权限受限时也可用——新用户正是靠充值开通，不能被这道 return 拦掉。
+  const billingPromise = refreshBillingAvailability();
+  if (accountAccessCopy(currentUser)) {
+    await billingPromise;
+    return;
+  }
   const scopePromise = loadAuthScope();
+  await billingPromise;
   await Promise.all([loadCurrentViewData(), loadModels()]);
   await scopePromise;
 }
@@ -3292,6 +4026,8 @@ async function loadAuthScope() {
     el("teamTab").classList.toggle("hidden", !currentUser.isTeamLeader);
     el("departmentTab").classList.toggle("hidden", !currentUser.isAdmin);
     el("teamWelcomeTitle").textContent = `所选范围 · ${teamScopeLabel()}`;
+    // isAdmin 到这里才确定，充值管理面板的可见性随之更新。
+    renderAdminBilling();
     render();
   } catch (error) {
     showToast("部分权限信息加载失败，请刷新重试");
@@ -3321,6 +4057,24 @@ function showLogin() {
   teamEmployees = [];
   teamMemberUsageData = [];
   teamMemberUsageSummary = null;
+  // 换账号时清空充值状态，避免上一个账号的余额与订单残留在页面上。
+  stopTopupPolling();
+  billingConfig = null;
+  billingAccount = null;
+  billingOrders = [];
+  billingOrderTotal = 0;
+  billingAvailable = false;
+  billingLoadError = "";
+  selectedTopupAmount = 0;
+  pendingTopupTradeNo = "";
+  el("billingPayPanel")?.classList.add("hidden");
+  adminRedemptions = [];
+  adminRedemptionTotal = 0;
+  adminBillingOrders = [];
+  adminBillingReviews = [];
+  adminBillingPendingSync = 0;
+  adminBillingPendingReview = 0;
+  adminBillingKeyword = "";
   if (teamUsageRequestController) teamUsageRequestController.abort();
   if (teamRankingRequestController) teamRankingRequestController.abort();
   teamUsageRequestId += 1;
@@ -3644,6 +4398,60 @@ el("accountAccessRetryButton").addEventListener("click", async () => {
   } finally {
     setButtonLoading("accountAccessRetryButton", false);
   }
+});
+
+el("accountAccessTopupButton").addEventListener("click", () => switchView("billing"));
+el("adminRedemptionForm").addEventListener("submit", generateRedemptions);
+el("adminBillingRetrySync").addEventListener("click", retryBillingSync);
+el("adminBillingSearchButton").addEventListener("click", () => {
+  adminBillingKeyword = String(el("adminBillingSearch")?.value || "").trim();
+  loadAdminBillingData();
+});
+el("adminBillingSearch").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  adminBillingKeyword = String(el("adminBillingSearch")?.value || "").trim();
+  loadAdminBillingData();
+});
+el("adminBillingSection").addEventListener("click", (event) => {
+  const disableTarget = event.target.closest("[data-disable-redemption]");
+  if (disableTarget) {
+    disableRedemption(disableTarget.dataset.disableRedemption);
+    return;
+  }
+  const completeTarget = event.target.closest("[data-complete-order]");
+  if (completeTarget) {
+    completeBillingOrder(completeTarget.dataset.completeOrder);
+    return;
+  }
+  const rejectTarget = event.target.closest("[data-reject-order]");
+  if (rejectTarget) {
+    rejectBillingOrder(rejectTarget.dataset.rejectOrder);
+    return;
+  }
+  if (event.target.closest("[data-copy-codes]")) {
+    copyText(el("adminRedemptionResult")?.dataset.codes || "", "兑换码已复制");
+  }
+});
+el("topupForm").addEventListener("submit", submitTopup);
+el("manualPayForm").addEventListener("submit", submitManualPayment);
+el("billingPayCancel").addEventListener("click", hideManualPayPanel);
+el("topupAmount").addEventListener("input", () => {
+  // 手输金额与快选档位互斥，输入后取消高亮。
+  selectedTopupAmount = 0;
+  renderTopupOptions();
+  updateTopupPayable();
+  setFieldError("topupError", "");
+});
+el("topupOptions").addEventListener("click", (event) => {
+  const option = event.target.closest("[data-topup-amount]");
+  if (!option) return;
+  selectedTopupAmount = Number(option.dataset.topupAmount || 0);
+  const amountInput = el("topupAmount");
+  if (amountInput) amountInput.value = String(selectedTopupAmount);
+  renderTopupOptions();
+  updateTopupPayable();
+  setFieldError("topupError", "");
 });
 
 document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));

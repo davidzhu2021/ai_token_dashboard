@@ -2805,6 +2805,247 @@
         display: none;
       }
 
+      /* 充值中心 */
+      .billing-stat-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 16px;
+        margin-bottom: 18px;
+      }
+
+      .billing-stat-card {
+        display: grid;
+        gap: 6px;
+        padding: 20px 22px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--panel-strong);
+        box-shadow: var(--shadow-soft);
+      }
+
+      .billing-stat-card.accent {
+        background: linear-gradient(140deg, var(--ice), var(--panel-strong));
+        border-color: rgba(6, 115, 210, 0.22);
+      }
+
+      .billing-stat-label {
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      .billing-stat-value {
+        font-size: 28px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .billing-stat-sub {
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .billing-action-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+        gap: 16px;
+        margin-bottom: 18px;
+      }
+
+      .billing-redeem-form,
+      .billing-topup-form {
+        display: grid;
+        gap: 14px;
+        padding: 4px 22px 22px;
+      }
+
+      .billing-pay-body {
+        display: grid;
+        grid-template-columns: minmax(0, 200px) minmax(0, 1fr);
+        gap: 20px;
+        padding: 4px 22px 22px;
+      }
+
+      .billing-pay-qr {
+        display: grid;
+        justify-items: center;
+        gap: 10px;
+      }
+
+      .billing-pay-qr img {
+        width: 100%;
+        max-width: 200px;
+        aspect-ratio: 1 / 1;
+        object-fit: contain;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        background: #fff;
+      }
+
+      .billing-pay-detail {
+        display: grid;
+        gap: 8px;
+        align-content: start;
+      }
+
+      .billing-pay-amount {
+        margin: 0;
+        font-size: 15px;
+        color: var(--muted);
+      }
+
+      .billing-pay-amount strong {
+        font-size: 26px;
+        font-variant-numeric: tabular-nums;
+        color: var(--gold);
+      }
+
+      .billing-pay-line {
+        margin: 0;
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      .billing-pay-line strong,
+      .billing-pay-line code {
+        color: var(--ink);
+        font-variant-numeric: tabular-nums;
+      }
+
+      .billing-manual-form {
+        display: grid;
+        gap: 12px;
+        margin-top: 6px;
+      }
+
+      .billing-review-note {
+        display: block;
+        margin-top: 4px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .billing-amount-options {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+
+      .billing-amount-option {
+        padding: 9px 16px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--panel-strong);
+        color: var(--ink);
+        font-size: 14px;
+        font-variant-numeric: tabular-nums;
+        cursor: pointer;
+        transition: border-color 0.15s ease, background 0.15s ease;
+      }
+
+      .billing-amount-option:hover {
+        border-color: rgba(6, 115, 210, 0.4);
+      }
+
+      .billing-amount-option.active {
+        border-color: var(--brand);
+        background: var(--ice);
+        color: var(--brand);
+        font-weight: 600;
+      }
+
+      .billing-method-row {
+        display: flex;
+        gap: 12px;
+      }
+
+      .billing-method {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 9px 16px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        background: var(--panel-strong);
+        cursor: pointer;
+      }
+
+      .billing-method:has(input:checked) {
+        border-color: var(--brand);
+        background: var(--ice);
+        color: var(--brand);
+      }
+
+      .billing-payable {
+        margin: 0;
+        font-size: 20px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        color: var(--gold);
+      }
+
+      .billing-order-status {
+        display: inline-flex;
+        align-items: center;
+        padding: 3px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+      }
+
+      .billing-order-status.success {
+        background: var(--blue-soft);
+        color: var(--blue);
+      }
+
+      .billing-order-status.pending {
+        background: var(--gold-soft);
+        color: var(--gold);
+      }
+
+      .billing-order-status.failed {
+        background: var(--rose-soft);
+        color: var(--rose);
+      }
+
+      .billing-admin-fields {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 14px;
+      }
+
+      .billing-admin-search {
+        display: flex;
+        gap: 10px;
+        padding: 0 22px 16px;
+      }
+
+      .billing-admin-search .input {
+        flex: 1;
+      }
+
+      .billing-code-result {
+        margin: 0 22px 16px;
+        padding: 14px 16px;
+        border: 1px dashed rgba(6, 115, 210, 0.35);
+        border-radius: var(--radius-sm);
+        background: var(--ice);
+      }
+
+      .billing-code-result p {
+        margin: 0 0 8px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      .billing-code-list {
+        display: grid;
+        gap: 6px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 14px;
+        word-break: break-all;
+      }
+
       .key-mobile-card {
         display: grid;
         gap: 14px;
@@ -4239,6 +4480,23 @@
           text-align: center;
         }
 
+        .billing-stat-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .billing-action-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .billing-pay-body {
+          grid-template-columns: 1fr;
+        }
+
+        /* 充值记录列少、可横向滚动，移动端保留表格而不隐藏。 */
+        .billing-order-panel .table-wrap {
+          overflow-x: auto;
+        }
+
         .key-table-panel {
           display: none;
         }
@@ -4884,6 +5142,10 @@
                 <span class="nav-icon"><svg><use href="#icon-key"></use></svg></span>
                 令牌管理
               </button>
+              <button id="billingTab" class="view-tab hidden" type="button" data-view="billing">
+                <span class="nav-icon"><svg><use href="#icon-cost"></use></svg></span>
+                充值中心
+              </button>
             </nav>
           </div>
         </aside>
@@ -4897,6 +5159,7 @@
             <p id="accountAccessDescription">我们正在同步你的个人用量空间，通常只需要一点时间。</p>
           </div>
           <button id="accountAccessRetryButton" class="primary-btn" type="button">重新检查</button>
+          <button id="accountAccessTopupButton" class="primary-btn hidden" type="button">前往充值</button>
         </section>
         <section id="personalDailyOverview" class="daily-overview" aria-label="所选范围用量摘要">
           <div class="daily-main-card">
@@ -5181,6 +5444,134 @@
                 <tbody id="adminUserTable"></tbody>
               </table>
             </div>
+          </section>
+
+          <section id="adminBillingSection" class="hidden">
+            <section class="panel">
+              <div class="panel-header">
+                <div class="panel-heading">
+                  <span class="panel-icon"><svg><use href="#icon-cost"></use></svg></span>
+                  <div>
+                    <h3 class="panel-title">待确认到账</h3>
+                    <p class="panel-desc">用户已提交付款凭证的订单。核对收款流水后确认，额度才会入账。</p>
+                  </div>
+                </div>
+                <span id="adminBillingPendingReview" class="chip gold">0 笔待确认</span>
+              </div>
+              <div class="table-wrap">
+                <table aria-label="待确认到账订单列表">
+                  <thead>
+                    <tr>
+                      <th>提交时间</th>
+                      <th>订单号</th>
+                      <th>账号</th>
+                      <th>方式</th>
+                      <th class="num">额度</th>
+                      <th class="num">应付金额</th>
+                      <th>付款说明</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="adminBillingReviewBody"></tbody>
+                </table>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <div class="panel-heading">
+                  <span class="panel-icon"><svg><use href="#icon-key"></use></svg></span>
+                  <div>
+                    <h3 class="panel-title">兑换码管理</h3>
+                    <p class="panel-desc">批量生成兑换码发放给用户，用户在充值页面看不到兑换入口。明文只在生成时显示一次，请及时保存。</p>
+                  </div>
+                </div>
+                <span id="adminRedemptionCount" class="chip blue">0 张</span>
+              </div>
+              <form id="adminRedemptionForm" class="billing-redeem-form" autocomplete="off">
+                <div class="billing-admin-fields">
+                  <div class="field">
+                    <label for="adminRedemptionAmount">每张额度（美元）</label>
+                    <input id="adminRedemptionAmount" class="input" type="number" min="1" step="0.01" value="50" />
+                  </div>
+                  <div class="field">
+                    <label for="adminRedemptionCount2">生成数量</label>
+                    <input id="adminRedemptionCount2" class="input" type="number" min="1" max="200" value="1" />
+                  </div>
+                  <div class="field">
+                    <label for="adminRedemptionName">批次备注</label>
+                    <input id="adminRedemptionName" class="input" type="text" maxlength="100" placeholder="如：七月推广" />
+                  </div>
+                  <div class="field">
+                    <label for="adminRedemptionExpiry">有效天数（0 为永久）</label>
+                    <input id="adminRedemptionExpiry" class="input" type="number" min="0" max="3650" value="0" />
+                  </div>
+                </div>
+                <p id="adminRedemptionError" class="field-error" aria-live="polite"></p>
+                <button id="adminRedemptionSubmit" class="primary-btn" type="submit">生成兑换码</button>
+              </form>
+              <div id="adminRedemptionResult" class="billing-code-result hidden" aria-live="polite"></div>
+              <div class="table-wrap">
+                <table aria-label="兑换码列表">
+                  <thead>
+                    <tr>
+                      <th>创建时间</th>
+                      <th>批次备注</th>
+                      <th>尾号</th>
+                      <th class="num">额度</th>
+                      <th>状态</th>
+                      <th>使用者</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="adminRedemptionBody"></tbody>
+                </table>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <div class="panel-heading">
+                  <span class="panel-icon"><svg><use href="#icon-table"></use></svg></span>
+                  <div>
+                    <h3 class="panel-title">充值订单</h3>
+                    <p class="panel-desc">查看全站充值流水。支付成功但未到账的订单可人工补单。</p>
+                  </div>
+                </div>
+                <div class="key-page-actions">
+                  <span id="adminBillingPendingSync" class="chip gold hidden">0 笔待同步</span>
+                  <button id="adminBillingRetrySync" class="ghost-btn hidden" type="button">重试同步</button>
+                </div>
+              </div>
+              <div class="billing-admin-search">
+                <input
+                  id="adminBillingSearch"
+                  class="input"
+                  type="search"
+                  maxlength="100"
+                  placeholder="按订单号或账号搜索"
+                  aria-label="搜索充值订单"
+                />
+                <button id="adminBillingSearchButton" class="ghost-btn" type="button">搜索</button>
+              </div>
+              <div class="table-wrap">
+                <table aria-label="全站充值订单列表">
+                  <thead>
+                    <tr>
+                      <th>时间</th>
+                      <th>订单号</th>
+                      <th>账号</th>
+                      <th>方式</th>
+                      <th class="num">额度</th>
+                      <th class="num">支付金额</th>
+                      <th>状态</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="adminBillingOrderBody"></tbody>
+                </table>
+              </div>
+            </section>
           </section>
         </section>
 
@@ -5571,6 +5962,141 @@
           <section id="keyCardList" class="key-card-list" aria-label="个人访问密钥卡片列表"></section>
         </section>
 
+        <section id="billingView" class="view-section hidden">
+          <section class="panel key-page-head">
+            <div>
+              <span class="eyebrow">额度账户</span>
+              <h2>充值中心</h2>
+              <p>充值后额度立即到账，可用于 Codex、Claude Code 和其他 AI 工具。额度按实际消耗扣减，余额不足时请及时充值。</p>
+            </div>
+            <div class="key-page-actions">
+              <span id="billingBalanceChip" class="chip blue">余额 $0.00</span>
+            </div>
+          </section>
+
+          <section class="billing-stat-grid">
+            <div class="billing-stat-card accent">
+              <span class="billing-stat-label">当前可用额度</span>
+              <strong id="billingBalance" class="billing-stat-value">$0.00</strong>
+              <span id="billingBalanceHint" class="billing-stat-sub">扣减已消耗后的剩余额度</span>
+            </div>
+            <div class="billing-stat-card">
+              <span class="billing-stat-label">累计充值</span>
+              <strong id="billingTopupTotal" class="billing-stat-value">$0.00</strong>
+              <span class="billing-stat-sub">历史充值总额</span>
+            </div>
+            <div class="billing-stat-card">
+              <span class="billing-stat-label">已消耗</span>
+              <strong id="billingSpent" class="billing-stat-value">$0.00</strong>
+              <span class="billing-stat-sub">累计充值减去当前余额</span>
+            </div>
+          </section>
+
+          <section class="billing-action-grid">
+            <div id="billingOnlinePanel" class="panel hidden">
+              <div class="panel-header">
+                <div class="panel-heading">
+                  <span class="panel-icon"><svg><use href="#icon-cost"></use></svg></span>
+                  <div>
+                    <h3 class="panel-title">充值</h3>
+                    <p id="billingOnlineDesc" class="panel-desc">选择额度后完成支付，额度到账即可使用。</p>
+                  </div>
+                </div>
+                <span id="billingRateChip" class="chip gold">汇率 ¥7.30 / $1</span>
+              </div>
+              <form id="topupForm" class="billing-topup-form" autocomplete="off">
+                <div id="topupOptions" class="billing-amount-options" role="group" aria-label="充值额度快选"></div>
+                <div class="field">
+                  <label for="topupAmount">自定义额度（美元）</label>
+                  <input
+                    id="topupAmount"
+                    class="input"
+                    type="number"
+                    min="1"
+                    step="0.01"
+                    inputmode="decimal"
+                    placeholder="请输入充值额度"
+                  />
+                  <p id="topupError" class="field-error" aria-live="polite"></p>
+                </div>
+                <div id="topupMethodRow" class="billing-method-row" role="radiogroup" aria-label="支付方式"></div>
+                <p id="topupPayable" class="billing-payable">应付 ¥0.00</p>
+                <button id="topupSubmit" class="primary-btn" type="submit">立即充值</button>
+                <p id="topupHint" class="hint">支付完成后请返回本页，系统会自动确认到账结果。</p>
+              </form>
+            </div>
+
+            <div id="billingPayPanel" class="panel hidden">
+              <div class="panel-header">
+                <div class="panel-heading">
+                  <span class="panel-icon"><svg><use href="#icon-key"></use></svg></span>
+                  <div>
+                    <h3 class="panel-title">扫码付款</h3>
+                    <p class="panel-desc">用手机扫下方收款码付款，付款后提交凭证等待确认。</p>
+                  </div>
+                </div>
+                <button id="billingPayCancel" class="ghost-btn" type="button">取消</button>
+              </div>
+              <div class="billing-pay-body">
+                <div class="billing-pay-qr">
+                  <img id="billingPayQr" alt="收款二维码" />
+                  <span id="billingPayMethod" class="chip blue">支付宝</span>
+                </div>
+                <div class="billing-pay-detail">
+                  <p class="billing-pay-amount">应付 <strong id="billingPayMoney">¥0.00</strong></p>
+                  <p class="billing-pay-line">到账额度 <strong id="billingPayAmount">$0.00</strong></p>
+                  <p class="billing-pay-line">订单号 <code id="billingPayTradeNo">-</code></p>
+                  <p id="billingPayNotice" class="hint"></p>
+                  <form id="manualPayForm" class="billing-manual-form" autocomplete="off">
+                    <div class="field">
+                      <label for="manualPayNote">付款说明（选填）</label>
+                      <input
+                        id="manualPayNote"
+                        class="input"
+                        type="text"
+                        maxlength="200"
+                        placeholder="付款账号后四位或转账流水号"
+                        aria-describedby="manualPayHint"
+                      />
+                      <p id="manualPayError" class="field-error" aria-live="polite"></p>
+                    </div>
+                    <button id="manualPaySubmit" class="primary-btn" type="submit">我已付款，提交确认</button>
+                    <p id="manualPayHint" class="hint"></p>
+                  </form>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel billing-order-panel">
+            <div class="panel-header">
+              <div class="panel-heading">
+                <span class="panel-icon"><svg><use href="#icon-table"></use></svg></span>
+                <div>
+                  <h3 class="panel-title">充值记录</h3>
+                  <p class="panel-desc">全部充值订单与到账结果。</p>
+                </div>
+              </div>
+              <span id="billingOrderCount" class="chip blue">0 条</span>
+            </div>
+            <div class="table-wrap">
+              <table aria-label="充值记录列表">
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>订单号</th>
+                    <th>方式</th>
+                    <th class="num">到账额度</th>
+                    <th class="num">支付金额</th>
+                    <th>状态</th>
+                  </tr>
+                </thead>
+                <tbody id="billingOrderBody"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
         <section id="modelsView" class="view-section hidden">
           <section class="model-hero">
             <div class="hero-copy">
@@ -5726,6 +6252,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260728-model-alias-display-names"></script>
+    <script src="/assets/app.js?v=20260729-topup-manual-qr"></script>
   </body>
 </html>

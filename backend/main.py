@@ -2,6 +2,7 @@ import base64
 import asyncio
 import hashlib
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -22,7 +23,7 @@ import httpx
 from authlib.integrations.base_client import OAuthError
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from starlette.middleware.sessions import SessionMiddleware
@@ -51,7 +52,17 @@ from .auth import (
     verify_csrf_token,
     verify_password,
 )
+from . import billing
 from .auth_store import AuthStore, AuthStoreConfigError, DuplicateEmailError
+from .billing_store import (
+    BillingStore,
+    BillingStoreError,
+    CHANNEL_EPAY,
+    CHANNEL_MANUAL_QR,
+    ORDER_PENDING,
+    SYNC_DONE,
+    SYNC_PENDING,
+)
 from .litellm_client import LiteLLMClient, default_date_range, mask_key, normalize_model_display_name, usage_today
 from .key_vault import KeyVault, KeyVaultError
 from .usage_store import UsageStore
@@ -81,6 +92,7 @@ def session_cookie_max_age() -> int:
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
     validate_runtime_auth_config()
+    await start_billing_store()
     await start_usage_sync()
     try:
         yield
@@ -130,6 +142,7 @@ team_member_usage_cache = TTLCache()
 _litellm_client: LiteLLMClient | None = None
 _key_vault: KeyVault | None = None
 _usage_store: UsageStore | None = UsageStore.from_environment()
+_billing_store: BillingStore | None = BillingStore.from_environment()
 _auth_store: AuthStore | None = None
 local_entitlement_cache = TTLCache()
 _usage_sync_task: asyncio.Task[Any] | None = None
@@ -325,6 +338,21 @@ def usage_store() -> UsageStore | None:
     return _usage_store
 
 
+def billing_store() -> BillingStore | None:
+    return _billing_store
+
+
+def require_billing_store() -> BillingStore:
+    """取充值账本，未启用时按未实现的功能返回 404。
+
+    这样未配置的部署完全看不到充值能力，行为与上线前保持一致。
+    """
+    store = billing_store()
+    if store is None or store.pool is None:
+        raise HTTPException(status_code=404, detail="充值功能尚未开放")
+    return store
+
+
 def auth_store() -> AuthStore:
     global _auth_store
     if _auth_store is None:
@@ -469,6 +497,21 @@ async def start_usage_sync() -> None:
     _usage_sync_task = asyncio.create_task(usage_sync_loop(), name="usage-sync-loop")
 
 
+async def start_billing_store() -> None:
+    """建立充值账本连接。
+
+    连接失败不阻止应用启动——用量看板与登录不该被充值功能拖垮，路由层会把
+    未连接的账本当成"功能未开放"。
+    """
+    store = billing_store()
+    if store is None:
+        return
+    try:
+        await store.connect()
+    except Exception:
+        logger.exception("billing store connect failed; topup routes stay disabled")
+
+
 async def close_litellm_client() -> None:
     global _usage_sync_task, _usage_refresh_task, _usage_sync_stop
     if _usage_sync_stop is not None:
@@ -490,6 +533,8 @@ async def close_litellm_client() -> None:
         _usage_refresh_task = None
     if usage_store() is not None:
         await usage_store().close()
+    if billing_store() is not None:
+        await billing_store().close()
     global _litellm_client
     if _litellm_client is not None:
         await _litellm_client.close()
@@ -1838,6 +1883,51 @@ class ChangePasswordRequest(BaseModel):
     newPassword: str = Field(min_length=8, max_length=128)
 
 
+class RedeemRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=64)
+
+    @field_validator("code")
+    @classmethod
+    def normalize_code(cls, value: str) -> str:
+        return value.strip().upper()
+
+
+class CreateTopupOrderRequest(BaseModel):
+    amount: float = Field(gt=0)
+    paymentMethod: Literal["alipay", "wxpay"] = "alipay"
+    channel: Literal["epay", "manual_qr"] = "epay"
+
+
+class SubmitManualPaymentRequest(BaseModel):
+    payerNote: str = Field(default="", max_length=500)
+
+    @field_validator("payerNote")
+    @classmethod
+    def strip_note(cls, value: str) -> str:
+        return value.strip()
+
+
+class ReviewOrderRequest(BaseModel):
+    note: str = Field(default="", max_length=500)
+
+    @field_validator("note")
+    @classmethod
+    def strip_note(cls, value: str) -> str:
+        return value.strip()
+
+
+class CreateRedemptionRequest(BaseModel):
+    count: int = Field(default=1, ge=1, le=200)
+    amount: float = Field(gt=0)
+    name: str = Field(default="", max_length=100)
+    expiresInDays: int = Field(default=0, ge=0, le=3650)
+
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, value: str) -> str:
+        return value.strip()
+
+
 def write_key_audit(event: str, email: str, key_id: str, request: Request, result: str) -> None:
     audit_key_id = hashlib.sha256(key_id.encode("utf-8")).hexdigest() if key_id.startswith("sk-") else key_id
     safe_id = re.sub(r"[^A-Za-z0-9_-]", "", audit_key_id)[:64] or "-"
@@ -2035,6 +2125,32 @@ async def health() -> dict[str, Any]:
         result["usageDatabase"] = {"enabled": False, "connected": False, "status": "disabled"}
     if result["usageSync"].get("status") in {"error", "failed", "partial"}:
         result["status"] = "degraded"
+    billing_ledger = billing_store()
+    if billing_ledger is None:
+        result["billing"] = {"enabled": False, "status": "disabled"}
+    elif billing_ledger.pool is None:
+        result["billing"] = {"enabled": True, "connected": False, "status": "error"}
+        result["status"] = "degraded"
+    else:
+        try:
+            pending_sync = await billing_ledger.pending_sync_count()
+            pending_review = await billing_ledger.pending_review_count()
+        except Exception:
+            logger.exception("billing health check failed")
+            result["billing"] = {"enabled": True, "connected": False, "status": "error"}
+            result["status"] = "degraded"
+        else:
+            # 待同步积压意味着钱已收到但上游额度没写上，必须让运维看见。
+            # 待确认只是等人工处理，不算异常，仅暴露数量。
+            result["billing"] = {
+                "enabled": True,
+                "connected": True,
+                "status": "degraded" if pending_sync else "ok",
+                "pendingSyncCount": pending_sync,
+                "pendingReviewCount": pending_review,
+            }
+            if pending_sync:
+                result["status"] = "degraded"
     if turnstile_enabled() and not turnstile_configured():
         result["turnstile"] = {"enabled": True, "configured": False, "status": "error"}
         result["status"] = "degraded"
@@ -2862,6 +2978,420 @@ async def reveal_my_key(key_id: str, request: Request) -> JSONResponse:
         raise HTTPException(status_code=404, detail="该密钥创建时未保管完整值，请再生成后查看")
     write_key_audit("reveal", app_user["email"], key_id, request, "success")
     return JSONResponse({"key": plaintext}, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
+
+# ---- 充值中心 ----
+
+
+async def billing_identity(request: Request) -> tuple[dict[str, Any], str]:
+    """返回当前用户与其上游账号标识。
+
+    刻意不调用 :func:`require_active_local_entitlement`：新注册用户正是要靠充值
+    才能拿到权限，若在这里挡住，新用户永远无法自助开通。
+    """
+    app_user = require_user(request)
+    local_user_id = str(app_user.get("id") or "")
+    if not local_user_id:
+        # 企业 SSO 员工走部门预算，不属于自助充值范围。
+        raise HTTPException(status_code=403, detail="当前账号无需自助充值")
+    local_user = await auth_store_call("get_user", local_user_id)
+    if not local_user or str(local_user.get("status") or "active") != "active":
+        raise auth_http_error(401, "登录已失效，请重新登录", "AUTH_LOGIN_REQUIRED")
+    account = await auth_store_call("get_upstream_account", local_user_id, "primary")
+    upstream_user_id = str((account or {}).get("upstream_user_id") or "")
+    if not account or account.get("status") != "provisioned" or not upstream_user_id:
+        raise auth_http_error(409, "账号仍在开通中，请稍后重试", "AUTH_PROVISIONING_PENDING")
+    return app_user, upstream_user_id
+
+
+async def apply_topup_entitlement(trade_no: str, user_id: str, upstream_user_id: str) -> dict[str, Any]:
+    """把已落账的充值同步到上游额度。
+
+    上游写入失败不回滚本地余额——钱已经收到了。这里只把订单标成待同步，由
+    :func:`retry_pending_billing_sync` 补偿，并在健康检查里暴露积压数量。
+    """
+    store = require_billing_store()
+    account = await store.get_account(user_id)
+    try:
+        result = await billing.sync_upstream_entitlement(
+            client(), upstream_user_id, float(account["topupTotalUsd"])
+        )
+    except Exception as exc:
+        error = f"{exc.__class__.__name__}: {exc}"
+        await store.mark_sync_state(trade_no, SYNC_PENDING, error)
+        logger.exception("topup upstream sync failed trade_no=%s", trade_no)
+        return {"synced": False, "error": error}
+    await store.mark_sync_state(trade_no, SYNC_DONE, "")
+    # 权限可能刚被放开，清缓存让前端立刻看到可用状态。
+    local_entitlement_cache.delete(f"local-entitlement:{upstream_user_id}")
+    return {"synced": True, **result}
+
+
+async def retry_pending_billing_sync(limit: int = 20) -> int:
+    """重试上游额度写入失败的已付订单。"""
+    store = billing_store()
+    if store is None or store.pool is None:
+        return 0
+    pending = await store.pending_sync_orders(limit)
+    repaired = 0
+    for order in pending:
+        account = await auth_store_call("get_upstream_account", order["userId"], "primary")
+        upstream_user_id = str((account or {}).get("upstream_user_id") or "")
+        if not upstream_user_id:
+            continue
+        outcome = await apply_topup_entitlement(order["tradeNo"], order["userId"], upstream_user_id)
+        if outcome.get("synced"):
+            repaired += 1
+    return repaired
+
+
+@app.get("/api/me/billing")
+async def my_billing(
+    request: Request,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    store = require_billing_store()
+    app_user, _ = await billing_identity(request)
+    user_id = str(app_user["id"])
+    account, orders = await asyncio.gather(
+        store.get_account(user_id),
+        store.list_user_orders(user_id, limit, offset),
+    )
+    return {"config": billing.public_config(), "account": account, "orders": orders}
+
+
+@app.post("/api/me/billing/redeem")
+async def redeem_code(data: RedeemRequest, request: Request) -> dict[str, Any]:
+    await enforce_csrf(request)
+    store = require_billing_store()
+    app_user, upstream_user_id = await billing_identity(request)
+    user_id = str(app_user["id"])
+    try:
+        result = await store.redeem(data.code, user_id)
+    except BillingStoreError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    sync = await apply_topup_entitlement(result["tradeNo"], user_id, upstream_user_id)
+    return {
+        "ok": True,
+        "amountUsd": result["amountUsd"],
+        "account": result["account"],
+        "entitlementSynced": bool(sync.get("synced")),
+    }
+
+
+@app.post("/api/me/billing/orders")
+async def create_topup_order(data: CreateTopupOrderRequest, request: Request) -> dict[str, Any]:
+    await enforce_csrf(request)
+    store = require_billing_store()
+    app_user, _ = await billing_identity(request)
+    channel = data.channel
+    if channel == CHANNEL_EPAY and not billing.epay_enabled():
+        # 自动支付未开通时优先退到收款码渠道，别把用户堵在死路上。
+        channel = CHANNEL_MANUAL_QR if billing.manual_qr_enabled() else channel
+    if channel == CHANNEL_EPAY and not billing.epay_enabled():
+        raise HTTPException(status_code=503, detail="在线支付暂未开放，请联系管理员")
+    if channel == CHANNEL_MANUAL_QR and not billing.manual_qr_enabled():
+        raise HTTPException(status_code=503, detail="扫码转账暂未开放，请联系管理员")
+    try:
+        amount = billing.normalize_amount(data.amount)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    money = billing.money_for_amount(amount)
+    if money < 0.01:
+        raise HTTPException(status_code=400, detail="充值金额过小，请提高充值额度")
+    if channel == CHANNEL_MANUAL_QR:
+        allowed = {item["method"] for item in billing.manual_qr_methods()}
+        if data.paymentMethod not in allowed:
+            raise HTTPException(status_code=400, detail="该支付方式暂未开放")
+
+    trade_no = billing.generate_trade_no(str(app_user["id"]))
+    params: dict[str, str] = {}
+    submit_url = ""
+    if channel == CHANNEL_EPAY:
+        try:
+            params = billing.epay_purchase_params(
+                trade_no,
+                money,
+                data.paymentMethod,
+                "通衢 API 额度充值",
+                billing.epay_notify_url(),
+                billing.epay_return_url(),
+            )
+            submit_url = billing.epay_submit_url()
+        except ValueError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+    try:
+        await store.create_order(
+            trade_no,
+            str(app_user["id"]),
+            channel,
+            amount,
+            money,
+            billing.exchange_rate(),
+            data.paymentMethod,
+        )
+    except BillingStoreError as exc:
+        raise HTTPException(status_code=500, detail="创建充值订单失败，请稍后重试") from exc
+    payload: dict[str, Any] = {
+        "tradeNo": trade_no,
+        "channel": channel,
+        "amountUsd": amount,
+        "moneyCny": money,
+        "paymentMethod": data.paymentMethod,
+    }
+    if channel == CHANNEL_EPAY:
+        payload["submitUrl"] = submit_url
+        payload["params"] = params
+        payload["redirectUrl"] = billing.epay_redirect_url(params)
+    else:
+        method = next(
+            (item for item in billing.manual_qr_methods() if item["method"] == data.paymentMethod),
+            None,
+        )
+        payload["qrUrl"] = (method or {}).get("qrUrl", "")
+        payload["methodLabel"] = (method or {}).get("label", "")
+        payload["notice"] = billing.manual_qr_notice()
+        payload["contact"] = billing.manual_qr_contact()
+        payload["reviewMinutes"] = billing.manual_review_minutes()
+    return payload
+
+
+@app.post("/api/me/billing/orders/{trade_no}/submit")
+async def submit_manual_payment(
+    trade_no: str, data: SubmitManualPaymentRequest, request: Request
+) -> dict[str, Any]:
+    """用户扫码付款后回填付款说明，等管理员确认到账。
+
+    个人收款码没有支付回调，平台无法自动判定到账，因此这里只把订单推进"待确认"，
+    额度必须由管理员在后台确认后才入账。
+    """
+    await enforce_csrf(request)
+    store = require_billing_store()
+    app_user, _ = await billing_identity(request)
+    existing = await store.get_order(trade_no)
+    if existing is None or existing["userId"] != str(app_user["id"]):
+        raise HTTPException(status_code=404, detail="充值订单不存在")
+    if existing["channel"] != CHANNEL_MANUAL_QR:
+        raise HTTPException(status_code=400, detail="该订单无需提交付款凭证")
+    try:
+        order = await store.submit_manual_payment(trade_no, str(app_user["id"]), data.payerNote)
+    except BillingStoreError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "order": order, "reviewMinutes": billing.manual_review_minutes()}
+
+
+@app.get("/api/me/billing/orders/{trade_no}")
+async def my_billing_order(trade_no: str, request: Request) -> dict[str, Any]:
+    store = require_billing_store()
+    app_user, _ = await billing_identity(request)
+    order = await store.get_order(trade_no)
+    # 只能查自己的订单，避免用订单号枚举他人充值记录。
+    if order is None or order["userId"] != str(app_user["id"]):
+        raise HTTPException(status_code=404, detail="充值订单不存在")
+    account = await store.get_account(str(app_user["id"]))
+    return {"order": order, "account": account}
+
+
+@app.api_route("/api/pay/epay/notify", methods=["GET", "POST"])
+async def epay_notify(request: Request) -> PlainTextResponse:
+    """支付网关异步回调。
+
+    这个端点必须免登录，因此不信任任何调用者身份，只认三道校验：签名、订单处于
+    待付状态、金额与下单快照一致。响应体固定为纯文本，否则网关会无限重推。
+    """
+    store = billing_store()
+    if store is None or store.pool is None:
+        return PlainTextResponse("fail")
+    params: dict[str, str] = {}
+    if request.method == "POST":
+        # 网关回调是 application/x-www-form-urlencoded，手工解析可以免掉
+        # multipart 解析依赖，也避免超大 body 被当表单缓冲。
+        body = (await request.body())[:8192].decode("utf-8", "ignore")
+        params.update({str(name): str(value) for name, value in parse_qsl(body, keep_blank_values=True)})
+    params.update({str(name): str(value) for name, value in request.query_params.items()})
+
+    trade_no = str(params.get("out_trade_no") or "").strip()
+    if not billing.epay_verify(params):
+        logger.warning("epay notify signature rejected trade_no=%s ip=%s", trade_no, request_ip(request))
+        return PlainTextResponse("fail")
+    if str(params.get("trade_status") or "").upper() != "TRADE_SUCCESS":
+        # 非成功状态无需落账，但要回 success 以免网关持续重推。
+        return PlainTextResponse("success")
+
+    order = await store.get_order(trade_no)
+    if order is None:
+        logger.warning("epay notify for unknown order trade_no=%s", trade_no)
+        return PlainTextResponse("fail")
+    try:
+        paid = round(float(params.get("money") or 0), 2)
+    except (TypeError, ValueError):
+        logger.warning("epay notify money unparseable trade_no=%s", trade_no)
+        return PlainTextResponse("fail")
+    if abs(paid - round(float(order["moneyCny"]), 2)) > 0.001:
+        # 金额被改写：签名可能来自另一笔订单的重放，坚决不落账。
+        logger.error(
+            "epay notify amount mismatch trade_no=%s expected=%s paid=%s",
+            trade_no, order["moneyCny"], paid,
+        )
+        return PlainTextResponse("fail")
+
+    try:
+        result = await store.settle_order(
+            trade_no,
+            upstream_trade_no=str(params.get("trade_no") or ""),
+            notify_payload=json.dumps(params, ensure_ascii=False),
+        )
+    except BillingStoreError:
+        logger.exception("epay notify settle failed trade_no=%s", trade_no)
+        return PlainTextResponse("fail")
+
+    if result["settled"]:
+        account = await auth_store_call("get_upstream_account", order["userId"], "primary")
+        upstream_user_id = str((account or {}).get("upstream_user_id") or "")
+        if upstream_user_id:
+            await apply_topup_entitlement(trade_no, order["userId"], upstream_user_id)
+        else:
+            await store.mark_sync_state(trade_no, SYNC_PENDING, "账号尚未完成开通")
+    return PlainTextResponse("success")
+
+
+# ---- 充值管理 ----
+
+
+@app.get("/api/admin/billing/redemptions")
+async def admin_list_redemptions(
+    request: Request,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    store = require_billing_store()
+    require_admin(request)
+    return await store.list_redemptions(limit, offset)
+
+
+@app.post("/api/admin/billing/redemptions")
+async def admin_create_redemptions(data: CreateRedemptionRequest, request: Request) -> JSONResponse:
+    await enforce_csrf(request)
+    store = require_billing_store()
+    admin = require_admin(request)
+    try:
+        amount = billing.normalize_amount(data.amount)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(days=data.expiresInDays) if data.expiresInDays else None
+    )
+    created = await store.create_redemptions(
+        data.count, amount, data.name, str(admin.get("email") or ""), expires_at
+    )
+    # 明文兑换码只在这一次响应里出现，之后库里只有哈希。
+    return JSONResponse(
+        {"items": created, "count": len(created)},
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
+
+
+@app.post("/api/admin/billing/redemptions/{redemption_id}/disable")
+async def admin_disable_redemption(redemption_id: str, request: Request) -> dict[str, Any]:
+    await enforce_csrf(request)
+    store = require_billing_store()
+    require_admin(request)
+    changed = await store.disable_redemption(redemption_id)
+    if not changed:
+        raise HTTPException(status_code=400, detail="该兑换码已被使用或已停用")
+    return {"ok": True}
+
+
+@app.get("/api/admin/billing/orders")
+async def admin_list_orders(
+    request: Request,
+    keyword: str = Query("", max_length=100),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    store = require_billing_store()
+    require_admin(request)
+    payload = await store.list_all_orders(keyword, limit, offset)
+    payload["pendingSyncCount"] = await store.pending_sync_count()
+    payload["pendingReviewCount"] = await store.pending_review_count()
+    payload["pendingReviews"] = await store.list_pending_reviews()
+    return payload
+
+
+@app.post("/api/admin/billing/orders/{trade_no}/complete")
+async def admin_complete_order(
+    trade_no: str, request: Request, data: ReviewOrderRequest | None = None
+) -> dict[str, Any]:
+    """人工确认到账。
+
+    既用于收款码转账的到账确认，也用于自动支付成功但回调丢失的补单。确认人写入
+    ``reviewed_by``，便于事后追溯是谁放的款。
+    """
+    await enforce_csrf(request)
+    store = require_billing_store()
+    app_user = require_admin(request)
+    reviewer = str(app_user.get("email") or "")
+    order = await store.get_order(trade_no)
+    if order is None:
+        raise HTTPException(status_code=404, detail="充值订单不存在")
+    if order["status"] != ORDER_PENDING:
+        raise HTTPException(status_code=400, detail="该订单不处于待支付状态")
+    try:
+        result = await store.settle_order(
+            trade_no,
+            notify_payload=json.dumps({"manual_by": reviewer}, ensure_ascii=False),
+            reviewed_by=reviewer,
+            review_note=(data.note if data else "") or "管理员确认到账",
+        )
+    except BillingStoreError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    account = await auth_store_call("get_upstream_account", order["userId"], "primary")
+    upstream_user_id = str((account or {}).get("upstream_user_id") or "")
+    sync: dict[str, Any] = {"synced": False, "error": "账号尚未完成开通"}
+    if upstream_user_id:
+        sync = await apply_topup_entitlement(trade_no, order["userId"], upstream_user_id)
+    else:
+        await store.mark_sync_state(trade_no, SYNC_PENDING, "账号尚未完成开通")
+    return {
+        "ok": True,
+        "settled": result["settled"],
+        "account": result["account"],
+        "entitlementSynced": bool(sync.get("synced")),
+    }
+
+
+@app.post("/api/admin/billing/orders/{trade_no}/reject")
+async def admin_reject_order(
+    trade_no: str, request: Request, data: ReviewOrderRequest | None = None
+) -> dict[str, Any]:
+    """驳回未收到款的待确认订单，订单转为已失败，不影响余额。"""
+    await enforce_csrf(request)
+    store = require_billing_store()
+    app_user = require_admin(request)
+    order = await store.get_order(trade_no)
+    if order is None:
+        raise HTTPException(status_code=404, detail="充值订单不存在")
+    if order["status"] != ORDER_PENDING:
+        raise HTTPException(status_code=400, detail="该订单不处于待支付状态")
+    changed = await store.fail_order(
+        trade_no,
+        (data.note if data else "") or "管理员核对后未查到该笔付款",
+        reviewed_by=str(app_user.get("email") or ""),
+    )
+    if not changed:
+        raise HTTPException(status_code=400, detail="该订单已被处理")
+    return {"ok": True}
+
+
+@app.post("/api/admin/billing/sync/retry")
+async def admin_retry_billing_sync(request: Request) -> dict[str, Any]:
+    """重试积压的上游额度写入。"""
+    await enforce_csrf(request)
+    store = require_billing_store()
+    require_admin(request)
+    repaired = await retry_pending_billing_sync()
+    return {"ok": True, "repaired": repaired, "pendingSyncCount": await store.pending_sync_count()}
 
 
 @app.get("/api/models")

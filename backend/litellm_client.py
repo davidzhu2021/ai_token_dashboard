@@ -1409,6 +1409,109 @@ class LiteLLMClient:
         scope = await self.key_model_scope(user_id, backend)
         return scope.models, scope.unrestricted
 
+    async def set_user_budget(
+        self,
+        user_id: str,
+        max_budget: float,
+        backend: LiteLLMBackend | None = None,
+    ) -> None:
+        """把账户累计充值额度写成上游的用户级消费上限。
+
+        上游 ``max_budget`` 与 ``spend`` 都是累计值，两者相减才是可用余额，这与
+        看板既有的 spend 语义一致。因此这里写入的是"累计已充值"，不是"当前余额"。
+        """
+        backend = backend or self.backends[0]
+        target = str(user_id).strip()
+        if not target:
+            raise HTTPException(status_code=400, detail="缺少账号标识，无法写入额度")
+        await self.request_backend(
+            backend,
+            "POST",
+            "/user/update",
+            json={"user_id": target, "max_budget": max(0.0, float(max_budget))},
+        )
+        self.invalidate_key_cache(target, backend)
+
+    async def grant_default_models(
+        self,
+        user_id: str,
+        models: list[str],
+        backend: LiteLLMBackend | None = None,
+    ) -> list[str]:
+        """首次充值时解除 ``no-default-models`` 限制。
+
+        只在账号仍未获得任何真实模型权限时写入，已被管理员单独开通过模型的账号
+        保持原样，避免充值把更宽的权限收窄回默认集。返回实际生效的模型列表，未
+        改动时返回空列表。
+        """
+        backend = backend or self.backends[0]
+        target = str(user_id).strip()
+        desired = sorted({str(item).strip() for item in models if str(item).strip()})
+        if not target or not desired:
+            return []
+        info = await self.key_user_info(target, backend)
+        current = self._clean_model_list(info.get("models"))
+        existing = [model for model in current if model != NO_DEFAULT_MODELS]
+        if existing:
+            return []
+        await self.request_backend(
+            backend,
+            "POST",
+            "/user/update",
+            json={"user_id": target, "models": desired},
+        )
+        self.invalidate_key_cache(target, backend)
+        return desired
+
+    async def raise_key_daily_budgets(
+        self,
+        user_id: str,
+        daily_budget: float,
+        backend: LiteLLMBackend | None = None,
+        changed_by: str = "billing-topup",
+    ) -> list[str]:
+        """把该账号名下访问密钥的每日额度抬高到给定值。
+
+        只升不降：已经拥有更高日额度的密钥保持不动，避免充值反而收紧限额。返回
+        实际被调整的密钥编号。
+        """
+        backend = backend or self.backends[0]
+        target = str(user_id).strip()
+        if not target:
+            return []
+        ceiling = max(0.0, float(daily_budget))
+        if ceiling <= 0:
+            return []
+        keys = await self.keys_for_user(target, backend, refresh=True)
+        adjusted: list[str] = []
+        for item in keys:
+            key_id = _clean_text(item.get("id"))
+            if not key_id or item.get("status") != "正常":
+                continue
+            rotation = item.get("_rotation")
+            current = rotation.get("max_budget") if isinstance(rotation, dict) else None
+            try:
+                current_value = float(current) if current is not None else 0.0
+            except (TypeError, ValueError):
+                current_value = 0.0
+            if current_value >= ceiling:
+                continue
+            await self.request_backend(
+                backend,
+                "POST",
+                "/key/update",
+                headers={"litellm-changed-by": changed_by},
+                json={
+                    "key": key_id,
+                    "max_budget": ceiling,
+                    "budget_duration": DEFAULT_PERSONAL_KEY_BUDGET_DURATION,
+                },
+            )
+            adjusted.append(key_id)
+        if adjusted:
+            self.invalidate_key_cache(target, backend)
+        return adjusted
+
     async def ensure_personal_key_budget(
         self,
         backend: LiteLLMBackend,

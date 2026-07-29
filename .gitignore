@@ -7,3 +7,6 @@ __pycache__/
 .playwright-cli/
 audit.log
 .data/
+# 收款码属于收款凭证，不入库；部署时手工上传到服务器对应目录。
+assets/pay/*
+!assets/pay/README.md
