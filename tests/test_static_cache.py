@@ -12,7 +12,8 @@ def test_index_uses_fresh_app_asset_and_disables_html_cache() -> None:
     assert "Cache-Control" in response.headers
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["Referrer-Policy"] == "no-referrer"
-    assert "/assets/app.js?v=20260728-vendor-official-icons" in response.text
+    assert "/assets/app.js?v=20260728-model-alias-display-names" in response.text
+    assert "20260728-vendor-official-icons" not in response.text
     assert "20260728-model-plaza-pricing" not in response.text
     assert "20260728-auth-required-fix" not in response.text
     assert "20260727-carher-landing" not in response.text

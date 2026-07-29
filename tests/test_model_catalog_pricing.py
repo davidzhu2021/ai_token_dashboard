@@ -12,6 +12,7 @@ from backend.litellm_client import (
     LiteLLMBackend,
     LiteLLMClient,
     is_internal_model_alias,
+    model_display_name,
     model_family,
 )
 
@@ -64,7 +65,8 @@ def _stub(
 
 
 def _catalog(client: LiteLLMClient) -> dict[str, dict[str, Any]]:
-    return {item["modelName"]: item for item in asyncio.run(client.models({}))}
+    """按展示名索引目录（展示名是模型广场上的唯一标识）。"""
+    return {item["displayName"]: item for item in asyncio.run(client.models({}))}
 
 
 @pytest.mark.parametrize(
@@ -109,7 +111,7 @@ def test_model_family_classifies_by_real_model_root(model_name: str, expected_ke
         "",
     ],
 )
-def test_internal_aliases_are_hidden(model_name: str) -> None:
+def test_internal_aliases_are_recognized(model_name: str) -> None:
     assert is_internal_model_alias(model_name) is True
 
 
@@ -134,6 +136,45 @@ def test_internal_aliases_are_hidden(model_name: str) -> None:
 )
 def test_clean_model_names_are_kept(model_name: str) -> None:
     assert is_internal_model_alias(model_name) is False
+
+
+@pytest.mark.parametrize(
+    ("model_name", "expected"),
+    [
+        # 线路/账号前缀与后缀都要剥掉，只留员工认得的模型名。
+        ("wangsu-gpt-5.5", "gpt-5.5"),
+        ("wangsu7-gpt-5.4", "gpt-5.4"),
+        ("kuaihui-gpt-5.4-codex", "gpt-5.4-codex"),
+        ("openrouter-gpt-5.5-pro", "gpt-5.5-pro"),
+        ("chatgpt-gpt-5.5", "gpt-5.5"),
+        ("local-deepseek-v4-flash-responses", "deepseek-v4-flash-responses"),
+        ("wangsu-cheliantianxia1-gpt-5.4", "gpt-5.4"),
+        ("claude-max-liuguoxian-opus", "claude-max-opus"),
+        # `pool` 是线路池的内部编排概念，对员工无意义。
+        ("zerokey-pool-gpt-5.3-mini", "gpt-5.3-mini"),
+        ("zerokey-codex-sol", "codex-sol"),
+        # 供应商点号前缀可能有多层。
+        ("anthropic.claude-opus-5", "claude-opus-5"),
+        ("anthropic.wangsu.claude-fable-5", "claude-fable-5"),
+        ("anthropic.openrouter.claude-opus-4-6", "claude-opus-4-6"),
+        ("BAAI/bge-m3", "bge-m3"),
+        # 正常主名原样保留，尤其是带小数点和带 max 档位的。
+        ("gpt-5.2", "gpt-5.2"),
+        ("claude-opus-4-8", "claude-opus-4-8"),
+        ("qwen3.7-max", "qwen3.7-max"),
+        # `max` 是真实档位而非线路标记，剥掉会与 zai-glm-5.2 撞名。
+        ("zai-max-glm-5.2", "max-glm-5.2"),
+        ("zai-glm-5.2", "glm-5.2"),
+    ],
+)
+def test_display_name_strips_internal_gateway_tokens(model_name: str, expected: str) -> None:
+    assert model_display_name(model_name) == expected
+
+
+def test_display_name_never_becomes_empty() -> None:
+    # 整个名字都是线路词元时不能剥成空串，否则模型会凭空消失。
+    assert model_display_name("wangsu") == "wangsu"
+    assert model_display_name("  ") == ""
 
 
 def test_pricing_uses_highest_priced_deployment_of_the_same_model() -> None:
@@ -192,7 +233,7 @@ def test_models_without_any_price_are_dropped_from_the_catalog() -> None:
     assert sorted(_catalog(client)) == ["gpt-5.5"]
 
 
-def test_internal_aliases_are_filtered_out_of_the_catalog() -> None:
+def test_internal_aliases_are_shown_under_their_clean_display_name() -> None:
     client = make_client()
     _stub(
         client,
@@ -211,7 +252,60 @@ def test_internal_aliases_are_filtered_out_of_the_catalog() -> None:
         },
     )
 
-    assert sorted(_catalog(client)) == ["claude-code-glm-5.1", "gpt-5.2"]
+    catalog = _catalog(client)
+
+    # 只有别名部署的模型不再整条消失，而是以脱敏展示名出现。
+    assert sorted(catalog) == ["claude-code-glm-5.1", "claude-opus-4-8", "codex-sol", "gpt-5.2", "gpt-5.5"]
+    # 展示名脱敏，但复制按钮拿到的仍是可直接调用的上游原始名。
+    assert catalog["gpt-5.5"]["modelName"] == "wangsu-gpt-5.5"
+    assert catalog["codex-sol"]["modelName"] == "zerokey-codex-sol"
+    assert catalog["claude-opus-4-8"]["modelName"] == "anthropic.claude-opus-4-8"
+
+
+def test_deployments_sharing_a_display_name_collapse_to_the_canonical_one() -> None:
+    client = make_client()
+    _stub(
+        client,
+        models={
+            "primary": [{"id": "wangsu-gpt-5.5"}, {"id": "gpt-5.5"}, {"id": "kuaihui-gpt-5.5"}],
+            "secondary": [{"id": "chatgpt-gpt-5.5"}],
+        },
+        infos={
+            "primary": [
+                _info("wangsu-gpt-5.5", input_cost_per_token=9e-06, output_cost_per_token=3e-05),
+                _info("gpt-5.5", input_cost_per_token=5e-06, output_cost_per_token=3e-05),
+                _info("kuaihui-gpt-5.5", input_cost_per_token=6e-06, output_cost_per_token=3e-05),
+            ],
+            "secondary": [_info("chatgpt-gpt-5.5", input_cost_per_token=7e-06, output_cost_per_token=3e-05)],
+        },
+    )
+
+    catalog = _catalog(client)
+
+    # 四条线路合成一张卡片，且优先保留原始名就等于展示名的那条，
+    # 员工填最短的 gpt-5.5 就能路由，不必知道任何线路代号。
+    assert sorted(catalog) == ["gpt-5.5"]
+    assert catalog["gpt-5.5"]["modelName"] == "gpt-5.5"
+
+
+def test_alias_only_display_group_keeps_the_highest_priced_deployment() -> None:
+    client = make_client()
+    _stub(
+        client,
+        models={"primary": [{"id": "wangsu-gpt-5.5"}, {"id": "kuaihui-gpt-5.5"}]},
+        infos={
+            "primary": [
+                _info("wangsu-gpt-5.5", input_cost_per_token=5e-06, output_cost_per_token=3e-05),
+                _info("kuaihui-gpt-5.5", input_cost_per_token=8e-06, output_cost_per_token=4e-05),
+            ]
+        },
+    )
+
+    catalog = _catalog(client)
+
+    # 没有干净主名可选时取输入单价最高的那条，与 _model_pricing 的口径一致，不低报成本。
+    assert catalog["gpt-5.5"]["modelName"] == "kuaihui-gpt-5.5"
+    assert catalog["gpt-5.5"]["inputPricePerMillion"] == 8.0
 
 
 def test_billing_type_and_capabilities_come_from_upstream_mode_and_support_flags() -> None:
@@ -289,7 +383,8 @@ def test_catalog_survives_when_the_pricing_endpoint_is_unavailable(monkeypatch: 
 
     catalog = _catalog(client)
 
-    # 计费接口全挂时不清空目录，但内部别名仍然不展示。
+    # 计费接口全挂时不清空目录，别名照常合并到干净展示名下。
     assert sorted(catalog) == ["gpt-5.5"]
+    assert catalog["gpt-5.5"]["modelName"] == "gpt-5.5"
     assert catalog["gpt-5.5"]["familyLabel"] == "OpenAI"
     assert "inputPricePerMillion" not in catalog["gpt-5.5"]

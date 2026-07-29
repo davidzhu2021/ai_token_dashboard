@@ -2421,6 +2421,12 @@ function modelFamilyLabel(model) {
   return model.familyLabel || model.provider || "其他";
 }
 
+// 卡片标题用后端脱敏后的展示名，复制按钮必须给上游原始模型名，否则复制到的
+// 名字调不通。老后端没有 displayName 字段时退回原始名。
+function modelDisplayName(model) {
+  return model.displayName || model.modelName || "";
+}
+
 function vendorIconMarkup(model, extraClass = "") {
   const key = VENDOR_ICON_KEYS.has(model.familyKey) ? model.familyKey : "other";
   return `<span class="vendor-icon vendor-${key}${extraClass ? ` ${extraClass}` : ""}" aria-hidden="true">${icon(`vendor-${key}`)}</span>`;
@@ -2485,7 +2491,11 @@ function filteredModels() {
   const provider = el("providerFilter").value;
   const billingType = el("billingFilter").value;
   return modelCatalog.filter((model) => {
-    const matchesKeyword = !keyword || model.modelName.toLowerCase().includes(keyword) || modelFamilyLabel(model).toLowerCase().includes(keyword);
+    const matchesKeyword =
+      !keyword ||
+      modelDisplayName(model).toLowerCase().includes(keyword) ||
+      String(model.modelName || "").toLowerCase().includes(keyword) ||
+      modelFamilyLabel(model).toLowerCase().includes(keyword);
     const matchesProvider = provider === "all" || modelFamilyLabel(model) === provider;
     const matchesBilling = billingType === "all" || model.billingType === billingType;
     return matchesKeyword && matchesProvider && matchesBilling;
@@ -2505,7 +2515,8 @@ function setModelViewMode(mode) {
 function renderModelCards(models) {
   el("modelGrid").innerHTML = models
     .map((model) => {
-      const name = escapeHtml(model.modelName);
+      const name = escapeHtml(modelDisplayName(model));
+      const copyName = escapeHtml(model.modelName);
       const priceRows = modelPriceRows(model);
       const priceMarkup = priceRows.length
         ? priceRows.map(([label, text]) => `<div class="model-price-row"><span>${escapeHtml(label)}</span><strong>${escapeHtml(text)}</strong></div>`).join("")
@@ -2520,7 +2531,7 @@ function renderModelCards(models) {
                 <div class="provider">${escapeHtml(modelFamilyLabel(model))}</div>
               </div>
             </div>
-            <button class="model-copy-btn" type="button" data-copy-model="${name}" title="复制模型名称" aria-label="复制模型名称 ${name}">${icon("copy")}</button>
+            <button class="model-copy-btn" type="button" data-copy-model="${copyName}" title="复制模型名称" aria-label="复制模型名称 ${name}">${icon("copy")}</button>
           </div>
           <div class="model-price-list">${priceMarkup}</div>
           <div class="model-card-foot">
@@ -2536,7 +2547,8 @@ function renderModelCards(models) {
 function renderModelTable(models) {
   el("modelTableBody").innerHTML = models
     .map((model) => {
-      const name = escapeHtml(model.modelName);
+      const name = escapeHtml(modelDisplayName(model));
+      const copyName = escapeHtml(model.modelName);
       const price = (value) => escapeHtml(formatPricePerMillion(value) || "-");
       return `
         <tr>
@@ -2547,7 +2559,7 @@ function renderModelTable(models) {
           <td class="num">${price(model.outputPricePerMillion)}</td>
           <td class="num">${price(model.cacheReadPricePerMillion)}</td>
           <td class="num">${escapeHtml(modelContextText(model))}</td>
-          <td><button class="model-copy-btn" type="button" data-copy-model="${name}" title="复制模型名称" aria-label="复制模型名称 ${name}">${icon("copy")}</button></td>
+          <td><button class="model-copy-btn" type="button" data-copy-model="${copyName}" title="复制模型名称" aria-label="复制模型名称 ${name}">${icon("copy")}</button></td>
         </tr>
       `;
     })

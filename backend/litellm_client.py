@@ -327,7 +327,8 @@ def model_family(model_name: str) -> tuple[str, str]:
 
 
 # 上游把同一模型按账号/线路配了多份部署别名（wangsu-、zerokey-、kuaihui- 等）。
-# 这些是内部网关代号，按前端产品边界不得展示给员工，模型广场只保留主名。
+# 这些词元是内部网关代号，按前端产品边界不得出现在展示名里；但别名本身仍是
+# 员工唯一能调用的模型名，所以只从展示名里剥离，不据此丢弃模型（见 model_display_name）。
 _INTERNAL_ALIAS_TOKENS = frozenset(
     {
         "wangsu",
@@ -348,16 +349,53 @@ _INTERNAL_ALIAS_TOKENS = frozenset(
 # 供应商前缀形如 `anthropic.claude-opus-4-8`。要求点号后紧跟字母，否则
 # `gpt-5.2` 这类带小数点的正常模型名会被误判成别名。
 _VENDOR_DOT_PREFIX_RE = re.compile(r"^[a-z][a-z0-9]*\.[a-z]", re.IGNORECASE)
+# `pool` 是上游线路池的内部编排概念，对员工无意义，仅在别名里剥掉。
+# 刻意不剥 `max`：它是真实档位（zai-max-glm-5.2 与 zai-glm-5.2 是两个不同部署、
+# 价格不同），剥掉会让两者撞成同一个展示名而丢掉一个。
+_ALIAS_POOL_TOKENS = frozenset({"pool"})
 
 
 def is_internal_model_alias(model_name: str) -> bool:
-    """判断模型名是否为内部网关部署别名（不在模型广场展示）。"""
+    """判断模型名是否带内部网关线路标记（展示名需要脱敏，不代表该模型不可用）。"""
     name = _clean_text(model_name).lower()
     if not name:
         return True
     if "/" in name or _VENDOR_DOT_PREFIX_RE.match(name):
         return True
     return bool(_INTERNAL_ALIAS_TOKENS.intersection(name.split("-")))
+
+
+def model_display_name(model_name: str) -> str:
+    """把内部部署别名转成可展示的模型名（剥掉线路/供应商代号）。
+
+    员工调用时必须填上游原始名，所以这里只影响展示，复制按钮仍用原始名。
+    剥离后可能与其他别名重名（wangsu-gpt-5.5 与 kuaihui-gpt-5.5 都变成
+    gpt-5.5），去重由 `LiteLLMClient._priced_catalog` 负责。
+    """
+    name = _clean_text(model_name)
+    if not name:
+        return ""
+    body = name.split("/")[-1]
+    # 供应商前缀可能有多层，如 anthropic.openrouter.claude-opus-4-6。逐层剥，
+    # 只剥已知的供应商/线路代号，`gpt-5.2` 的小数点因此不受影响。
+    while True:
+        head, dot, rest = body.partition(".")
+        if not dot or not rest or not _is_vendor_token(head):
+            break
+        body = rest
+    segments = body.split("-")
+    kept = [segment for segment in segments if segment.lower() not in _INTERNAL_ALIAS_TOKENS]
+    if len(kept) != len(segments):
+        # 只有确认是别名时才剥线路池标记，正常主名里的 max 要留着。
+        kept = [segment for segment in kept if segment.lower() not in _ALIAS_POOL_TOKENS]
+    display = "-".join(segment for segment in kept if segment)
+    return display or name
+
+
+def _is_vendor_token(token: str) -> bool:
+    """点号前缀是否是供应商/线路代号（而非 gpt-5.2 这类小数点）。"""
+    value = token.lower()
+    return value in _INTERNAL_ALIAS_TOKENS or value in {"anthropic", "openai", "google", "custom_openai"}
 
 
 class LiteLLMClient:
@@ -3013,49 +3051,79 @@ class LiteLLMClient:
         # The production route supplies database counts. Keep the upstream call as
         # a compatibility fallback for local deployments without the snapshot DB.
         usage = usage_counts if usage_counts is not None else await self.model_usage_counts(start_date, end_date)
+        # 用量按上游原始名统计，而目录已按展示名合并了多条线路部署，所以热度要把
+        # 同一展示名下所有别名的调用量加起来，否则合并后的卡片会被低估排到后面。
+        usage_by_display: dict[str, int] = defaultdict(int)
+        for model in models:
+            model_name = _clean_text(model.get("modelName"))
+            display_key = self._normalized_model_name(model_display_name(model_name))
+            if display_key:
+                usage_by_display[display_key] += usage.get(self._normalized_model_name(model_name), 0)
         return sorted(
             catalog,
             key=lambda item: (
-                -usage.get(self._normalized_model_name(item.get("modelName")), 0),
-                self._normalized_model_name(item.get("modelName")),
+                -usage_by_display.get(self._normalized_model_name(item.get("displayName")), 0),
+                self._normalized_model_name(item.get("displayName")),
             ),
         )
 
     async def _priced_catalog(self, models: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """给模型目录补上厂商与计费信息，并剔除不该展示的条目。
+        """给模型目录补上展示名、厂商与计费信息，并按展示名去重。
 
-        剔除两类：内部网关部署别名，以及在任何部署上都查不到有效单价的模型
-        （单价缺失时展示成免费会误导员工）。上游计费接口整体不可用时不做剔除，
-        退化为不带价格的目录，避免模型广场直接变空。
+        上游同一模型配了多条线路部署（wangsu-gpt-5.5、kuaihui-gpt-5.5 …），
+        展示名都是 gpt-5.5。这里每个展示名只保留一条：优先留原始名就等于
+        展示名的那条（员工填最短的名字即可路由），其次留输入单价最高的那条
+        （与 `_model_pricing` 取最高价的口径一致，不低报成本）。
+
+        在任何部署上都查不到有效单价的模型仍然剔除（单价缺失时展示成免费会
+        误导员工）。上游计费接口整体不可用时不做价格剔除，退化为不带价格的
+        目录，避免模型广场直接变空。
         """
         pricing = await self._model_pricing()
-        catalog: list[dict[str, Any]] = []
+        grouped: dict[str, dict[str, Any]] = {}
         for model in models:
             model_name = _clean_text(model.get("modelName"))
-            if is_internal_model_alias(model_name):
+            display_name = model_display_name(model_name)
+            if not display_name:
                 continue
             family_key, family_label = model_family(model_name)
-            entry = {**model, "familyKey": family_key, "familyLabel": family_label}
+            entry = {
+                **model,
+                "modelName": model_name,
+                "displayName": display_name,
+                "familyKey": family_key,
+                "familyLabel": family_label,
+            }
             price = pricing.get(self._normalized_model_name(model_name))
-            if price is None:
-                if pricing:
-                    continue
-                catalog.append(entry)
+            if price is None and pricing:
                 continue
-            entry.update(
-                {
-                    "billingType": price["billingType"],
-                    "inputPricePerMillion": price["inputPricePerMillion"],
-                    "outputPricePerMillion": price["outputPricePerMillion"],
-                    "cacheReadPricePerMillion": price["cacheReadPricePerMillion"],
-                    "cacheWritePricePerMillion": price["cacheWritePricePerMillion"],
-                    "capabilities": self._pricing_capabilities(price),
-                }
-            )
-            if price["contextWindow"]:
-                entry["contextWindow"] = str(price["contextWindow"])
-            catalog.append(entry)
-        return catalog
+            if price is not None:
+                entry.update(
+                    {
+                        "billingType": price["billingType"],
+                        "inputPricePerMillion": price["inputPricePerMillion"],
+                        "outputPricePerMillion": price["outputPricePerMillion"],
+                        "cacheReadPricePerMillion": price["cacheReadPricePerMillion"],
+                        "cacheWritePricePerMillion": price["cacheWritePricePerMillion"],
+                        "capabilities": self._pricing_capabilities(price),
+                    }
+                )
+                if price["contextWindow"]:
+                    entry["contextWindow"] = str(price["contextWindow"])
+            key = self._normalized_model_name(display_name)
+            if key not in grouped or self._prefer_catalog_entry(entry, grouped[key]):
+                grouped[key] = entry
+        return list(grouped.values())
+
+    @staticmethod
+    def _prefer_catalog_entry(candidate: dict[str, Any], current: dict[str, Any]) -> bool:
+        """同一展示名的多条部署里，判断 candidate 是否比 current 更适合展示。"""
+
+        def rank(entry: dict[str, Any]) -> tuple[int, float]:
+            is_canonical = LiteLLMClient._normalized_model_name(entry.get("modelName")) == LiteLLMClient._normalized_model_name(entry.get("displayName"))
+            return (1 if is_canonical else 0, _as_number(entry.get("inputPricePerMillion")))
+
+        return rank(candidate) > rank(current)
 
 
 def default_date_range(days: int = 30) -> tuple[str, str]:
