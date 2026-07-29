@@ -2943,12 +2943,17 @@ class LiteLLMClient:
         同一模型名在不同线路/后端上会有多份部署，单价并不一致。这里沿用
         LiteLLM 自身 `_set_model_group_info`（litellm/router.py）的口径：取同名
         部署中输入单价最高的那一份，既与上游聚合一致，也不会低报成本。
+
+        上下文窗口不跟着价格走：它是模型自身能力、不随线路变，而上游只有部分
+        部署填了 `max_input_tokens`。若跟着「输入价最高」的那一份取，恰好那份
+        没填时 1M 窗口会显示成「未标注」，所以按模型名单独取非零最大值。
         """
         hit, value, _ = self._model_cache.get("model_pricing")
         if hit:
             return value
 
         pricing: dict[str, dict[str, Any]] = {}
+        context_windows: dict[str, int] = {}
         successful_backends = 0
         for backend in self.backends:
             try:
@@ -2964,6 +2969,10 @@ class LiteLLMClient:
                 if not normalized_name:
                     continue
                 info = item.get("model_info") if isinstance(item.get("model_info"), dict) else {}
+                # 窗口要在价格过滤之前收集：没配价的透传部署常常反而填了窗口。
+                max_input_tokens = _as_int(info.get("max_input_tokens"))
+                if max_input_tokens > context_windows.get(normalized_name, 0):
+                    context_windows[normalized_name] = max_input_tokens
                 input_price = self._price_per_million(info.get("input_cost_per_token"))
                 output_price = self._price_per_million(info.get("output_cost_per_token"))
                 if input_price is None and output_price is None:
@@ -2971,19 +2980,21 @@ class LiteLLMClient:
                 current = pricing.get(normalized_name)
                 if current is not None and (current.get("inputPricePerMillion") or 0) >= (input_price or 0):
                     continue
-                max_input_tokens = _as_int(info.get("max_input_tokens"))
                 pricing[normalized_name] = {
                     "billingType": "按次计费" if _clean_text(info.get("mode")) == "image_generation" else "按量计费",
                     "inputPricePerMillion": input_price,
                     "outputPricePerMillion": output_price,
                     "cacheReadPricePerMillion": self._price_per_million(info.get("cache_read_input_token_cost")),
                     "cacheWritePricePerMillion": self._price_per_million(info.get("cache_creation_input_token_cost")),
-                    "contextWindow": max_input_tokens if max_input_tokens > 0 else None,
                     "supportsVision": bool(info.get("supports_vision")),
                     "supportsReasoning": bool(info.get("supports_reasoning")),
                     "supportsFunctionCalling": bool(info.get("supports_function_calling")),
                     "isEmbedding": _clean_text(info.get("mode")) == "embedding",
                 }
+
+        for normalized_name, entry in pricing.items():
+            window = context_windows.get(normalized_name, 0)
+            entry["contextWindow"] = window if window > 0 else None
 
         if successful_backends:
             self._model_cache.set("model_pricing", pricing, _env_int("MODEL_CACHE_TTL_SECONDS", 1800))
@@ -3078,8 +3089,13 @@ class LiteLLMClient:
         在任何部署上都查不到有效单价的模型仍然剔除（单价缺失时展示成免费会
         误导员工）。上游计费接口整体不可用时不做价格剔除，退化为不带价格的
         目录，避免模型广场直接变空。
+
+        上下文窗口按展示名单独取非零最大值，不跟着被选中的那条部署走：窗口是
+        模型能力、不随线路变，而上游只有部分部署填了这个字段（例如 fable-5 的
+        1M 窗口只写在 kuaihui 那条线路上）。
         """
         pricing = await self._model_pricing()
+        context_windows = self._context_windows_by_display_name(models, pricing)
         grouped: dict[str, dict[str, Any]] = {}
         for model in models:
             model_name = _clean_text(model.get("modelName"))
@@ -3108,12 +3124,40 @@ class LiteLLMClient:
                         "capabilities": self._pricing_capabilities(price),
                     }
                 )
-                if price["contextWindow"]:
-                    entry["contextWindow"] = str(price["contextWindow"])
             key = self._normalized_model_name(display_name)
+            window = context_windows.get(key, 0)
+            if window > 0:
+                entry["contextWindow"] = str(window)
             if key not in grouped or self._prefer_catalog_entry(entry, grouped[key]):
                 grouped[key] = entry
         return list(grouped.values())
+
+    @classmethod
+    def _context_windows_by_display_name(
+        cls, models: list[dict[str, Any]], pricing: dict[str, dict[str, Any]]
+    ) -> dict[str, int]:
+        """按展示名汇总上下文窗口，取同组各线路部署里的非零最大值。
+
+        `/models` 自身很少带窗口，主要来源是 `/model/info`（已由 `_model_pricing`
+        按原始名整理好），所以两处都看一眼，谁给出更大的非零值就用谁。
+        """
+        windows: dict[str, int] = {}
+
+        def record(display_key: str, value: Any) -> None:
+            window = _as_int(value)
+            if window > windows.get(display_key, 0):
+                windows[display_key] = window
+
+        for model in models:
+            model_name = _clean_text(model.get("modelName"))
+            display_key = cls._normalized_model_name(model_display_name(model_name))
+            if not display_key:
+                continue
+            record(display_key, model.get("contextWindow"))
+            price = pricing.get(cls._normalized_model_name(model_name))
+            if price:
+                record(display_key, price.get("contextWindow"))
+        return windows
 
     @staticmethod
     def _prefer_catalog_entry(candidate: dict[str, Any], current: dict[str, Any]) -> bool:

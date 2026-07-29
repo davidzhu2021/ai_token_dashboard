@@ -341,6 +341,64 @@ def test_billing_type_and_capabilities_come_from_upstream_mode_and_support_flags
     assert catalog["gpt-5.6-terra"]["contextWindow"] == "1050000"
 
 
+def test_context_window_is_taken_from_any_deployment_that_reports_one() -> None:
+    # 上游只有部分部署填了 max_input_tokens，且未必是输入价最高的那一份。
+    # 窗口是模型能力、不随线路变，所以不能跟着价格聚合走（真实案例：fable-5
+    # 的 1M 窗口只写在 kuaihui 线路上，结果卡片显示「未标注」）。
+    client = make_client()
+    _stub(
+        client,
+        models={"primary": [{"id": "claude-fable-5"}]},
+        infos={
+            "primary": [
+                _info("claude-fable-5", input_cost_per_token=1e-05, output_cost_per_token=5e-05),
+                _info("claude-fable-5", input_cost_per_token=2e-06, output_cost_per_token=1e-05, max_input_tokens=1000000),
+                # 没配价的透传部署也可能带窗口，价格过滤不能把它的窗口一起丢掉。
+                _info("claude-fable-5", input_cost_per_token=0, output_cost_per_token=0, max_input_tokens=200000),
+            ]
+        },
+    )
+
+    model = _catalog(client)["claude-fable-5"]
+
+    # 价格仍按最高价取，与 LiteLLM 自身口径一致。
+    assert model["inputPricePerMillion"] == 10.0
+    assert model["contextWindow"] == "1000000"
+
+
+def test_context_window_is_shared_across_aliases_of_the_same_display_name() -> None:
+    # 窗口只写在别名部署上时，合并后的卡片也要能拿到。
+    client = make_client()
+    _stub(
+        client,
+        models={"primary": [{"id": "claude-fable-5"}, {"id": "kuaihui.claude-fable-5"}]},
+        infos={
+            "primary": [
+                _info("claude-fable-5", input_cost_per_token=2e-06, output_cost_per_token=1e-05),
+                _info("kuaihui.claude-fable-5", input_cost_per_token=2e-06, output_cost_per_token=1e-05, max_input_tokens=1000000),
+            ]
+        },
+    )
+
+    catalog = _catalog(client)
+
+    assert list(catalog) == ["claude-fable-5"]
+    # 展示的是主名那条部署，但窗口来自 kuaihui 线路。
+    assert catalog["claude-fable-5"]["modelName"] == "claude-fable-5"
+    assert catalog["claude-fable-5"]["contextWindow"] == "1000000"
+
+
+def test_context_window_stays_unlabelled_when_no_deployment_reports_one() -> None:
+    client = make_client()
+    _stub(
+        client,
+        models={"primary": [{"id": "gpt-5.5"}]},
+        infos={"primary": [_info("gpt-5.5", input_cost_per_token=2.5e-06, output_cost_per_token=1.5e-05)]},
+    )
+
+    assert _catalog(client)["gpt-5.5"]["contextWindow"] == "未标注"
+
+
 def test_prices_are_converted_to_cost_per_million_tokens() -> None:
     client = make_client()
     _stub(
