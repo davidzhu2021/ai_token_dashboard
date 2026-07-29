@@ -77,6 +77,19 @@ let isAdminLoading = false;
 let isDepartmentLoading = false;
 let isTeamLoading = false;
 let isTeamMemberLoading = false;
+let organizationSnapshot = null;
+let organizationMembers = [];
+let organizationMemberTotal = 0;
+let organizationMemberPage = 1;
+const organizationMemberPageSize = 20;
+let organizationMemberFilters = { search: "", departmentId: "", role: "", status: "" };
+let isOrganizationLoading = false;
+let isOrganizationMemberLoading = false;
+let isOrganizationDepartmentSaving = false;
+let isOrganizationMemberSaving = false;
+let editingOrganizationDepartmentId = "";
+let editingOrganizationMemberId = "";
+let organizationSearchTimer = null;
 let isSsoRedirecting = false;
 let billingConfig = null;
 let billingAccount = null;
@@ -3171,10 +3184,13 @@ function renderTopupMethods() {
 function renderBilling() {
   const balance = Number(billingAccount?.balanceUsd || 0);
   const topupTotal = Number(billingAccount?.topupTotalUsd || 0);
+  const spent = Number.isFinite(Number(billingAccount?.spentUsd))
+    ? Math.max(0, Number(billingAccount.spentUsd))
+    : Math.max(0, topupTotal - balance);
   setText("billingBalance", money.format(balance));
   setText("billingBalanceChip", `余额 ${money.format(balance)}`);
   setText("billingTopupTotal", money.format(topupTotal));
-  setText("billingSpent", money.format(Math.max(0, topupTotal - balance)));
+  setText("billingSpent", money.format(spent));
   setText("billingRateChip", `汇率 ${formatCny(billingExchangeRate())} / $1`);
 
   const channel = billingChannel();
@@ -3727,10 +3743,368 @@ async function copyText(text, successMessage) {
   }
 }
 
+const ORGANIZATION_ROLE_LABELS = {
+  owner: "企业主",
+  admin: "企业管理员",
+  member: "成员",
+};
+
+const ORGANIZATION_STATUS_LABELS = {
+  active: "已启用",
+  invited: "待邀请",
+  suspended: "已暂停",
+};
+
+function organizationField(record, camelCase, snakeCase = "") {
+  if (!record || typeof record !== "object") return undefined;
+  if (record[camelCase] !== undefined) return record[camelCase];
+  return snakeCase && record[snakeCase] !== undefined ? record[snakeCase] : undefined;
+}
+
+function organizationDepartments() {
+  const departments = organizationSnapshot?.departments || organizationSnapshot?.departmentList || [];
+  return Array.isArray(departments) ? departments : [];
+}
+
+function organizationDepartmentId(department) {
+  return String(organizationField(department, "id", "department_id") || organizationField(department, "departmentId", "department_id") || "");
+}
+
+function organizationMemberId(member) {
+  return String(organizationField(member, "id", "member_id") || organizationField(member, "memberId", "member_id") || "");
+}
+
+function organizationDate(value) {
+  if (!value) return "-";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return String(value);
+  return parsed.toLocaleDateString("zh-CN", { year: "numeric", month: "numeric", day: "numeric" });
+}
+
+function organizationRoleLabel(role) {
+  return ORGANIZATION_ROLE_LABELS[String(role || "")] || "成员";
+}
+
+function organizationStatusLabel(status) {
+  return ORGANIZATION_STATUS_LABELS[String(status || "")] || "未知";
+}
+
+function organizationStats() {
+  const stats = organizationSnapshot?.stats || {};
+  const members = organizationMembers;
+  const departments = organizationDepartments();
+  const value = (camelCase, snakeCase, fallback) => {
+    const statValue = organizationField(stats, camelCase, snakeCase);
+    return Number.isFinite(Number(statValue)) ? Number(statValue) : fallback;
+  };
+  return {
+    departmentCount: value("departmentCount", "department_count", departments.length),
+    memberCount: value("memberCount", "member_count", organizationMemberTotal || members.length),
+    activeMemberCount: value("activeMemberCount", "active_member_count", members.filter((member) => member.status === "active").length),
+    invitedMemberCount: value("invitedMemberCount", "invited_member_count", members.filter((member) => member.status === "invited").length),
+  };
+}
+
+function organizationCanManage() {
+  const capabilities = organizationSnapshot?.capabilities || {};
+  const serverCapability = capabilities.canManageOrganization ?? capabilities.canManage;
+  if (organizationSnapshot && serverCapability === false) return false;
+  return Boolean(currentUser?.canManageOrganization);
+}
+
+function organizationCanView() {
+  if (!currentUser?.organizationDemoEnabled) return false;
+  const role = organizationSnapshot?.organizationRole
+    || organizationSnapshot?.currentMember?.role
+    || currentUser?.organizationRole;
+  return ["owner", "admin", "member"].includes(String(role || ""));
+}
+
+function renderOrganizationDepartmentOptions(selectId, selectedId = "", placeholder = "请选择部门") {
+  const select = el(selectId);
+  if (!select) return;
+  const activeDepartments = organizationDepartments().filter((department) => String(department.status || "active") === "active");
+  const options = activeDepartments.map((department) => {
+    const id = organizationDepartmentId(department);
+    return `<option value="${escapeHtml(id)}">${escapeHtml(department.name || "未命名部门")}</option>`;
+  }).join("");
+  select.innerHTML = placeholder === null ? options : `<option value="">${escapeHtml(placeholder)}</option>${options}`;
+  select.value = selectedId;
+  if (select.value !== selectedId) select.value = "";
+}
+
+function renderOrganizationFilters() {
+  const currentSelection = organizationMemberFilters.departmentId || "";
+  renderOrganizationDepartmentOptions("organizationDepartmentFilter", currentSelection, "全部部门");
+  el("organizationRoleFilter").value = organizationMemberFilters.role;
+  el("organizationStatusFilter").value = organizationMemberFilters.status;
+  if (el("organizationMemberSearch").value !== organizationMemberFilters.search) {
+    el("organizationMemberSearch").value = organizationMemberFilters.search;
+  }
+}
+
+function renderOrganizationDepartments() {
+  const container = el("organizationDepartmentList");
+  const departments = organizationDepartments();
+  if (isOrganizationLoading && !departments.length) {
+    container.innerHTML = '<div class="organization-empty">正在加载部门…</div>';
+    return;
+  }
+  if (!departments.length) {
+    container.innerHTML = '<div class="organization-empty">还没有部门。创建一个部门后即可邀请成员加入。</div>';
+    return;
+  }
+  const canManage = organizationCanManage();
+  container.innerHTML = departments.map((department) => {
+    const id = organizationDepartmentId(department);
+    const memberCount = Number(organizationField(department, "memberCount", "member_count") || 0);
+    const activeMemberCount = Number(organizationField(department, "activeMemberCount", "active_member_count") || 0);
+    const invitedMemberCount = Number(organizationField(department, "invitedMemberCount", "invited_member_count") || 0);
+    return `
+      <article class="organization-department-card">
+        <div class="organization-department-card-head">
+          <div>
+            <h3>${escapeHtml(department.name || "未命名部门")}</h3>
+            <p>${escapeHtml(id || "部门")}</p>
+          </div>
+          <span class="chip">${fmt.format(memberCount)} 人</span>
+        </div>
+        <div class="organization-department-metrics">
+          <div><strong>${fmt.format(memberCount)}</strong><span>全部成员</span></div>
+          <div><strong>${fmt.format(activeMemberCount)}</strong><span>已启用</span></div>
+          <div><strong>${fmt.format(invitedMemberCount)}</strong><span>待邀请</span></div>
+        </div>
+        <div class="organization-department-card-actions">
+          <button class="ghost-btn" type="button" data-organization-department-edit="${escapeHtml(id)}" ${canManage ? "" : "disabled"}>改名</button>
+          <button class="danger-outline-btn" type="button" data-organization-department-archive="${escapeHtml(id)}" ${canManage ? "" : "disabled"}>归档</button>
+        </div>
+      </article>
+    `;
+  }).join("");
+}
+
+function renderOrganizationMembers() {
+  const table = el("organizationMemberTable");
+  const totalPages = Math.max(1, Math.ceil(organizationMemberTotal / organizationMemberPageSize));
+  const page = Math.min(organizationMemberPage, totalPages);
+  if (organizationMemberPage !== page) organizationMemberPage = page;
+  const stats = organizationStats();
+  setText("organizationMemberCountChip", `${fmt.format(organizationMemberTotal)} / ${fmt.format(stats.memberCount)} 人`);
+  setText("organizationPageInfo", `第 ${page} / ${totalPages} 页`);
+  el("organizationPreviousPageButton").disabled = page <= 1 || isOrganizationMemberLoading;
+  el("organizationNextPageButton").disabled = page >= totalPages || isOrganizationMemberLoading;
+  if (isOrganizationMemberLoading && !organizationMembers.length) {
+    table.innerHTML = '<tr><td colspan="6"><div class="organization-empty">正在加载成员…</div></td></tr>';
+    return;
+  }
+  if (!organizationMembers.length) {
+    table.innerHTML = '<tr><td colspan="6"><div class="organization-empty">没有符合当前筛选条件的成员。</div></td></tr>';
+    return;
+  }
+  const canManage = organizationCanManage();
+  table.innerHTML = organizationMembers.map((member) => {
+    const id = organizationMemberId(member);
+    const name = member.name || "未命名成员";
+    const email = member.email || "-";
+    const role = String(member.role || "member");
+    const status = String(member.status || "invited");
+    const departmentName = organizationField(member, "departmentName", "department_name") || "未分配部门";
+    const joinedAt = organizationField(member, "createdAt", "created_at");
+    const toggleStatus = status === "suspended" ? "active" : "suspended";
+    const toggleLabel = status === "suspended" ? "恢复" : "暂停";
+    return `
+      <tr>
+        <td>
+          <div class="organization-member-name">
+            <span class="organization-member-avatar" aria-hidden="true">${escapeHtml(initials(email, name))}</span>
+            <div><strong>${escapeHtml(name)}</strong><span>${escapeHtml(email)}</span></div>
+          </div>
+        </td>
+        <td>${escapeHtml(departmentName)}</td>
+        <td><span class="organization-role ${escapeHtml(role)}">${escapeHtml(organizationRoleLabel(role))}</span></td>
+        <td><span class="organization-status ${escapeHtml(status)}">${escapeHtml(organizationStatusLabel(status))}</span></td>
+        <td>${escapeHtml(organizationDate(joinedAt))}</td>
+        <td>
+          <div class="organization-member-actions">
+            <button class="ghost-btn" type="button" data-organization-member-edit="${escapeHtml(id)}" ${canManage ? "" : "disabled"}>编辑</button>
+            <button class="${toggleStatus === "suspended" ? "danger-outline-btn" : "ghost-btn"}" type="button" data-organization-member-status="${escapeHtml(id)}" data-organization-member-next-status="${escapeHtml(toggleStatus)}" ${canManage ? "" : "disabled"}>${toggleLabel}</button>
+          </div>
+        </td>
+      </tr>
+    `;
+  }).join("");
+}
+
+function renderOrganization() {
+  if (!organizationCanView()) return;
+  const organization = organizationSnapshot?.organization || {};
+  const currentRole = organizationSnapshot?.organizationRole || organizationSnapshot?.currentMember?.role || currentUser.organizationRole || "admin";
+  const name = organization.name || "企业组织";
+  const stats = organizationStats();
+  const canManage = organizationCanManage();
+  setText("organizationTitle", name);
+  setText("organizationSubtitle", `${name} · 当前身份：${organizationRoleLabel(currentRole)}。这里的内容为演示数据，不会创建真实账号或发送邮件。`);
+  setText("organizationDepartmentCount", fmt.format(stats.departmentCount));
+  setText("organizationMemberCount", fmt.format(stats.memberCount));
+  setText("organizationActiveMemberCount", fmt.format(stats.activeMemberCount));
+  setText("organizationInvitedMemberCount", fmt.format(stats.invitedMemberCount));
+  el("createOrganizationDepartmentButton").disabled = !canManage;
+  el("inviteOrganizationMemberButton").disabled = !canManage;
+  el("resetOrganizationDemoButton").disabled = !canManage;
+  renderOrganizationFilters();
+  renderOrganizationDepartments();
+  renderOrganizationMembers();
+}
+
+function organizationMembersUrl() {
+  const params = new URLSearchParams({
+    page: String(organizationMemberPage),
+    pageSize: String(organizationMemberPageSize),
+  });
+  if (organizationMemberFilters.search) params.set("search", organizationMemberFilters.search);
+  if (organizationMemberFilters.departmentId) params.set("departmentId", organizationMemberFilters.departmentId);
+  if (organizationMemberFilters.role) params.set("role", organizationMemberFilters.role);
+  if (organizationMemberFilters.status) params.set("status", organizationMemberFilters.status);
+  return `/api/organization/current/members?${params.toString()}`;
+}
+
+async function loadOrganizationMembers() {
+  if (!organizationCanView() || isOrganizationMemberLoading) return;
+  isOrganizationMemberLoading = true;
+  renderOrganizationMembers();
+  try {
+    const payload = await api(organizationMembersUrl());
+    organizationMembers = Array.isArray(payload?.items) ? payload.items : [];
+    organizationMemberTotal = Number(payload?.total || 0);
+    organizationMemberPage = Number(payload?.page || organizationMemberPage || 1);
+  } catch (error) {
+    organizationMembers = [];
+    organizationMemberTotal = 0;
+    showToast(error.message || "成员列表加载失败");
+  } finally {
+    isOrganizationMemberLoading = false;
+    renderOrganization();
+  }
+}
+
+async function loadOrganizationData() {
+  if (!organizationCanView() || isOrganizationLoading) return;
+  isOrganizationLoading = true;
+  renderOrganization();
+  try {
+    const [currentPayload, membersPayload] = await Promise.all([
+      api("/api/organization/current"),
+      api(organizationMembersUrl()),
+    ]);
+    organizationSnapshot = currentPayload || null;
+    organizationMembers = Array.isArray(membersPayload?.items) ? membersPayload.items : [];
+    organizationMemberTotal = Number(membersPayload?.total || 0);
+    organizationMemberPage = Number(membersPayload?.page || organizationMemberPage || 1);
+  } catch (error) {
+    organizationSnapshot = null;
+    organizationMembers = [];
+    organizationMemberTotal = 0;
+    showToast(error.message || "企业组织加载失败");
+  } finally {
+    isOrganizationLoading = false;
+    renderOrganization();
+  }
+}
+
+function closeOrganizationDepartmentModal(options = {}) {
+  if (isOrganizationDepartmentSaving && !options.force) return;
+  editingOrganizationDepartmentId = "";
+  el("organizationDepartmentForm").reset();
+  el("organizationDepartmentModal").classList.add("hidden");
+}
+
+function openOrganizationDepartmentModal(departmentId = "") {
+  if (!organizationCanManage()) return;
+  const department = organizationDepartments().find((item) => organizationDepartmentId(item) === String(departmentId));
+  editingOrganizationDepartmentId = department ? organizationDepartmentId(department) : "";
+  el("organizationDepartmentForm").reset();
+  setText("organizationDepartmentModalTitle", department ? "修改部门名称" : "新增部门");
+  setText("organizationDepartmentModalDescription", department ? "修改后会立即更新成员列表中的部门名称。" : "创建后可邀请成员加入这个部门。");
+  setText("submitOrganizationDepartmentButton", department ? "保存修改" : "创建部门");
+  el("organizationDepartmentNameInput").value = department?.name || "";
+  el("organizationDepartmentModal").classList.remove("hidden");
+  window.setTimeout(() => el("organizationDepartmentNameInput").focus(), 0);
+}
+
+function closeOrganizationMemberModal(options = {}) {
+  if (isOrganizationMemberSaving && !options.force) return;
+  editingOrganizationMemberId = "";
+  el("organizationMemberForm").reset();
+  el("organizationMemberEmailInput").disabled = false;
+  el("organizationMemberStatusField").classList.add("hidden");
+  el("organizationMemberModal").classList.add("hidden");
+}
+
+function openOrganizationMemberModal(memberId = "") {
+  if (!organizationCanManage()) return;
+  const member = organizationMembers.find((item) => organizationMemberId(item) === String(memberId));
+  editingOrganizationMemberId = member ? organizationMemberId(member) : "";
+  el("organizationMemberForm").reset();
+  renderOrganizationDepartmentOptions(
+    "organizationMemberDepartmentInput",
+    member ? String(organizationField(member, "departmentId", "department_id") || "") : "",
+    null,
+  );
+  const isEditing = Boolean(member);
+  setText("organizationMemberModalTitle", isEditing ? "编辑成员" : "邀请成员");
+  setText("organizationMemberModalDescription", isEditing ? "更新角色、部门或访问状态后会立即生效。" : "成员会以待邀请状态加入演示企业，不会发送真实邮件。");
+  setText("submitOrganizationMemberButton", isEditing ? "保存修改" : "发送邀请");
+  el("organizationMemberStatusField").classList.toggle("hidden", !isEditing);
+  el("organizationMemberNameInput").value = member?.name || "";
+  el("organizationMemberEmailInput").value = member?.email || "";
+  el("organizationMemberEmailInput").disabled = isEditing;
+  el("organizationMemberRoleInput").value = member?.role || "member";
+  el("organizationMemberStatusInput").value = member?.status || "invited";
+  el("organizationMemberModal").classList.remove("hidden");
+  window.setTimeout(() => el("organizationMemberNameInput").focus(), 0);
+}
+
+async function archiveOrganizationDepartment(departmentId) {
+  if (!organizationCanManage()) return;
+  const department = organizationDepartments().find((item) => organizationDepartmentId(item) === String(departmentId));
+  if (!department || !window.confirm(`归档“${department.name}”？归档前需要先迁移或暂停该部门所有已启用和待邀请成员。`)) return;
+  try {
+    await ensureCsrfToken();
+    await api(`/api/organization/current/departments/${encodeURIComponent(departmentId)}/archive`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    if (organizationMemberFilters.departmentId === String(departmentId)) {
+      organizationMemberFilters = { ...organizationMemberFilters, departmentId: "" };
+    }
+    organizationMemberPage = 1;
+    await loadOrganizationData();
+    showToast("部门已归档");
+  } catch (error) {
+    showToast(error.message || "部门归档失败");
+  }
+}
+
+async function updateOrganizationMemberStatus(memberId, status) {
+  if (!organizationCanManage()) return;
+  try {
+    await ensureCsrfToken();
+    await api(`/api/organization/current/members/${encodeURIComponent(memberId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status }),
+    });
+    await loadOrganizationData();
+    showToast(status === "suspended" ? "成员已暂停" : "成员已恢复");
+  } catch (error) {
+    showToast(error.message || "成员状态更新失败");
+  }
+}
+
 function switchView(view) {
   if (view === "admin" && !currentUser?.isAdmin) view = "dashboard";
   if (view === "department" && !currentUser?.isAdmin) view = "dashboard";
   if (view === "team" && !currentUser?.isTeamLeader) view = "dashboard";
+  if (view === "organization" && !organizationCanView()) view = "dashboard";
   if (view === "billing" && !billingAvailable) view = "dashboard";
   if (currentView === "keys" && view !== "keys") clearRevealedKeys();
   // 离开充值页就停掉支付轮询与二维码，避免后台空转和收款码久留在页面上。
@@ -3742,10 +4116,11 @@ function switchView(view) {
   el("adminView").classList.toggle("hidden", view !== "admin");
   el("teamView").classList.toggle("hidden", view !== "team");
   el("departmentView").classList.toggle("hidden", view !== "department");
+  el("organizationView").classList.toggle("hidden", view !== "organization");
   el("keysView").classList.toggle("hidden", view !== "keys");
   el("billingView").classList.toggle("hidden", view !== "billing");
   el("modelsView").classList.toggle("hidden", view !== "models");
-  el("dashboardFilters").classList.toggle("hidden", view === "models" || view === "keys" || view === "billing");
+  el("dashboardFilters").classList.toggle("hidden", view === "models" || view === "keys" || view === "billing" || view === "organization");
   let activeButton = null;
   document.querySelectorAll("[data-view]").forEach((button) => {
     const isActive = button.dataset.view === view;
@@ -3783,6 +4158,7 @@ function switchView(view) {
   }
   if (view === "team" && currentUser?.isTeamLeader && !teamUsageData.length) loadTeamData();
   if (view === "department" && !departmentUsageData.length) loadDepartmentData();
+  if (view === "organization" && !organizationSnapshot && !isOrganizationLoading) loadOrganizationData();
 }
 
 async function loadCurrentViewData(forceRefresh = false) {
@@ -3792,6 +4168,7 @@ async function loadCurrentViewData(forceRefresh = false) {
   if (currentView === "admin") return loadAdminData(forceRefresh);
   if (currentView === "team") return loadTeamData(forceRefresh);
   if (currentView === "department") return loadDepartmentData(forceRefresh);
+  if (currentView === "organization") return loadOrganizationData();
   return loadDashboardData(forceRefresh);
 }
 
@@ -4076,6 +4453,7 @@ async function showApp(user) {
   el("adminTab").classList.add("hidden");
   el("teamTab").classList.add("hidden");
   el("departmentTab").classList.add("hidden");
+  el("organizationTab").classList.toggle("hidden", !organizationCanView());
   el("billingTab").classList.add("hidden");
   el("userEmail").textContent = currentUser.email;
   el("userName").textContent = currentUser.name || currentUser.email;
@@ -4105,6 +4483,7 @@ async function loadAuthScope() {
     el("adminTab").classList.toggle("hidden", !currentUser.isAdmin);
     el("teamTab").classList.toggle("hidden", !currentUser.isTeamLeader);
     el("departmentTab").classList.toggle("hidden", !currentUser.isAdmin);
+    el("organizationTab").classList.toggle("hidden", !organizationCanView());
     el("teamWelcomeTitle").textContent = `所选范围 · ${teamScopeLabel()}`;
     // isAdmin 到这里才确定，充值管理面板的可见性随之更新。
     renderAdminBilling();
@@ -4171,6 +4550,20 @@ function showLogin() {
   leaderTeams = [];
   selectedTeamRef = "";
   departmentPickerOptions = [];
+  organizationSnapshot = null;
+  organizationMembers = [];
+  organizationMemberTotal = 0;
+  organizationMemberPage = 1;
+  organizationMemberFilters = { search: "", departmentId: "", role: "", status: "" };
+  isOrganizationLoading = false;
+  isOrganizationMemberLoading = false;
+  isOrganizationDepartmentSaving = false;
+  isOrganizationMemberSaving = false;
+  editingOrganizationDepartmentId = "";
+  editingOrganizationMemberId = "";
+  el("organizationTab").classList.add("hidden");
+  el("organizationDepartmentModal").classList.add("hidden");
+  el("organizationMemberModal").classList.add("hidden");
   personalKeys = [];
   availableKeyModels = [];
   unrestrictedKeyModels = false;
@@ -4481,6 +4874,171 @@ el("accountAccessRetryButton").addEventListener("click", async () => {
 });
 
 el("accountAccessTopupButton").addEventListener("click", () => switchView("billing"));
+el("createOrganizationDepartmentButton").addEventListener("click", () => openOrganizationDepartmentModal());
+el("inviteOrganizationMemberButton").addEventListener("click", () => openOrganizationMemberModal());
+el("cancelOrganizationDepartmentButton").addEventListener("click", closeOrganizationDepartmentModal);
+el("cancelOrganizationMemberButton").addEventListener("click", closeOrganizationMemberModal);
+
+el("organizationDepartmentForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (isOrganizationDepartmentSaving || !organizationCanManage()) return;
+  const name = el("organizationDepartmentNameInput").value.trim();
+  if (!name) {
+    showToast("请输入部门名称");
+    el("organizationDepartmentNameInput").focus();
+    return;
+  }
+  const isEditing = Boolean(editingOrganizationDepartmentId);
+  isOrganizationDepartmentSaving = true;
+  setButtonLoading("submitOrganizationDepartmentButton", true, isEditing ? "保存中" : "创建中");
+  try {
+    await ensureCsrfToken();
+    await api(
+      isEditing
+        ? `/api/organization/current/departments/${encodeURIComponent(editingOrganizationDepartmentId)}`
+        : "/api/organization/current/departments",
+      {
+        method: isEditing ? "PATCH" : "POST",
+        body: JSON.stringify({ name }),
+      },
+    );
+    closeOrganizationDepartmentModal({ force: true });
+    await loadOrganizationData();
+    showToast(isEditing ? "部门名称已更新" : "部门已创建");
+  } catch (error) {
+    showToast(error.message || (isEditing ? "部门更新失败" : "部门创建失败"));
+  } finally {
+    isOrganizationDepartmentSaving = false;
+    setButtonLoading("submitOrganizationDepartmentButton", false);
+  }
+});
+
+el("organizationMemberForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (isOrganizationMemberSaving || !organizationCanManage()) return;
+  const name = el("organizationMemberNameInput").value.trim();
+  const email = el("organizationMemberEmailInput").value.trim();
+  const departmentId = el("organizationMemberDepartmentInput").value;
+  const role = el("organizationMemberRoleInput").value;
+  const status = el("organizationMemberStatusInput").value;
+  if (!name || !departmentId) {
+    showToast("请填写姓名并选择部门");
+    return;
+  }
+  if (!editingOrganizationMemberId && !validEmail(email)) {
+    showToast("请输入有效的工作邮箱");
+    el("organizationMemberEmailInput").focus();
+    return;
+  }
+  const isEditing = Boolean(editingOrganizationMemberId);
+  isOrganizationMemberSaving = true;
+  setButtonLoading("submitOrganizationMemberButton", true, isEditing ? "保存中" : "邀请中");
+  try {
+    await ensureCsrfToken();
+    const body = isEditing
+      ? { name, departmentId, role, status }
+      : { name, email, departmentId, role };
+    await api(
+      isEditing
+        ? `/api/organization/current/members/${encodeURIComponent(editingOrganizationMemberId)}`
+        : "/api/organization/current/members",
+      { method: isEditing ? "PATCH" : "POST", body: JSON.stringify(body) },
+    );
+    closeOrganizationMemberModal({ force: true });
+    organizationMemberPage = 1;
+    await loadOrganizationData();
+    showToast(isEditing ? "成员信息已更新" : "成员邀请已创建");
+  } catch (error) {
+    showToast(error.message || (isEditing ? "成员更新失败" : "成员邀请失败"));
+  } finally {
+    isOrganizationMemberSaving = false;
+    setButtonLoading("submitOrganizationMemberButton", false);
+  }
+});
+
+el("organizationDepartmentList").addEventListener("click", (event) => {
+  const editButton = event.target.closest("[data-organization-department-edit]");
+  if (editButton) {
+    openOrganizationDepartmentModal(editButton.dataset.organizationDepartmentEdit);
+    return;
+  }
+  const archiveButton = event.target.closest("[data-organization-department-archive]");
+  if (archiveButton) archiveOrganizationDepartment(archiveButton.dataset.organizationDepartmentArchive);
+});
+
+el("organizationMemberTable").addEventListener("click", (event) => {
+  const editButton = event.target.closest("[data-organization-member-edit]");
+  if (editButton) {
+    openOrganizationMemberModal(editButton.dataset.organizationMemberEdit);
+    return;
+  }
+  const statusButton = event.target.closest("[data-organization-member-status]");
+  if (statusButton) {
+    updateOrganizationMemberStatus(
+      statusButton.dataset.organizationMemberStatus,
+      statusButton.dataset.organizationMemberNextStatus,
+    );
+  }
+});
+
+el("organizationMemberSearch").addEventListener("input", () => {
+  window.clearTimeout(organizationSearchTimer);
+  organizationSearchTimer = window.setTimeout(() => {
+    organizationMemberFilters.search = el("organizationMemberSearch").value.trim();
+    organizationMemberPage = 1;
+    loadOrganizationMembers();
+  }, 260);
+});
+
+["organizationDepartmentFilter", "organizationRoleFilter", "organizationStatusFilter"].forEach((id) => {
+  el(id).addEventListener("change", () => {
+    organizationMemberFilters = {
+      ...organizationMemberFilters,
+      departmentId: el("organizationDepartmentFilter").value,
+      role: el("organizationRoleFilter").value,
+      status: el("organizationStatusFilter").value,
+    };
+    organizationMemberPage = 1;
+    loadOrganizationMembers();
+  });
+});
+
+el("resetOrganizationMemberFiltersButton").addEventListener("click", () => {
+  organizationMemberFilters = { search: "", departmentId: "", role: "", status: "" };
+  organizationMemberPage = 1;
+  renderOrganizationFilters();
+  loadOrganizationMembers();
+});
+
+el("organizationPreviousPageButton").addEventListener("click", () => {
+  if (organizationMemberPage <= 1) return;
+  organizationMemberPage -= 1;
+  loadOrganizationMembers();
+});
+
+el("organizationNextPageButton").addEventListener("click", () => {
+  if (organizationMemberPage * organizationMemberPageSize >= organizationMemberTotal) return;
+  organizationMemberPage += 1;
+  loadOrganizationMembers();
+});
+
+el("resetOrganizationDemoButton").addEventListener("click", async () => {
+  if (!organizationCanManage() || !window.confirm("重置后会清除本次演示中的部门与成员变更，并恢复初始样例。确定继续吗？")) return;
+  setButtonLoading("resetOrganizationDemoButton", true, "重置中");
+  try {
+    await ensureCsrfToken();
+    await api("/api/organization/current/demo/reset", { method: "POST", body: JSON.stringify({}) });
+    organizationMemberPage = 1;
+    organizationMemberFilters = { search: "", departmentId: "", role: "", status: "" };
+    await loadOrganizationData();
+    showToast("演示数据已重置");
+  } catch (error) {
+    showToast(error.message || "演示数据重置失败");
+  } finally {
+    setButtonLoading("resetOrganizationDemoButton", false);
+  }
+});
+
 el("adminRedemptionForm").addEventListener("submit", generateRedemptions);
 el("adminBillingRetrySync").addEventListener("click", retryBillingSync);
 el("adminBillingSearchButton").addEventListener("click", () => {
@@ -4613,6 +5171,9 @@ el("refreshButton").addEventListener("click", async () => {
   } else if (currentView === "department") {
     await loadDepartmentData(true);
     showToast("已刷新部门用量");
+  } else if (currentView === "organization") {
+    await loadOrganizationData();
+    showToast("已刷新企业组织");
   } else {
     await loadDashboardData(true);
     showToast("已刷新个人用量");
@@ -4968,6 +5529,8 @@ document.querySelectorAll(".modal-backdrop").forEach((backdrop) => {
     if (backdrop.id === "regenerateKeyModal") closeRegenerateKeyModal();
     if (backdrop.id === "deleteKeyModal") closeDeleteKeyModal();
     if (backdrop.id === "newKeyModal") clearPlainKey();
+    if (backdrop.id === "organizationDepartmentModal") closeOrganizationDepartmentModal();
+    if (backdrop.id === "organizationMemberModal") closeOrganizationMemberModal();
   });
 });
 
@@ -4977,6 +5540,8 @@ document.addEventListener("keydown", (event) => {
   else if (!el("deleteKeyModal").classList.contains("hidden")) closeDeleteKeyModal();
   else if (!el("regenerateKeyModal").classList.contains("hidden")) closeRegenerateKeyModal();
   else if (!el("createKeyModal").classList.contains("hidden")) closeCreateKeyModal();
+  else if (!el("organizationMemberModal").classList.contains("hidden")) closeOrganizationMemberModal();
+  else if (!el("organizationDepartmentModal").classList.contains("hidden")) closeOrganizationDepartmentModal();
 });
 
 document.addEventListener("visibilitychange", () => {

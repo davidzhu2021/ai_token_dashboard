@@ -18,7 +18,7 @@ https://myai.carher.net
 
 - 飞书扫码登录：复用公司 Casdoor + 飞书 SSO 登录链路，并按企业邮箱域名限制访问。
 - 邮箱注册与密码登录：可选为 `auto-link.com.cn`、`gmail.com`、`qq.com`、`163.com` 开放邮箱验证码注册、密码登录、找回/修改密码和服务端会话；默认安全关闭，不影响现有 SSO。
-- 注册权限隔离：新注册账号默认没有模型访问权限，不自动创建访问密钥；充值能力属于后续阶段，本期需由管理员另行开通权限。
+- 注册权限隔离：新注册账号默认没有模型访问权限，不自动创建访问密钥；启用充值中心后，到账充值可自动开通配置的模型访问范围。
 - 我的用量：员工登录后只能查看自己的 Token、金额、请求次数、成功率、来源拆分、模型排行和明细。
 - 个人访问密钥：展示本人访问密钥的名称、用途、掩码、状态、最近使用时间和用量，并支持本人密钥再生成。
 - 团队负责人看板：团队负责人可查看自己负责团队的成员用量、趋势、来源占比、模型排行和成员排行。
@@ -26,6 +26,8 @@ https://myai.carher.net
 - 模型广场：展示当前账号可用模型，支持搜索、筛选和复制模型名称。
 - 多数据源聚合：主数据源用于通衢 API，可选 Her 数据源用于补充 Her 聊天机器人相关用量。
 - 缓存加速：员工映射、个人用量、团队权限、团队用量、管理员用量、部门用量、密钥列表和模型列表均使用轻量 TTL 缓存。
+- 充值中心：支持兑换码、在线支付和个人微信/支付宝收款码转账；收款码转账必须由管理员核对到账后才发放额度。
+- 企业组织（演示）：可在独立控制台维护部门和成员，默认关闭，仅展示进程内 Mock 数据。
 
 LiteLLM 是本系统的内部后端集成。员工前端文案应使用通衢 API、模型、来源、Token、Codex、Claude Code、Her、访问权限等产品术语，不暴露上游网关、管理员密钥或供应商实现细节。
 
@@ -181,6 +183,8 @@ FEISHU_REDIRECT_URI=http://10.68.13.198:30882/callback
 DEV_LOGIN_ENABLED=false
 DEBUG_MAPPING_ENABLED=false
 DEBUG_OIDC_CLAIMS=false
+# Enterprise organization Mock V1. Keep false except for controlled demos.
+ORGANIZATION_DEMO_ENABLED=false
 USAGE_LOG_MAX_PAGES=20
 USER_MAPPING_CACHE_TTL_SECONDS=1800
 PERSONAL_USAGE_CACHE_TTL_SECONDS=300
@@ -206,6 +210,7 @@ USAGE_TIMEZONE_OFFSET_MINUTES=-480
 - `APP_BASE_URL` 本地开发可改为 `http://127.0.0.1:8000`，生产环境使用正式域名。
 - `SESSION_SECRET` 必须使用随机长字符串，生产环境不要使用示例值。
 - `AUTH_ENABLED`、`PASSWORD_LOGIN_ENABLED`、`PUBLIC_SIGNUP_ENABLED` 在模板中均默认关闭；三个开关应按后文的生产启用顺序逐步打开。
+- `ORGANIZATION_DEMO_ENABLED=false` 默认不展示“企业组织”页。设为 `true` 时，页面只使用进程内确定性演示数据：不会创建真实账号、不会发送邀请邮件、不会调用上游服务；浏览器刷新会保留本次演示操作，服务重启或点击“重置演示数据”后恢复初始样例。生产环境应保持关闭，除非在受控演示中临时开启。
 - `AUTH_ALLOWED_EMAIL_DOMAINS` 是逗号分隔的精确邮箱域名白名单；ToC 首期固定为 `auto-link.com.cn,gmail.com,qq.com,163.com`，不匹配子域名或后缀相似域名。留空代表不限制域名，生产公开注册不得留空。
 - `AUTH_DATABASE_PATH` 当前指向本地 SQLite 文件。容器部署必须将其放在持久化卷中；当前实现按单应用实例设计，不要让多个副本同时写同一个 SQLite 文件。
 - `AUTH_DEFAULT_UPSTREAM_ROLE=internal_user_viewer` 将新注册账号限制为只读角色；代码同时使用 `no-default-models` 禁止默认模型访问且不会自动创建访问密钥。不要将该变量设置为管理员角色。
@@ -256,8 +261,36 @@ Turnstile 配置：
 
 - 注册成功会创建本地账号并尝试创建受限的用量系统账号；开户请求不自动创建访问密钥，模型范围使用 `no-default-models`，默认角色为 `internal_user_viewer`。
 - 即使开户成功，新用户的 `entitlementStatus` 仍为 `inactive`，在管理员开通权限前不能查询个人用量、创建访问密钥或调用模型。
-- 本期不包含支付订单、充值回调、余额扣减或充值后自动激活。后续充值功能以 `entitlementStatus` 为接入点；在此之前只能由管理员人工开通。
+- 启用充值中心后，已结算订单会把累计充值额同步为用户级消费上限；当前可用额度按累计充值额减去实际累计消耗计算。首次充值可通过 `TOPUP_DEFAULT_MODELS` 自动授予模型范围。
+- 个人收款码没有可信的支付回调。扫码转账后，用户提交付款说明，管理员必须在收款流水中核对后再确认到账；不要把“已提交”当作“已到账”。
 - 飞书 SSO 与本地密码账号并存，但不会因为邮箱相同而自动合并身份。
+
+## 充值中心配置
+
+充值账本使用 `USAGE_DATABASE_URL` 指向的 PostgreSQL，与用量快照共用数据库但使用独立表。默认关闭；只有数据库已连接且 `BILLING_ENABLED=true` 时，注册用户才能看到“充值中心”。
+
+```dotenv
+BILLING_ENABLED=true
+BILLING_EXCHANGE_RATE=7.3
+BILLING_MIN_TOPUP_USD=1
+BILLING_MAX_TOPUP_USD=10000
+BILLING_TOPUP_OPTIONS=10,50,100,500
+BILLING_KEY_DAILY_BUDGET_CAP=100
+BILLING_REDEMPTION_SECRET=<随机长字符串>
+TOPUP_DEFAULT_MODELS=<首次充值后开放的模型，逗号分隔>
+
+# 个人收款码试运行：仅人工核对到账，不会自动入账。
+MANUAL_PAY_ENABLED=true
+MANUAL_PAY_ALIPAY_QR=/assets/pay/alipay.png
+MANUAL_PAY_WXPAY_QR=/assets/pay/wechat.png
+MANUAL_PAY_NOTICE=请按订单金额扫码付款，并在付款备注里填写订单号，便于快速核对。
+MANUAL_PAY_REVIEW_MINUTES=30
+MANUAL_PAY_CONTACT=<收款咨询联系方式>
+```
+
+收款码文件不要提交到 Git：将支付宝、微信收款码分别上传到部署机的 `assets/pay/alipay.png`、`assets/pay/wechat.png`，再重建服务。管理员使用企业 SSO 管理员账号进入“全员看板”，在“待确认到账”中核对收款流水并确认或驳回。订单确认是不可逆的发放动作，必须核对订单号、应付金额、付款方式和付款说明。
+
+如需自动到账，可配置兼容易支付协议的商户网关：`EPAY_ENABLED=true`、`EPAY_GATEWAY_URL`、`EPAY_PARTNER_ID`、`EPAY_KEY` 与公网可访问的 `EPAY_NOTIFY_BASE_URL`。异步回调会校验签名、订单状态和金额；不要将个人收款码伪装成自动支付渠道。
 
 反向代理配置：
 

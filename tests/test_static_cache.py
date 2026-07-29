@@ -12,7 +12,8 @@ def test_index_uses_fresh_app_asset_and_disables_html_cache() -> None:
     assert "Cache-Control" in response.headers
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["Referrer-Policy"] == "no-referrer"
-    assert "/assets/app.js?v=20260729-ranking-column-sort" in response.text
+    assert "/assets/app.js?v=20260729-organization-demo" in response.text
+    assert "20260729-ranking-column-sort" not in response.text
     assert "20260729-topup-manual-qr" not in response.text
     assert "20260729-topup-billing-center" not in response.text
     assert "20260728-model-alias-display-names" not in response.text
