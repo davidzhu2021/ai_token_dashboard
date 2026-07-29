@@ -118,6 +118,28 @@ def test_scan_groups_all_users_in_one_pass(monkeypatch) -> None:
     assert [int(r["page"]) for r in client.requests] == [1, 2]
 
 
+def test_log_sync_prioritizes_claude_cli_tags_over_legacy_cursor_identity(monkeypatch) -> None:
+    monkeypatch.setenv("USAGE_TIMEZONE_OFFSET_MINUTES", "-480")
+
+    claude_cli_log = _log("cursor-zhuyida", "2026-07-28T01:00:00+00:00", 700, "7.0", model="claude-opus-5")
+    claude_cli_log["metadata"] = {"user_api_key_user_id": "cursor-zhuyida"}
+    claude_cli_log["request_tags"] = ["User-Agent: claude-cli", "User-Agent: claude-cli/2.1.220"]
+    legacy_cursor_log = _log("cursor-zhuyida", "2026-07-28T02:00:00+00:00", 300, "3.0", model="claude-opus-5")
+    legacy_cursor_log["metadata"] = {"user_api_key_user_id": "cursor-zhuyida"}
+    legacy_cursor_log["request_tags"] = ["User-Agent: curl/8.0"]
+    client = _LogClient([[claude_cli_log, legacy_cursor_log]])
+
+    rows, complete = asyncio.run(client.sync_rows_from_logs("2026-07-28", "2026-07-28", PRIMARY))
+
+    assert complete is True
+    by_source = {row["source"]: row for row in rows["cursor-zhuyida"]}
+    assert set(by_source) == {"Claude Code", "Cursor"}
+    assert by_source["Claude Code"]["model"] == "claude-opus-5"
+    assert by_source["Claude Code"]["totalTokens"] == 700
+    assert by_source["Claude Code"]["requestCount"] == 1
+    assert by_source["Cursor"]["totalTokens"] == 300
+
+
 def test_truncated_scan_reports_incomplete(monkeypatch) -> None:
     """超过页数上限时必须报告不完整，让调用方退回旧路径而不是写入残缺数据。"""
     monkeypatch.setenv("USAGE_TIMEZONE_OFFSET_MINUTES", "-480")

@@ -105,6 +105,49 @@ def _metadata_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _source_text_parts(value: Any, *, _depth: int = 0, _seen: set[int] | None = None) -> list[str]:
+    """Flatten heterogeneous upstream tag fields without trusting their shape."""
+    if value is None or _depth >= 12:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            decoded = json.loads(text)
+        except (TypeError, ValueError):
+            return [text]
+        if decoded is value:
+            return [text]
+        return _source_text_parts(decoded, _depth=_depth + 1, _seen=_seen)
+    if isinstance(value, (dict, list, tuple, set)):
+        seen = _seen if _seen is not None else set()
+        value_id = id(value)
+        if value_id in seen:
+            return []
+        seen.add(value_id)
+        parts: list[str] = []
+        items = value.items() if isinstance(value, dict) else enumerate(value)
+        for key, item in items:
+            if isinstance(value, dict):
+                parts.extend(_source_text_parts(key, _depth=_depth + 1, _seen=seen))
+            parts.extend(_source_text_parts(item, _depth=_depth + 1, _seen=seen))
+        return parts
+    return [_clean_text(value)] if _clean_text(value) else []
+
+
+def _source_text(*values: Any) -> str:
+    parts: list[str] = []
+    for value in values:
+        parts.extend(_source_text_parts(value))
+    return " ".join(parts)
+
+
+def _has_claude_cli_tag(value: Any) -> bool:
+    text = _source_text(value).casefold()
+    return bool(re.search(r"(?<![\w-])claude-cli(?![\w-])(?:\s*/\s*[^\s,;\]\}]+)?", text))
+
+
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
 
@@ -216,18 +259,27 @@ def _date_text_in_usage_timezone(value: Any) -> str:
 
 
 def detect_source(record: dict[str, Any]) -> str:
-    metadata = _first(record, "metadata", "request_tags", "tags", default={})
+    # LiteLLM writes the caller User-Agent to request_tags. Treat that explicit
+    # client signal as stronger evidence than legacy account or key names.
+    request_tags = record.get("request_tags")
+    if _has_claude_cli_tag(request_tags):
+        return "Claude Code"
+
     values = [
         _first(record, "source", "tool", "client", "application", default=""),
         _first(record, "user", "user_id", "end_user", default=""),
         _first(record, "key_alias", "key_name", "api_key_alias", default=""),
-        metadata,
+        request_tags,
+        record.get("tags"),
+        record.get("metadata"),
     ]
-    haystack = " ".join(str(value) for value in values).lower()
+    haystack = _source_text(*values).casefold()
+    if _has_claude_cli_tag(record.get("tags")) or any(
+        word in haystack for word in ("claude code", "claude-code", "claudecode")
+    ):
+        return "Claude Code"
     if any(word in haystack for word in ("cursor", "curosr")):
         return "Cursor"
-    if any(word in haystack for word in ("claude code", "claude-code", "claudecode")):
-        return "Claude Code"
     return "其他"
 
 

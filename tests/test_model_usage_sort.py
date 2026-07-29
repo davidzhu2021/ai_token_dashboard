@@ -176,6 +176,51 @@ def test_usage_from_logs_prefers_actual_model_id_and_falls_back_in_order() -> No
     ]
 
 
+def test_usage_from_logs_prioritizes_claude_cli_tags_over_legacy_cursor_identity() -> None:
+    client = make_client()
+    client.backends = [client.backends[0]]
+    client._backend_map = {backend.id: backend for backend in client.backends}
+
+    async def fake_request_backend(_backend: LiteLLMBackend, _method: str, path: str, **kwargs: Any) -> Any:
+        assert path == "/spend/logs/v2"
+        assert kwargs["params"]["user_id"] == "cursor-zhuyida"
+        return {
+            "logs": [
+                {
+                    "user": "cursor-zhuyida",
+                    "metadata": {"user_api_key_user_id": "cursor-zhuyida"},
+                    "request_tags": ["User-Agent: claude-cli", "User-Agent: claude-cli/2.1.220"],
+                    "startTime": "2026-07-01T01:00:00Z",
+                    "model": "claude-opus-5",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+                {
+                    "user": "cursor-zhuyida",
+                    "metadata": {"user_api_key_user_id": "cursor-zhuyida"},
+                    "request_tags": [],
+                    "startTime": "2026-07-01T02:00:00Z",
+                    "model": "claude-opus-5",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "total_tokens": 5,
+                },
+            ],
+            "total_pages": 1,
+        }
+
+    client.request_backend = fake_request_backend  # type: ignore[assignment]
+
+    rows = asyncio.run(client._usage_from_logs("cursor-zhuyida", "2026-07-01", "2026-07-01", "all"))
+
+    by_source = {row["source"]: row for row in rows}
+    assert set(by_source) == {"Claude Code", "Cursor"}
+    assert by_source["Claude Code"]["model"] == "claude-opus-5"
+    assert by_source["Claude Code"]["totalTokens"] == 15
+    assert by_source["Cursor"]["totalTokens"] == 5
+
+
 def test_daily_activity_expands_actual_models_from_breakdown() -> None:
     client = make_client()
 

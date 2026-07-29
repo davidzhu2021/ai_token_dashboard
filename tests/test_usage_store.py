@@ -1,6 +1,8 @@
 from datetime import date, datetime, timezone
 import asyncio
 
+import pytest
+
 from backend import main
 from backend.litellm_client import _date_text_in_usage_timezone, detect_source, detect_source_from_key
 from backend.usage_store import UsageStore, empty_totals, summarize
@@ -419,6 +421,57 @@ def test_source_detection_falls_back_to_other_without_request_details() -> None:
     assert detect_source({"user": "ordinary-account"}) == "其他"
     assert detect_source_from_key({"name": "personal-cursor-key"}) == "Cursor"
     assert detect_source_from_key({"name": "unclassified"}) == "其他"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("request_tags", ["User-Agent: claude-cli", "User-Agent: claude-cli/2.1.220"]),
+        ("request_tags", {"user_agent": "claude-cli/2.1.220"}),
+        ("request_tags", '["User-Agent: claude-cli/2.1.220"]'),
+        ("request_tags", "User-Agent: claude-cli/2.1.220"),
+        ("tags", {"user_agent": "claude-cli/2.1.220"}),
+        ("tags", ["User-Agent: claude-cli/2.1.220"]),
+        ("tags", '["User-Agent: claude-cli/2.1.220"]'),
+        ("tags", "User-Agent: claude-cli/2.1.220"),
+    ],
+)
+def test_source_detection_prioritizes_claude_cli_tags_over_legacy_cursor_identity(field, value) -> None:
+    record = {
+        "user": "cursor-zhuyida",
+        "metadata": {"user_api_key_user_id": "cursor-zhuyida"},
+        field: value,
+    }
+
+    assert detect_source(record) == "Claude Code"
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"client": "claude-code"},
+        ["client: claude-code"],
+        '{"client": "claude-code"}',
+        "claude-code",
+    ],
+)
+def test_source_detection_prioritizes_explicit_metadata_claude_code_over_legacy_cursor_identity(metadata) -> None:
+    assert detect_source({"user": "cursor-zhuyida", "metadata": metadata}) == "Claude Code"
+
+
+def test_source_detection_falls_back_to_legacy_identity_without_claude_cli_tags() -> None:
+    record = {
+        "user": "cursor-zhuyida",
+        "metadata": {"user_api_key_user_id": "cursor-zhuyida"},
+    }
+
+    assert detect_source({**record, "request_tags": []}) == "Cursor"
+    assert detect_source({**record, "request_tags": ["User-Agent: curl/8.0"]}) == "Cursor"
+    assert detect_source({**record, "request_tags": None}) == "Cursor"
+    assert detect_source({**record, "request_tags": "User-Agent: notclaude-cli/2.1.220"}) == "Cursor"
+    assert detect_source({**record, "request_tags": "[malformed"}) == "Cursor"
+    assert detect_source({**record, "tags": "[malformed"}) == "Cursor"
+    assert detect_source({**record, "metadata": '{"client":'}) == "Cursor"
 
 
 def test_usage_timezone_converts_utc_boundary_to_business_date(monkeypatch) -> None:
