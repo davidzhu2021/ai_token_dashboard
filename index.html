@@ -2610,6 +2610,66 @@
         text-align: right;
       }
 
+      th.sortable {
+        padding: 0;
+      }
+
+      th.sortable .th-sort {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        width: 100%;
+        padding: 13px 12px;
+        border: 0;
+        background: transparent;
+        color: inherit;
+        font-size: 12px;
+        font-weight: 600;
+        white-space: nowrap;
+        transition: color 140ms ease, background 140ms ease;
+      }
+
+      th.sortable.num .th-sort {
+        justify-content: flex-end;
+      }
+
+      th.sortable .th-sort:hover {
+        color: var(--brand);
+        background: rgba(6, 115, 210, 0.07);
+      }
+
+      th.sortable .th-sort:focus-visible {
+        outline: 2px solid var(--brand);
+        outline-offset: -2px;
+      }
+
+      th.sortable .sort-arrow {
+        font-size: 11px;
+        line-height: 1;
+        opacity: 0.42;
+        transition: opacity 140ms ease;
+      }
+
+      th.sortable .th-sort:hover .sort-arrow {
+        opacity: 0.75;
+      }
+
+      th.sortable[aria-sort="ascending"],
+      th.sortable[aria-sort="descending"] {
+        background: rgba(6, 115, 210, 0.08);
+      }
+
+      th.sortable[aria-sort="ascending"] .th-sort,
+      th.sortable[aria-sort="descending"] .th-sort {
+        color: var(--brand);
+        font-weight: 800;
+      }
+
+      th.sortable[aria-sort="ascending"] .sort-arrow,
+      th.sortable[aria-sort="descending"] .sort-arrow {
+        opacity: 1;
+      }
+
       .section-title {
         display: flex;
         align-items: center;
@@ -5434,10 +5494,10 @@
                     <th>员工</th>
                     <th>邮箱</th>
                     <th>主要来源</th>
-                    <th class="num">请求数</th>
-                    <th class="num">总 Token</th>
-                    <th class="num">金额</th>
-                    <th class="num">成功率</th>
+                    <th class="num sortable" data-sort-key="requestCount" aria-sort="none"><button class="th-sort" type="button" title="按请求数排序（点击切换升序 / 降序）">请求数<span class="sort-arrow" aria-hidden="true">↕</span></button></th>
+                    <th class="num sortable" data-sort-key="totalTokens" aria-sort="none"><button class="th-sort" type="button" title="按总 Token 排序（点击切换升序 / 降序）">总 Token<span class="sort-arrow" aria-hidden="true">↕</span></button></th>
+                    <th class="num sortable" data-sort-key="spend" aria-sort="none"><button class="th-sort" type="button" title="按金额排序（点击切换升序 / 降序）">金额<span class="sort-arrow" aria-hidden="true">↕</span></button></th>
+                    <th class="num sortable" data-sort-key="successRate" aria-sort="none"><button class="th-sort" type="button" title="按成功率排序（点击切换升序 / 降序）">成功率<span class="sort-arrow" aria-hidden="true">↕</span></button></th>
                     <th>状态</th>
                   </tr>
                 </thead>
@@ -5706,10 +5766,10 @@
                       <th>邮箱</th>
                       <th>主要来源</th>
                       <th>团队角色</th>
-                      <th class="num">请求数</th>
-                      <th class="num">总 Token</th>
-                      <th class="num">金额</th>
-                      <th class="num">成功率</th>
+                      <th class="num sortable" data-sort-key="requestCount" aria-sort="none"><button class="th-sort" type="button" title="按请求数排序（点击切换升序 / 降序）">请求数<span class="sort-arrow" aria-hidden="true">↕</span></button></th>
+                      <th class="num sortable" data-sort-key="totalTokens" aria-sort="none"><button class="th-sort" type="button" title="按总 Token 排序（点击切换升序 / 降序）">总 Token<span class="sort-arrow" aria-hidden="true">↕</span></button></th>
+                      <th class="num sortable" data-sort-key="spend" aria-sort="none"><button class="th-sort" type="button" title="按金额排序（点击切换升序 / 降序）">金额<span class="sort-arrow" aria-hidden="true">↕</span></button></th>
+                      <th class="num sortable" data-sort-key="successRate" aria-sort="none"><button class="th-sort" type="button" title="按成功率排序（点击切换升序 / 降序）">成功率<span class="sort-arrow" aria-hidden="true">↕</span></button></th>
                       <th>状态</th>
                     </tr>
                   </thead>
@@ -5902,7 +5962,7 @@
                 </div>
                 <button id="departmentSearchButton" class="ghost-btn" type="button">搜索</button>
               </div>
-              <span id="departmentLimitHint" class="hint">默认按 Token 从高到低排序</span>
+              <span id="departmentLimitHint" class="hint">默认按 Token 从高到低排序，点击表头可切换升降序</span>
             </div>
             <div class="table-wrap">
               <table>
@@ -5911,10 +5971,10 @@
                     <th>部门 / 员工</th>
                     <th>ID / 邮箱</th>
                     <th>主要来源</th>
-                    <th class="num">请求数</th>
-                    <th class="num">总 Token</th>
-                    <th class="num">金额</th>
-                    <th class="num">成功率</th>
+                    <th class="num sortable" data-sort-key="requestCount" aria-sort="none"><button class="th-sort" type="button" title="按请求数排序（点击切换升序 / 降序）">请求数<span class="sort-arrow" aria-hidden="true">↕</span></button></th>
+                    <th class="num sortable" data-sort-key="totalTokens" aria-sort="none"><button class="th-sort" type="button" title="按总 Token 排序（点击切换升序 / 降序）">总 Token<span class="sort-arrow" aria-hidden="true">↕</span></button></th>
+                    <th class="num sortable" data-sort-key="spend" aria-sort="none"><button class="th-sort" type="button" title="按金额排序（点击切换升序 / 降序）">金额<span class="sort-arrow" aria-hidden="true">↕</span></button></th>
+                    <th class="num sortable" data-sort-key="successRate" aria-sort="none"><button class="th-sort" type="button" title="按成功率排序（点击切换升序 / 降序）">成功率<span class="sort-arrow" aria-hidden="true">↕</span></button></th>
                     <th>状态</th>
                   </tr>
                 </thead>
@@ -6252,6 +6312,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260729-topup-manual-qr"></script>
+    <script src="/assets/app.js?v=20260729-ranking-column-sort"></script>
   </body>
 </html>

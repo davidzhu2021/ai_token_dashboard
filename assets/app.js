@@ -1708,6 +1708,84 @@ function renderTable(data, tableId = "usageTable", countId = "tableCount") {
   );
 }
 
+// 排行表默认按 Token 降序；用户可点击表头在四个数值列上切换升降序。
+const DEFAULT_RANKING_SORT = { key: "totalTokens", direction: "desc" };
+const RANKING_SORT_KEYS = ["requestCount", "totalTokens", "spend", "successRate"];
+const RANKING_SORT_TIP = "默认按 Token 从高到低排序，点击请求数 / Token / 金额 / 成功率表头可切换升降序";
+const rankingSortState = new Map();
+
+function rankingSort(tableId) {
+  return rankingSortState.get(tableId) || DEFAULT_RANKING_SORT;
+}
+
+function rankingSortValue(item, key) {
+  if (key === "successRate") {
+    const requests = Number(item.requestCount || 0);
+    return requests ? Number(item.successCount || 0) / requests : 0;
+  }
+  return Number(item[key] || 0);
+}
+
+function rankingComparator(tableId, nameOf) {
+  const { key, direction } = rankingSort(tableId);
+  const sign = direction === "asc" ? 1 : -1;
+  return (a, b) => {
+    const primary = rankingSortValue(a, key) - rankingSortValue(b, key);
+    if (primary) return primary * sign;
+    // 主排序列相同时沿用默认降序链，保证名次稳定。
+    for (const fallback of ["totalTokens", "spend", "requestCount"]) {
+      if (fallback === key) continue;
+      const diff = Number(b[fallback] || 0) - Number(a[fallback] || 0);
+      if (diff) return diff;
+    }
+    return nameOf(a).localeCompare(nameOf(b), "zh-CN");
+  };
+}
+
+function employeeRankingName(item) {
+  return item.employeeName || item.employeeEmail || item.employeeId || "";
+}
+
+function departmentRankingName(item) {
+  return item.departmentName || item.departmentId || "";
+}
+
+function sortedRankingRows(tableId, items, nameOf) {
+  return items.slice().sort(rankingComparator(tableId, nameOf));
+}
+
+function rankingHead(tableId) {
+  return el(tableId)?.closest("table")?.querySelector("thead") || null;
+}
+
+function updateRankingSortIndicators(tableId) {
+  const head = rankingHead(tableId);
+  if (!head) return;
+  const { key, direction } = rankingSort(tableId);
+  head.querySelectorAll("th.sortable").forEach((th) => {
+    const active = th.dataset.sortKey === key;
+    th.setAttribute("aria-sort", active ? (direction === "asc" ? "ascending" : "descending") : "none");
+    const arrow = th.querySelector(".sort-arrow");
+    if (arrow) arrow.textContent = active ? (direction === "asc" ? "↑" : "↓") : "↕";
+  });
+}
+
+function setupRankingSorting(tableId, rerender) {
+  const head = rankingHead(tableId);
+  if (!head) return;
+  head.addEventListener("click", (event) => {
+    const th = event.target.closest("th.sortable");
+    const key = th?.dataset.sortKey;
+    if (!key || !RANKING_SORT_KEYS.includes(key)) return;
+    const current = rankingSort(tableId);
+    // 换列时先给降序（排行更常看高值），同列再次点击才切升序。
+    const direction = current.key === key && current.direction === "desc" ? "asc" : "desc";
+    rankingSortState.set(tableId, { key, direction });
+    rerender();
+  });
+  updateRankingSortIndicators(tableId);
+}
+
 function sortedAdminEmployees(items) {
   return items.slice().sort((a, b) => {
     const tokenDiff = Number(b.totalTokens || 0) - Number(a.totalTokens || 0);
@@ -1882,8 +1960,9 @@ function employeeSummariesFromRows(rows) {
 }
 
 function renderEmployeeRanking(tableId, countId, employees, emptyText) {
-  const sorted = sortedAdminEmployees(employees);
+  const sorted = sortedRankingRows(tableId, employees, employeeRankingName);
   const isTeamTable = tableId === "teamUserTable";
+  updateRankingSortIndicators(tableId);
   el(countId).textContent = `${sorted.length} 人`;
   el(tableId).innerHTML = sorted.length
     ? sorted
@@ -1909,7 +1988,8 @@ function renderEmployeeRanking(tableId, countId, employees, emptyText) {
 }
 
 function renderDepartmentRanking(tableId, countId, departments, emptyText) {
-  const sorted = sortedDepartments(departments);
+  const sorted = sortedRankingRows(tableId, departments, departmentRankingName);
+  updateRankingSortIndicators(tableId);
   el(countId).textContent = `${sorted.length} 个部门`;
   el(tableId).innerHTML = sorted.length
     ? sorted
@@ -1942,7 +2022,7 @@ function renderDepartmentUsers() {
   el("departmentBackButton").classList.toggle("hidden", !selectedDepartment);
   if (selectedDepartment) {
     el("departmentRankingTitle").textContent = `${scopeLabel}员工排行`;
-    el("departmentRankingDesc").textContent = `当前展示 ${scopeLabel} 内员工用量，默认按 Token 从高到低排序。`;
+    el("departmentRankingDesc").textContent = `当前展示 ${scopeLabel} 内员工用量，点击表头可切换排序。`;
     renderEmployeeRanking("departmentUserTable", "departmentUserCount", departmentEmployees, "当前筛选范围暂无部门员工用量");
   } else {
     el("departmentRankingTitle").textContent = "部门用量排行";
@@ -2196,7 +2276,7 @@ function renderDepartmentLoading() {
   el("departmentBackButton").classList.toggle("hidden", !selectedDepartment);
   setText("departmentRankingTitle", selectedDepartment ? `${scopeLabel}员工排行` : "部门用量排行");
   setText("departmentRankingDesc", selectedDepartment
-    ? `当前展示 ${scopeLabel} 内员工用量，默认按 Token 从高到低排序。`
+    ? `当前展示 ${scopeLabel} 内员工用量，点击表头可切换排序。`
     : "点击部门查看该部门用量看板和员工排行。");
   setDailyTokenValue("departmentHeroTotal", "加载中");
   setText("departmentHeroSpend", "--");
@@ -3760,9 +3840,9 @@ async function loadAdminData(forceRefresh = false) {
     adminDataFreshness = payload.dataFreshness || null;
     lastAdminUsageCacheHit = Boolean(payload.cache?.hit);
     if (payload.truncated) {
-      el("adminLimitHint").textContent = `默认按 Token 从高到低排序；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），员工排行可能不完整`;
+      el("adminLimitHint").textContent = `${RANKING_SORT_TIP}；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），员工排行可能不完整`;
     } else {
-      el("adminLimitHint").textContent = `默认按 Token 从高到低排序；已读取 ${payload.pagesRead || 0} 页日志，按当前筛选范围统计`;
+      el("adminLimitHint").textContent = `${RANKING_SORT_TIP}；已读取 ${payload.pagesRead || 0} 页日志，按当前筛选范围统计`;
     }
   } catch (error) {
     showToast(error.message || "全员数据加载失败");
@@ -3797,9 +3877,9 @@ async function loadDepartmentData(forceRefresh = false) {
     lastDepartmentUsageCacheHit = Boolean(payload.cache?.hit);
     const rankingSubject = selectedDepartment ? "员工排行" : "部门排行";
     if (payload.truncated) {
-      el("departmentLimitHint").textContent = `${rankingSubject}默认按 Token 从高到低排序；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），排行可能不完整`;
+      el("departmentLimitHint").textContent = `${rankingSubject}${RANKING_SORT_TIP}；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），排行可能不完整`;
     } else {
-      el("departmentLimitHint").textContent = `${rankingSubject}默认按 Token 从高到低排序；已读取 ${payload.pagesRead || 0} 页日志，按当前筛选范围统计`;
+      el("departmentLimitHint").textContent = `${rankingSubject}${RANKING_SORT_TIP}；已读取 ${payload.pagesRead || 0} 页日志，按当前筛选范围统计`;
     }
   } catch (error) {
     showToast(error.message || "部门数据加载失败");
@@ -4633,6 +4713,10 @@ el("teamUserTable").addEventListener("click", async (event) => {
   if (!row) return;
   await loadTeamMemberData(row.dataset.employee);
 });
+
+setupRankingSorting("adminUserTable", renderAdminUsers);
+setupRankingSorting("departmentUserTable", renderDepartmentUsers);
+setupRankingSorting("teamUserTable", renderTeamUsers);
 
 el("teamBackButton").addEventListener("click", clearTeamMemberSelection);
 

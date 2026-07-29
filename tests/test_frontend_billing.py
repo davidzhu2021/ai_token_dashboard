@@ -205,7 +205,7 @@ def test_static_asset_version_bumped_for_billing_release() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
 
     # 不更新版本号线上用户会命中旧缓存，看不到充值中心。
-    assert 'src="/assets/app.js?v=20260729-topup-manual-qr"' in markup
+    assert 'src="/assets/app.js?v=20260729-ranking-column-sort"' in markup
 
 
 def test_billing_copy_avoids_upstream_provider_terms() -> None:
