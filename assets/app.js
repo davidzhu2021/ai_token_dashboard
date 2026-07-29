@@ -953,8 +953,8 @@ function normalizeModelKey(model) {
   // 去掉路由、账号别名和供应商前缀，使同一模型聚合为一条。
   let name = String(model ?? "").trim();
   if (!name) return "";
-  // 上游 provider/model 路由格式（如 bedrock/anthropic.claude-opus-4-8）。
-  name = name.replace(/^[A-Za-z][A-Za-z0-9_-]*\//, "");
+  // 上游路由可能有多层 provider/ 前缀，模型名始终取最后一段。
+  name = name.split("/").pop().trim() || name;
   name = name.replace(/^[A-Za-z][A-Za-z0-9]*-acct-\d+-/i, "");
   name = name.replace(/^[A-Za-z][A-Za-z0-9]*\./i, "");
   return name;
@@ -963,9 +963,7 @@ function normalizeModelKey(model) {
 function displayModelName(model) {
   const normalized = normalizeModelKey(model);
   if (!normalized) return "未知模型";
-  const separatorIndex = normalized.lastIndexOf("/");
-  const shortName = separatorIndex >= 0 ? normalized.slice(separatorIndex + 1).trim() : normalized;
-  return shortName || normalized;
+  return normalized;
 }
 
 function renderDailyOverview(config) {

@@ -114,9 +114,11 @@ _VENDOR_PREFIX_RE = re.compile(r"^[a-z][a-z0-9]*\.", re.IGNORECASE)
 
 
 def normalize_model_display_name(value: Any) -> str:
-    """去掉账号别名前缀和供应商前缀，使同一模型在用量统计中聚合为一条。
+    """隐藏路由、账号别名和供应商前缀，使同一模型在用量统计中聚合为一条。
 
     示例:
+    - openrouter/anthropic/claude-opus-5 -> claude-opus-5
+    - wangsu-direct5/claude-haiku-4-5 -> claude-haiku-4-5
     - chatgpt-acct-84-gpt-4 -> gpt-4
     - anthropic.claude-opus-4-8 -> claude-opus-4-8
     - openai.gpt-4 -> gpt-4
@@ -124,8 +126,10 @@ def normalize_model_display_name(value: Any) -> str:
     text = _clean_text(value)
     if not text:
         return ""
-    # 移除账号别名前缀
-    stripped = _ACCOUNT_ALIAS_PREFIX_RE.sub("", text, count=1)
+    # 上游路由可能有多层 provider/ 前缀，模型名始终取最后一段。
+    stripped = text.rsplit("/", 1)[-1].strip() or text
+    # 移除账号别名前缀。
+    stripped = _ACCOUNT_ALIAS_PREFIX_RE.sub("", stripped, count=1)
     # 移除供应商前缀
     stripped = _VENDOR_PREFIX_RE.sub("", stripped, count=1)
     return stripped or text

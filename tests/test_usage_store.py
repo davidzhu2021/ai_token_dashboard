@@ -82,6 +82,78 @@ def test_coalesce_usage_rows_prevents_duplicate_upsert_records() -> None:
     assert result[0]["totalTokens"] == 5
 
 
+def test_coalesce_usage_rows_merges_normalized_route_models_by_source() -> None:
+    rows = [
+        {"date": "2026-07-22", "_userId": "alice", "source": "Codex", "model": "openrouter/anthropic/claude-opus-5", "totalTokens": 2, "requestCount": 1},
+        {"date": "2026-07-22", "_userId": "alice", "source": "Codex", "model": "claude-opus-5", "totalTokens": 3, "requestCount": 2},
+        {"date": "2026-07-22", "_userId": "alice", "source": "Claude Code", "model": "claude-opus-5", "totalTokens": 5, "requestCount": 1},
+    ]
+
+    result = UsageStore._coalesce_usage_rows(rows)
+    by_source = {item["source"]: item for item in result}
+
+    assert len(result) == 2
+    assert by_source["Codex"]["model"] == "claude-opus-5"
+    assert by_source["Codex"]["totalTokens"] == 5
+    assert by_source["Codex"]["requestCount"] == 3
+    assert by_source["Claude Code"]["totalTokens"] == 5
+
+
+def test_team_member_rows_merge_normalized_models_without_mixing_sources() -> None:
+    rows = [
+        {
+            "date": "2026-07-22",
+            "source": "Codex",
+            "model": "openrouter/anthropic/claude-opus-5",
+            "promptTokens": 2,
+            "completionTokens": 3,
+            "totalTokens": 5,
+            "requestCount": 1,
+            "successCount": 1,
+            "failureCount": 0,
+            "spend": 0.1,
+        },
+        {
+            "date": "2026-07-22",
+            "source": "Codex",
+            "model": "claude-opus-5",
+            "promptTokens": 4,
+            "completionTokens": 6,
+            "totalTokens": 10,
+            "requestCount": 2,
+            "successCount": 1,
+            "failureCount": 1,
+            "spend": 0.2,
+        },
+        {
+            "date": "2026-07-22",
+            "source": "Claude Code",
+            "model": "claude-opus-5",
+            "promptTokens": 7,
+            "completionTokens": 8,
+            "totalTokens": 15,
+            "requestCount": 1,
+            "successCount": 1,
+            "failureCount": 0,
+            "spend": 0.3,
+        },
+    ]
+
+    result = main.merge_team_member_usage_rows(rows)
+    by_source = {item["source"]: item for item in result}
+
+    assert len(result) == 2
+    assert by_source["Codex"]["model"] == "claude-opus-5"
+    assert by_source["Codex"]["promptTokens"] == 6
+    assert by_source["Codex"]["completionTokens"] == 9
+    assert by_source["Codex"]["totalTokens"] == 15
+    assert by_source["Codex"]["requestCount"] == 3
+    assert by_source["Codex"]["successCount"] == 2
+    assert by_source["Codex"]["failureCount"] == 1
+    assert by_source["Codex"]["spend"] == 0.1 + 0.2
+    assert by_source["Claude Code"]["totalTokens"] == 15
+
+
 def test_team_member_ranking_merges_accounts_by_normalized_email() -> None:
     members = [
         {"user_id": "alice-1", "employee_email": " Alice@example.com ", "employee_name": "Alice", "team_role": "user"},

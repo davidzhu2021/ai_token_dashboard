@@ -15,12 +15,13 @@ from .litellm_client import department_key, normalize_model_display_name, normal
 
 
 def _model_normalize_sql(column: str) -> str:
-    """生成规范化模型名称的 SQL 表达式：同时去掉账号别名前缀和供应商前缀。
+    """生成规范化模型名称的 SQL 表达式：去掉路由、账号别名和供应商前缀。
 
     与 normalize_model_display_name() 保持一致，确保 SQL GROUP BY 阶段
-    就把同一模型（如 anthropic.claude-opus-4-8 与 claude-opus-4-8）聚合为一条。
+    就把同一模型（如 openrouter/anthropic/claude-opus-5 与 claude-opus-5）聚合为一条。
     """
-    account_stripped = f"regexp_replace({column}, '^[A-Za-z][A-Za-z0-9]*-acct-[0-9]+-', '', 'i')"
+    path_stripped = f"regexp_replace({column}, '^.*/', '')"
+    account_stripped = f"regexp_replace({path_stripped}, '^[A-Za-z][A-Za-z0-9]*-acct-[0-9]+-', '', 'i')"
     return f"regexp_replace({account_stripped}, '^[A-Za-z][A-Za-z0-9]*\\.', '', 'i')"
 
 
@@ -389,15 +390,17 @@ class UsageStore:
     def _coalesce_usage_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         for row in rows:
+            model = normalize_model_display_name(row.get("model")) or "未知模型"
             key = (
                 _clean_text(row.get("date")),
                 _clean_text(row.get("_userId") or row.get("userId")) or "unknown",
                 _clean_text(row.get("source")) or "其他",
-                _clean_text(row.get("model")) or "未知模型",
+                model,
             )
             current = grouped.get(key)
             if current is None:
                 current = dict(row)
+                current["model"] = model
                 current.update(empty_totals())
                 grouped[key] = current
             add_totals(current, row)
@@ -1466,15 +1469,15 @@ class UsageStore:
                    0::bigint AS request_count, 0::bigint AS success_count, 0::bigint AS failure_count, 0::double precision AS spend
             FROM selected s
             UNION ALL
-            SELECT 'usage', u.backend_id, NULL, NULL, u.user_id, MAX(u.employee_email), MAX(u.employee_name), NULL,
-                   u.usage_date, u.source, {model_sql}, {self._aggregate_metrics_sql('u.')}
+            SELECT 'usage', MIN(u.backend_id), NULL, NULL, MIN(u.user_id), MAX(u.employee_email), MAX(u.employee_name), NULL,
+                   u.usage_date, u.source, {model_sql} AS model_name, {self._aggregate_metrics_sql('u.')}
             FROM usage_daily u
             WHERE u.backend_id=ANY($1::text[]) AND u.usage_date BETWEEN $3::date AND $4::date
               AND ($7='all' OR u.source=$7)
               AND EXISTS (SELECT 1 FROM selected s WHERE s.backend_id=u.backend_id AND (s.user_id=u.user_id OR (NULLIF(btrim(s.employee_email),'') IS NOT NULL AND lower(btrim(s.employee_email))=lower(btrim(u.employee_email)))))
               AND EXISTS (SELECT 1 FROM usage_team_membership_daily m JOIN scope sc ON sc.backend_id=m.backend_id AND sc.team_id=m.team_id WHERE m.backend_id=u.backend_id AND m.snapshot_date=u.usage_date AND (m.user_id=u.user_id OR (NULLIF(btrim(m.employee_email),'') IS NOT NULL AND lower(btrim(m.employee_email))=lower(btrim(u.employee_email)))))
-            GROUP BY u.backend_id, u.usage_date, u.user_id, u.source, {model_sql}
-            ORDER BY kind, usage_date NULLS FIRST, backend_id, user_id, source, model_name
+            GROUP BY u.usage_date, u.source, {model_sql}
+            ORDER BY kind, usage_date NULLS FIRST, source, model_name
             """,
             backend_ids, team_ids, _as_date(start_date), _as_date(end_date), selected_user, selected_backend, source or "all",
         )

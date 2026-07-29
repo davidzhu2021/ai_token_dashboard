@@ -10,7 +10,7 @@ APP_JS = Path(__file__).parents[1] / "assets" / "app.js"
 def test_frontend_model_normalization_handles_provider_prefixes() -> None:
     source = APP_JS.read_text(encoding="utf-8")
 
-    assert 'name = name.replace(/^[A-Za-z][A-Za-z0-9_-]*\\//, "");' in source
+    assert 'name = name.split("/").pop().trim() || name;' in source
 
     script = f"""
 const source = {json.dumps(source)};
@@ -23,6 +23,8 @@ console.log(JSON.stringify([
   normalizeModelKey('bedrock/anthropic.claude-opus-4-8'),
   normalizeModelKey('bedrock/chatgpt-acct-84-anthropic.claude-opus-4-8'),
   normalizeModelKey('bedrock/claude-opus-4-7'),
+  normalizeModelKey('openrouter/anthropic/claude-opus-5'),
+  normalizeModelKey('wangsu-direct5/claude-haiku-4-5'),
   normalizeModelKey('')
 ]));
 """
@@ -39,6 +41,8 @@ console.log(JSON.stringify([
         "claude-opus-4-8",
         "claude-opus-4-8",
         "claude-opus-4-7",
+        "claude-opus-5",
+        "claude-haiku-4-5",
         "",
     ]
 
@@ -46,7 +50,5 @@ console.log(JSON.stringify([
 def test_frontend_model_normalization_keeps_model_body_specific() -> None:
     source = APP_JS.read_text(encoding="utf-8")
 
-    # The display helper still shortens only after normalization; model names
-    # remain specific and are not matched by fuzzy substrings.
-    assert "const separatorIndex = normalized.lastIndexOf(\"/\")" in source
-    assert "slice(separatorIndex + 1)" in source
+    # Model names remain specific and are not matched by fuzzy substrings.
+    assert "return normalized;" in source

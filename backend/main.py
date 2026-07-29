@@ -52,7 +52,7 @@ from .auth import (
     verify_password,
 )
 from .auth_store import AuthStore, AuthStoreConfigError, DuplicateEmailError
-from .litellm_client import LiteLLMClient, default_date_range, mask_key, usage_today
+from .litellm_client import LiteLLMClient, default_date_range, mask_key, normalize_model_display_name, usage_today
 from .key_vault import KeyVault, KeyVaultError
 from .usage_store import UsageStore
 from .usage_sync import UsageSynchronizer
@@ -1071,7 +1071,7 @@ def team_usage_cache_key(email: str, team: dict[str, Any], start_date: str, end_
 
 
 def team_member_usage_cache_key(email: str, team: dict[str, Any], employee: str, start_date: str, end_date: str, source: str) -> str:
-    return f"team-member-usage:v6:{email.strip().lower()}:{team_scope_fingerprint(team)}:{employee.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
+    return f"team-member-usage:v7:{email.strip().lower()}:{team_scope_fingerprint(team)}:{employee.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def team_ref(team: dict[str, Any]) -> str:
@@ -1130,6 +1130,24 @@ def add_usage_totals(target: dict[str, Any], row: dict[str, Any]) -> None:
     for field in ("promptTokens", "completionTokens", "totalTokens", "requestCount", "successCount", "failureCount"):
         target[field] += int(row.get(field) or 0)
     target["spend"] += float(row.get("spend") or 0)
+
+
+def merge_team_member_usage_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge one member's normalized model rows without mixing call sources."""
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in rows:
+        model = normalize_model_display_name(row.get("model")) or "未知模型"
+        source = str(row.get("source") or "其他")
+        key = (str(row.get("date") or ""), source, model)
+        current = grouped.get(key)
+        if current is None:
+            current = dict(row)
+            current["source"] = source
+            current["model"] = model
+            current.update(empty_usage_totals())
+            grouped[key] = current
+        add_usage_totals(current, row)
+    return sorted(grouped.values(), key=lambda item: (str(item.get("date") or ""), str(item.get("source") or ""), str(item.get("model") or "")))
 
 
 def usage_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1674,6 +1692,7 @@ async def team_member_usage_payload(
         selected_employee = find_team_employee(team_payload, employee)
         selected_values = employee_match_values(selected_employee)
         rows = [row for row in team_payload.get("rows") or [] if employee_match_values(row) & selected_values]
+    rows = merge_team_member_usage_rows(rows)
     public_user = team_employee_public_user(selected_employee, team)
     payload = {
         "user": public_user,
