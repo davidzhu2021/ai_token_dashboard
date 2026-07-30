@@ -35,6 +35,7 @@ class FakeUpstream:
         self.key_budgets: list[tuple[str, float]] = []
         self.existing_models: list[str] = ["no-default-models"]
         self.fail_budget = False
+        self.spend = 0.0
 
     async def set_user_budget(self, user_id: str, max_budget: float) -> None:
         if self.fail_budget:
@@ -54,7 +55,12 @@ class FakeUpstream:
 
     async def user_info(self, user_id: str) -> dict[str, Any]:
         # 登录时会用它判定权限状态。
-        return {"user_id": user_id, "models": list(self.existing_models), "blocked": False}
+        return {
+            "user_id": user_id,
+            "models": list(self.existing_models),
+            "blocked": False,
+            "spend": self.spend,
+        }
 
     async def close(self) -> None:
         # 应用关闭时会调用。
@@ -210,6 +216,21 @@ def test_billing_is_open_to_users_without_entitlement(billing_env) -> None:
     # 新用户尚未获得模型权限，但必须能进充值页，否则无法自助开通。
     assert response.status_code == 200
     assert response.json()["account"]["balanceUsd"] == pytest.approx(0.0)
+
+
+def test_billing_balance_uses_authoritative_upstream_spend(billing_env) -> None:
+    client, auth, store, upstream, call = billing_env()
+    local_id = _seed_user(auth, "u@example.com", "local-u")
+    call(lambda: store.create_order("PAID-1", local_id, "manual", 50.0, 365.0, 7.3))
+    call(lambda: store.settle_order("PAID-1"))
+    upstream.spend = 12.5
+    _login(client, "u@example.com")
+
+    account = client.get("/api/me/billing").json()["account"]
+
+    assert account["topupTotalUsd"] == pytest.approx(50.0)
+    assert account["spentUsd"] == pytest.approx(12.5)
+    assert account["balanceUsd"] == pytest.approx(37.5)
 
 
 # ---- 兑换码链路 ----

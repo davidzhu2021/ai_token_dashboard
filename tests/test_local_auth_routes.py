@@ -330,6 +330,22 @@ def test_empty_upstream_model_list_does_not_activate_local_signup(tmp_path, monk
     assert payload["entitlementStatus"] == "inactive"
 
 
+def test_password_identity_never_inherits_platform_admin_flags(tmp_path, monkeypatch) -> None:
+    _client, store, _upstream = auth_client(tmp_path, monkeypatch)
+    monkeypatch.setenv("ADMIN_EMAILS", "seller-admin@example.com")
+    user = store.create_user(
+        "seller-admin@example.com",
+        "Seller Admin Password Account",
+        hash_auth_token("password"),
+        email_verified=True,
+    )
+
+    payload = asyncio.run(main.auth_user_payload(user))
+
+    assert payload["isAdmin"] is False
+    assert payload["isPlatformAdmin"] is False
+
+
 def test_inactive_local_user_cannot_query_or_manage_keys_or_models(tmp_path, monkeypatch) -> None:
     client, store, upstream = auth_client(tmp_path, monkeypatch)
     user = store.create_user("person@example.com", "Person", hash_password("password-123"), email_verified=True)

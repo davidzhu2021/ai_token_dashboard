@@ -42,10 +42,12 @@ from .auth import (
     get_server_session_token,
     hash_auth_token,
     hash_password,
+    is_platform_admin_email,
     normalize_user,
     oidc_configured,
     password_needs_rehash,
     require_admin,
+    require_platform_admin,
     require_user,
     set_server_session,
     validate_company_email,
@@ -70,6 +72,7 @@ from .organization_store import (
     InMemoryOrganizationStore,
     OrganizationConflictError,
     OrganizationNotFoundError,
+    OrganizationPermissionError,
     OrganizationStore,
     OrganizationStoreError,
     OrganizationValidationError,
@@ -628,102 +631,442 @@ def auth_http_error(status_code: int, detail: str, code: str, headers: dict[str,
     return HTTPException(status_code=status_code, detail={"error": detail, "code": code}, headers=headers)
 
 
-def organization_access_fields(user: dict[str, Any]) -> dict[str, Any]:
-    """Expose a cached organization role without changing platform privileges."""
+def organization_access_fields(
+    user: dict[str, Any],
+    membership: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return customer-org capabilities without changing platform privileges.
+
+    The old V1 mock elevated a platform admin to an owner of a synthetic
+    customer.  V2 deliberately removes that shortcut: seller admins browse
+    customers through /api/platform/organizations and are not members of any
+    customer organization.
+    """
+
     enabled = organization_demo_enabled()
-    role = user.get("organizationRole") if enabled else None
+    active_membership = membership if isinstance(membership, dict) and membership.get("status") == "active" else None
+    role = str(active_membership.get("role") or "") if active_membership else None
     if role not in {"owner", "admin", "member"}:
-        # An explicit null role means a matching membership is inactive (or a
-        # local-password identity was rejected), and must not be overridden by
-        # the platform-admin demo-entry fallback.
-        role = "owner" if enabled and "organizationRole" not in user and bool(user.get("isAdmin")) else None
-    can_manage = role in {"owner", "admin"}
+        role = None
+    organization_id = str(
+        (active_membership or {}).get("organizationId")
+        or (active_membership or {}).get("organization_id")
+        or ""
+    ) or None
+    organization = (
+        dict(active_membership.get("organization"))
+        if isinstance((active_membership or {}).get("organization"), dict)
+        else None
+    )
+    organization_name = str((organization or {}).get("name") or "")
+    # Customer admins have company-wide analytics access.  Master-data writes
+    # stay seller-only in Mock V2, so the old field remains false on purpose.
+    can_view_usage = role in {"owner", "admin"}
     return {
         "organizationDemoEnabled": enabled,
+        "isPlatformAdmin": bool(user.get("isPlatformAdmin") or user.get("isAdmin")),
+        "organizationId": organization_id,
+        # The customer name is safe display context for scoped boards. It lets
+        # a customer admin identify their tenant without exposing the seller's
+        # customer directory or enabling the master-data workspace.
+        "organization": organization,
+        "organizationName": organization_name or None,
         "organizationRole": role,
-        "canManageOrganization": can_manage,
+        "canViewOrganizationUsage": can_view_usage,
+        "canManageOrganization": False,
+        # Keep the explicit V2 capability separate from the legacy alias while
+        # older browser bundles are still in circulation.
+        "canManageCustomerOrganizations": bool(enabled and (user.get("isPlatformAdmin") or user.get("isAdmin"))),
+        "canManageCustomers": bool(enabled and (user.get("isPlatformAdmin") or user.get("isAdmin"))),
     }
 
 
+def organization_identity_status_fields(
+    memberships: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Expose an inactive demo identity without restoring its permissions.
+
+    The client needs a stable signal to render a useful pending/suspended
+    state and avoid seller-only navigation.  This deliberately omits customer
+    role and tenant id unless the membership is active, which keeps the
+    authorization boundary server derived.
+    """
+
+    membership = next((item for item in memberships if isinstance(item, dict)), None)
+    if membership is None:
+        return {
+            "isKnownDemoCustomerIdentity": False,
+            "organizationAccessStatus": None,
+        }
+    organization = membership.get("organization")
+    organization_status = (
+        str(organization.get("status") or "")
+        if isinstance(organization, dict)
+        else str(membership.get("organizationStatus") or "")
+    )
+    member_status = str(membership.get("status") or "")
+    if organization_status in {"archived", "suspended"}:
+        access_status = "archived" if organization_status == "archived" else "organization_suspended"
+    elif member_status in {"invited", "suspended"}:
+        access_status = member_status
+    else:
+        access_status = "active"
+    return {
+        "isKnownDemoCustomerIdentity": True,
+        "organizationAccessStatus": access_status,
+    }
+
+
+def _organization_membership_items(value: Any) -> list[dict[str, Any]]:
+    """Normalize both the V2 multi-store list and its old single-item shape."""
+
+    if isinstance(value, dict):
+        items = value.get("items") or value.get("memberships") or value.get("organizations")
+        if isinstance(items, list):
+            values = [item for item in items if isinstance(item, dict)]
+        else:
+            values = [value]
+    elif isinstance(value, list):
+        values = [item for item in value if isinstance(item, dict)]
+    else:
+        return []
+    normalized: list[dict[str, Any]] = []
+    for item in values:
+        member = item.get("member") if isinstance(item.get("member"), dict) else item
+        organization = item.get("organization") if isinstance(item.get("organization"), dict) else {}
+        normalized.append(
+            {
+                **member,
+                "organizationId": item.get("organizationId") or item.get("organization_id") or member.get("organizationId"),
+                "organization_id": item.get("organization_id") or item.get("organizationId") or member.get("organization_id"),
+                "organization": organization,
+                "organizationStatus": organization.get("status") if organization else item.get("organizationStatus"),
+            }
+        )
+    return normalized
+
+
+async def organization_memberships_for_user(user: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve active Mock memberships; password identities never inherit them."""
+
+    if (
+        not organization_demo_enabled()
+        or user.get("authType") == "password"
+        or is_platform_admin_email(str(user.get("email") or ""))
+    ):
+        return []
+    email = str(user.get("email") or "")
+    try:
+        # V2 store: a user may have at most one effective Mock customer.  The
+        # fallback preserves V1 tests until the store migration lands.
+        try:
+            result = await organization_store_call("resolve_members_by_email", email)
+        except AttributeError:
+            result = await organization_store_call("get_member_by_email", email)
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    return _organization_membership_items(result)
+
+
 async def organization_access_fields_for_user(user: dict[str, Any]) -> dict[str, Any]:
-    """Resolve the current active demo membership for auth bootstrap payloads."""
+    """Resolve bootstrap capabilities without granting platform admins membership."""
+
     if not organization_demo_enabled():
         return organization_access_fields(user)
-    # Local password identities remain distinct from enterprise SSO accounts,
-    # even when an email address happens to match a demo member.
-    if user.get("authType") == "password":
-        return organization_access_fields({**user, "organizationRole": None})
     try:
-        membership = await organization_store_call("get_member_by_email", str(user.get("email") or ""))
-    except OrganizationStoreError:
+        memberships = await organization_memberships_for_user(user)
+    except HTTPException:
         logger.exception("failed to resolve organization demo membership")
         return organization_access_fields(user)
-    if membership and membership.get("status") == "active":
-        return organization_access_fields({**user, "organizationRole": membership.get("role")})
-    if membership:
-        return organization_access_fields({**user, "organizationRole": None})
-    return organization_access_fields(user)
+    active = next(
+        (
+            item
+            for item in memberships
+            if item.get("status") == "active" and item.get("organizationStatus", "active") == "active"
+        ),
+        None,
+    )
+    return {
+        **organization_access_fields(user, active),
+        **organization_identity_status_fields(memberships),
+    }
 
 
 async def organization_scope_fields_for_user(user: dict[str, Any]) -> dict[str, Any]:
     """Avoid changing legacy scope payloads while the demo remains disabled."""
-    if not organization_demo_enabled():
+
+    # A local password identity is deliberately a different principal from an
+    # SSO-backed customer member.  Do not add demo capabilities to its legacy
+    # scope response, even when the email happens to match a seeded member.
+    if not organization_demo_enabled() or user.get("authType") == "password":
         return {}
     return await organization_access_fields_for_user(user)
 
 
 async def organization_user(request: Request) -> dict[str, Any]:
-    """Resolve the session to a mock membership, or synthesize a platform owner."""
+    """Require an active customer membership derived from the server session."""
+
     if not organization_demo_enabled():
         raise HTTPException(status_code=404, detail="企业组织演示功能尚未启用")
     user = require_user(request)
     if user.get("authType") == "password":
         raise auth_http_error(403, "本地密码账号不能继承企业组织权限", "ORGANIZATION_SSO_REQUIRED")
-    try:
-        membership = await organization_store_call("get_member_by_email", str(user.get("email") or ""))
-    except OrganizationStoreError as exc:
-        raise organization_store_error(exc) from exc
-    if membership and membership.get("status") == "active":
-        role = str(membership.get("role") or "member")
-        identity = {**user, "organizationRole": role}
-        return {
-            **identity,
-            "organizationMember": membership,
-            **organization_access_fields(identity),
-        }
-    if membership:
+    memberships = await organization_memberships_for_user(user)
+    if any(item.get("status") != "active" or item.get("organizationStatus", "active") != "active" for item in memberships):
         raise auth_http_error(403, "当前企业成员尚未启用或已被暂停", "ORGANIZATION_MEMBER_INACTIVE")
-    if user.get("isAdmin"):
-        # The mock has no platform-admin membership table. A platform admin is
-        # only a demo entry point and receives a synthetic organization owner.
-        identity = {**user, "organizationRole": "owner"}
-        return {
-            **identity,
-            "organizationMember": None,
-            **organization_access_fields(identity),
-        }
-    raise auth_http_error(403, "当前账号不属于此企业组织", "ORGANIZATION_MEMBERSHIP_REQUIRED")
+    membership = next(
+        (
+            item
+            for item in memberships
+            if item.get("status") == "active" and item.get("organizationStatus", "active") == "active"
+        ),
+        None,
+    )
+    if not membership:
+        # A seller-side operator is intentionally not a customer membership.
+        raise auth_http_error(403, "当前账号不属于任何客户企业", "ORGANIZATION_MEMBERSHIP_REQUIRED")
+    fields = organization_access_fields(user, membership)
+    return {**user, "organizationMember": membership, **fields}
 
 
-async def require_organization_demo_manager(request: Request) -> dict[str, Any]:
+async def require_organization_usage_viewer(request: Request) -> dict[str, Any]:
     user = await organization_user(request)
-    if not user.get("canManageOrganization"):
-        raise auth_http_error(403, "当前成员没有企业组织管理权限", "ORGANIZATION_MANAGE_FORBIDDEN")
+    if not user.get("canViewOrganizationUsage"):
+        raise auth_http_error(403, "当前成员没有企业全员或部门看板权限", "ORGANIZATION_USAGE_FORBIDDEN")
     return user
 
 
+async def require_organization_directory_viewer(request: Request) -> dict[str, Any]:
+    """Allow the customer directory only to the company's analytics roles.
+
+    A regular member (including a team leader whose role is still ``member``)
+    must not learn the rest of the customer's member list through an otherwise
+    harmless-looking organization endpoint.  Their dashboard contract is
+    limited to personal usage or their assigned team.
+    """
+
+    user = await organization_user(request)
+    if not user.get("canViewOrganizationUsage"):
+        raise auth_http_error(403, "当前成员没有企业组织目录查看权限", "ORGANIZATION_DIRECTORY_FORBIDDEN")
+    return user
+
+
+async def require_organization_demo_manager(request: Request) -> dict[str, Any]:
+    """Compatibility gate: V2 leaves customer master-data mutation to seller admins."""
+
+    user = await organization_user(request)
+    raise auth_http_error(403, "客户企业资料仅可由平台管理员维护", "ORGANIZATION_MANAGE_FORBIDDEN")
+
+
 def organization_current_member(user: dict[str, Any]) -> dict[str, Any]:
-    """Return the real demo membership or a synthetic platform-admin owner."""
     membership = user.get("organizationMember")
-    if isinstance(membership, dict):
-        return membership
+    return dict(membership) if isinstance(membership, dict) else {}
+
+
+def organization_identifier(membership: dict[str, Any]) -> str:
+    """Extract the server-side tenant identifier from a resolved membership."""
+
+    identifier = str(membership.get("organizationId") or membership.get("organization_id") or "").strip()
+    if not identifier:
+        raise auth_http_error(403, "当前企业成员缺少有效的企业范围", "ORGANIZATION_SCOPE_INVALID")
+    return identifier
+
+
+async def organization_scoped_store_call(
+    organization_id: str,
+    method: str,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Call a V2 scoped facade, falling back to the keyword-compatible API."""
+
+    store = organization_store()
+    facade_factory = getattr(store, "for_organization", None)
+    if callable(facade_factory):
+        facade = await asyncio.to_thread(facade_factory, organization_id)
+        function = getattr(facade, method)
+        return await asyncio.to_thread(function, *args, **kwargs)
+    function = getattr(store, method)
+    try:
+        return await asyncio.to_thread(function, *args, organization_id=organization_id, **kwargs)
+    except TypeError:
+        # Legacy V1 compatibility exists only for existing tests.  A V2 store
+        # must expose either for_organization() or organization_id keywords.
+        if organization_id == "org-demo":
+            return await asyncio.to_thread(function, *args, **kwargs)
+        raise
+
+
+async def platform_organization_store_call(method: str, *args: Any, **kwargs: Any) -> Any:
+    """Call a V2 seller-side store operation and keep failures typed."""
+
+    return await organization_store_call(method, *args, **kwargs)
+
+
+async def require_platform_organization(request: Request, organization_id: str) -> dict[str, Any]:
+    """Authorize a seller operator and resolve exactly the requested customer."""
+
+    if not organization_demo_enabled():
+        raise HTTPException(status_code=404, detail="企业组织演示功能尚未启用")
+    user = require_platform_admin(request)
+    try:
+        organization = await platform_organization_store_call("get_organization", organization_id)
+    except AttributeError:
+        # The V1 store exposes no customer list and only keeps org-demo.
+        if organization_id == "org-demo":
+            organization = (await organization_store_call("get_current")).get("organization")
+        else:
+            organization = None
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    if not isinstance(organization, dict):
+        raise auth_http_error(404, "未找到对应客户企业", "ORGANIZATION_NOT_FOUND")
+    return {**user, "selectedOrganization": organization, "selectedOrganizationId": organization_id}
+
+
+async def mock_usage_payload(
+    method: str,
+    organization_id: str,
+    *,
+    start_date: str,
+    end_date: str,
+    source: str,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Read deterministic Mock usage only; never fall through to an upstream.
+
+    The V2 store owns these methods.  An unavailable method is deliberately a
+    503 rather than a tempting legacy LiteLLM fallback, because the latter
+    could reveal seller-wide data to a customer demo account.
+    """
+
+    method_names = [method]
+    legacy_method = {
+        "mock_personal_usage": "member_usage_payload",
+        "mock_organization_usage": "usage_payload",
+        "mock_department_usage": "department_usage_payload",
+        "mock_team_usage": "team_usage_payload",
+        "mock_team_member_usage": "team_member_usage_payload",
+    }.get(method)
+    if legacy_method:
+        method_names.append(legacy_method)
+    last_missing: AttributeError | None = None
+    for candidate in method_names:
+        try:
+            payload = await organization_scoped_store_call(
+                organization_id,
+                candidate,
+                start_date=start_date,
+                end_date=end_date,
+                source=source,
+                **kwargs,
+            )
+            break
+        except AttributeError as exc:
+            last_missing = exc
+        except OrganizationStoreError as exc:
+            raise organization_store_error(exc) from exc
+    else:
+        logger.warning("organization demo Mock usage method is unavailable methods=%s", method_names)
+        raise auth_http_error(503, "企业演示用量数据正在初始化，请稍后重试", "ORGANIZATION_USAGE_UNAVAILABLE") from last_missing
+    if not isinstance(payload, dict):
+        raise auth_http_error(503, "企业演示用量数据暂不可用", "ORGANIZATION_USAGE_UNAVAILABLE")
+    return payload
+
+
+async def is_demo_customer_user(app_user: dict[str, Any]) -> bool:
+    """True only for an active customer membership, never seller operators."""
+
+    if not organization_demo_enabled() or app_user.get("authType") == "password":
+        return False
+    try:
+        memberships = await organization_memberships_for_user(app_user)
+    except HTTPException:
+        return False
+    return any(
+        item.get("status") == "active" and item.get("organizationStatus", "active") == "active"
+        for item in memberships
+    )
+
+
+async def is_known_demo_customer_identity(app_user: dict[str, Any]) -> bool:
+    """Recognize suspended and archived demo identities before upstream fallback.
+
+    An inactive customer member must be denied rather than falling through to
+    a same-email seller account or a real upstream query.
+    """
+
+    if not organization_demo_enabled() or app_user.get("authType") == "password":
+        return False
+    try:
+        return bool(await organization_memberships_for_user(app_user))
+    except HTTPException:
+        return False
+
+
+async def require_non_inactive_demo_identity(app_user: dict[str, Any]) -> None:
+    """Fail closed before any non-Mock path can resolve a disabled customer.
+
+    Active customer identities are handled by their Mock adapters. Invited,
+    suspended, and archived customer identities must not fall through to a
+    same-email platform account or an upstream usage lookup.
+    """
+
+    if await is_demo_customer_user(app_user):
+        return
+    if await is_known_demo_customer_identity(app_user):
+        raise inactive_demo_customer_error()
+
+
+def inactive_demo_customer_error() -> HTTPException:
+    return auth_http_error(
+        403,
+        "当前企业成员尚未启用或所属客户已归档",
+        "ORGANIZATION_MEMBER_INACTIVE",
+    )
+
+
+async def demo_team_scope_for_user(app_user: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a Mock team-leader scope without calling the upstream client."""
+
+    memberships = await organization_memberships_for_user(app_user)
+    membership = next(
+        (
+            item
+            for item in memberships
+            if item.get("status") == "active" and item.get("organizationStatus", "active") == "active"
+        ),
+        None,
+    )
+    if not membership:
+        return {"isTeamLeader": False, "teamBoardStatus": "none", "team": None, "leaderTeams": []}
+    organization_id = organization_identifier(membership)
+    try:
+        scope = await organization_scoped_store_call(
+            organization_id, "team_scope_for_member", email=str(app_user.get("email") or "")
+        )
+    except (AttributeError, TypeError):
+        return {"isTeamLeader": False, "teamBoardStatus": "none", "team": None, "leaderTeams": []}
+    if not isinstance(scope, dict):
+        return {"isTeamLeader": False, "teamBoardStatus": "none", "team": None, "leaderTeams": []}
     return {
-        "id": f"session-owner:{str(user.get('email') or '').lower()}",
-        "name": str(user.get("name") or "企业管理员"),
-        "email": str(user.get("email") or "").lower(),
-        "role": "owner",
-        "status": "active",
+        "isTeamLeader": bool(scope.get("isTeamLeader")),
+        "teamBoardStatus": str(scope.get("teamBoardStatus") or "none"),
+        "team": public_team(scope.get("team")),
+        "leaderTeams": [team for team in (public_team(item) for item in scope.get("leaderTeams") or []) if team],
     }
+
+
+async def known_demo_member_email(email: str) -> bool:
+    """Check membership existence for the narrowly-scoped loopback dev login exception."""
+
+    if not organization_demo_enabled():
+        return False
+    try:
+        memberships = await organization_memberships_for_user({"email": email})
+    except HTTPException:
+        return False
+    return bool(memberships)
 
 
 def organization_store_error(exc: OrganizationStoreError) -> HTTPException:
@@ -732,6 +1075,8 @@ def organization_store_error(exc: OrganizationStoreError) -> HTTPException:
         return auth_http_error(404, "未找到对应的部门或成员", "ORGANIZATION_NOT_FOUND")
     if isinstance(exc, DuplicateMemberEmailError):
         return auth_http_error(409, "该邮箱已在企业成员列表中", "ORGANIZATION_MEMBER_EXISTS")
+    if isinstance(exc, OrganizationPermissionError):
+        return auth_http_error(403, "当前成员无权查看该团队范围", "ORGANIZATION_SCOPE_FORBIDDEN")
     if isinstance(exc, OrganizationConflictError):
         return auth_http_error(409, "当前组织状态不允许此操作，请先调整成员或管理员", "ORGANIZATION_CONFLICT")
     if isinstance(exc, OrganizationValidationError):
@@ -742,14 +1087,23 @@ def organization_store_error(exc: OrganizationStoreError) -> HTTPException:
 
 async def organization_current_payload(user: dict[str, Any]) -> dict[str, Any]:
     try:
+        snapshot = await organization_scoped_store_call(
+            organization_identifier(organization_current_member(user)), "organization_snapshot"
+        )
+    except AttributeError:
+        # V1 compatibility for the existing one-company demo; V2 always uses
+        # organization_snapshot so customer records cannot be mixed.
         snapshot = await organization_store_call("get_current")
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
     return {
         **snapshot,
+        # The UI uses this explicit context label when it reuses the existing
+        # full-member and department boards for a customer-scoped session.
+        "organizationName": str((snapshot.get("organization") or {}).get("name") or ""),
         "currentMember": organization_current_member(user),
         "capabilities": {"canManageOrganization": bool(user.get("canManageOrganization"))},
-        **organization_access_fields(user),
+        **organization_access_fields(user, organization_current_member(user)),
     }
 
 
@@ -790,6 +1144,23 @@ def auth_database_configured() -> bool:
 def is_loopback_development() -> bool:
     parsed_base_url = urlparse(os.getenv("APP_BASE_URL", "").strip())
     return parsed_base_url.scheme.lower() == "http" and (parsed_base_url.hostname or "").lower() in LOOPBACK_HOSTS
+
+
+def is_loopback_request_peer(request: Request) -> bool:
+    """Return whether the transport peer is local, without trusting Host.
+
+    ``testclient`` is emitted only by Starlette's in-process ASGI transport;
+    a Uvicorn TCP peer is always an IP address. Keeping that compatibility
+    lets development login enforce the actual peer in deployed processes.
+    """
+
+    peer = str(request.client.host if request.client else "").strip().lower()
+    if peer == "testclient":
+        return True
+    try:
+        return ipaddress.ip_address(peer).is_loopback
+    except ValueError:
+        return False
 
 
 def smtp_host_is_private_relay() -> bool:
@@ -1122,6 +1493,7 @@ async def auth_user_payload(user: dict[str, Any], *, refresh_entitlement: bool =
     # Password accounts are intentionally separate from SSO identities, even
     # when they use the same email address. Do not inherit admin privileges.
     normalized["isAdmin"] = False
+    normalized["isPlatformAdmin"] = False
     return {
         **normalized,
         "id": str(user["id"]),
@@ -1275,6 +1647,9 @@ def team_member_usage_cache_key(email: str, team: dict[str, Any], employee: str,
 
 
 def team_ref(team: dict[str, Any]) -> str:
+    existing = str(team.get("teamRef") or "").strip()
+    if existing:
+        return existing
     raw = f"{team.get('backend')}:{team.get('id')}".encode("utf-8")
     return base64.urlsafe_b64encode(hashlib.sha256(raw).digest()[:12]).decode("ascii").rstrip("=")
 
@@ -1287,6 +1662,10 @@ def public_team(team: dict[str, Any] | None) -> dict[str, Any] | None:
         "id": team.get("id"),
         "name": team.get("name"),
         "memberCount": team.get("memberCount"),
+        # The organization id is safe scope context for the Mock team board;
+        # it lets the browser label the selected customer without exposing a
+        # mutable authorization handle.
+        "organizationId": team.get("organizationId"),
     }
 
 
@@ -1924,6 +2303,12 @@ async def team_member_usage_payload(
 
 async def current_upstream_user(request: Request, refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
     app_user = require_user(request)
+    if await is_demo_customer_user(app_user):
+        # Customer demo identities deliberately have no upstream account.  Any
+        # endpoint that still tries to use one must fail closed instead of
+        # resolving a same-email seller account.
+        raise auth_http_error(403, "企业演示账号不提供个人令牌或上游账户操作", "ORGANIZATION_UPSTREAM_FORBIDDEN")
+    await require_non_inactive_demo_identity(app_user)
     local_user_id = str(app_user.get("id") or "")
     if local_user_id:
         local_user = await auth_store_call("get_user", local_user_id)
@@ -2130,6 +2515,31 @@ class OrganizationEmptyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class PlatformOrganizationRequest(BaseModel):
+    """Seller-side customer organization create/update request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=120)
+
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, value: str) -> str:
+        return value.strip()
+
+
+class PlatformOrganizationCreateRequest(PlatformOrganizationRequest):
+    """Create one customer and its first active customer owner atomically."""
+
+    ownerName: str = Field(min_length=1, max_length=120)
+    ownerEmail: str = Field(min_length=3, max_length=254)
+
+    @field_validator("ownerName", "ownerEmail")
+    @classmethod
+    def strip_owner_text(cls, value: str) -> str:
+        return value.strip()
+
+
 def write_key_audit(event: str, email: str, key_id: str, request: Request, result: str) -> None:
     audit_key_id = hashlib.sha256(key_id.encode("utf-8")).hexdigest() if key_id.startswith("sk-") else key_id
     safe_id = re.sub(r"[^A-Za-z0-9_-]", "", audit_key_id)[:64] or "-"
@@ -2223,7 +2633,11 @@ def store_created_key(user_id: str, created: dict[str, str]) -> str:
 async def debug_me_mapping(request: Request, refresh: bool = Query(False)) -> dict[str, Any]:
     if not env_bool("DEBUG_MAPPING_ENABLED", False):
         raise HTTPException(status_code=404, detail="接口不存在")
-    if require_user(request).get("id"):
+    app_user = require_user(request)
+    if await is_demo_customer_user(app_user):
+        raise auth_http_error(403, "企业演示账号不提供上游调试查询", "ORGANIZATION_UPSTREAM_FORBIDDEN")
+    await require_non_inactive_demo_identity(app_user)
+    if app_user.get("id"):
         raise auth_http_error(403, "本地密码账号不能使用调试接口", "AUTH_LOCAL_DEBUG_UNAVAILABLE")
     app_user, upstream_user = await current_upstream_user(request, refresh)
     return {
@@ -2245,8 +2659,11 @@ async def debug_me_usage_compare(
     if not env_bool("DEBUG_MAPPING_ENABLED", False):
         raise HTTPException(status_code=404, detail="接口不存在")
     app_user = require_user(request)
+    if await is_demo_customer_user(app_user):
+        raise auth_http_error(403, "企业演示账号不提供上游调试查询", "ORGANIZATION_UPSTREAM_FORBIDDEN")
     if app_user.get("id"):
         raise auth_http_error(403, "本地密码账号不能使用调试接口", "AUTH_LOCAL_DEBUG_UNAVAILABLE")
+    await require_non_inactive_demo_identity(app_user)
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
     upstream, mapping_cache = await cached_resolve_user(app_user["email"], app_user.get("name"))
@@ -2412,7 +2829,10 @@ async def auth_me(request: Request) -> dict[str, Any]:
     if local_user:
         await retry_local_provisioning(local_user)
     user = await auth_user_payload(local_user, refresh_entitlement=True) if local_user else dict(require_user(request))
-    user.update({"isTeamLeader": False, "teamBoardStatus": "loading", "team": None, "leaderTeams": []})
+    if await is_demo_customer_user(user):
+        user.update(await demo_team_scope_for_user(user))
+    else:
+        user.update({"isTeamLeader": False, "teamBoardStatus": "loading", "team": None, "leaderTeams": []})
     user.update(await organization_access_fields_for_user(user))
     user["csrfToken"] = csrf_token(request)
     return user
@@ -2609,6 +3029,12 @@ async def change_password(data: ChangePasswordRequest, request: Request) -> dict
 @app.get("/api/auth/scope")
 async def auth_scope(request: Request) -> dict[str, Any]:
     user = require_user(request)
+    if await is_demo_customer_user(user):
+        return {**(await demo_team_scope_for_user(user)), **(await organization_scope_fields_for_user(user))}
+    # An invited, suspended, or archived Mock identity must never fall through
+    # to the legacy upstream team resolver.  It is a known customer identity
+    # whose access is deliberately inactive.
+    await require_non_inactive_demo_identity(user)
     if user.get("id"):
         return {
             "isTeamLeader": False,
@@ -2637,14 +3063,28 @@ async def dev_login(request: Request) -> dict[str, Any]:
     app_base_url = os.getenv("APP_BASE_URL", "http://127.0.0.1:8000").strip()
     app_host = (urlparse(app_base_url).hostname or "").lower()
     request_host_name = (request.url.hostname or "").lower()
-    if urlparse(app_base_url).scheme.lower() == "https" or app_host not in LOOPBACK_HOSTS or request_host_name not in LOOPBACK_HOSTS | {"testserver"}:
+    if (
+        urlparse(app_base_url).scheme.lower() == "https"
+        or app_host not in LOOPBACK_HOSTS
+        or request_host_name not in LOOPBACK_HOSTS | {"testserver"}
+        or not is_loopback_request_peer(request)
+    ):
         raise HTTPException(status_code=403, detail="开发登录仅允许在本机开发环境使用")
     await enforce_csrf(request)
     payload = await request.json()
     email = str(payload.get("email", "")).strip()
     if "@" not in email:
         raise HTTPException(status_code=400, detail="请输入有效的企业邮箱")
-    email = validate_company_email(email)
+    # The controlled Mock includes customer domains that intentionally differ
+    # from the seller's normal SSO allow-list.  It is only usable from a local
+    # loopback dev-login request and only for a seeded/created demo member.
+    normalized_email = email.lower()
+    try:
+        email = validate_company_email(email)
+    except HTTPException:
+        if not (organization_demo_enabled() and await known_demo_member_email(normalized_email)):
+            raise
+        email = normalized_email
     user = normalize_user(email)
     token = get_server_session_token(request)
     if token:
@@ -2755,7 +3195,7 @@ async def logout(request: Request) -> dict[str, bool]:
 
 @app.get("/api/organization/current")
 async def organization_current(request: Request) -> dict[str, Any]:
-    user = await organization_user(request)
+    user = await require_organization_directory_viewer(request)
     return await organization_current_payload(user)
 
 
@@ -2770,11 +3210,12 @@ async def organization_members(
     page: int = Query(1, ge=1, le=100000),
     pageSize: int = Query(50, ge=1, le=100),
 ) -> dict[str, Any]:
-    await organization_user(request)
+    user = await require_organization_directory_viewer(request)
     # ``pending`` is the UI wording for a member whose invitation is waiting.
     normalized_status = "invited" if status == "pending" else status
     try:
-        return await organization_store_call(
+        return await organization_scoped_store_call(
+            organization_identifier(organization_current_member(user)),
             "list_members",
             keyword=search or keyword,
             department_id=departmentId,
@@ -2785,6 +3226,70 @@ async def organization_members(
         )
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
+
+
+@app.get("/api/organization/current/usage")
+async def organization_current_usage(
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    source: str = Query("all"),
+    employee: str | None = Query(None, max_length=320),
+) -> dict[str, Any]:
+    """Return Mock full-member usage for the authenticated customer only."""
+
+    user = await require_organization_usage_viewer(request)
+    if not start_date or not end_date:
+        start_date, end_date = default_date_range()
+    organization_id = organization_identifier(organization_current_member(user))
+    payload = await mock_usage_payload(
+        "mock_organization_usage",
+        organization_id,
+        start_date=start_date,
+        end_date=end_date,
+        source=source,
+        employee=(employee or "").strip(),
+    )
+    return {
+        "organization": {"id": organization_id},
+        "startDate": start_date,
+        "endDate": end_date,
+        "source": source,
+        "employee": (employee or "").strip(),
+        **payload,
+    }
+
+
+@app.get("/api/organization/current/departments/usage")
+async def organization_current_department_usage(
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    source: str = Query("all"),
+    department: str | None = Query(None, max_length=128),
+) -> dict[str, Any]:
+    """Return Mock department usage scoped to the authenticated customer."""
+
+    user = await require_organization_usage_viewer(request)
+    if not start_date or not end_date:
+        start_date, end_date = default_date_range()
+    organization_id = organization_identifier(organization_current_member(user))
+    payload = await mock_usage_payload(
+        "mock_department_usage",
+        organization_id,
+        start_date=start_date,
+        end_date=end_date,
+        source=source,
+        department=(department or "").strip(),
+    )
+    return {
+        "organization": {"id": organization_id},
+        "startDate": start_date,
+        "endDate": end_date,
+        "source": source,
+        "department": (department or "").strip(),
+        **payload,
+    }
 
 
 @app.post("/api/organization/current/departments")
@@ -2882,6 +3387,281 @@ async def organization_reset_demo(
     return {"ok": True, **await organization_current_payload(user)}
 
 
+@app.get("/api/platform/organizations")
+async def platform_organizations(
+    request: Request,
+    search: str = Query("", max_length=120),
+    status: str = Query("", max_length=16),
+    page: int = Query(1, ge=1, le=100000),
+    pageSize: int = Query(20, ge=1, le=100),
+) -> dict[str, Any]:
+    """List seller-managed customer organizations, never customer memberships."""
+
+    if not organization_demo_enabled():
+        raise HTTPException(status_code=404, detail="客户企业演示功能尚未启用")
+    require_platform_admin(request)
+    try:
+        return await platform_organization_store_call(
+            "list_organizations",
+            keyword=search,
+            status=status,
+            page=page,
+            page_size=pageSize,
+            include_archived=True,
+        )
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+
+
+@app.post("/api/platform/organizations")
+async def platform_create_organization(
+    data: PlatformOrganizationCreateRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Create a Mock customer with its default department and first owner."""
+
+    if not organization_demo_enabled():
+        raise HTTPException(status_code=404, detail="客户企业演示功能尚未启用")
+    await enforce_csrf(request)
+    require_platform_admin(request)
+    try:
+        created = await platform_organization_store_call(
+            "create_organization_with_owner",
+            data.name,
+            data.ownerName,
+            data.ownerEmail,
+        )
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    return created
+
+
+@app.get("/api/platform/organizations/{organization_id}")
+async def platform_organization_detail(organization_id: str, request: Request) -> dict[str, Any]:
+    selected = await require_platform_organization(request, organization_id)
+    try:
+        return await organization_scoped_store_call(
+            str(selected["selectedOrganizationId"]), "organization_snapshot"
+        )
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+
+
+@app.patch("/api/platform/organizations/{organization_id}")
+async def platform_update_organization(
+    organization_id: str,
+    data: PlatformOrganizationRequest,
+    request: Request,
+) -> dict[str, Any]:
+    await enforce_csrf(request)
+    await require_platform_organization(request, organization_id)
+    try:
+        organization = await platform_organization_store_call(
+            "update_organization", organization_id, data.name
+        )
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    return {"organization": organization}
+
+
+@app.post("/api/platform/organizations/{organization_id}/archive")
+async def platform_archive_organization(
+    organization_id: str,
+    request: Request,
+    _data: OrganizationEmptyRequest | None = None,
+) -> dict[str, Any]:
+    await enforce_csrf(request)
+    await require_platform_organization(request, organization_id)
+    try:
+        organization = await platform_organization_store_call("archive_organization", organization_id)
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    return {"organization": organization}
+
+
+@app.get("/api/platform/organizations/{organization_id}/members")
+async def platform_organization_members(
+    organization_id: str,
+    request: Request,
+    search: str = Query("", max_length=120),
+    keyword: str = Query("", max_length=120),
+    departmentId: str = Query("", max_length=128),
+    role: str = Query("", max_length=16),
+    status: str = Query("", max_length=16),
+    page: int = Query(1, ge=1, le=100000),
+    pageSize: int = Query(50, ge=1, le=100),
+) -> dict[str, Any]:
+    await require_platform_organization(request, organization_id)
+    try:
+        return await organization_scoped_store_call(
+            organization_id,
+            "list_members",
+            keyword=search or keyword,
+            department_id=departmentId,
+            role=role,
+            status="invited" if status == "pending" else status,
+            page=page,
+            page_size=pageSize,
+        )
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+
+
+@app.post("/api/platform/organizations/{organization_id}/departments")
+async def platform_create_department(
+    organization_id: str, data: OrganizationDepartmentRequest, request: Request
+) -> dict[str, Any]:
+    await enforce_csrf(request)
+    await require_platform_organization(request, organization_id)
+    try:
+        department = await organization_scoped_store_call(organization_id, "create_department", data.name)
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    return {"department": department}
+
+
+@app.patch("/api/platform/organizations/{organization_id}/departments/{department_id}")
+async def platform_update_department(
+    organization_id: str,
+    department_id: str,
+    data: OrganizationDepartmentRequest,
+    request: Request,
+) -> dict[str, Any]:
+    await enforce_csrf(request)
+    await require_platform_organization(request, organization_id)
+    try:
+        department = await organization_scoped_store_call(
+            organization_id, "update_department", department_id, data.name
+        )
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    return {"department": department}
+
+
+@app.post("/api/platform/organizations/{organization_id}/departments/{department_id}/archive")
+async def platform_archive_department(
+    organization_id: str,
+    department_id: str,
+    request: Request,
+    _data: OrganizationEmptyRequest | None = None,
+) -> dict[str, Any]:
+    await enforce_csrf(request)
+    await require_platform_organization(request, organization_id)
+    try:
+        department = await organization_scoped_store_call(
+            organization_id, "archive_department", department_id
+        )
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    return {"department": department}
+
+
+@app.post("/api/platform/organizations/{organization_id}/members")
+async def platform_create_member(
+    organization_id: str, data: OrganizationMemberCreateRequest, request: Request
+) -> dict[str, Any]:
+    await enforce_csrf(request)
+    await require_platform_organization(request, organization_id)
+    try:
+        member = await organization_scoped_store_call(
+            organization_id, "create_member", data.name, data.email, data.departmentId, data.role
+        )
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    return {"member": member}
+
+
+@app.patch("/api/platform/organizations/{organization_id}/members/{member_id}")
+async def platform_update_member(
+    organization_id: str,
+    member_id: str,
+    data: OrganizationMemberUpdateRequest,
+    request: Request,
+) -> dict[str, Any]:
+    await enforce_csrf(request)
+    await require_platform_organization(request, organization_id)
+    fields = data.model_fields_set
+    if not fields:
+        raise auth_http_error(400, "请至少填写一项需要更新的成员信息", "ORGANIZATION_INVALID_INPUT")
+    updates: dict[str, Any] = {}
+    if "name" in fields:
+        updates["name"] = data.name
+    if "departmentId" in fields:
+        updates["department_id"] = data.departmentId
+    if "role" in fields:
+        updates["role"] = data.role
+    if "status" in fields:
+        updates["status"] = "invited" if data.status == "pending" else data.status
+    try:
+        member = await organization_scoped_store_call(
+            organization_id, "update_member", member_id, **updates
+        )
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    return {"member": member}
+
+
+@app.get("/api/platform/organizations/{organization_id}/usage")
+async def platform_organization_usage(
+    organization_id: str,
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    source: str = Query("all"),
+    employee: str | None = Query(None, max_length=320),
+) -> dict[str, Any]:
+    await require_platform_organization(request, organization_id)
+    if not start_date or not end_date:
+        start_date, end_date = default_date_range()
+    payload = await mock_usage_payload(
+        "mock_organization_usage",
+        organization_id,
+        start_date=start_date,
+        end_date=end_date,
+        source=source,
+        employee=(employee or "").strip(),
+    )
+    return {"startDate": start_date, "endDate": end_date, "source": source, "employee": (employee or "").strip(), **payload}
+
+
+@app.get("/api/platform/organizations/{organization_id}/departments/usage")
+async def platform_organization_department_usage(
+    organization_id: str,
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    source: str = Query("all"),
+    department: str | None = Query(None, max_length=128),
+) -> dict[str, Any]:
+    await require_platform_organization(request, organization_id)
+    if not start_date or not end_date:
+        start_date, end_date = default_date_range()
+    payload = await mock_usage_payload(
+        "mock_department_usage",
+        organization_id,
+        start_date=start_date,
+        end_date=end_date,
+        source=source,
+        department=(department or "").strip(),
+    )
+    return {"startDate": start_date, "endDate": end_date, "source": source, "department": (department or "").strip(), **payload}
+
+
+@app.post("/api/platform/organizations/demo/reset")
+async def platform_reset_organization_demo(
+    request: Request, _data: OrganizationEmptyRequest | None = None
+) -> dict[str, Any]:
+    if not organization_demo_enabled():
+        raise HTTPException(status_code=404, detail="客户企业演示功能尚未启用")
+    await enforce_csrf(request)
+    require_platform_admin(request)
+    try:
+        await platform_organization_store_call("reset_all")
+        return {"ok": True, **await platform_organization_store_call("list_organizations")}
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+
+
 @app.get("/api/me/usage")
 async def my_usage(
     request: Request,
@@ -2891,6 +3671,26 @@ async def my_usage(
     refresh: bool = Query(False),
 ) -> dict[str, Any]:
     app_user = require_user(request)
+    if await is_demo_customer_user(app_user):
+        if not start_date or not end_date:
+            start_date, end_date = default_date_range()
+        memberships = await organization_memberships_for_user(app_user)
+        membership = next(
+            item
+            for item in memberships
+            if item.get("status") == "active" and item.get("organizationStatus", "active") == "active"
+        )
+        organization_id = organization_identifier(membership)
+        payload = await mock_usage_payload(
+            "mock_personal_usage",
+            organization_id,
+            start_date=start_date,
+            end_date=end_date,
+            source=source,
+            email=str(app_user.get("email") or ""),
+        )
+        return {"user": app_user, "startDate": start_date, "endDate": end_date, "source": source, **payload}
+    await require_non_inactive_demo_identity(app_user)
     if app_user.get("id"):
         local_user = await auth_store_call("get_user", str(app_user["id"]))
         if not local_user:
@@ -2913,6 +3713,28 @@ async def team_usage(
     include_member_rankings: bool = Query(True),
 ) -> dict[str, Any]:
     app_user = require_user(request)
+    if await is_demo_customer_user(app_user):
+        if not start_date or not end_date:
+            start_date, end_date = default_date_range()
+        memberships = await organization_memberships_for_user(app_user)
+        membership = next(
+            item
+            for item in memberships
+            if item.get("status") == "active" and item.get("organizationStatus", "active") == "active"
+        )
+        organization_id = organization_identifier(membership)
+        payload = await mock_usage_payload(
+            "mock_team_usage",
+            organization_id,
+            start_date=start_date,
+            end_date=end_date,
+            source=source,
+            email=str(app_user.get("email") or ""),
+            team_ref=(team_ref or "").strip(),
+            include_member_rankings=include_member_rankings,
+        )
+        return {"leader": {"email": app_user["email"], "name": app_user["name"]}, "startDate": start_date, "endDate": end_date, "source": source, "teamRef": payload.get("teamRef") or team_ref or "", **payload}
+    await require_non_inactive_demo_identity(app_user)
     if app_user.get("id"):
         # Password and enterprise SSO accounts remain separate identities.
         raise auth_http_error(403, "当前账号还没有团队负责人权限", "AUTH_TEAM_SCOPE_UNAVAILABLE")
@@ -2940,6 +3762,30 @@ async def team_member_usage(
     refresh: bool = Query(False),
 ) -> dict[str, Any]:
     app_user = require_user(request)
+    if await is_demo_customer_user(app_user):
+        if not start_date or not end_date:
+            start_date, end_date = default_date_range()
+        if not employee:
+            raise HTTPException(status_code=400, detail="请选择要查看的团队成员")
+        memberships = await organization_memberships_for_user(app_user)
+        membership = next(
+            item
+            for item in memberships
+            if item.get("status") == "active" and item.get("organizationStatus", "active") == "active"
+        )
+        organization_id = organization_identifier(membership)
+        payload = await mock_usage_payload(
+            "mock_team_member_usage",
+            organization_id,
+            start_date=start_date,
+            end_date=end_date,
+            source=source,
+            email=str(app_user.get("email") or ""),
+            team_ref=(team_ref or "").strip(),
+            employee=employee,
+        )
+        return {"leader": {"email": app_user["email"], "name": app_user["name"]}, "startDate": start_date, "endDate": end_date, "source": source, "teamRef": payload.get("teamRef") or team_ref or "", **payload}
+    await require_non_inactive_demo_identity(app_user)
     if app_user.get("id"):
         # Local accounts never inherit team scopes from a same-email SSO user.
         raise auth_http_error(403, "当前账号还没有团队负责人权限", "AUTH_TEAM_SCOPE_UNAVAILABLE")
@@ -2968,6 +3814,27 @@ async def my_usage_logs(
     page_size: int = Query(50, ge=1, le=100),
 ) -> dict[str, Any]:
     app_user = require_user(request)
+    if await is_demo_customer_user(app_user):
+        if not start_date or not end_date:
+            start_date, end_date = default_date_range()
+        memberships = await organization_memberships_for_user(app_user)
+        membership = next(
+            item
+            for item in memberships
+            if item.get("status") == "active" and item.get("organizationStatus", "active") == "active"
+        )
+        payload = await mock_usage_payload(
+            "mock_personal_usage",
+            organization_identifier(membership),
+            start_date=start_date,
+            end_date=end_date,
+            source=source,
+            email=str(app_user.get("email") or ""),
+        )
+        rows = list(payload.get("rows") or [])
+        start = (page - 1) * page_size
+        return {"user": app_user, "rows": rows[start : start + page_size], "total": len(rows), "page": page, "pageSize": page_size, "cache": {"hit": False, "ttlSeconds": 0}}
+    await require_non_inactive_demo_identity(app_user)
     if app_user.get("id"):
         local_user = await auth_store_call("get_user", str(app_user["id"]))
         if not local_user:
@@ -3314,6 +4181,9 @@ async def billing_identity(request: Request) -> tuple[dict[str, Any], str]:
     才能拿到权限，若在这里挡住，新用户永远无法自助开通。
     """
     app_user = require_user(request)
+    if await is_demo_customer_user(app_user):
+        raise auth_http_error(403, "企业演示账号不提供自助充值", "ORGANIZATION_BILLING_FORBIDDEN")
+    await require_non_inactive_demo_identity(app_user)
     local_user_id = str(app_user.get("id") or "")
     if not local_user_id:
         # 企业 SSO 员工走部门预算，不属于自助充值范围。
@@ -3731,6 +4601,9 @@ async def admin_retry_billing_sync(request: Request) -> dict[str, Any]:
 @app.get("/api/models")
 async def models(request: Request) -> dict[str, Any]:
     app_user = require_user(request)
+    if await is_demo_customer_user(app_user):
+        raise auth_http_error(403, "企业演示账号不提供模型目录查询", "ORGANIZATION_MODELS_FORBIDDEN")
+    await require_non_inactive_demo_identity(app_user)
     if app_user.get("id"):
         local_user = await auth_store_call("get_user", str(app_user["id"]))
         if not local_user:

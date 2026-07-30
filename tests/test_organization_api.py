@@ -1,6 +1,9 @@
+"""Mock V2 customer-organization API contracts and identity separation."""
+
 import base64
 import json
 import os
+from typing import Any
 
 from fastapi.testclient import TestClient
 from itsdangerous import TimestampSigner
@@ -10,164 +13,262 @@ from backend.auth import CSRF_SESSION_KEY, SESSION_USER_KEY
 from backend.organization_store import InMemoryOrganizationStore
 
 
-def signed_session(payload: dict) -> str:
+CSRF_TOKEN = "organization-v2-api-csrf"
+PLATFORM_EMAIL = "platform-admin@example.test"
+
+
+def signed_session(payload: dict[str, Any]) -> str:
     data = base64.b64encode(json.dumps(payload).encode("utf-8"))
     return TimestampSigner(os.getenv("SESSION_SECRET", "dev-session-secret-change-me")).sign(data).decode("utf-8")
 
 
-def organization_client(monkeypatch, *, email: str, is_platform_admin: bool = False) -> TestClient:
+def organization_client(monkeypatch, *, email: str, platform_admin: bool = False) -> TestClient:
     monkeypatch.setenv("ORGANIZATION_DEMO_ENABLED", "true")
-    monkeypatch.setenv("ADMIN_EMAILS", email if is_platform_admin else "platform-admin@example.test")
+    monkeypatch.setenv("ADMIN_EMAILS", PLATFORM_EMAIL)
     monkeypatch.setattr(main, "_organization_store", InMemoryOrganizationStore())
-    client = TestClient(main.app)
-    session = {
-        SESSION_USER_KEY: {
-            "email": email,
-            "name": "Test User",
-            "avatar": "T",
-            "department": "Engineering",
-            "isAdmin": is_platform_admin,
-        },
-        CSRF_SESSION_KEY: "organization-test-csrf",
-    }
-    client.cookies.set(main.SESSION_COOKIE_NAME, signed_session(session))
+    client = TestClient(main.app, raise_server_exceptions=False)
+    client.cookies.set(
+        main.SESSION_COOKIE_NAME,
+        signed_session(
+            {
+                SESSION_USER_KEY: {
+                    "email": email,
+                    "name": "Platform Test User" if platform_admin else "Customer Test User",
+                    "avatar": "T",
+                    "department": "Engineering",
+                    "isAdmin": platform_admin,
+                },
+                CSRF_SESSION_KEY: CSRF_TOKEN,
+            }
+        ),
+    )
     return client
 
 
 def write_headers() -> dict[str, str]:
-    return {"X-CSRF-Token": "organization-test-csrf"}
+    return {"X-CSRF-Token": CSRF_TOKEN}
+
+
+def error_code(response) -> str:
+    return response.json()["detail"]["code"]
 
 
 def test_organization_demo_routes_are_hidden_when_disabled(monkeypatch) -> None:
     monkeypatch.setenv("ORGANIZATION_DEMO_ENABLED", "false")
     client = TestClient(main.app)
 
-    response = client.get("/api/organization/current")
-
-    assert response.status_code == 404
-
-
-def test_platform_admin_gets_synthetic_owner_and_can_manage_demo(monkeypatch) -> None:
-    client = organization_client(monkeypatch, email="platform-admin@example.test", is_platform_admin=True)
-
-    me = client.get("/api/auth/me")
-    response = client.get("/api/organization/current")
-
-    assert me.status_code == 200
-    assert me.json()["organizationRole"] == "owner"
-    assert me.json()["canManageOrganization"] is True
-    assert me.json()["organizationDemoEnabled"] is True
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["organization"]["isDemo"] is True
-    assert payload["stats"]["departmentCount"] == 3
-    assert payload["stats"]["memberCount"] == 12
-    assert payload["currentMember"]["email"] == "platform-admin@example.test"
-    assert payload["currentMember"]["role"] == "owner"
+    assert client.get("/api/organization/current").status_code == 404
+    assert client.get("/api/platform/organizations").status_code == 404
 
 
-def test_seed_member_role_controls_read_and_write_access(monkeypatch) -> None:
-    client = organization_client(monkeypatch, email="avery.chen@demo.example")
-
-    me = client.get("/api/auth/me")
-    current = client.get("/api/organization/current")
-    members = client.get("/api/organization/current/members?search=Avery&page=1&pageSize=10")
-    write = client.post(
-        "/api/organization/current/departments",
-        json={"name": "Customer Success"},
-        headers=write_headers(),
+def test_platform_and_customer_roles_are_never_mixed(monkeypatch) -> None:
+    platform_client = organization_client(
+        monkeypatch, email=PLATFORM_EMAIL, platform_admin=True
     )
+    customer_client = organization_client(monkeypatch, email="admin@demo.example")
 
-    assert me.json()["organizationRole"] == "member"
-    assert me.json()["canManageOrganization"] is False
-    assert current.status_code == 200
-    assert current.json()["currentMember"]["id"] == "member-001"
-    assert members.status_code == 200
-    assert members.json()["total"] == 1
-    assert write.status_code == 403
-    assert write.json()["detail"]["code"] == "ORGANIZATION_MANAGE_FORBIDDEN"
+    platform_me = platform_client.get("/api/auth/me")
+    customer_me = customer_client.get("/api/auth/me")
+
+    assert platform_me.status_code == 200
+    assert platform_me.json()["isAdmin"] is True
+    assert platform_me.json()["isPlatformAdmin"] is True
+    assert platform_me.json()["organizationRole"] is None
+    assert platform_me.json()["organizationId"] is None
+    assert platform_me.json()["canViewOrganizationUsage"] is False
+    assert platform_me.json()["canManageOrganization"] is False
+    assert platform_me.json()["canManageCustomerOrganizations"] is True
+    assert platform_me.json()["isKnownDemoCustomerIdentity"] is False
+    assert platform_me.json()["organizationAccessStatus"] is None
+    assert customer_me.status_code == 200
+    assert customer_me.json()["isAdmin"] is False
+    assert customer_me.json()["isPlatformAdmin"] is False
+    assert customer_me.json()["organizationRole"] == "admin"
+    assert customer_me.json()["organizationId"] == "org-demo"
+    assert customer_me.json()["organizationName"] == "Demo Company"
+    assert customer_me.json()["organization"]["id"] == "org-demo"
+    assert customer_me.json()["organization"]["name"] == "Demo Company"
+    assert customer_me.json()["canViewOrganizationUsage"] is True
+    assert customer_me.json()["canManageOrganization"] is False
+    assert customer_me.json()["canManageCustomerOrganizations"] is False
+    assert customer_me.json()["isKnownDemoCustomerIdentity"] is True
+    assert customer_me.json()["organizationAccessStatus"] == "active"
 
 
-def test_organization_mutations_require_csrf_and_return_public_records(monkeypatch) -> None:
-    client = organization_client(monkeypatch, email="admin@demo.example")
-
-    missing_csrf = client.post("/api/organization/current/departments", json={"name": "Customer Success"})
-    created_department = client.post(
-        "/api/organization/current/departments",
-        json={"name": "Customer Success"},
-        headers=write_headers(),
+def test_platform_customer_directory_filters_paginates_and_is_platform_only(monkeypatch) -> None:
+    platform_client = organization_client(
+        monkeypatch, email=PLATFORM_EMAIL, platform_admin=True
     )
-    department = created_department.json()["department"]
-    created_member = client.post(
-        "/api/organization/current/members",
+    customer_client = organization_client(monkeypatch, email="admin@demo.example")
+
+    page = platform_client.get("/api/platform/organizations?search=北&page=1&pageSize=1")
+    denied = customer_client.get("/api/platform/organizations")
+
+    assert page.status_code == 200
+    payload = page.json()
+    assert payload["total"] == 1
+    assert payload["page"] == 1
+    assert payload["pageSize"] == 1
+    assert [item["id"] for item in payload["items"]] == ["org-aurora"]
+    assert denied.status_code == 403
+
+
+def test_platform_create_sets_default_department_and_active_owner(monkeypatch) -> None:
+    client = organization_client(monkeypatch, email=PLATFORM_EMAIL, platform_admin=True)
+
+    created = client.post(
+        "/api/platform/organizations",
         json={
-            "name": "New Administrator",
-            "email": "new.admin@demo.example",
-            "departmentId": department["id"],
-            "role": "admin",
+            "name": "新客户企业",
+            "ownerName": "Initial Owner",
+            "ownerEmail": "initial.owner@customer.example",
         },
+        headers=write_headers(),
+    )
+
+    assert created.status_code == 200
+    payload = created.json()
+    organization_id = payload["organization"]["id"]
+    assert payload["department"]["name"] == "企业管理"
+    assert payload["owner"]["role"] == "owner"
+    assert payload["owner"]["status"] == "active"
+    assert payload["stats"]["departmentCount"] == 1
+    assert payload["stats"]["activeMemberCount"] == 1
+
+
+def test_platform_create_rejects_client_organization_id_and_requires_csrf(monkeypatch) -> None:
+    client = organization_client(monkeypatch, email=PLATFORM_EMAIL, platform_admin=True)
+    body = {
+        "name": "Strict Customer",
+        "ownerName": "Strict Owner",
+        "ownerEmail": "strict.owner@customer.example",
+    }
+
+    missing_csrf = client.post("/api/platform/organizations", json=body)
+    extra_field = client.post(
+        "/api/platform/organizations",
+        json={**body, "organizationId": "org-other"},
         headers=write_headers(),
     )
 
     assert missing_csrf.status_code == 403
-    assert missing_csrf.json()["detail"]["code"] == "AUTH_CSRF_INVALID"
-    assert created_department.status_code == 200
-    assert department["name"] == "Customer Success"
-    assert created_member.status_code == 200
-    member = created_member.json()["member"]
-    assert member["status"] == "invited"
-    assert member["role"] == "admin"
-    assert member["departmentId"] == department["id"]
+    assert error_code(missing_csrf) == "AUTH_CSRF_INVALID"
+    assert extra_field.status_code == 422
 
 
-def test_organization_validates_duplicates_and_protects_last_owner(monkeypatch) -> None:
-    client = organization_client(monkeypatch, email="owner@demo.example")
+def test_platform_customer_usage_never_calls_upstream(monkeypatch) -> None:
+    client = organization_client(monkeypatch, email=PLATFORM_EMAIL, platform_admin=True)
 
-    duplicate = client.post(
-        "/api/organization/current/members",
+    def unexpected_client() -> Any:
+        raise AssertionError("Mock customer usage must not initialize the upstream client")
+
+    monkeypatch.setattr(main, "client", unexpected_client)
+    usage = client.get(
+        "/api/platform/organizations/org-aurora/usage?start_date=2026-01-01&end_date=2026-01-03"
+    )
+    departments = client.get(
+        "/api/platform/organizations/org-aurora/departments/usage?start_date=2026-01-01&end_date=2026-01-03"
+    )
+
+    assert usage.status_code == 200
+    assert departments.status_code == 200
+    assert usage.json()["organization"]["id"] == "org-aurora"
+    assert departments.json()["organization"]["id"] == "org-aurora"
+    assert {row["organizationId"] for row in usage.json()["rows"]} == {"org-aurora"}
+    assert {row["organizationId"] for row in departments.json()["rows"]} == {"org-aurora"}
+
+
+def test_customer_usage_scope_is_derived_from_the_session(monkeypatch) -> None:
+    client = organization_client(monkeypatch, email="admin@demo.example")
+
+    usage = client.get(
+        "/api/organization/current/usage?organizationId=org-aurora&start_date=2026-01-01&end_date=2026-01-03"
+    )
+    departments = client.get(
+        "/api/organization/current/departments/usage?organizationId=org-aurora&start_date=2026-01-01&end_date=2026-01-03"
+    )
+
+    assert usage.status_code == 200
+    assert departments.status_code == 200
+    assert usage.json()["organization"]["id"] == "org-demo"
+    assert departments.json()["organization"]["id"] == "org-demo"
+    assert {row["organizationId"] for row in usage.json()["rows"]} == {"org-demo"}
+    assert {row["organizationId"] for row in departments.json()["rows"]} == {"org-demo"}
+
+
+def test_customer_member_cannot_access_company_boards_or_platform_directory(monkeypatch) -> None:
+    client = organization_client(monkeypatch, email="avery.chen@demo.example")
+
+    current = client.get("/api/organization/current")
+    usage = client.get("/api/organization/current/usage")
+    departments = client.get("/api/organization/current/departments/usage")
+    customers = client.get("/api/platform/organizations")
+
+    assert current.status_code == 403
+    assert error_code(current) == "ORGANIZATION_DIRECTORY_FORBIDDEN"
+    assert usage.status_code == 403
+    assert error_code(usage) == "ORGANIZATION_USAGE_FORBIDDEN"
+    assert departments.status_code == 403
+    assert error_code(departments) == "ORGANIZATION_USAGE_FORBIDDEN"
+    assert customers.status_code == 403
+
+
+def test_customer_master_data_writes_are_platform_only(monkeypatch) -> None:
+    customer_client = organization_client(monkeypatch, email="owner@demo.example")
+    platform_client = organization_client(
+        monkeypatch, email=PLATFORM_EMAIL, platform_admin=True
+    )
+
+    customer_write = customer_client.post(
+        "/api/organization/current/departments",
+        json={"name": "Blocked Customer Department"},
+        headers=write_headers(),
+    )
+    platform_write = platform_client.post(
+        "/api/platform/organizations/org-demo/departments",
+        json={"name": "Seller Managed Department"},
+        headers=write_headers(),
+    )
+
+    assert customer_write.status_code == 403
+    assert error_code(customer_write) == "ORGANIZATION_MANAGE_FORBIDDEN"
+    assert platform_write.status_code == 200
+    assert platform_write.json()["department"]["name"] == "Seller Managed Department"
+
+
+def test_platform_cross_customer_member_id_is_not_found(monkeypatch) -> None:
+    client = organization_client(monkeypatch, email=PLATFORM_EMAIL, platform_admin=True)
+
+    response = client.patch(
+        "/api/platform/organizations/org-aurora/members/member-001",
+        json={"status": "suspended"},
+        headers=write_headers(),
+    )
+
+    assert response.status_code == 404
+    assert error_code(response) == "ORGANIZATION_NOT_FOUND"
+
+
+def test_platform_reset_restores_all_seed_customers(monkeypatch) -> None:
+    client = organization_client(monkeypatch, email=PLATFORM_EMAIL, platform_admin=True)
+    created = client.post(
+        "/api/platform/organizations",
         json={
-            "name": "Duplicate Owner",
-            "email": "OWNER@demo.example",
-            "departmentId": "dept-engineering",
-            "role": "member",
+            "name": "Temporary Customer",
+            "ownerName": "Temporary Owner",
+            "ownerEmail": "temporary.owner@customer.example",
         },
         headers=write_headers(),
     )
-    remove_last_owner = client.patch(
-        "/api/organization/current/members/member-owner",
-        json={"role": "member"},
-        headers=write_headers(),
-    )
-    archive_live_department = client.post(
-        "/api/organization/current/departments/dept-engineering/archive",
-        json={},
-        headers=write_headers(),
-    )
+    reset = client.post("/api/platform/organizations/demo/reset", json={}, headers=write_headers())
 
-    assert duplicate.status_code == 409
-    assert duplicate.json()["detail"]["code"] == "ORGANIZATION_MEMBER_EXISTS"
-    assert remove_last_owner.status_code == 409
-    assert remove_last_owner.json()["detail"]["code"] == "ORGANIZATION_CONFLICT"
-    assert archive_live_department.status_code == 409
-    assert archive_live_department.json()["detail"]["code"] == "ORGANIZATION_CONFLICT"
-
-
-def test_demo_reset_restores_seed_data_and_member_filters(monkeypatch) -> None:
-    client = organization_client(monkeypatch, email="owner@demo.example")
-
-    added = client.post(
-        "/api/organization/current/departments",
-        json={"name": "Temporary Department"},
-        headers=write_headers(),
-    )
-    listed = client.get("/api/organization/current/members?status=pending&role=admin&page=1&pageSize=10")
-    reset = client.post("/api/organization/current/demo/reset", json={}, headers=write_headers())
-    current = client.get("/api/organization/current")
-
-    assert added.status_code == 200
-    assert listed.status_code == 200
-    assert all(member["status"] == "invited" for member in listed.json()["items"])
-    assert all(member["role"] == "admin" for member in listed.json()["items"])
+    assert created.status_code == 200
     assert reset.status_code == 200
-    assert reset.json()["stats"]["departmentCount"] == 3
-    assert current.json()["stats"]["departmentCount"] == 3
+    payload = reset.json()
+    assert payload["ok"] is True
+    assert payload["total"] == 3
+    assert {item["id"] for item in payload["items"]} == {
+        "org-demo",
+        "org-aurora",
+        "org-harbor",
+    }

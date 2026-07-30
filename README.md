@@ -27,7 +27,7 @@ https://myai.carher.net
 - 多数据源聚合：主数据源用于通衢 API，可选 Her 数据源用于补充 Her 聊天机器人相关用量。
 - 缓存加速：员工映射、个人用量、团队权限、团队用量、管理员用量、部门用量、密钥列表和模型列表均使用轻量 TTL 缓存。
 - 充值中心：支持兑换码、在线支付和个人微信/支付宝收款码转账；收款码转账必须由管理员核对到账后才发放额度。
-- 企业组织（演示）：可在独立控制台维护部门和成员，默认关闭，仅展示进程内 Mock 数据。
+- 客户企业（演示）：卖方平台管理员可在独立客户企业中心维护甲方企业、部门和成员；甲方成员只会看到自身企业范围内的 Mock 用量。默认关闭。
 
 LiteLLM 是本系统的内部后端集成。员工前端文案应使用通衢 API、模型、来源、Token、Codex、Claude Code、Her、访问权限等产品术语，不暴露上游网关、管理员密钥或供应商实现细节。
 
@@ -82,6 +82,35 @@ http://127.0.0.1:8000
 ```powershell
 Invoke-RestMethod -Uri 'http://127.0.0.1:8000/api/health'
 ```
+
+## 客户企业 Mock V2 演示
+
+客户企业中心是卖方平台管理员使用的受控本地演示，不会访问真实上游、发送邮件或创建真实账号。它默认关闭；不要为了演示修改共享的 `.env`。如果本机 `8000` 正在运行其他服务，可在独立的 `8001` 进程中启动：
+
+```powershell
+cd D:\ai_token_dashboard
+$env:APP_BASE_URL = 'http://127.0.0.1:8001'
+$env:ORGANIZATION_DEMO_ENABLED = 'true'
+$env:DEV_LOGIN_ENABLED = 'true'
+.\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8001
+```
+
+也可使用同一条 PowerShell 命令启动，三个变量只作用于当前进程：
+
+```powershell
+$env:APP_BASE_URL='http://127.0.0.1:8001'; $env:ORGANIZATION_DEMO_ENABLED='true'; $env:DEV_LOGIN_ENABLED='true'; .\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8001
+```
+
+打开 `http://127.0.0.1:8001`，用 `ADMIN_EMAILS` 中的卖方平台管理员邮箱进行“开发环境邮箱登录”。`APP_BASE_URL` 必须与浏览器实际访问的协议、主机和端口完全一致；例如访问 `8001` 时必须是 `http://127.0.0.1:8001`，否则请求来源校验会拒绝登录。上面的启动方式不会停止、重启或请求 `8000` 上的服务。
+
+演示种子含三家独立客户：`Demo Company`（3 个部门、12 名成员）、北辰智造有限公司和远海零售集团。开启演示后，下列已知 Mock 邮箱可以在回环地址使用开发登录，即使其域名不在正常企业邮箱白名单中：
+
+- `owner@demo.example`：Demo Company 企业主，也是团队负责人。
+- `admin@demo.example`：Demo Company 企业管理员，也是团队负责人。
+- `avery.chen@demo.example`：Demo Company 普通成员，仅个人用量。
+- `ning.shen@aurora.example`：北辰智造有限公司企业主和团队负责人。
+
+卖方平台管理员保留全局全员/部门看板，并额外看到“客户企业”；进入具体客户后才能维护该客户的部门和成员并查看该客户的 Mock 看板。甲方企业主和管理员只能看到自己的企业范围看板，团队负责人只看自己负责团队，普通成员不显示客户企业或企业范围看板。浏览器刷新会保留本次内存操作；服务重启或平台管理员点击“重置演示数据”后会恢复固定种子。生产环境必须保持 `ORGANIZATION_DEMO_ENABLED=false` 和 `DEV_LOGIN_ENABLED=false`。
 
 ## Docker 启动
 
@@ -207,16 +236,16 @@ USAGE_TIMEZONE_OFFSET_MINUTES=-480
 
 - `LITELLM_ADMIN_KEY` 和 `HER_LITELLM_ADMIN_KEY` 只允许后端读取，前端永远不能保存或展示。
 - `HER_LITELLM_BASE_URL` 和 `HER_LITELLM_ADMIN_KEY` 同时存在时启用 Her 数据源；留空则不加载 Her。
-- `APP_BASE_URL` 本地开发可改为 `http://127.0.0.1:8000`，生产环境使用正式域名。
+- `APP_BASE_URL` 必须与浏览器实际访问的协议、主机和端口完全一致；本地 `8000` 可设为 `http://127.0.0.1:8000`，独立 `8001` 演示则必须设为 `http://127.0.0.1:8001`，生产环境使用正式域名。
 - `SESSION_SECRET` 必须使用随机长字符串，生产环境不要使用示例值。
 - `AUTH_ENABLED`、`PASSWORD_LOGIN_ENABLED`、`PUBLIC_SIGNUP_ENABLED` 在模板中均默认关闭；三个开关应按后文的生产启用顺序逐步打开。
-- `ORGANIZATION_DEMO_ENABLED=false` 默认不展示“企业组织”页。设为 `true` 时，页面只使用进程内确定性演示数据：不会创建真实账号、不会发送邀请邮件、不会调用上游服务；浏览器刷新会保留本次演示操作，服务重启或点击“重置演示数据”后恢复初始样例。生产环境应保持关闭，除非在受控演示中临时开启。
+- `ORGANIZATION_DEMO_ENABLED=false` 默认不展示“客户企业”页。设为 `true` 时，页面只使用进程内确定性 Mock 客户数据：不会创建真实账号、不会发送邀请邮件、不会调用上游服务；浏览器刷新会保留本次演示操作，服务重启或平台管理员点击“重置演示数据”后恢复三家客户的初始样例。生产环境应保持关闭，除非在受控演示中临时开启。
 - `AUTH_ALLOWED_EMAIL_DOMAINS` 是逗号分隔的精确邮箱域名白名单；ToC 首期固定为 `auto-link.com.cn,gmail.com,qq.com,163.com`，不匹配子域名或后缀相似域名。留空代表不限制域名，生产公开注册不得留空。
 - `AUTH_DATABASE_PATH` 当前指向本地 SQLite 文件。容器部署必须将其放在持久化卷中；当前实现按单应用实例设计，不要让多个副本同时写同一个 SQLite 文件。
 - `AUTH_DEFAULT_UPSTREAM_ROLE=internal_user_viewer` 将新注册账号限制为只读角色；代码同时使用 `no-default-models` 禁止默认模型访问且不会自动创建访问密钥。不要将该变量设置为管理员角色。
 - `SMTP_PASSWORD`、`TURNSTILE_SECRET_KEY` 与 `SESSION_SECRET` 属于部署 Secret，不得写入前端、日志或仓库。
 - `AUTH_TRUSTED_PROXY_IPS` 只填写与应用直接连接的反向代理 IP 或 CIDR。为空时忽略 `X-Forwarded-For`；不得使用 `0.0.0.0/0` 或 `::/0` 这样的全网信任范围。
-- `ADMIN_EMAILS` 是管理员白名单，普通员工不会看到全员或部门看板入口。
+- `ADMIN_EMAILS` 是卖方平台管理员白名单，保留平台全局全员/部门看板并可看到“客户企业”。它不是甲方企业管理员角色；甲方企业主/管理员由客户成员关系单独推导，不能访问平台 `/api/admin/*`。
 - `USAGE_TIMEZONE_OFFSET_MINUTES=-480` 表示按北京时间统计日期窗口；如果部署环境改用其他业务时区，需要同步调整。
 - `ADMIN_USAGE_PAGE_SIZE` 必须小于等于 100；想扩大日志覆盖范围时增加 `ADMIN_USAGE_LOG_MAX_PAGES`，不要增大单页大小。
 - `USAGE_SYNC_ENABLED=true` 时启用独立 PostgreSQL 聚合快照；数据库只保存按日期、账号、来源和模型聚合的 Token、请求、成功/失败及金额，不保存 API Key、提示词、响应正文或请求明细。

@@ -11,13 +11,15 @@ APP_JS = Path(__file__).parents[1] / "assets" / "app.js"
 INDEX_HTML = Path(__file__).parents[1] / "index.html"
 
 
-def test_organization_view_is_hidden_until_the_server_grants_demo_access() -> None:
+def test_customer_directory_is_the_only_organization_sidebar_entry() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
     source = APP_JS.read_text(encoding="utf-8")
 
-    assert 'id="organizationTab" class="view-tab hidden"' in markup
+    assert 'id="customersTab" class="view-tab hidden"' in markup
+    assert 'id="organizationTab"' not in markup
     assert 'id="organizationView" class="view-section organization-view hidden"' in markup
-    assert 'organizationDemoEnabled' in source
+    assert 'const isCustomerDetailView = isViewingCustomerOrganization()' in source
+    assert 'button.dataset.view === "customers"' in source
     assert 'function organizationCanView()' in source
     assert 'function organizationCanManage()' in source
 
@@ -51,6 +53,49 @@ def test_organization_ui_has_demo_copy_filters_and_keyboard_close() -> None:
     assert 'event.key !== "Escape"' in source
     assert 'closeOrganizationMemberModal()' in source
     assert 'closeOrganizationDepartmentModal()' in source
+
+
+def test_customer_usage_detail_has_working_return_controls_and_mock_safe_bootstrap() -> None:
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    for required in (
+        'id="customerUsageBreadcrumb"',
+        'id="customerDepartmentBreadcrumb"',
+        'id="backToCustomerOrganizationButton"',
+        'id="backToCustomerOrganizationDepartmentButton"',
+    ):
+        assert required in markup
+    assert "function renderCustomerUsageBreadcrumbs" in source
+    assert 'renderCustomerUsageBreadcrumbs(view);' in source
+    assert 'el("backToCustomerOrganizationButton").addEventListener("click", () => showOrganizationUsage("info"));' in source
+    assert 'el("backToCustomerOrganizationDepartmentButton").addEventListener("click", () => showOrganizationUsage("info"));' in source
+    assert "const isDemoCustomer = isMockCustomerIdentity();" in source
+    assert "if (isDemoCustomer) {" in source
+
+
+def test_customer_usage_detail_hides_platform_billing_management() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    # A seller admin viewing a customer's usage must not load or render the
+    # platform-wide redemption and billing management panel in that scope.
+    assert "function adminBillingVisible()" in source
+    assert "currentUser?.isAdmin && billingAvailable && !isViewingCustomerOrganization()" in source
+
+
+def test_inactive_mock_customer_identity_has_a_clear_limited_access_state() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert 'user?.isKnownDemoCustomerIdentity' in source
+    assert 'organizationAccessStatus === "invited"' in source
+    assert 'organizationAccessStatus === "suspended"' in source
+    assert '"所属客户企业暂不可用"' in source
+
+
+def test_archived_customer_controls_are_read_only_in_the_directory() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert 'data-customer-organization-edit="${escapeHtml(id)}" ${isArchived ? "disabled" : ""}' in source
 
 
 def test_organization_copy_does_not_expose_backend_provider_terms() -> None:

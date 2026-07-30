@@ -1,0 +1,179 @@
+"""Store-level isolation rules for the Mock V2 customer enterprise center."""
+
+import pytest
+
+from backend.organization_store import (
+    DuplicateMemberEmailError,
+    InMemoryOrganizationStore,
+    OrganizationConflictError,
+    OrganizationNotFoundError,
+)
+
+
+def test_v2_seed_has_three_independent_customer_organizations() -> None:
+    store = InMemoryOrganizationStore()
+
+    organizations = store.list_organizations(page_size=50)
+
+    assert organizations["total"] == 3
+    assert {item["id"] for item in organizations["items"]} == {
+        "org-demo",
+        "org-aurora",
+        "org-harbor",
+    }
+    demo = store.get_organization_snapshot("org-demo")
+    aurora = store.get_organization_snapshot("org-aurora")
+    harbor = store.get_organization_snapshot("org-harbor")
+    assert demo["stats"]["departmentCount"] == 3
+    assert demo["stats"]["memberCount"] == 12
+    for snapshot in (demo, aurora, harbor):
+        members = store.list_members(organization_id=snapshot["organization"]["id"], page_size=50)["items"]
+        assert {item["role"] for item in members} == {"owner", "admin", "member"}
+        assert {item["status"] for item in members} == {"active", "invited", "suspended"}
+
+
+def test_member_lookup_preserves_customer_scope_and_global_email_uniqueness() -> None:
+    store = InMemoryOrganizationStore()
+
+    resolved = store.resolve_member_by_email("NING.SHEN@AURORA.EXAMPLE")
+
+    assert resolved is not None
+    assert resolved["organizationId"] == "org-aurora"
+    assert resolved["organization"]["name"] == "北辰智造有限公司"
+    assert resolved["member"]["role"] == "owner"
+    with pytest.raises(DuplicateMemberEmailError):
+        store.create_member(
+            "Conflicting Demo Email",
+            "avery.chen@demo.example",
+            "dept-aurora-research",
+            organization_id="org-aurora",
+        )
+
+
+def test_department_and_member_ids_cannot_cross_customer_boundaries() -> None:
+    store = InMemoryOrganizationStore()
+
+    assert store.get_department("dept-engineering", organization_id="org-aurora") is None
+    assert store.get_member("member-001", organization_id="org-aurora") is None
+    with pytest.raises(OrganizationNotFoundError):
+        store.update_member(
+            "member-001",
+            status="suspended",
+            organization_id="org-aurora",
+        )
+    with pytest.raises(OrganizationNotFoundError):
+        store.create_member(
+            "Wrong Department",
+            "wrong.department@aurora.example",
+            "dept-engineering",
+            organization_id="org-aurora",
+        )
+
+
+def test_mock_usage_rows_are_organization_scoped_and_created_member_has_no_history() -> None:
+    store = InMemoryOrganizationStore()
+    start_date = "2026-01-01"
+    end_date = "2026-01-03"
+
+    demo_usage = store.mock_organization_usage("org-demo", start_date, end_date)
+    aurora_usage = store.mock_organization_usage("org-aurora", start_date, end_date)
+    added = store.create_member(
+        "No History Yet",
+        "no.history@aurora.example",
+        "dept-aurora-research",
+        organization_id="org-aurora",
+    )
+    refreshed_usage = store.mock_organization_usage("org-aurora", start_date, end_date)
+
+    assert {row["organizationId"] for row in demo_usage["rows"]} == {"org-demo"}
+    assert {row["organizationId"] for row in aurora_usage["rows"]} == {"org-aurora"}
+    assert all(item["employeeId"] != added["id"] for item in refreshed_usage["employees"])
+
+
+def test_created_owner_and_invited_member_keep_empty_mock_usage_after_activation() -> None:
+    store = InMemoryOrganizationStore()
+    created = store.create_organization_with_owner(
+        "No History Customer",
+        "Fresh Owner",
+        "fresh.owner@customer.example",
+        organization_id="org-no-history",
+    )
+    organization_id = created["organization"]["id"]
+    owner_id = created["owner"]["id"]
+    invited = store.create_member(
+        "Fresh Invitee",
+        "fresh.invitee@customer.example",
+        created["department"]["id"],
+        organization_id=organization_id,
+    )
+    store.update_member(invited["id"], status="active", organization_id=organization_id)
+
+    usage = store.mock_organization_usage(organization_id, "2026-01-01", "2026-01-03")
+
+    assert usage["rows"] == []
+    assert usage["employees"] == []
+    assert owner_id != invited["id"]
+
+
+def test_archive_preserves_platform_history_but_prevents_customer_mutation() -> None:
+    store = InMemoryOrganizationStore()
+
+    archived = store.archive_organization("org-harbor")
+    historical = store.get_organization_snapshot("org-harbor")
+    historical_usage = store.mock_organization_usage(
+        "org-harbor", "2026-01-01", "2026-01-03"
+    )
+
+    assert archived["status"] == "archived"
+    assert historical["stats"]["memberCount"] == 8
+    assert historical_usage["rows"]
+    with pytest.raises(OrganizationConflictError):
+        store.create_department("Blocked After Archive", organization_id="org-harbor")
+    with pytest.raises(OrganizationConflictError):
+        store.update_member(
+            "member-harbor-001",
+            status="suspended",
+            organization_id="org-harbor",
+        )
+
+
+def test_last_active_management_protection_is_per_customer() -> None:
+    store = InMemoryOrganizationStore()
+
+    with pytest.raises(OrganizationConflictError, match="active owner"):
+        store.update_member(
+            "member-aurora-owner",
+            status="suspended",
+            organization_id="org-aurora",
+        )
+    second_demo_owner = store.create_member(
+        "Second Demo Owner",
+        "second.demo.owner@example.test",
+        "dept-product",
+        role="owner",
+        organization_id="org-demo",
+    )
+    store.update_member(
+        second_demo_owner["id"],
+        status="active",
+        organization_id="org-demo",
+    )
+    updated_demo_owner = store.update_member(
+        "member-owner",
+        status="suspended",
+        organization_id="org-demo",
+    )
+
+    assert updated_demo_owner["status"] == "suspended"
+    assert store.get_member("member-aurora-owner", organization_id="org-aurora")["status"] == "active"
+
+
+def test_reset_all_restores_all_customer_seeds_after_a_platform_change() -> None:
+    store = InMemoryOrganizationStore()
+    created = store.create_organization("Transient Customer")
+
+    assert store.list_organizations(page_size=50)["total"] == 4
+    store.reset_all()
+
+    assert store.get_organization(created["id"]) is None
+    assert store.list_organizations(page_size=50)["total"] == 3

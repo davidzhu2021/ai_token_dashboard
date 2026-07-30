@@ -149,6 +149,18 @@ def is_admin_email(email: str) -> bool:
     return email.strip().lower() in admin_emails()
 
 
+def is_platform_admin_email(email: str) -> bool:
+    """Return whether an enterprise identity is a seller-side platform admin.
+
+    ``ADMIN_EMAILS`` predates the customer-organization console and remains its
+    configuration source.  Keeping the naming distinction here prevents
+    callers from accidentally treating a customer organization administrator
+    as a platform operator.
+    """
+
+    return is_admin_email(email)
+
+
 def initials(email: str, name: str | None = None) -> str:
     source = (name or email or "员工").strip()
     return source[:1].upper()
@@ -167,12 +179,17 @@ def display_name(email: str, name: str | None = None) -> str:
 def normalize_user(email: str, name: str | None = None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
     normalized_email = email.strip().lower()
     normalized_name = display_name(normalized_email, name)
+    is_platform_admin = is_platform_admin_email(normalized_email)
     return {
         "email": normalized_email,
         "name": normalized_name,
         "avatar": initials(normalized_email, normalized_name),
         "department": (extra or {}).get("department", "研发中心"),
-        "isAdmin": is_admin_email(normalized_email),
+        # ``isAdmin`` is retained for the legacy seller-side /api/admin/*
+        # operations.  Customer organization roles are added by backend.main
+        # and must never be inferred from this field.
+        "isAdmin": is_platform_admin,
+        "isPlatformAdmin": is_platform_admin,
     }
 
 
@@ -206,7 +223,9 @@ def require_user(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=401, detail="请先登录后再查看个人数据")
     # A password account with the same email as an enterprise account is a
     # separate identity. It must not inherit enterprise administrator access.
-    user["isAdmin"] = False if user.get("authType") == "password" else is_admin_email(str(user.get("email", "")))
+    is_platform_admin = False if user.get("authType") == "password" else is_platform_admin_email(str(user.get("email", "")))
+    user["isAdmin"] = is_platform_admin
+    user["isPlatformAdmin"] = is_platform_admin
     return user
 
 
@@ -214,6 +233,19 @@ def require_admin(request: Request) -> dict[str, Any]:
     user = require_user(request)
     if not user.get("isAdmin"):
         raise HTTPException(status_code=403, detail="当前账号没有管理员看板权限")
+    return user
+
+
+def require_platform_admin(request: Request) -> dict[str, Any]:
+    """Require the seller-side administrator role.
+
+    This is intentionally separate from customer organization ``owner`` and
+    ``admin`` roles, which are resolved by the organization store.
+    """
+
+    user = require_user(request)
+    if not user.get("isPlatformAdmin"):
+        raise HTTPException(status_code=403, detail="当前账号没有平台客户管理权限")
     return user
 
 

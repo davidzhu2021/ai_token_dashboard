@@ -27,6 +27,9 @@ let adminUsageData = [];
 let adminSummaryData = [];
 let adminEmployees = [];
 let selectedAdminEmployee = "";
+let adminUsageScopeKey = "";
+let adminUsageLoadingScopeKey = "";
+let adminUsageRequestId = 0;
 let departmentUsageData = [];
 let departmentSummaryData = [];
 let departmentRankings = [];
@@ -53,6 +56,9 @@ let selectedTeamRef = "";
 let selectedDepartment = "";
 let departmentPickerOpen = false;
 let departmentPickerOptions = [];
+let departmentUsageScopeKey = "";
+let departmentUsageLoadingScopeKey = "";
+let departmentUsageRequestId = 0;
 let modelCatalog = [];
 let modelViewMode = "card";
 let personalKeys = [];
@@ -85,11 +91,26 @@ const organizationMemberPageSize = 20;
 let organizationMemberFilters = { search: "", departmentId: "", role: "", status: "" };
 let isOrganizationLoading = false;
 let isOrganizationMemberLoading = false;
+let organizationDataLoadingScopeKey = "";
+let organizationMemberLoadingScopeKey = "";
+let organizationDataRequestId = 0;
+let organizationMemberRequestId = 0;
 let isOrganizationDepartmentSaving = false;
 let isOrganizationMemberSaving = false;
 let editingOrganizationDepartmentId = "";
 let editingOrganizationMemberId = "";
 let organizationSearchTimer = null;
+let customerOrganizations = [];
+let customerOrganizationsTotal = 0;
+let customerOrganizationsPage = 1;
+const customerOrganizationsPageSize = 12;
+let customerOrganizationsFilters = { search: "", status: "" };
+let isCustomerOrganizationsLoading = false;
+let customerOrganizationsSearchTimer = null;
+let selectedCustomerOrganization = null;
+let customerOrganizationDetailTab = "info";
+let isCustomerOrganizationSaving = false;
+let editingCustomerOrganizationId = "";
 let isSsoRedirecting = false;
 let billingConfig = null;
 let billingAccount = null;
@@ -810,6 +831,30 @@ function validateAuthMode(mode) {
 }
 
 function accountAccessCopy(user) {
+  const organizationAccessStatus = String(user?.organizationAccessStatus || "");
+  if (user?.organizationDemoEnabled && user?.isKnownDemoCustomerIdentity) {
+    if (organizationAccessStatus === "invited") {
+      return {
+        title: "企业邀请等待启用",
+        description: "你的企业演示邀请尚未启用，暂时不能查看用量或使用企业资源。",
+        retry: false,
+      };
+    }
+    if (organizationAccessStatus === "suspended") {
+      return {
+        title: "企业访问已暂停",
+        description: "你的企业演示访问已暂停，请联系企业管理员或平台运营人员确认后续安排。",
+        retry: false,
+      };
+    }
+    if (["archived", "organization_suspended"].includes(organizationAccessStatus)) {
+      return {
+        title: "所属客户企业暂不可用",
+        description: "所属客户企业已归档或暂停，当前不能访问企业演示数据。",
+        retry: false,
+      };
+    }
+  }
   const accountStatus = user?.accountStatus || "provisioned";
   const entitlementStatus = user?.entitlementStatus || "active";
   if (["provisioning", "pending", "provisioning_failed"].includes(accountStatus)) {
@@ -1197,25 +1242,30 @@ function selectedAdminEmployeeLabel() {
 
 function updateAdminChartTitles() {
   const scopeName = selectedAdminEmployee ? selectedAdminEmployeeLabel() : "全员";
-  setText("adminTrendTitle", `${scopeName}每日 Token 趋势`);
-  setText("adminTrendDesc", `按日期汇总${scopeName} Prompt 与 Completion Token。`);
-  setText("adminSpendTitle", `${scopeName}每日金额消费趋势`);
-  setText("adminSpendDesc", `按日期汇总${scopeName}预估消费金额。`);
-  setText("adminSourceTitle", `${scopeName}用量占比`);
+  const customerName = organizationUsageScope()?.kind === "platformCustomer" ? organizationUsageScope()?.name : "";
+  const scopedName = customerName ? `${customerName} · ${scopeName}` : scopeName;
+  setText("adminTrendTitle", `${scopedName}每日 Token 趋势`);
+  setText("adminTrendDesc", `按日期汇总${scopedName} Prompt 与 Completion Token。`);
+  setText("adminSpendTitle", `${scopedName}每日金额消费趋势`);
+  setText("adminSpendDesc", `按日期汇总${scopedName}预估消费金额。`);
+  setText("adminSourceTitle", `${scopedName}用量占比`);
   setText("adminSourceDesc", selectedAdminEmployee
-    ? `按${scopeName} Codex、Claude Code 与其他来源拆分用量。`
-    : "按 Codex、Claude Code 与其他来源拆分用量。");
+    ? `按${scopedName} Codex、Claude Code 与其他来源拆分用量。`
+    : `按${scopedName} Codex、Claude Code 与其他来源拆分用量。`);
 }
 
 function renderAdminMetrics(data) {
   const totalData = adminSummaryData.length ? adminSummaryData : data;
   const label = rangeLabel();
   const source = sourceText();
+  const scope = organizationUsageScope();
+  const isOrganizationScope = ["platformCustomer", "currentOrganization"].includes(scope?.kind);
+  const scopePrefix = scope?.kind === "platformCustomer" ? "客户企业" : "企业范围";
   renderDailyOverview({
     prefix: "admin",
     data: totalData,
-    title: "所选范围 · 管理员视图",
-    totalLabel: "所选范围全员 Token",
+    title: isOrganizationScope ? `${scopePrefix} · ${scope.name}` : "所选范围 · 管理员视图",
+    totalLabel: isOrganizationScope ? `${scope.name} 全员 Token` : "所选范围全员 Token",
     sideLabel: "活跃员工",
     sideValue: adminEmployees.length,
     sideSub: "当前筛选范围",
@@ -1236,11 +1286,14 @@ function renderAdminMemberMetrics(data) {
   const { days } = selectedDateRange();
   const isSingleDay = days === 1;
   const dailyAvgSpend = days ? sum(data, "spend") / days : 0;
+  const scope = organizationUsageScope();
+  const isOrganizationScope = ["platformCustomer", "currentOrganization"].includes(scope?.kind);
+  const scopePrefix = scope?.kind === "platformCustomer" ? "客户企业" : "企业范围";
   renderDailyOverview({
     prefix: "admin",
     data,
-    title: "所选范围 · 员工视图",
-    totalLabel: "所选范围员工 Token",
+    title: isOrganizationScope ? `${scopePrefix} · ${scope.name}` : "所选范围 · 员工视图",
+    totalLabel: isOrganizationScope ? `${scope.name} 成员 Token` : "所选范围员工 Token",
     sideLabel: "当前员工",
     sideValue: 1,
     sideSub: employee?.employeeEmail || employee?.employeeId || selectedAdminEmployee,
@@ -1262,11 +1315,14 @@ function renderDepartmentMetrics(data) {
   const label = rangeLabel();
   const source = sourceText();
   const scopeLabel = departmentScopeLabel();
+  const scope = organizationUsageScope();
+  const isOrganizationScope = ["platformCustomer", "currentOrganization"].includes(scope?.kind);
+  const scopePrefix = scope?.kind === "platformCustomer" ? "客户企业" : "企业范围";
   renderDailyOverview({
     prefix: "department",
     data,
-    title: `所选范围 · ${scopeLabel}`,
-    totalLabel: "所选范围 Token",
+    title: isOrganizationScope ? `${scopePrefix} · ${scope.name} · ${scopeLabel}` : `所选范围 · ${scopeLabel}`,
+    totalLabel: isOrganizationScope ? `${scope.name} Token` : "所选范围 Token",
     sideLabel: selectedDepartment ? "活跃员工" : "活跃部门",
     sideValue: selectedDepartment ? departmentEmployees.length : departmentRankings.length,
     sideSub: selectedDepartment ? "当前部门" : "当前筛选范围",
@@ -2518,9 +2574,11 @@ function render() {
   renderAccountAccessState();
   if (accountAccessCopy(currentUser)) return;
   renderPersonal();
-  if (currentUser?.isAdmin) renderAdmin();
-  if (currentUser?.isAdmin) renderDepartment();
+  if (canViewAdminUsage()) renderAdmin();
+  if (canViewDepartmentUsage()) renderDepartment();
   if (currentUser?.isTeamLeader) renderTeam();
+  if (customerOrganizationsAvailable()) renderCustomerOrganizations();
+  if (organizationCanView()) renderOrganization();
 }
 
 const VENDOR_ICON_KEYS = new Set(["openai", "anthropic", "google", "deepseek", "zhipu", "moonshot", "qwen", "minimax", "baai", "other"]);
@@ -3450,7 +3508,7 @@ let isAdminBillingLoading = false;
 let isGeneratingRedemptions = false;
 
 function adminBillingVisible() {
-  return Boolean(currentUser?.isAdmin && billingAvailable);
+  return Boolean(currentUser?.isAdmin && billingAvailable && !isViewingCustomerOrganization());
 }
 
 function renderAdminRedemptions() {
@@ -3742,6 +3800,223 @@ const ORGANIZATION_STATUS_LABELS = {
   suspended: "已暂停",
 };
 
+function isPlatformAdmin() {
+  // `isAdmin` remains a compatibility fallback while V2 rolls out its
+  // explicit platform capability. Organization roles never grant this access.
+  return Boolean(currentUser?.isPlatformAdmin ?? currentUser?.isAdmin);
+}
+
+function canManageCustomerOrganizations() {
+  // The API exposes the concise V2 capability name. Keep the longer alias
+  // while mixed-version deployments finish rolling forward.
+  return Boolean(currentUser?.canManageCustomerOrganizations || currentUser?.canManageCustomers);
+}
+
+function canViewCurrentOrganizationUsage() {
+  if (currentUser?.canViewOrganizationUsage !== undefined) {
+    return Boolean(currentUser.canViewOrganizationUsage);
+  }
+  // Keep older demo payloads usable without giving ordinary members the
+  // organization-wide boards while a server bundle is being upgraded.
+  return Boolean(
+    currentUser?.organizationDemoEnabled
+    && ["owner", "admin"].includes(String(currentUser?.organizationRole || "")),
+  );
+}
+
+function selectedCustomerOrganizationId() {
+  const organization = selectedCustomerOrganization?.organization || selectedCustomerOrganization;
+  return String(organization?.id || "");
+}
+
+function selectedCustomerOrganizationName() {
+  const organization = selectedCustomerOrganization?.organization || selectedCustomerOrganization;
+  return String(organization?.name || "客户企业");
+}
+
+function customerOrganizationsAvailable() {
+  return canManageCustomerOrganizations();
+}
+
+function isViewingCustomerOrganization() {
+  return customerOrganizationsAvailable() && Boolean(selectedCustomerOrganizationId());
+}
+
+function customerOrganizationPath(organizationId = selectedCustomerOrganizationId()) {
+  const id = String(organizationId || "").trim();
+  return `/api/platform/organizations/${encodeURIComponent(id)}`;
+}
+
+function customerOrganizationRecord(item) {
+  if (!item || typeof item !== "object") return {};
+  return item.organization && typeof item.organization === "object" ? item.organization : item;
+}
+
+function customerOrganizationId(item) {
+  const record = customerOrganizationRecord(item);
+  return String(organizationField(record, "id", "organization_id") || organizationField(record, "organizationId", "organization_id") || "");
+}
+
+function customerOrganizationStats(item) {
+  const record = customerOrganizationRecord(item);
+  const stats = item?.stats && typeof item.stats === "object" ? item.stats : record?.stats || {};
+  const numericValue = (camelCase, snakeCase) => {
+    const value = organizationField(stats, camelCase, snakeCase)
+      ?? organizationField(record, camelCase, snakeCase);
+    return Number.isFinite(Number(value)) ? Number(value) : 0;
+  };
+  return {
+    departmentCount: numericValue("departmentCount", "department_count"),
+    memberCount: numericValue("memberCount", "member_count"),
+    activeMemberCount: numericValue("activeMemberCount", "active_member_count"),
+    invitedMemberCount: numericValue("invitedMemberCount", "invited_member_count"),
+  };
+}
+
+function customerOrganizationStatus(item) {
+  const record = customerOrganizationRecord(item);
+  return String(organizationField(record, "status", "status") || "active");
+}
+
+function customerOrganizationUpdatedAt(item) {
+  const record = customerOrganizationRecord(item);
+  return organizationField(record, "updatedAt", "updated_at") || organizationField(item, "updatedAt", "updated_at");
+}
+
+function customerOrganizationsUrl() {
+  const params = new URLSearchParams({
+    page: String(customerOrganizationsPage),
+    pageSize: String(customerOrganizationsPageSize),
+  });
+  if (customerOrganizationsFilters.search) params.set("search", customerOrganizationsFilters.search);
+  if (customerOrganizationsFilters.status) params.set("status", customerOrganizationsFilters.status);
+  return `/api/platform/organizations?${params.toString()}`;
+}
+
+function organizationUsageScope() {
+  const customerOrganizationId = selectedCustomerOrganizationId();
+  if (customerOrganizationsAvailable() && customerOrganizationId) {
+    return {
+      kind: "platformCustomer",
+      organizationId: customerOrganizationId,
+      name: selectedCustomerOrganizationName(),
+      usagePath: `/api/platform/organizations/${encodeURIComponent(customerOrganizationId)}/usage`,
+      departmentsUsagePath: `/api/platform/organizations/${encodeURIComponent(customerOrganizationId)}/departments/usage`,
+    };
+  }
+  if (canViewCurrentOrganizationUsage()) {
+    return {
+      kind: "currentOrganization",
+      organizationId: String(currentUser?.organizationId || ""),
+      // The auth bootstrap already has the tenant id, while the directory
+      // snapshot is intentionally unavailable to ordinary customer members.
+      // Prefer the resolved organization name when it exists so the company
+      // scope never flashes as a generic placeholder for an admin/owner.
+      name: String(
+        organizationSnapshot?.organization?.name
+        || currentUser?.organization?.name
+        || currentUser?.organizationName
+        || "我的企业",
+      ),
+      usagePath: "/api/organization/current/usage",
+      departmentsUsagePath: "/api/organization/current/departments/usage",
+    };
+  }
+  return null;
+}
+
+function organizationUsageScopeKey() {
+  const scope = organizationUsageScope();
+  return scope ? `${scope.kind}:${scope.organizationId || ""}` : "platform";
+}
+
+function resetOrganizationUsageViews() {
+  // Customer selection changes the server-side tenant. Clear every derived
+  // view so an in-flight or cached platform response cannot appear in it.
+  adminUsageRequestId += 1;
+  departmentUsageRequestId += 1;
+  selectedAdminEmployee = "";
+  selectedDepartment = "";
+  departmentPickerOpen = false;
+  departmentPickerOptions = [];
+  adminUsageData = [];
+  adminSummaryData = [];
+  adminEmployees = [];
+  adminDataFreshness = null;
+  departmentUsageData = [];
+  departmentSummaryData = [];
+  departmentRankings = [];
+  departmentEmployees = [];
+  departmentDataFreshness = null;
+  adminUsageScopeKey = "";
+  adminUsageLoadingScopeKey = "";
+  departmentUsageScopeKey = "";
+  departmentUsageLoadingScopeKey = "";
+  el("adminEmployeeSearch").value = "";
+  el("departmentEmployeeSearch").value = "";
+  closeDepartmentPicker();
+}
+
+function canViewAdminUsage() {
+  return Boolean(organizationUsageScope() || isPlatformAdmin());
+}
+
+function canViewDepartmentUsage() {
+  return Boolean(organizationUsageScope() || isPlatformAdmin());
+}
+
+function organizationUsageScopeLabel() {
+  return organizationUsageScope()?.name || "全员";
+}
+
+function isMockCustomerIdentity() {
+  return Boolean(
+    currentUser?.organizationDemoEnabled
+    && (currentUser?.organizationRole || currentUser?.isKnownDemoCustomerIdentity),
+  );
+}
+
+function syncNavigationVisibility() {
+  const canBrowseCustomers = customerOrganizationsAvailable();
+  const canViewAdmin = canViewAdminUsage();
+  const canViewDepartments = canViewDepartmentUsage();
+  const isCustomer = isMockCustomerIdentity();
+  el("customersTab").classList.toggle("hidden", !canBrowseCustomers);
+  el("adminTab").classList.toggle("hidden", !canViewAdmin);
+  el("departmentTab").classList.toggle("hidden", !canViewDepartments);
+  // Customer identities use their demo-scoped views only; never expose
+  // seller account functions that lack a customer-local contract.
+  document.querySelectorAll('[data-view="keys"], [data-view="billing"]').forEach((button) => {
+    button.classList.toggle("hidden", isCustomer);
+  });
+  document.querySelectorAll('[data-global-page="models"]').forEach((button) => {
+    button.classList.toggle("hidden", isCustomer);
+  });
+}
+
+function renderCustomerUsageBreadcrumbs(view = currentView) {
+  const isCustomerUsage = isViewingCustomerOrganization() && ["admin", "department"].includes(view);
+  const scopeLabel = isCustomerUsage ? `客户企业：${selectedCustomerOrganizationName()}` : "";
+  el("customerUsageBreadcrumb")?.classList.toggle("hidden", !(isCustomerUsage && view === "admin"));
+  el("customerDepartmentBreadcrumb")?.classList.toggle("hidden", !(isCustomerUsage && view === "department"));
+  if (isCustomerUsage) {
+    setText("customerUsageBreadcrumbLabel", scopeLabel);
+    setText("customerDepartmentBreadcrumbLabel", scopeLabel);
+  }
+}
+
+function organizationApiBasePath() {
+  const customerOrganizationId = selectedCustomerOrganizationId();
+  if (customerOrganizationsAvailable() && customerOrganizationId) {
+    return customerOrganizationPath(customerOrganizationId);
+  }
+  return "/api/organization/current";
+}
+
+function organizationApiPath(suffix = "") {
+  return `${organizationApiBasePath()}${suffix}`;
+}
+
 function organizationField(record, camelCase, snakeCase = "") {
   if (!record || typeof record !== "object") return undefined;
   if (record[camelCase] !== undefined) return record[camelCase];
@@ -3793,6 +4068,10 @@ function organizationStats() {
 }
 
 function organizationCanManage() {
+  if (customerOrganizationsAvailable()) {
+    return Boolean(selectedCustomerOrganizationId())
+      && customerOrganizationStatus(selectedCustomerOrganization) !== "archived";
+  }
   const capabilities = organizationSnapshot?.capabilities || {};
   const serverCapability = capabilities.canManageOrganization ?? capabilities.canManage;
   if (organizationSnapshot && serverCapability === false) return false;
@@ -3800,11 +4079,10 @@ function organizationCanManage() {
 }
 
 function organizationCanView() {
-  if (!currentUser?.organizationDemoEnabled) return false;
-  const role = organizationSnapshot?.organizationRole
-    || organizationSnapshot?.currentMember?.role
-    || currentUser?.organizationRole;
-  return ["owner", "admin", "member"].includes(String(role || ""));
+  // The organization detail is a seller-side customer-management surface.
+  // Customer identities use the organization-scoped usage boards instead;
+  // never expose the underlying member/department directory to them.
+  return isViewingCustomerOrganization();
 }
 
 function renderOrganizationDepartmentOptions(selectId, selectedId = "", placeholder = "请选择部门") {
@@ -3922,6 +4200,125 @@ function renderOrganizationMembers() {
   }).join("");
 }
 
+function renderCustomerOrganizations() {
+  const grid = el("customerOrganizationGrid");
+  if (!grid) return;
+  const totalPages = Math.max(1, Math.ceil(customerOrganizationsTotal / customerOrganizationsPageSize));
+  const page = Math.min(customerOrganizationsPage, totalPages);
+  if (customerOrganizationsPage !== page) customerOrganizationsPage = page;
+  setText("customerOrganizationCountChip", `${fmt.format(customerOrganizationsTotal)} 家`);
+  setText("customerOrganizationPageInfo", `第 ${page} / ${totalPages} 页`);
+  el("customerOrganizationPreviousPageButton").disabled = page <= 1 || isCustomerOrganizationsLoading;
+  el("customerOrganizationNextPageButton").disabled = page >= totalPages || isCustomerOrganizationsLoading;
+  if (isCustomerOrganizationsLoading && !customerOrganizations.length) {
+    grid.innerHTML = '<div class="customer-directory-empty">正在加载客户企业…</div>';
+    return;
+  }
+  if (!customerOrganizations.length) {
+    grid.innerHTML = '<div class="customer-directory-empty">没有符合当前筛选条件的客户企业。新增企业后，可继续维护其部门和成员。</div>';
+    return;
+  }
+  grid.innerHTML = customerOrganizations.map((item) => {
+    const organization = customerOrganizationRecord(item);
+    const id = customerOrganizationId(item);
+    const name = organization.name || "未命名企业";
+    const status = customerOrganizationStatus(item);
+    const isArchived = status === "archived";
+    const stats = customerOrganizationStats(item);
+    return `
+      <article class="customer-organization-card ${isArchived ? "archived" : ""}">
+        <div class="customer-organization-card-head">
+          <div>
+            <h3>${escapeHtml(name)}</h3>
+            <p>${escapeHtml(id || "企业")}</p>
+          </div>
+          <span class="customer-organization-status ${isArchived ? "archived" : ""}">${isArchived ? "已归档" : "正常"}</span>
+        </div>
+        <div class="customer-organization-metrics">
+          <div><strong>${fmt.format(stats.departmentCount)}</strong><span>部门</span></div>
+          <div><strong>${fmt.format(stats.memberCount)}</strong><span>成员</span></div>
+          <div><strong>${fmt.format(stats.activeMemberCount)}</strong><span>已启用</span></div>
+          <div><strong>${fmt.format(stats.invitedMemberCount)}</strong><span>待邀请</span></div>
+        </div>
+        <p>更新于 ${escapeHtml(organizationDate(customerOrganizationUpdatedAt(item)))}</p>
+        <div class="customer-organization-card-actions">
+          <button class="primary-btn" type="button" data-customer-organization-open="${escapeHtml(id)}">进入企业</button>
+          <button class="ghost-btn" type="button" data-customer-organization-edit="${escapeHtml(id)}" ${isArchived ? "disabled" : ""}>改名</button>
+          <button class="danger-outline-btn" type="button" data-customer-organization-archive="${escapeHtml(id)}" ${isArchived ? "disabled" : ""}>归档</button>
+        </div>
+      </article>
+    `;
+  }).join("");
+}
+
+function renderCustomerOrganizationFilters() {
+  const search = el("customerOrganizationSearch");
+  const status = el("customerOrganizationStatusFilter");
+  if (search && search.value !== customerOrganizationsFilters.search) search.value = customerOrganizationsFilters.search;
+  if (status) status.value = customerOrganizationsFilters.status;
+}
+
+async function loadCustomerOrganizations() {
+  if (!customerOrganizationsAvailable() || isCustomerOrganizationsLoading) return;
+  isCustomerOrganizationsLoading = true;
+  renderCustomerOrganizations();
+  try {
+    const payload = await api(customerOrganizationsUrl());
+    customerOrganizations = Array.isArray(payload?.items) ? payload.items : Array.isArray(payload?.organizations) ? payload.organizations : [];
+    customerOrganizationsTotal = Number(payload?.total ?? customerOrganizations.length);
+    customerOrganizationsPage = Number(payload?.page || customerOrganizationsPage || 1);
+  } catch (error) {
+    customerOrganizations = [];
+    customerOrganizationsTotal = 0;
+    showToast(error.message || "客户企业列表加载失败");
+  } finally {
+    isCustomerOrganizationsLoading = false;
+    renderCustomerOrganizationFilters();
+    renderCustomerOrganizations();
+  }
+}
+
+async function openCustomerOrganization(organizationId) {
+  if (!customerOrganizationsAvailable() || !organizationId) return;
+  const id = String(organizationId);
+  selectedCustomerOrganization = customerOrganizations.find((item) => customerOrganizationId(item) === id) || { id };
+  resetOrganizationUsageViews();
+  organizationDataRequestId += 1;
+  organizationMemberRequestId += 1;
+  isOrganizationLoading = false;
+  isOrganizationMemberLoading = false;
+  organizationDataLoadingScopeKey = "";
+  organizationMemberLoadingScopeKey = "";
+  organizationSnapshot = null;
+  organizationMembers = [];
+  organizationMemberTotal = 0;
+  organizationMemberPage = 1;
+  organizationMemberFilters = { search: "", departmentId: "", role: "", status: "" };
+  customerOrganizationDetailTab = "info";
+  syncNavigationVisibility();
+  switchView("organization");
+  await loadOrganizationData();
+}
+
+function closeCustomerOrganization() {
+  selectedCustomerOrganization = null;
+  resetOrganizationUsageViews();
+  organizationDataRequestId += 1;
+  organizationMemberRequestId += 1;
+  isOrganizationLoading = false;
+  isOrganizationMemberLoading = false;
+  organizationDataLoadingScopeKey = "";
+  organizationMemberLoadingScopeKey = "";
+  organizationSnapshot = null;
+  organizationMembers = [];
+  organizationMemberTotal = 0;
+  organizationMemberPage = 1;
+  organizationMemberFilters = { search: "", departmentId: "", role: "", status: "" };
+  syncNavigationVisibility();
+  switchView("customers");
+  loadCustomerOrganizations();
+}
+
 function renderOrganization() {
   if (!organizationCanView()) return;
   const organization = organizationSnapshot?.organization || {};
@@ -3929,15 +4326,32 @@ function renderOrganization() {
   const name = organization.name || "企业组织";
   const stats = organizationStats();
   const canManage = organizationCanManage();
+  const isPlatformCustomer = customerOrganizationsAvailable() && Boolean(selectedCustomerOrganizationId());
   setText("organizationTitle", name);
-  setText("organizationSubtitle", `${name} · 当前身份：${organizationRoleLabel(currentRole)}。这里的内容为演示数据，不会创建真实账号或发送邮件。`);
+  setText(
+    "organizationSubtitle",
+    isPlatformCustomer
+      ? `${name} · 平台运营视图。可维护客户资料、部门和成员，并切换查看企业全员或部门用量。`
+      : `${name} · 当前身份：${organizationRoleLabel(currentRole)}。这里的内容为演示数据，不会创建真实账号或发送邮件。`,
+  );
   setText("organizationDepartmentCount", fmt.format(stats.departmentCount));
   setText("organizationMemberCount", fmt.format(stats.memberCount));
   setText("organizationActiveMemberCount", fmt.format(stats.activeMemberCount));
   setText("organizationInvitedMemberCount", fmt.format(stats.invitedMemberCount));
-  el("createOrganizationDepartmentButton").disabled = !canManage;
-  el("inviteOrganizationMemberButton").disabled = !canManage;
-  el("resetOrganizationDemoButton").disabled = !canManage;
+  const createDepartmentButton = el("createOrganizationDepartmentButton");
+  const inviteMemberButton = el("inviteOrganizationMemberButton");
+  const resetDemoButton = el("resetOrganizationDemoButton");
+  if (createDepartmentButton) createDepartmentButton.disabled = !canManage;
+  if (inviteMemberButton) inviteMemberButton.disabled = !canManage;
+  if (resetDemoButton) resetDemoButton.disabled = !canManage;
+  el("backToCustomersButton")?.classList.toggle("hidden", !isPlatformCustomer);
+  if (resetDemoButton) resetDemoButton.classList.toggle("hidden", isPlatformCustomer);
+  if (isPlatformCustomer && customerOrganizationStatus(selectedCustomerOrganization) === "archived") {
+    setText("organizationSubtitle", `${name} · 已归档客户企业，仅可查看历史组织信息。`);
+  }
+  el("organizationUsageTabs")?.classList.toggle("hidden", !isPlatformCustomer && !canViewCurrentOrganizationUsage());
+  el("organizationManagementWorkspace")?.classList.toggle("hidden", !isPlatformCustomer && !currentUser?.canManageOrganization);
+  renderOrganizationUsageTabs();
   renderOrganizationFilters();
   renderOrganizationDepartments();
   renderOrganizationMembers();
@@ -3952,49 +4366,179 @@ function organizationMembersUrl() {
   if (organizationMemberFilters.departmentId) params.set("departmentId", organizationMemberFilters.departmentId);
   if (organizationMemberFilters.role) params.set("role", organizationMemberFilters.role);
   if (organizationMemberFilters.status) params.set("status", organizationMemberFilters.status);
-  return `/api/organization/current/members?${params.toString()}`;
+  return `${organizationApiPath("/members")}?${params.toString()}`;
+}
+
+function renderOrganizationUsageTabs() {
+  const scope = organizationUsageScope();
+  const tabs = el("organizationUsageTabs");
+  if (!tabs) return;
+  tabs.classList.toggle("hidden", !scope);
+  if (!scope) return;
+  const scopeName = scope.name || "企业";
+  const selected = customerOrganizationDetailTab || "info";
+  tabs.querySelectorAll("[data-organization-usage-view]").forEach((button) => {
+    const isActive = button.dataset.organizationUsageView === selected;
+    button.classList.toggle("active", isActive);
+    button.setAttribute("aria-selected", isActive ? "true" : "false");
+  });
+  setText("organizationUsageScopeLabel", scope.kind === "platformCustomer" ? `客户：${scopeName}` : `企业：${scopeName}`);
+}
+
+function showOrganizationUsage(view) {
+  const scope = organizationUsageScope();
+  if (!scope) return;
+  customerOrganizationDetailTab = ["info", "usage", "departments-usage"].includes(view) ? view : "info";
+  renderOrganizationUsageTabs();
+  if (customerOrganizationDetailTab === "info") {
+    switchView("organization");
+  } else if (customerOrganizationDetailTab === "usage") {
+    switchView("admin");
+  } else {
+    switchView("department");
+  }
 }
 
 async function loadOrganizationMembers() {
+  const scopeKey = organizationUsageScopeKey();
   if (!organizationCanView() || isOrganizationMemberLoading) return;
+  const requestId = ++organizationMemberRequestId;
   isOrganizationMemberLoading = true;
+  organizationMemberLoadingScopeKey = scopeKey;
   renderOrganizationMembers();
   try {
     const payload = await api(organizationMembersUrl());
+    if (requestId !== organizationMemberRequestId || scopeKey !== organizationUsageScopeKey()) return;
     organizationMembers = Array.isArray(payload?.items) ? payload.items : [];
     organizationMemberTotal = Number(payload?.total || 0);
     organizationMemberPage = Number(payload?.page || organizationMemberPage || 1);
   } catch (error) {
+    if (requestId !== organizationMemberRequestId || scopeKey !== organizationUsageScopeKey()) return;
     organizationMembers = [];
     organizationMemberTotal = 0;
     showToast(error.message || "成员列表加载失败");
   } finally {
+    if (requestId !== organizationMemberRequestId) return;
     isOrganizationMemberLoading = false;
+    organizationMemberLoadingScopeKey = "";
     renderOrganization();
   }
 }
 
 async function loadOrganizationData() {
+  const scopeKey = organizationUsageScopeKey();
   if (!organizationCanView() || isOrganizationLoading) return;
+  const requestId = ++organizationDataRequestId;
   isOrganizationLoading = true;
+  organizationDataLoadingScopeKey = scopeKey;
   renderOrganization();
   try {
     const [currentPayload, membersPayload] = await Promise.all([
-      api("/api/organization/current"),
+      api(organizationApiPath()),
       api(organizationMembersUrl()),
     ]);
+    if (requestId !== organizationDataRequestId || scopeKey !== organizationUsageScopeKey()) return;
     organizationSnapshot = currentPayload || null;
     organizationMembers = Array.isArray(membersPayload?.items) ? membersPayload.items : [];
     organizationMemberTotal = Number(membersPayload?.total || 0);
     organizationMemberPage = Number(membersPayload?.page || organizationMemberPage || 1);
   } catch (error) {
+    if (requestId !== organizationDataRequestId || scopeKey !== organizationUsageScopeKey()) return;
     organizationSnapshot = null;
     organizationMembers = [];
     organizationMemberTotal = 0;
     showToast(error.message || "企业组织加载失败");
   } finally {
+    if (requestId !== organizationDataRequestId) return;
     isOrganizationLoading = false;
+    organizationDataLoadingScopeKey = "";
     renderOrganization();
+  }
+}
+
+function closeCustomerOrganizationModal(options = {}) {
+  if (isCustomerOrganizationSaving && !options.force) return;
+  editingCustomerOrganizationId = "";
+  el("customerOrganizationForm").reset();
+  el("customerOrganizationModal").classList.add("hidden");
+}
+
+function openCustomerOrganizationModal(organizationId = "") {
+  if (!customerOrganizationsAvailable()) return;
+  const id = String(organizationId || "");
+  const listItem = customerOrganizations.find((item) => customerOrganizationId(item) === id);
+  const organization = listItem ? customerOrganizationRecord(listItem) : {};
+  editingCustomerOrganizationId = listItem ? customerOrganizationId(listItem) : "";
+  el("customerOrganizationForm").reset();
+  const isEditing = Boolean(editingCustomerOrganizationId);
+  el("customerOrganizationOwnerNameField").classList.toggle("hidden", isEditing);
+  el("customerOrganizationOwnerEmailField").classList.toggle("hidden", isEditing);
+  el("customerOrganizationOwnerNameInput").required = !isEditing;
+  el("customerOrganizationOwnerEmailInput").required = !isEditing;
+  setText("customerOrganizationModalTitle", isEditing ? "修改客户企业名称" : "新增客户企业");
+  setText(
+    "customerOrganizationModalDescription",
+    isEditing ? "修改后会立即显示在企业目录和详情页。" : "创建后可进入企业详情，继续维护部门和成员。",
+  );
+  setText("submitCustomerOrganizationButton", isEditing ? "保存修改" : "创建企业");
+  el("customerOrganizationNameInput").value = organization.name || "";
+  el("customerOrganizationOwnerNameInput").value = "";
+  el("customerOrganizationOwnerEmailInput").value = "";
+  el("customerOrganizationModal").classList.remove("hidden");
+  window.setTimeout(() => el("customerOrganizationNameInput").focus(), 0);
+}
+
+async function archiveCustomerOrganization(organizationId) {
+  if (!customerOrganizationsAvailable() || !organizationId) return;
+  const item = customerOrganizations.find((candidate) => customerOrganizationId(candidate) === String(organizationId));
+  const organization = customerOrganizationRecord(item);
+  const name = organization.name || "这家客户企业";
+  if (!window.confirm(`归档“${name}”？已归档企业将无法继续管理或访问演示数据。`)) return;
+  try {
+    await ensureCsrfToken();
+    await api(`${customerOrganizationPath(organizationId)}/archive`, { method: "POST", body: JSON.stringify({}) });
+    if (selectedCustomerOrganizationId() === String(organizationId)) {
+      selectedCustomerOrganization = null;
+      resetOrganizationUsageViews();
+      organizationDataRequestId += 1;
+      organizationMemberRequestId += 1;
+      isOrganizationLoading = false;
+      isOrganizationMemberLoading = false;
+      organizationDataLoadingScopeKey = "";
+      organizationMemberLoadingScopeKey = "";
+      syncNavigationVisibility();
+    }
+    await loadCustomerOrganizations();
+    showToast("客户企业已归档");
+  } catch (error) {
+    showToast(error.message || "客户企业归档失败");
+  }
+}
+
+async function resetCustomerOrganizationsDemo() {
+  if (!customerOrganizationsAvailable()) return;
+  if (!window.confirm("重置后会清除本次演示中的所有客户企业、部门与成员变更，并恢复初始样例。确定继续吗？")) return;
+  setButtonLoading("resetCustomerOrganizationsDemoButton", true, "重置中");
+  try {
+    await ensureCsrfToken();
+    await api("/api/platform/organizations/demo/reset", { method: "POST", body: JSON.stringify({}) });
+    selectedCustomerOrganization = null;
+    resetOrganizationUsageViews();
+    organizationDataRequestId += 1;
+    organizationMemberRequestId += 1;
+    isOrganizationLoading = false;
+    isOrganizationMemberLoading = false;
+    organizationDataLoadingScopeKey = "";
+    organizationMemberLoadingScopeKey = "";
+    syncNavigationVisibility();
+    customerOrganizationsPage = 1;
+    customerOrganizationsFilters = { search: "", status: "" };
+    await loadCustomerOrganizations();
+    showToast("演示数据已重置");
+  } catch (error) {
+    showToast(error.message || "演示数据重置失败");
+  } finally {
+    setButtonLoading("resetCustomerOrganizationsDemoButton", false);
   }
 }
 
@@ -4057,7 +4601,7 @@ async function archiveOrganizationDepartment(departmentId) {
   if (!department || !window.confirm(`归档“${department.name}”？归档前需要先迁移或暂停该部门所有已启用和待邀请成员。`)) return;
   try {
     await ensureCsrfToken();
-    await api(`/api/organization/current/departments/${encodeURIComponent(departmentId)}/archive`, {
+    await api(organizationApiPath(`/departments/${encodeURIComponent(departmentId)}/archive`), {
       method: "POST",
       body: JSON.stringify({}),
     });
@@ -4076,7 +4620,7 @@ async function updateOrganizationMemberStatus(memberId, status) {
   if (!organizationCanManage()) return;
   try {
     await ensureCsrfToken();
-    await api(`/api/organization/current/members/${encodeURIComponent(memberId)}`, {
+    await api(organizationApiPath(`/members/${encodeURIComponent(memberId)}`), {
       method: "PATCH",
       body: JSON.stringify({ status }),
     });
@@ -4088,10 +4632,12 @@ async function updateOrganizationMemberStatus(memberId, status) {
 }
 
 function switchView(view) {
-  if (view === "admin" && !currentUser?.isAdmin) view = "dashboard";
-  if (view === "department" && !currentUser?.isAdmin) view = "dashboard";
+  if (view === "customers" && !customerOrganizationsAvailable()) view = "dashboard";
+  if (view === "admin" && !canViewAdminUsage()) view = "dashboard";
+  if (view === "department" && !canViewDepartmentUsage()) view = "dashboard";
   if (view === "team" && !currentUser?.isTeamLeader) view = "dashboard";
   if (view === "organization" && !organizationCanView()) view = "dashboard";
+  if (isMockCustomerIdentity() && (view === "keys" || view === "billing" || view === "models")) view = "dashboard";
   if (view === "billing" && !billingAvailable) view = "dashboard";
   if (currentView === "keys" && view !== "keys") clearRevealedKeys();
   // 离开充值页就停掉支付轮询与二维码，避免后台空转和收款码久留在页面上。
@@ -4103,14 +4649,22 @@ function switchView(view) {
   el("adminView").classList.toggle("hidden", view !== "admin");
   el("teamView").classList.toggle("hidden", view !== "team");
   el("departmentView").classList.toggle("hidden", view !== "department");
+  el("customersView").classList.toggle("hidden", view !== "customers");
   el("organizationView").classList.toggle("hidden", view !== "organization");
   el("keysView").classList.toggle("hidden", view !== "keys");
   el("billingView").classList.toggle("hidden", view !== "billing");
   el("modelsView").classList.toggle("hidden", view !== "models");
-  el("dashboardFilters").classList.toggle("hidden", view === "models" || view === "keys" || view === "billing" || view === "organization");
+  el("dashboardFilters").classList.toggle("hidden", view === "models" || view === "keys" || view === "billing" || view === "customers" || view === "organization");
+  renderCustomerUsageBreadcrumbs(view);
+  const isCustomerDetailView = isViewingCustomerOrganization()
+    && ["organization", "admin", "department"].includes(view);
   let activeButton = null;
   document.querySelectorAll("[data-view]").forEach((button) => {
-    const isActive = button.dataset.view === view;
+    // Customer detail is a child workspace of the customer directory, not a
+    // second top-level destination in the sidebar.
+    const isActive = isCustomerDetailView
+      ? button.dataset.view === "customers"
+      : button.dataset.view === view;
     button.classList.toggle("active", isActive);
     if (isActive) {
       activeButton = button;
@@ -4138,17 +4692,19 @@ function switchView(view) {
     if (!isBillingLoading) loadBillingData();
   }
   if (view === "dashboard" && !usageData.length) loadDashboardData();
+  if (view === "customers" && !isCustomerOrganizationsLoading) loadCustomerOrganizations();
   if (view === "admin") {
     renderAdminBilling();
-    if (!adminUsageData.length) loadAdminData();
+    if (!adminUsageData.length || adminUsageScopeKey !== organizationUsageScopeKey()) loadAdminData();
     if (adminBillingVisible() && !adminRedemptions.length && !adminBillingOrders.length) loadAdminBillingData();
   }
   if (view === "team" && currentUser?.isTeamLeader && !teamUsageData.length) loadTeamData();
-  if (view === "department" && !departmentUsageData.length) loadDepartmentData();
+  if (view === "department" && (!departmentUsageData.length || departmentUsageScopeKey !== organizationUsageScopeKey())) loadDepartmentData();
   if (view === "organization" && !organizationSnapshot && !isOrganizationLoading) loadOrganizationData();
 }
 
 async function loadCurrentViewData(forceRefresh = false) {
+  if (currentView === "customers") return loadCustomerOrganizations();
   if (currentView === "keys") return loadKeys();
   if (currentView === "billing") return loadBillingData();
   if (currentView === "models") return loadModels();
@@ -4186,8 +4742,11 @@ async function loadDashboardData(forceRefresh = false) {
 }
 
 async function loadAdminData(forceRefresh = false) {
-  if (!currentUser?.isAdmin || isAdminLoading) return;
+  const scopeKey = organizationUsageScopeKey();
+  if (!canViewAdminUsage() || (isAdminLoading && adminUsageLoadingScopeKey === scopeKey)) return;
+  const requestId = ++adminUsageRequestId;
   isAdminLoading = true;
+  adminUsageLoadingScopeKey = scopeKey;
   renderAdmin();
   const { startDate, endDate } = selectedDateRange();
   const source = el("sourceSelect").value;
@@ -4197,11 +4756,15 @@ async function loadAdminData(forceRefresh = false) {
   if (employee) query.set("employee", employee);
   if (forceRefresh) query.set("refresh", "1");
   try {
-    const payload = await api(`/api/admin/usage?${query.toString()}`);
+    const scope = organizationUsageScope();
+    const usagePath = scope?.usagePath || "/api/admin/usage";
+    const payload = await api(`${usagePath}?${query.toString()}`);
+    if (requestId !== adminUsageRequestId || scopeKey !== organizationUsageScopeKey()) return;
     adminUsageData = payload.rows || [];
     adminSummaryData = payload.summaryRows || adminUsageData;
     adminEmployees = payload.employees || [];
     adminDataFreshness = payload.dataFreshness || null;
+    adminUsageScopeKey = scopeKey;
     lastAdminUsageCacheHit = Boolean(payload.cache?.hit);
     if (payload.truncated) {
       el("adminLimitHint").textContent = `${RANKING_SORT_TIP}；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），员工排行可能不完整`;
@@ -4209,19 +4772,25 @@ async function loadAdminData(forceRefresh = false) {
       el("adminLimitHint").textContent = `${RANKING_SORT_TIP}；已读取 ${payload.pagesRead || 0} 页日志，按当前筛选范围统计`;
     }
   } catch (error) {
+    if (requestId !== adminUsageRequestId || scopeKey !== organizationUsageScopeKey()) return;
     showToast(error.message || "全员数据加载失败");
     adminUsageData = [];
     adminSummaryData = [];
     adminEmployees = [];
   } finally {
+    if (requestId !== adminUsageRequestId) return;
     isAdminLoading = false;
+    adminUsageLoadingScopeKey = "";
     renderAdmin();
   }
 }
 
 async function loadDepartmentData(forceRefresh = false) {
-  if (!currentUser?.isAdmin || isDepartmentLoading) return;
+  const scopeKey = organizationUsageScopeKey();
+  if (!canViewDepartmentUsage() || (isDepartmentLoading && departmentUsageLoadingScopeKey === scopeKey)) return;
+  const requestId = ++departmentUsageRequestId;
   isDepartmentLoading = true;
+  departmentUsageLoadingScopeKey = scopeKey;
   renderDepartment();
   const { startDate, endDate } = selectedDateRange();
   const source = el("sourceSelect").value;
@@ -4231,12 +4800,16 @@ async function loadDepartmentData(forceRefresh = false) {
   if (department) query.set("department", department);
   if (forceRefresh) query.set("refresh", "1");
   try {
-    const payload = await api(`/api/admin/departments/usage?${query.toString()}`);
+    const scope = organizationUsageScope();
+    const usagePath = scope?.departmentsUsagePath || "/api/admin/departments/usage";
+    const payload = await api(`${usagePath}?${query.toString()}`);
+    if (requestId !== departmentUsageRequestId || scopeKey !== organizationUsageScopeKey()) return;
     departmentUsageData = payload.rows || [];
     departmentSummaryData = payload.summaryRows || departmentUsageData;
     departmentRankings = payload.departments || [];
     departmentEmployees = payload.employees || [];
     departmentDataFreshness = payload.dataFreshness || null;
+    departmentUsageScopeKey = scopeKey;
     if (!department) departmentPickerOptions = departmentRankings;
     lastDepartmentUsageCacheHit = Boolean(payload.cache?.hit);
     const rankingSubject = selectedDepartment ? "员工排行" : "部门排行";
@@ -4246,6 +4819,7 @@ async function loadDepartmentData(forceRefresh = false) {
       el("departmentLimitHint").textContent = `${rankingSubject}${RANKING_SORT_TIP}；已读取 ${payload.pagesRead || 0} 页日志，按当前筛选范围统计`;
     }
   } catch (error) {
+    if (requestId !== departmentUsageRequestId || scopeKey !== organizationUsageScopeKey()) return;
     showToast(error.message || "部门数据加载失败");
     departmentUsageData = [];
     departmentSummaryData = [];
@@ -4253,7 +4827,9 @@ async function loadDepartmentData(forceRefresh = false) {
     departmentEmployees = [];
     if (!department) departmentPickerOptions = [];
   } finally {
+    if (requestId !== departmentUsageRequestId) return;
     isDepartmentLoading = false;
+    departmentUsageLoadingScopeKey = "";
     renderDepartment();
   }
 }
@@ -4411,6 +4987,15 @@ function clearTeamMemberSelection() {
 }
 
 async function loadModels() {
+  // Customer demo identities intentionally have no model-catalog contract.
+  // Do not make a forbidden request merely because an older navigation event
+  // tries to prefetch the global page.
+  if (isMockCustomerIdentity()) {
+    modelCatalog = [];
+    setupModelFilters();
+    renderModels();
+    return;
+  }
   try {
     const payload = await api("/api/models");
     modelCatalog = payload.models || [];
@@ -4437,11 +5022,9 @@ async function showApp(user) {
   el("landingView").classList.add("hidden");
   el("loginView").classList.add("hidden");
   el("appView").classList.remove("hidden");
-  el("adminTab").classList.add("hidden");
   el("teamTab").classList.add("hidden");
-  el("departmentTab").classList.add("hidden");
-  el("organizationTab").classList.toggle("hidden", !organizationCanView());
   el("billingTab").classList.add("hidden");
+  syncNavigationVisibility();
   el("userEmail").textContent = currentUser.email;
   el("userName").textContent = currentUser.name || currentUser.email;
   el("avatar").textContent = currentUser.avatar || initials(currentUser.email, currentUser.name);
@@ -4449,6 +5032,17 @@ async function showApp(user) {
   el("departmentWelcomeTitle").textContent = "所选范围 · 全部部门";
   switchView("dashboard");
   render();
+  const isDemoCustomer = isMockCustomerIdentity();
+  if (isDemoCustomer) {
+    // The Mock customer path is deliberately limited to personal, team and
+    // organization usage. Billing and model catalog requests would touch
+    // seller-only integrations and are rejected by the API.
+    billingAvailable = false;
+    modelCatalog = [];
+    const scopePromise = loadAuthScope();
+    await Promise.all([loadCurrentViewData(), scopePromise]);
+    return;
+  }
   // 充值入口要在权限受限时也可用——新用户正是靠充值开通，不能被这道 return 拦掉。
   const billingPromise = refreshBillingAvailability();
   if (accountAccessCopy(currentUser)) {
@@ -4467,10 +5061,8 @@ async function loadAuthScope() {
     Object.assign(currentUser, scope);
     leaderTeams = normalizeLeaderTeams(currentUser);
     selectedTeamRef = currentUser.team?.teamRef || leaderTeams[0]?.teamRef || "";
-    el("adminTab").classList.toggle("hidden", !currentUser.isAdmin);
     el("teamTab").classList.toggle("hidden", !currentUser.isTeamLeader);
-    el("departmentTab").classList.toggle("hidden", !currentUser.isAdmin);
-    el("organizationTab").classList.toggle("hidden", !organizationCanView());
+    syncNavigationVisibility();
     el("teamWelcomeTitle").textContent = `所选范围 · ${teamScopeLabel()}`;
     // isAdmin 到这里才确定，充值管理面板的可见性随之更新。
     renderAdminBilling();
@@ -4494,10 +5086,16 @@ function showLogin() {
   adminUsageData = [];
   adminSummaryData = [];
   adminEmployees = [];
+  adminUsageScopeKey = "";
+  adminUsageLoadingScopeKey = "";
+  adminUsageRequestId += 1;
   departmentUsageData = [];
   departmentSummaryData = [];
   departmentRankings = [];
   departmentEmployees = [];
+  departmentUsageScopeKey = "";
+  departmentUsageLoadingScopeKey = "";
+  departmentUsageRequestId += 1;
   teamUsageData = [];
   teamSummaryData = [];
   teamEmployees = [];
@@ -4544,13 +5142,26 @@ function showLogin() {
   organizationMemberFilters = { search: "", departmentId: "", role: "", status: "" };
   isOrganizationLoading = false;
   isOrganizationMemberLoading = false;
+  organizationDataLoadingScopeKey = "";
+  organizationMemberLoadingScopeKey = "";
+  organizationDataRequestId += 1;
+  organizationMemberRequestId += 1;
   isOrganizationDepartmentSaving = false;
   isOrganizationMemberSaving = false;
   editingOrganizationDepartmentId = "";
   editingOrganizationMemberId = "";
-  el("organizationTab").classList.add("hidden");
+  customerOrganizations = [];
+  customerOrganizationsTotal = 0;
+  customerOrganizationsPage = 1;
+  customerOrganizationsFilters = { search: "", status: "" };
+  selectedCustomerOrganization = null;
+  customerOrganizationDetailTab = "info";
+  editingCustomerOrganizationId = "";
+  window.clearTimeout(customerOrganizationsSearchTimer);
+  el("customersTab").classList.add("hidden");
   el("organizationDepartmentModal").classList.add("hidden");
   el("organizationMemberModal").classList.add("hidden");
+  el("customerOrganizationModal").classList.add("hidden");
   personalKeys = [];
   availableKeyModels = [];
   unrestrictedKeyModels = false;
@@ -4861,10 +5472,113 @@ el("accountAccessRetryButton").addEventListener("click", async () => {
 });
 
 el("accountAccessTopupButton").addEventListener("click", () => switchView("billing"));
+el("createCustomerOrganizationButton").addEventListener("click", () => openCustomerOrganizationModal());
+el("resetCustomerOrganizationsDemoButton").addEventListener("click", resetCustomerOrganizationsDemo);
+el("cancelCustomerOrganizationButton").addEventListener("click", closeCustomerOrganizationModal);
+el("backToCustomersButton").addEventListener("click", closeCustomerOrganization);
+el("backToCustomerOrganizationButton").addEventListener("click", () => showOrganizationUsage("info"));
+el("backToCustomerOrganizationDepartmentButton").addEventListener("click", () => showOrganizationUsage("info"));
 el("createOrganizationDepartmentButton").addEventListener("click", () => openOrganizationDepartmentModal());
 el("inviteOrganizationMemberButton").addEventListener("click", () => openOrganizationMemberModal());
 el("cancelOrganizationDepartmentButton").addEventListener("click", closeOrganizationDepartmentModal);
 el("cancelOrganizationMemberButton").addEventListener("click", closeOrganizationMemberModal);
+
+el("customerOrganizationForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (isCustomerOrganizationSaving || !customerOrganizationsAvailable()) return;
+  const name = el("customerOrganizationNameInput").value.trim();
+  const ownerName = el("customerOrganizationOwnerNameInput").value.trim();
+  const ownerEmail = el("customerOrganizationOwnerEmailInput").value.trim();
+  if (!name || !ownerName) {
+    showToast("请填写企业名称和首位企业主姓名");
+    return;
+  }
+  if (!validEmail(ownerEmail)) {
+    showToast("请输入有效的首位企业主邮箱");
+    el("customerOrganizationOwnerEmailInput").focus();
+    return;
+  }
+  const isEditing = Boolean(editingCustomerOrganizationId);
+  isCustomerOrganizationSaving = true;
+  setButtonLoading("submitCustomerOrganizationButton", true, isEditing ? "保存中" : "创建中");
+  try {
+    await ensureCsrfToken();
+    const payload = await api(
+      isEditing ? customerOrganizationPath(editingCustomerOrganizationId) : "/api/platform/organizations",
+      {
+        method: isEditing ? "PATCH" : "POST",
+        body: JSON.stringify(isEditing ? { name } : { name, ownerName, ownerEmail }),
+      },
+    );
+    const created = payload?.organization || payload;
+    const createdId = customerOrganizationId(created);
+    closeCustomerOrganizationModal({ force: true });
+    customerOrganizationsPage = 1;
+    await loadCustomerOrganizations();
+    showToast(isEditing ? "客户企业名称已更新" : "客户企业已创建");
+    if (!isEditing && createdId) await openCustomerOrganization(createdId);
+  } catch (error) {
+    showToast(error.message || (isEditing ? "客户企业更新失败" : "客户企业创建失败"));
+  } finally {
+    isCustomerOrganizationSaving = false;
+    setButtonLoading("submitCustomerOrganizationButton", false);
+  }
+});
+
+el("customerOrganizationGrid").addEventListener("click", (event) => {
+  const openButton = event.target.closest("[data-customer-organization-open]");
+  if (openButton) {
+    openCustomerOrganization(openButton.dataset.customerOrganizationOpen);
+    return;
+  }
+  const editButton = event.target.closest("[data-customer-organization-edit]");
+  if (editButton) {
+    openCustomerOrganizationModal(editButton.dataset.customerOrganizationEdit);
+    return;
+  }
+  const archiveButton = event.target.closest("[data-customer-organization-archive]");
+  if (archiveButton) archiveCustomerOrganization(archiveButton.dataset.customerOrganizationArchive);
+});
+
+el("customerOrganizationSearch").addEventListener("input", () => {
+  window.clearTimeout(customerOrganizationsSearchTimer);
+  customerOrganizationsSearchTimer = window.setTimeout(() => {
+    customerOrganizationsFilters = {
+      ...customerOrganizationsFilters,
+      search: el("customerOrganizationSearch").value.trim(),
+    };
+    customerOrganizationsPage = 1;
+    loadCustomerOrganizations();
+  }, 260);
+});
+
+el("customerOrganizationStatusFilter").addEventListener("change", () => {
+  customerOrganizationsFilters = {
+    ...customerOrganizationsFilters,
+    status: el("customerOrganizationStatusFilter").value,
+  };
+  customerOrganizationsPage = 1;
+  loadCustomerOrganizations();
+});
+
+el("resetCustomerOrganizationFiltersButton").addEventListener("click", () => {
+  customerOrganizationsFilters = { search: "", status: "" };
+  customerOrganizationsPage = 1;
+  renderCustomerOrganizationFilters();
+  loadCustomerOrganizations();
+});
+
+el("customerOrganizationPreviousPageButton").addEventListener("click", () => {
+  if (customerOrganizationsPage <= 1) return;
+  customerOrganizationsPage -= 1;
+  loadCustomerOrganizations();
+});
+
+el("customerOrganizationNextPageButton").addEventListener("click", () => {
+  if (customerOrganizationsPage * customerOrganizationsPageSize >= customerOrganizationsTotal) return;
+  customerOrganizationsPage += 1;
+  loadCustomerOrganizations();
+});
 
 el("organizationDepartmentForm").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -4882,8 +5596,8 @@ el("organizationDepartmentForm").addEventListener("submit", async (event) => {
     await ensureCsrfToken();
     await api(
       isEditing
-        ? `/api/organization/current/departments/${encodeURIComponent(editingOrganizationDepartmentId)}`
-        : "/api/organization/current/departments",
+        ? organizationApiPath(`/departments/${encodeURIComponent(editingOrganizationDepartmentId)}`)
+        : organizationApiPath("/departments"),
       {
         method: isEditing ? "PATCH" : "POST",
         body: JSON.stringify({ name }),
@@ -4927,8 +5641,8 @@ el("organizationMemberForm").addEventListener("submit", async (event) => {
       : { name, email, departmentId, role };
     await api(
       isEditing
-        ? `/api/organization/current/members/${encodeURIComponent(editingOrganizationMemberId)}`
-        : "/api/organization/current/members",
+        ? organizationApiPath(`/members/${encodeURIComponent(editingOrganizationMemberId)}`)
+        : organizationApiPath("/members"),
       { method: isEditing ? "PATCH" : "POST", body: JSON.stringify(body) },
     );
     closeOrganizationMemberModal({ force: true });
@@ -5024,6 +5738,10 @@ el("resetOrganizationDemoButton").addEventListener("click", async () => {
   } finally {
     setButtonLoading("resetOrganizationDemoButton", false);
   }
+});
+
+document.querySelectorAll("[data-organization-usage-view]").forEach((button) => {
+  button.addEventListener("click", () => showOrganizationUsage(button.dataset.organizationUsageView));
 });
 
 el("adminRedemptionForm").addEventListener("submit", generateRedemptions);
@@ -5516,6 +6234,7 @@ document.querySelectorAll(".modal-backdrop").forEach((backdrop) => {
     if (backdrop.id === "regenerateKeyModal") closeRegenerateKeyModal();
     if (backdrop.id === "deleteKeyModal") closeDeleteKeyModal();
     if (backdrop.id === "newKeyModal") clearPlainKey();
+    if (backdrop.id === "customerOrganizationModal") closeCustomerOrganizationModal();
     if (backdrop.id === "organizationDepartmentModal") closeOrganizationDepartmentModal();
     if (backdrop.id === "organizationMemberModal") closeOrganizationMemberModal();
   });
@@ -5527,6 +6246,7 @@ document.addEventListener("keydown", (event) => {
   else if (!el("deleteKeyModal").classList.contains("hidden")) closeDeleteKeyModal();
   else if (!el("regenerateKeyModal").classList.contains("hidden")) closeRegenerateKeyModal();
   else if (!el("createKeyModal").classList.contains("hidden")) closeCreateKeyModal();
+  else if (!el("customerOrganizationModal").classList.contains("hidden")) closeCustomerOrganizationModal();
   else if (!el("organizationMemberModal").classList.contains("hidden")) closeOrganizationMemberModal();
   else if (!el("organizationDepartmentModal").classList.contains("hidden")) closeOrganizationDepartmentModal();
 });
