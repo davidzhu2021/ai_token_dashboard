@@ -87,10 +87,16 @@ def test_frontend_calls_billing_endpoints() -> None:
 def test_billing_view_is_reachable_without_entitlement() -> None:
     source = APP_JS.read_text(encoding="utf-8")
 
-    # showApp 在权限受限时会提前 return；充值必须在那之前初始化，
-    # 否则新用户永远看不到唯一的自助开通入口。
-    assert "const billingPromise = refreshBillingAvailability();" in source
-    assert "if (accountAccessCopy(currentUser)) {\n    await billingPromise;\n    return;\n  }" in source
+    # showApp 在权限受限时会提前 return；充值可见性必须在那之前由轻量
+    # /api/auth/scope 解析，不能等待真实账本余额或订单请求。
+    assert "const scopePromise = loadAuthScope();" in source
+    assert (
+        "if (accountAccessCopy(currentUser)) {\n"
+        "    // 权限受限的新用户照样要看到充值入口——他们正是靠充值开通。\n"
+        "    await scopePromise;\n"
+        "    return;\n  }"
+    ) in source
+    assert "if (scope?.billingAvailable !== undefined) {\n      billingAvailable = Boolean(scope.billingAvailable);\n    }" in source
     assert 'el("accountAccessTopupButton").addEventListener("click", () => switchView("billing"));' in source
 
 
@@ -201,11 +207,11 @@ def test_logout_clears_billing_state() -> None:
         assert cleared in source
 
 
-def test_static_asset_version_bumped_for_customer_organization_release() -> None:
+def test_static_asset_version_bumped_for_sidebar_reveal_release() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
 
-    # 不更新版本号线上用户会命中旧缓存，看不到客户企业中心与隔离看板。
-    assert 'src="/assets/app.js?v=20260730-customer-organizations"' in markup
+    # 不更新版本号线上用户会命中旧缓存，侧边栏仍会逐项蹦出。
+    assert 'src="/assets/app.js?v=20260730-sidebar-nav-reveal"' in markup
 
 
 def test_billing_copy_avoids_upstream_provider_terms() -> None:

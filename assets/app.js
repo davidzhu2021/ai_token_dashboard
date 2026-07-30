@@ -121,6 +121,13 @@ let isCreatingTopup = false;
 let isSubmittingManualPay = false;
 let billingLoadError = "";
 let billingAvailable = false;
+// 侧边栏导航整栏一次性揭示的闸门：为 false 时 syncNavigationVisibility() 不动 DOM。
+let isNavigationRevealed = false;
+let navigationRevealTimer = null;
+// 权限探测的兜底时限。已开通员工的 /api/auth/scope 是 10ms 量级，永远赶得上；
+// 但上游查不到账号的邮箱（新入职、拼错地址）要翻完整个用户列表，实测 24-32 秒
+// ——那种情况下先揭示已知项，别让整栏空着。
+const NAVIGATION_REVEAL_TIMEOUT_MS = 800;
 let selectedTopupAmount = 0;
 let pendingTopupTradeNo = "";
 let topupPollTimer = null;
@@ -3311,8 +3318,8 @@ async function refreshBillingAvailability() {
 }
 
 function updateBillingNav() {
-  const tab = el("billingTab");
-  if (tab) tab.classList.toggle("hidden", !billingAvailable);
+  // 充值入口和其余导航项一起揭示，不再单独 toggle 自己那一项。
+  syncNavigationVisibility();
   // 受限提示里的"前往充值"依赖 billingAvailable，可用性变化后要重渲染。
   renderAccountAccessState();
   renderAdminBilling();
@@ -3976,7 +3983,13 @@ function isMockCustomerIdentity() {
   );
 }
 
+// 侧边栏的每一项都由权限决定，逐项揭示会让「我的用量」「令牌管理」先蹦出来、
+// 其余项随各自的探测请求陆续追加。这里改成整栏一次性揭示：权限没落地前导航保持
+// 骨架占位，落地后同一帧内决定全部 7 项。
 function syncNavigationVisibility() {
+  // 权限尚未落地时不动导航：否则先返回的探测会把自己那一项揭示到骨架旁边，又变成
+  // 逐项蹦出。revealNavigation() 负责放开这道闸。
+  if (!isNavigationRevealed) return;
   const canBrowseCustomers = customerOrganizationsAvailable();
   const canViewAdmin = canViewAdminUsage();
   const canViewDepartments = canViewDepartmentUsage();
@@ -3984,13 +3997,56 @@ function syncNavigationVisibility() {
   el("customersTab").classList.toggle("hidden", !canBrowseCustomers);
   el("adminTab").classList.toggle("hidden", !canViewAdmin);
   el("departmentTab").classList.toggle("hidden", !canViewDepartments);
+  el("teamTab").classList.toggle("hidden", !currentUser?.isTeamLeader);
+  // 个人用量对每个登录身份都成立，但仍在这里统一揭示，避免它比其他项先出现。
+  el("dashboardTab")?.classList.remove("hidden");
   // Customer identities use their demo-scoped views only; never expose
   // seller account functions that lack a customer-local contract.
   document.querySelectorAll('[data-view="keys"], [data-view="billing"]').forEach((button) => {
     button.classList.toggle("hidden", isCustomer);
   });
+  el("billingTab")?.classList.toggle("hidden", isCustomer || !billingAvailable);
   document.querySelectorAll('[data-global-page="models"]').forEach((button) => {
     button.classList.toggle("hidden", isCustomer);
+  });
+}
+
+// 权限探测完成，收走骨架并让导航栏整体成形。重复调用是安全的。
+function revealNavigation() {
+  window.clearTimeout(navigationRevealTimer);
+  navigationRevealTimer = null;
+  isNavigationRevealed = true;
+  syncNavigationVisibility();
+  el("navSkeleton")?.classList.add("hidden");
+  const tabs = el("viewTabs");
+  if (tabs) {
+    tabs.classList.remove("nav-pending");
+    tabs.removeAttribute("aria-busy");
+  }
+}
+
+// 卡死兜底：权限迟迟不回来时先按已知信息揭示，团队看板等 scope 落地后再补上。
+// 正常员工的 scope 远快于这个时限，所以实际上不会触发。
+function scheduleNavigationRevealFallback() {
+  window.clearTimeout(navigationRevealTimer);
+  navigationRevealTimer = window.setTimeout(() => {
+    if (!isNavigationRevealed) revealNavigation();
+  }, NAVIGATION_REVEAL_TIMEOUT_MS);
+}
+
+// 换账号或退出登录时把导航退回骨架态，避免上一个身份的可见项闪现给下一个身份。
+function resetNavigationToPending() {
+  window.clearTimeout(navigationRevealTimer);
+  navigationRevealTimer = null;
+  isNavigationRevealed = false;
+  el("navSkeleton")?.classList.remove("hidden");
+  const tabs = el("viewTabs");
+  if (tabs) {
+    tabs.classList.add("nav-pending");
+    tabs.setAttribute("aria-busy", "true");
+  }
+  document.querySelectorAll('.sidebar [data-view]').forEach((button) => {
+    button.classList.add("hidden");
   });
 }
 
@@ -5022,9 +5078,9 @@ async function showApp(user) {
   el("landingView").classList.add("hidden");
   el("loginView").classList.add("hidden");
   el("appView").classList.remove("hidden");
-  el("teamTab").classList.add("hidden");
-  el("billingTab").classList.add("hidden");
-  syncNavigationVisibility();
+  // 导航退回骨架态：本次身份的权限还没落地，先不揭示任何一项。
+  resetNavigationToPending();
+  scheduleNavigationRevealFallback();
   el("userEmail").textContent = currentUser.email;
   el("userName").textContent = currentUser.name || currentUser.email;
   el("avatar").textContent = currentUser.avatar || initials(currentUser.email, currentUser.name);
@@ -5043,16 +5099,15 @@ async function showApp(user) {
     await Promise.all([loadCurrentViewData(), scopePromise]);
     return;
   }
-  // 充值入口要在权限受限时也可用——新用户正是靠充值开通，不能被这道 return 拦掉。
-  const billingPromise = refreshBillingAvailability();
+  // 团队权限与充值可见性都在 /api/auth/scope 里，一次往返就能决定整栏导航。
+  // 余额与订单仍留给充值页按需加载，不在引导路径上等它。
+  const scopePromise = loadAuthScope();
   if (accountAccessCopy(currentUser)) {
-    await billingPromise;
+    // 权限受限的新用户照样要看到充值入口——他们正是靠充值开通。
+    await scopePromise;
     return;
   }
-  const scopePromise = loadAuthScope();
-  await billingPromise;
-  await Promise.all([loadCurrentViewData(), loadModels()]);
-  await scopePromise;
+  await Promise.all([loadCurrentViewData(), loadModels(), scopePromise]);
 }
 
 async function loadAuthScope() {
@@ -5061,13 +5116,24 @@ async function loadAuthScope() {
     Object.assign(currentUser, scope);
     leaderTeams = normalizeLeaderTeams(currentUser);
     selectedTeamRef = currentUser.team?.teamRef || leaderTeams[0]?.teamRef || "";
-    el("teamTab").classList.toggle("hidden", !currentUser.isTeamLeader);
-    syncNavigationVisibility();
+    // 充值入口的可见性由 scope 里的零成本判断给出；老后端没有该字段时退回按需探测，
+    // 避免混合版本部署期间入口凭空消失。
+    if (scope?.billingAvailable !== undefined) {
+      billingAvailable = Boolean(scope.billingAvailable);
+    }
     el("teamWelcomeTitle").textContent = `所选范围 · ${teamScopeLabel()}`;
+    // 团队权限与充值可见性都已确定，导航栏整栏一次成形。
+    revealNavigation();
     // isAdmin 到这里才确定，充值管理面板的可见性随之更新。
     renderAdminBilling();
+    renderAccountAccessState();
     render();
+    if (scope?.billingAvailable === undefined && !isMockCustomerIdentity()) {
+      await refreshBillingAvailability();
+    }
   } catch (error) {
+    // 权限拿不到也必须放开导航，否则用户会一直卡在骨架态、连个人用量都点不到。
+    revealNavigation();
     showToast("部分权限信息加载失败，请刷新重试");
   }
 }
@@ -5158,7 +5224,8 @@ function showLogin() {
   customerOrganizationDetailTab = "info";
   editingCustomerOrganizationId = "";
   window.clearTimeout(customerOrganizationsSearchTimer);
-  el("customersTab").classList.add("hidden");
+  // 导航退回骨架态，下一个登录身份不会先看到上一个身份的可见项。
+  resetNavigationToPending();
   el("organizationDepartmentModal").classList.add("hidden");
   el("organizationMemberModal").classList.add("hidden");
   el("customerOrganizationModal").classList.add("hidden");

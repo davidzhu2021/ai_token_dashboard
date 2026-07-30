@@ -1495,6 +1495,27 @@
         color: var(--brand);
       }
 
+      /* 权限探测期间的导航占位。骨架条高度对齐 .sidebar .view-tab 的 42px，
+         让一次性揭示时不产生布局跳动。揭示时由 JS 加 .hidden 收走。 */
+      .nav-skeleton {
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+      }
+
+      .nav-skeleton .loading-line {
+        height: 42px;
+        border-radius: 10px;
+      }
+
+      .nav-skeleton .loading-line:nth-child(2) {
+        opacity: 0.72;
+      }
+
+      .nav-skeleton .loading-line:nth-child(3) {
+        opacity: 0.48;
+      }
+
       .dashboard-filters {
         display: grid;
         grid-template-columns: repeat(2, minmax(100px, 1fr));
@@ -4510,6 +4531,20 @@
           box-shadow: 0 8px 22px rgba(20, 40, 68, 0.04);
         }
 
+        /* 窄屏侧边栏是横向药丸条，骨架占位随之横向排布。 */
+        .nav-skeleton {
+          flex-direction: row;
+          align-items: center;
+          gap: 4px;
+          padding: 4px;
+        }
+
+        .nav-skeleton .loading-line {
+          width: 92px;
+          height: 36px;
+          border-radius: 999px;
+        }
+
         .action-zone {
           display: grid;
           grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -5958,7 +5993,14 @@
         <aside class="sidebar" aria-label="主导航">
           <p class="sidebar-label">用量导航</p>
           <div class="nav-zone">
-            <nav class="view-tabs" aria-label="页面导航">
+            <!-- 导航项的可见性全部由权限决定，所以每一项都先隐藏，等权限落地后由
+                 syncNavigationVisibility() 一次性揭示。骨架占位避免逐项蹦出。 -->
+            <div id="navSkeleton" class="nav-skeleton" aria-hidden="true">
+              <span class="loading-line"></span>
+              <span class="loading-line"></span>
+              <span class="loading-line"></span>
+            </div>
+            <nav id="viewTabs" class="view-tabs nav-pending" aria-label="页面导航" aria-busy="true">
               <button id="customersTab" class="view-tab hidden" type="button" data-view="customers">
                 <span class="nav-icon"><svg><use href="#icon-team"></use></svg></span>
                 客户企业
@@ -5967,7 +6009,7 @@
                 <span class="nav-icon"><svg><use href="#icon-dashboard"></use></svg></span>
                 全员看板
               </button>
-              <button id="departmentTab" class="view-tab" type="button" data-view="department">
+              <button id="departmentTab" class="view-tab hidden" type="button" data-view="department">
                 <span class="nav-icon"><svg><use href="#icon-dashboard"></use></svg></span>
                 部门看板
               </button>
@@ -5975,11 +6017,11 @@
                 <span class="nav-icon"><svg><use href="#icon-dashboard"></use></svg></span>
                 团队看板
               </button>
-              <button class="view-tab active" type="button" data-view="dashboard" aria-current="page">
+              <button id="dashboardTab" class="view-tab active hidden" type="button" data-view="dashboard" aria-current="page">
                 <span class="nav-icon"><svg><use href="#icon-dashboard"></use></svg></span>
                 我的用量
               </button>
-              <button class="view-tab" type="button" data-view="keys">
+              <button id="keysTab" class="view-tab hidden" type="button" data-view="keys">
                 <span class="nav-icon"><svg><use href="#icon-key"></use></svg></span>
                 令牌管理
               </button>
@@ -7377,6 +7419,6 @@
       </form>
     </div>
 
-    <script src="/assets/app.js?v=20260730-customer-organizations"></script>
+    <script src="/assets/app.js?v=20260730-sidebar-nav-reveal"></script>
   </body>
 </html>

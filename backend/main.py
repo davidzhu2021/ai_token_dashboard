@@ -3026,11 +3026,38 @@ async def change_password(data: ChangePasswordRequest, request: Request) -> dict
     return {"ok": True, "user": payload, "csrfToken": csrf_value}
 
 
+def self_service_billing_available(user: dict[str, Any]) -> bool:
+    """Whether the sidebar top-up destination applies to this identity.
+
+    Deliberately I/O free: it answers only the navigation-visibility question
+    that :func:`billing_identity` would otherwise answer at the cost of an
+    upstream ``user_info`` round trip.  Balance and orders stay on
+    ``/api/me/billing``, which the client calls when the view is opened.
+
+    The checks mirror ``billing_identity``'s own gates: the feature must be
+    configured, the ledger connected, and the caller must be a local account.
+    An SSO employee uses a department budget and never self-serves top-ups.
+    """
+
+    if not billing.billing_enabled():
+        return False
+    store = billing_store()
+    if store is None or store.pool is None:
+        return False
+    return bool(user.get("id"))
+
+
 @app.get("/api/auth/scope")
 async def auth_scope(request: Request) -> dict[str, Any]:
     user = require_user(request)
     if await is_demo_customer_user(user):
-        return {**(await demo_team_scope_for_user(user)), **(await organization_scope_fields_for_user(user))}
+        # A demo customer settles through its enterprise credit contract, so the
+        # personal top-up destination stays hidden for them by construction.
+        return {
+            **(await demo_team_scope_for_user(user)),
+            **(await organization_scope_fields_for_user(user)),
+            "billingAvailable": False,
+        }
     # An invited, suspended, or archived Mock identity must never fall through
     # to the legacy upstream team resolver.  It is a known customer identity
     # whose access is deliberately inactive.
@@ -3042,6 +3069,7 @@ async def auth_scope(request: Request) -> dict[str, Any]:
             "team": None,
             "leaderTeams": [],
             **(await organization_scope_fields_for_user(user)),
+            "billingAvailable": self_service_billing_available(user),
         }
     started = asyncio.get_running_loop().time()
     scope = await team_scope_for_user(user)
@@ -3051,6 +3079,7 @@ async def auth_scope(request: Request) -> dict[str, Any]:
         "team": public_team(scope.get("team")),
         "leaderTeams": [team for team in (public_team(item) for item in scope.get("leaderTeams") or []) if team],
         **(await organization_scope_fields_for_user(user)),
+        "billingAvailable": self_service_billing_available(user),
     }
     logger.info("auth scope resolved email=%s cache=%s duration_ms=%.0f", user.get("email"), scope.get("cache", {}).get("hit"), (asyncio.get_running_loop().time() - started) * 1000)
     return payload

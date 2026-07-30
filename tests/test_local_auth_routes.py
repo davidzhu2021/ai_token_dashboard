@@ -410,6 +410,8 @@ def test_local_password_account_never_inherits_same_email_sso_team_or_debug_scop
         "teamBoardStatus": "none",
         "team": None,
         "leaderTeams": [],
+        # 侧边栏靠这一个响应决定整栏可见性；本地账号在未配置充值时拿不到入口。
+        "billingAvailable": False,
     }
     for response in (team_usage,):
         assert response.status_code == 403

@@ -340,6 +340,42 @@ def test_auth_scope_returns_team_permissions(monkeypatch) -> None:
     assert payload["isTeamLeader"] is True
     assert payload["team"]["teamRef"]
     assert "backend" not in payload["team"]
+    # 侧边栏靠这一个响应决定整栏可见性，所以充值入口的判断也必须在里面。
+    assert payload["billingAvailable"] is False
+
+
+def test_auth_scope_reports_billing_visibility_without_upstream_calls(monkeypatch) -> None:
+    """充值入口的可见性必须是零 I/O 判断。
+
+    过去它要等 /api/me/billing，而那个接口夹了一次上游 user_info 往返，导致
+    「充值中心」比其他导航项晚出现。
+    """
+
+    reset_caches()
+    patch_user(monkeypatch)
+    fake = FakeLiteLLMClient({"isTeamLeader": False, "teamBoardStatus": "none", "team": None, "leaderTeams": []})
+    monkeypatch.setattr(main, "client", lambda: fake)
+
+    class FakeLedger:
+        pool = object()
+
+    # 未配置充值时入口不出现，且不因缺少账本连接而报错。
+    monkeypatch.setattr(main.billing, "billing_enabled", lambda: False)
+    monkeypatch.setattr(main, "billing_store", lambda: FakeLedger())
+    assert app_client().get("/api/auth/scope").json()["billingAvailable"] is False
+
+    # 账本没连上时同样不暴露入口——点进去只会拿到 404。
+    monkeypatch.setattr(main.billing, "billing_enabled", lambda: True)
+    monkeypatch.setattr(main, "billing_store", lambda: None)
+    assert app_client().get("/api/auth/scope").json()["billingAvailable"] is False
+
+    # SSO 员工走部门预算，不属于自助充值范围（会话里没有本地 id）。
+    monkeypatch.setattr(main, "billing_store", lambda: FakeLedger())
+    assert app_client().get("/api/auth/scope").json()["billingAvailable"] is False
+
+    # 本地密码账号在充值开放且账本可用时才看到入口。
+    assert main.self_service_billing_available({"id": "local-1"}) is True
+    assert main.self_service_billing_available({}) is False
 
 
 def test_auth_scope_requires_login() -> None:
