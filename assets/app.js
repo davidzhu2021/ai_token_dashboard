@@ -2467,11 +2467,14 @@ function renderAdmin() {
     return;
   }
   const totalData = adminSummaryData.length ? adminSummaryData : adminUsageData;
-  renderAdminMetrics(adminUsageData);
+  renderAdminMetrics(totalData);
   renderTrendTo("adminTrendChart", totalData);
   renderSpendTrendTo("adminSpendChart", totalData);
-  renderDonutTo("adminSourceDonut", "adminDonutTotal", "adminSourceLegend", adminUsageData);
-  renderModelBarsTo("adminModelBars", adminUsageData);
+  // 饼图按 source 聚合、条形图按 model 聚合，summaryRows 已按 date/source/model
+  // 汇总，两张图的结果与逐员工明细完全一致。未筛选员工时后端不再返回明细，
+  // 这里必须用聚合行，否则近 14/30 天的两张图会变空。
+  renderDonutTo("adminSourceDonut", "adminDonutTotal", "adminSourceLegend", totalData);
+  renderModelBarsTo("adminModelBars", totalData);
   renderAdminUsers();
 
   renderAdminDetailCard();

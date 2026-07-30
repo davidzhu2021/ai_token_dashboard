@@ -844,8 +844,14 @@ class UsageStore:
         where_sql = " AND ".join(conditions)
         pool = self._require_pool()
         model_sql = _model_normalize_sql("model")
-        row_records = await pool.fetch(
-            f"""
+        # 每员工×每天×每模型的明细只在筛选了某个员工时才有人看：未筛选时前端的
+        # 趋势图走 summaryRows、排行榜走 employees，明细仅喂按 source/model 聚合的
+        # 饼图与条形图，而那两张图从 summaryRows 能算出同样的结果。近 30 天这份明细
+        # 有 14000 多行，SQL 本身只占 172ms，其余一秒多全花在传输与构造 dict 上，
+        # 所以未筛选时直接不查。
+        row_records = (
+            await pool.fetch(
+                f"""
             SELECT backend_id, usage_date, user_id, MAX(employee_email) AS employee_email,
                    MAX(employee_name) AS employee_name, source, {model_sql} AS model_name,
                    {self._aggregate_metrics_sql()}
@@ -854,7 +860,10 @@ class UsageStore:
             GROUP BY backend_id, usage_date, user_id, source, {model_sql}
             ORDER BY usage_date, MAX(employee_name), source, model_name
             """,
-            *args,
+                *args,
+            )
+            if employee_filter
+            else []
         )
         enriched = []
         for record in row_records:
@@ -942,7 +951,8 @@ class UsageStore:
             "pageSize": 0,
             "pagesRead": 0,
             "totalPages": 0,
-            "totalRecords": len(enriched),
+            # 未筛选员工时不查明细，用聚合行数表示本次统计规模，避免看板把范围显示成空。
+            "totalRecords": len(enriched) if enriched else len(summary_rows),
             "truncated": False,
             "dataQuality": {"summarySource": "database", "rankingSource": "database"},
             "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered),
@@ -1012,14 +1022,17 @@ class UsageStore:
         """
         model_sql = _model_normalize_sql("u.model")
         pool = self._require_pool()
-        records = await pool.fetch(
-            f"""
+        # 与 admin_rows 同理：部门看板只在选中某个部门后才渲染逐员工明细，未选中时
+        # 画的是部门排行（departmentRankings）与聚合趋势，明细纯属白传。
+        records = (
+            await pool.fetch(
+                f"""
             SELECT u.backend_id, u.usage_date, u.user_id,
                    MAX(u.employee_email) AS employee_email,
                    MAX(u.employee_name) AS employee_name,
                    m.team_id, MAX(m.team_name) AS team_name, MAX(m.team_role) AS team_role,
                    u.source, {model_sql} AS model_name,
-                   {self._aggregate_metrics_sql('u.')} 
+                   {self._aggregate_metrics_sql('u.')}
             FROM usage_daily u
             JOIN usage_team_membership_daily m
               ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
@@ -1027,7 +1040,10 @@ class UsageStore:
             GROUP BY u.backend_id, u.usage_date, u.user_id, m.team_id, m.team_name, u.source, {model_sql}
             ORDER BY u.usage_date, MAX(m.team_name), MAX(u.employee_name), u.source, model_name
             """,
-            *args,
+                *args,
+            )
+            if department_filter
+            else []
         )
         rows = []
         for record in records:
