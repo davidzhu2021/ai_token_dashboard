@@ -26,6 +26,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 from .cache import TTLCache
@@ -113,6 +114,9 @@ async def app_lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="通衢 API", lifespan=app_lifespan)
+# 首屏要先下载 index.html 与 app.js 才能发出任何接口请求，两者合计 500KB 以上。
+# 它们是纯文本，压缩后只剩两成，是首屏可感知延迟里最便宜的一段。
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.mount("/assets", StaticFiles(directory=ROOT_DIR / "assets"), name="assets")
 
 

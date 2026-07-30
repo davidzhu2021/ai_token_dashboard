@@ -1,6 +1,11 @@
+import asyncio
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from backend import main
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
 
 
 def test_index_uses_fresh_app_asset_and_disables_html_cache() -> None:
@@ -69,3 +74,52 @@ def test_spa_fallback_disables_html_cache() -> None:
     assert response.status_code == 200
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["Referrer-Policy"] == "no-referrer"
+
+
+async def _wire_response(path: str) -> tuple[int, str | None]:
+    """按 ASGI 原始字节测量响应体，绕开测试客户端的透明解压。"""
+    body = bytearray()
+    headers: dict[str, str] = {}
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, object]) -> None:
+        if message["type"] == "http.response.start":
+            headers.update({key.decode(): value.decode() for key, value in message["headers"]})
+        elif message["type"] == "http.response.body":
+            body.extend(message.get("body", b""))
+
+    await main.app(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "root_path": "",
+            "scheme": "http",
+            "server": ("test", 80),
+            "client": ("test", 1),
+            "headers": [(b"host", b"test"), (b"accept-encoding", b"gzip")],
+        },
+        receive,
+        send,
+    )
+    return len(body), headers.get("content-encoding")
+
+
+def test_boot_assets_are_compressed_on_the_wire() -> None:
+    """首屏要先下载 index.html 与 app.js 才能发接口请求，两者必须压缩后再传。
+
+    只断言 content-encoding 不够：中间件顺序或 minimum_size 配错时头还在、
+    体积却没降，所以直接按 ASGI 原始字节校验压缩率。
+    """
+    for path in ("/", "/assets/app.js"):
+        wire_size, encoding = asyncio.run(_wire_response(path))
+        uncompressed = (ROOT_DIR / ("index.html" if path == "/" else "assets/app.js")).stat().st_size
+
+        assert encoding == "gzip", f"{path} 未压缩传输"
+        assert wire_size < uncompressed // 2, f"{path} 压缩后仍有 {wire_size} 字节"

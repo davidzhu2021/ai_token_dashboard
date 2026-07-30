@@ -60,6 +60,7 @@ let departmentUsageScopeKey = "";
 let departmentUsageLoadingScopeKey = "";
 let departmentUsageRequestId = 0;
 let modelCatalog = [];
+let modelCatalogRequest = null;
 let modelViewMode = "card";
 let personalKeys = [];
 let availableKeyModels = [];
@@ -5042,7 +5043,7 @@ function clearTeamMemberSelection() {
   renderTeam();
 }
 
-async function loadModels() {
+async function loadModels({ silent = false } = {}) {
   // Customer demo identities intentionally have no model-catalog contract.
   // Do not make a forbidden request merely because an older navigation event
   // tries to prefetch the global page.
@@ -5052,17 +5053,28 @@ async function loadModels() {
     renderModels();
     return;
   }
-  try {
-    const payload = await api("/api/models");
-    modelCatalog = payload.models || [];
-    setupModelFilters();
-    renderModels();
-  } catch (error) {
-    modelCatalog = [];
-    setupModelFilters();
-    renderModels();
-    showToast(error.message || "模型列表加载失败");
+  // 引导期的预取与切到模型广场时的按需加载可能撞在一起，复用同一个在途请求，
+  // 避免对上游目录接口发两次。
+  if (!modelCatalogRequest) {
+    modelCatalogRequest = (async () => {
+      try {
+        const payload = await api("/api/models");
+        modelCatalog = payload.models || [];
+        return null;
+      } catch (error) {
+        modelCatalog = [];
+        return error;
+      } finally {
+        modelCatalogRequest = null;
+        setupModelFilters();
+        renderModels();
+      }
+    })();
   }
+  const error = await modelCatalogRequest;
+  // 报错与否按调用方决定，而不是按发起预取时的身份：后台预取静默失败，
+  // 但用户已经打开模型广场时，同一个在途请求失败仍要给出提示。
+  if (error && !silent) showToast(error.message || "模型列表加载失败");
 }
 
 async function showApp(user) {
@@ -5107,7 +5119,11 @@ async function showApp(user) {
     await scopePromise;
     return;
   }
-  await Promise.all([loadCurrentViewData(), loadModels(), scopePromise]);
+  // 模型目录不在首屏渲染路径上（仪表盘不读 modelCatalog），而它冷缓存时要打上游
+  // /models 与 /model/info，是引导期最慢的一段。改为后台预取：首屏只等用量与权限，
+  // 切到模型广场时若预取还没回来，switchView 会复用这个在途请求。
+  loadModels({ silent: true });
+  await Promise.all([loadCurrentViewData(), scopePromise]);
 }
 
 async function loadAuthScope() {
