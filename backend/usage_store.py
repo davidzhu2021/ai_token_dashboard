@@ -889,6 +889,11 @@ class UsageStore:
                 SELECT employee_key, MIN(user_id) AS employee_id,
                        MAX(NULLIF(employee_email, '')) AS employee_email,
                        MAX(NULLIF(employee_name, '')) AS employee_name,
+                       -- user_ids 在这一次分组里顺便聚出来。写成相关子查询
+                       -- （ARRAY(SELECT ... WHERE employee_key = totals.employee_key)）
+                       -- 会让 Postgres 对每个员工重扫一遍 filtered：近 30 天是
+                       -- 513 loops × 15000 行 ≈ 1.3 秒，占该区间几乎全部耗时。
+                       ARRAY_AGG(DISTINCT user_id ORDER BY user_id) AS user_ids,
                        {self._aggregate_metrics_sql('')}
                 FROM filtered
                 GROUP BY employee_key
@@ -901,8 +906,7 @@ class UsageStore:
                 FROM source_totals
                 ORDER BY employee_key, source_tokens DESC, source
             )
-            SELECT totals.*, primary_sources.primary_source,
-                   ARRAY(SELECT DISTINCT user_id FROM filtered f WHERE f.employee_key = totals.employee_key ORDER BY user_id) AS user_ids
+            SELECT totals.*, primary_sources.primary_source
             FROM totals
             JOIN primary_sources USING (employee_key)
             ORDER BY totals.total_tokens DESC, totals.spend DESC, lower(COALESCE(totals.employee_name, totals.employee_id))
@@ -1076,6 +1080,9 @@ class UsageStore:
                 SELECT employee_key, MIN(user_id) AS employee_id,
                        MAX(NULLIF(employee_email, '')) AS employee_email,
                        MAX(NULLIF(employee_name, '')) AS employee_name,
+                       -- 与 admin_rows 同理：相关子查询会按员工数重扫 filtered，
+                       -- 这里在同一次分组里聚出 user_ids。
+                       ARRAY_AGG(DISTINCT user_id ORDER BY user_id) AS user_ids,
                        {self._aggregate_metrics_sql('')}
                 FROM filtered
                 GROUP BY employee_key
@@ -1088,8 +1095,7 @@ class UsageStore:
                 FROM source_totals
                 ORDER BY employee_key, source_tokens DESC, source
             )
-            SELECT totals.*, primary_sources.primary_source,
-                   ARRAY(SELECT DISTINCT user_id FROM filtered f WHERE f.employee_key = totals.employee_key ORDER BY user_id) AS user_ids
+            SELECT totals.*, primary_sources.primary_source
             FROM totals JOIN primary_sources USING (employee_key)
             ORDER BY totals.total_tokens DESC, totals.spend DESC, lower(COALESCE(totals.employee_name, totals.employee_id))
             """,
@@ -1265,6 +1271,8 @@ class UsageStore:
                        MAX(NULLIF(employee_email, '')) AS employee_email,
                        MAX(NULLIF(employee_name, '')) AS employee_name,
                        MAX(team_role) AS team_role,
+                       -- 同 admin_rows：避免按成员数重扫 filtered 的相关子查询。
+                       ARRAY_AGG(DISTINCT user_id ORDER BY user_id) AS user_ids,
                        {self._aggregate_metrics_sql('')}
             FROM filtered GROUP BY employee_key
             ), source_totals AS (
@@ -1274,8 +1282,7 @@ class UsageStore:
                 SELECT DISTINCT ON (employee_key) employee_key, source AS primary_source
                 FROM source_totals ORDER BY employee_key, source_tokens DESC, source
             )
-            SELECT totals.*, primary_sources.primary_source,
-                   ARRAY(SELECT DISTINCT user_id FROM filtered f WHERE f.employee_key = totals.employee_key ORDER BY user_id) AS user_ids
+            SELECT totals.*, primary_sources.primary_source
             FROM totals JOIN primary_sources USING (employee_key)
             ORDER BY totals.total_tokens DESC, totals.spend DESC, lower(COALESCE(totals.employee_name, totals.employee_id))
             """,
