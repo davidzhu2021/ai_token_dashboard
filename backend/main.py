@@ -3075,26 +3075,12 @@ async def my_keys(request: Request, refresh: bool = Query(False)) -> dict[str, A
 @app.post("/api/me/keys")
 async def create_my_key(data: CreatePersonalKeyRequest, request: Request) -> JSONResponse:
     await enforce_csrf(request)
-    app_user, upstream_user = await current_upstream_user(request)
+    app_user, _ = await current_upstream_user(request)
     require_active_local_entitlement(app_user)
-    primary_user_id = primary_upstream_user_id(upstream_user)
-    try:
-        created = await client().create_key(
-            primary_user_id,
-            data.name,
-            data.purpose,
-            data.duration,
-            data.models,
-            app_user["email"],
-        )
-    except HTTPException:
-        write_key_audit("create", app_user["email"], "-", request, "failed")
-        raise
-    warning = store_created_key(primary_user_id, created)
-    write_key_audit("create", app_user["email"], created.get("id", "-"), request, "success_vault_failed" if warning else "success")
-    return JSONResponse(
-        {**created, "revealable": not warning, "warning": warning},
-        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    write_key_audit("create", app_user["email"], "-", request, "disabled")
+    raise HTTPException(
+        status_code=403,
+        detail="管理员已暂时关闭新增访问密钥，请联系管理员申请。",
     )
 
 

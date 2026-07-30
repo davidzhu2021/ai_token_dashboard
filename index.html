@@ -6555,13 +6555,13 @@
             <div>
               <span class="eyebrow">访问权限</span>
               <h2>令牌管理</h2>
-              <p>管理你用于 Codex、Claude Code 和其他 AI 工具的个人访问密钥。新创建或更新的密钥会加密保管，可通过眼睛按钮查看。</p>
+              <p>管理你用于 Codex、Claude Code 和其他 AI 工具的个人访问密钥。当前暂停新增密钥；已有密钥仍可查看、更新或停用。</p>
             </div>
             <div class="key-page-actions">
               <span id="keyCount" class="chip blue">0 个密钥</span>
-              <button id="addKeyButton" class="primary-btn" type="button">
+              <button id="addKeyButton" class="primary-btn" type="button" disabled title="管理员已暂时关闭新增访问密钥">
                 <span class="app-icon"><svg><use href="#icon-key"></use></svg></span>
-                添加密钥
+                新增已暂停
               </button>
             </div>
           </section>

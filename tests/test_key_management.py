@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -647,20 +648,10 @@ def test_store_created_key_failure_returns_warning(monkeypatch) -> None:
     assert "sk-secret-ABCD" not in warning
 
 
-def test_create_endpoint_stores_key_and_reports_revealable(monkeypatch) -> None:
+def test_create_endpoint_is_disabled_and_never_calls_upstream(monkeypatch) -> None:
     class FakeClient:
         async def create_key(self, user_id, name, purpose, duration, models, changed_by):
-            assert user_id == "user-1"
-            return {"key": "sk-created-ABCD", "id": "hash-new", "masked": "sk-...ABCD", "expiresAt": "永不过期"}
-
-    class FakeVault:
-        def __init__(self) -> None:
-            self.stored = None
-
-        def store(self, backend_id, user_id, key_id, plaintext):
-            self.stored = (backend_id, user_id, key_id, plaintext)
-
-    vault = FakeVault()
+            raise AssertionError("disabled endpoint must not call the upstream key generator")
 
     async def fake_current_upstream_user(_request):
         return {"email": "employee@example.com"}, {
@@ -669,7 +660,6 @@ def test_create_endpoint_stores_key_and_reports_revealable(monkeypatch) -> None:
         }
 
     monkeypatch.setattr(main, "client", lambda: FakeClient())
-    monkeypatch.setattr(main, "key_vault", lambda: vault)
     monkeypatch.setattr(main, "current_upstream_user", fake_current_upstream_user)
     monkeypatch.setattr(main, "write_key_audit", lambda *_args: None)
 
@@ -680,46 +670,15 @@ def test_create_endpoint_stores_key_and_reports_revealable(monkeypatch) -> None:
             headers=csrf_headers(app_client),
         )
 
-    assert response.status_code == 200
-    assert response.json()["revealable"] is True
-    assert response.json()["warning"] == ""
-    assert response.headers["cache-control"] == "no-store"
-    assert response.headers["pragma"] == "no-cache"
-    assert vault.stored == ("primary", "user-1", "hash-new", "sk-created-ABCD")
+    assert response.status_code == 403
+    assert "暂时关闭新增访问密钥" in response.json()["detail"]
 
 
-def test_create_endpoint_returns_plaintext_and_warning_when_vault_fails(monkeypatch) -> None:
-    class FakeClient:
-        async def create_key(self, *_args):
-            return {"key": "sk-created-ABCD", "id": "hash-new", "masked": "sk-...ABCD", "expiresAt": "永不过期"}
+def test_key_creation_control_is_disabled_in_the_page() -> None:
+    markup = (Path(__file__).parents[1] / "index.html").read_text(encoding="utf-8")
 
-    class BrokenVault:
-        def store(self, *_args):
-            raise main.KeyVaultError("write failed")
-
-    async def fake_current_upstream_user(_request):
-        return {"email": "employee@example.com"}, {
-            "matched_user_ids": ["user-1"],
-            "matched_accounts": [{"backend": "primary", "user_id": "user-1"}],
-        }
-
-    monkeypatch.setattr(main, "client", lambda: FakeClient())
-    monkeypatch.setattr(main, "key_vault", lambda: BrokenVault())
-    monkeypatch.setattr(main, "current_upstream_user", fake_current_upstream_user)
-    monkeypatch.setattr(main, "write_key_audit", lambda *_args: None)
-
-    with TestClient(main.app) as app_client:
-        response = app_client.post(
-            "/api/me/keys",
-            json={"name": "我的密钥", "purpose": "", "duration": "never", "models": []},
-            headers=csrf_headers(app_client),
-        )
-
-    payload = response.json()
-    assert response.status_code == 200
-    assert payload["key"] == "sk-created-ABCD"
-    assert payload["revealable"] is False
-    assert "加密保管失败" in payload["warning"]
+    assert 'id="addKeyButton" class="primary-btn" type="button" disabled' in markup
+    assert "新增已暂停" in markup
 
 
 def test_regenerate_endpoint_replaces_old_vault_record(monkeypatch) -> None:

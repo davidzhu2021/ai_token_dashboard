@@ -2910,20 +2910,7 @@ function updateKeyModelMode() {
 }
 
 function openCreateKeyModal() {
-  if (!availableKeyModels.length) {
-    showToast("当前账号没有可用于创建访问密钥的模型权限，请联系管理员开通模型权限。");
-    return;
-  }
-  el("createKeyForm").reset();
-  el("keyModelMode").value = "all";
-  renderKeyModelChoices();
-  updateKeyModelMode();
-  const scopeText = unrestrictedKeyModels
-    ? "全部可用模型会跟随当前账号的全模型权限。"
-    : "全部可用模型会限制在你当前账号已授权的模型范围内。";
-  setText("keyModelHint", scopeText);
-  el("createKeyModal").classList.remove("hidden");
-  window.setTimeout(() => el("keyNameInput").focus(), 0);
+  showToast("管理员已暂时关闭新增访问密钥");
 }
 
 function closeCreateKeyModal() {
