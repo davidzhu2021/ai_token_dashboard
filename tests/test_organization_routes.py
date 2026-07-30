@@ -277,6 +277,24 @@ def test_mock_team_leader_uses_only_their_customer_team(monkeypatch) -> None:
     assert {row["organizationId"] for row in team_usage.json()["rows"]} == {"org-demo"}
 
 
+def test_mock_team_usage_rejects_non_leaders_and_other_customer_team_refs(monkeypatch) -> None:
+    member_client = demo_client(monkeypatch, "avery.chen@demo.example")
+    leader_client = demo_client(monkeypatch, "owner@demo.example")
+
+    non_leader = member_client.get(
+        "/api/team/usage?start_date=2026-01-01&end_date=2026-01-03"
+    )
+    cross_customer_ref = leader_client.get(
+        "/api/team/usage?start_date=2026-01-01&end_date=2026-01-03"
+        "&team_ref=mock-org-aurora-dept-aurora-research"
+    )
+
+    assert non_leader.status_code == 403
+    assert error_code(non_leader) == "ORGANIZATION_SCOPE_FORBIDDEN"
+    assert cross_customer_ref.status_code == 403
+    assert error_code(cross_customer_ref) == "ORGANIZATION_SCOPE_FORBIDDEN"
+
+
 def test_dev_login_allows_known_mock_customer_member_on_loopback_only(monkeypatch) -> None:
     monkeypatch.setenv("ORGANIZATION_DEMO_ENABLED", "true")
     monkeypatch.setenv("DEV_LOGIN_ENABLED", "true")

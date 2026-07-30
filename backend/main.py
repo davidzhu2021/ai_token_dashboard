@@ -664,7 +664,7 @@ def organization_access_fields(
     can_view_usage = role in {"owner", "admin"}
     return {
         "organizationDemoEnabled": enabled,
-        "isPlatformAdmin": bool(user.get("isPlatformAdmin") or user.get("isAdmin")),
+        "isPlatformAdmin": bool(user.get("isPlatformAdmin")),
         "organizationId": organization_id,
         # The customer name is safe display context for scoped boards. It lets
         # a customer admin identify their tenant without exposing the seller's
@@ -676,8 +676,8 @@ def organization_access_fields(
         "canManageOrganization": False,
         # Keep the explicit V2 capability separate from the legacy alias while
         # older browser bundles are still in circulation.
-        "canManageCustomerOrganizations": bool(enabled and (user.get("isPlatformAdmin") or user.get("isAdmin"))),
-        "canManageCustomers": bool(enabled and (user.get("isPlatformAdmin") or user.get("isAdmin"))),
+        "canManageCustomerOrganizations": bool(enabled and user.get("isPlatformAdmin")),
+        "canManageCustomers": bool(enabled and user.get("isPlatformAdmin")),
     }
 
 

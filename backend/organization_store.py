@@ -1743,7 +1743,7 @@ class InMemoryOrganizationStore:
     ) -> dict[str, Any]:
         scope = self.team_scope_for_member(organization_id, email)
         if not scope.get("isTeamLeader"):
-            raise OrganizationConflictError("member is not a team leader")
+            raise OrganizationPermissionError("member is not a team leader")
         authorized_ref = str((scope.get("team") or {}).get("teamRef") or "")
         selected_ref = team_ref or authorized_ref
         if selected_ref != authorized_ref:
@@ -1764,7 +1764,7 @@ class InMemoryOrganizationStore:
     ) -> dict[str, Any]:
         scope = self.team_scope_for_member(organization_id, email)
         if not scope.get("isTeamLeader"):
-            raise OrganizationConflictError("member is not a team leader")
+            raise OrganizationPermissionError("member is not a team leader")
         authorized_ref = str((scope.get("team") or {}).get("teamRef") or "")
         selected_ref = team_ref or authorized_ref
         if selected_ref != authorized_ref:
