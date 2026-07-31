@@ -1248,6 +1248,12 @@ function selectedAdminEmployeeLabel() {
   return employee?.employeeName || employee?.employeeEmail || employee?.employeeId || selectedAdminEmployee || "员工";
 }
 
+// 成员可能跨多个部门（多账号或多团队归属），逐个列出比只显示一个更诚实。
+function employeeDepartmentText(employee) {
+  const names = (employee?.departmentNames || []).map((name) => String(name).trim()).filter(Boolean);
+  return names.length ? names.join("、") : "未绑定部门";
+}
+
 function updateAdminChartTitles() {
   const scopeName = selectedAdminEmployee ? selectedAdminEmployeeLabel() : "全员";
   const customerName = organizationUsageScope()?.kind === "platformCustomer" ? organizationUsageScope()?.name : "";
@@ -2487,7 +2493,8 @@ function renderAdminDetailCard() {
   if (!selectedAdminEmployee) return;
   const employee = adminEmployees.find((item) => item.employeeEmail === selectedAdminEmployee || item.employeeId === selectedAdminEmployee);
   el("adminDetailTitle").textContent = `${employee?.employeeName || selectedAdminEmployee} 的用量详情`;
-  el("adminDetailSubtitle").textContent = employee?.employeeEmail || employee?.employeeId || selectedAdminEmployee;
+  const identity = employee?.employeeEmail || employee?.employeeId || selectedAdminEmployee;
+  el("adminDetailSubtitle").textContent = `${identity} · 部门：${employeeDepartmentText(employee)}`;
 }
 
 function renderDepartment() {

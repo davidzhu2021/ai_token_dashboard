@@ -150,6 +150,20 @@ def add_totals(target: dict[str, Any], row: dict[str, Any]) -> None:
     target["spend"] += _as_float(row.get("spend"))
 
 
+def _department_names_for(index: dict[str, list[str]], email: Any, user_ids: list[Any]) -> list[str]:
+    """按邮箱优先、再按各 user_id 查部门名，合并跨后端账号的部门归属。"""
+
+    names: list[str] = []
+    keys = [_clean_text(email).lower()] + [_clean_text(item).lower() for item in user_ids]
+    for key in keys:
+        if not key:
+            continue
+        for name in index.get(key, []):
+            if name not in names:
+                names.append(name)
+    return names
+
+
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     by_date: dict[str, dict[str, Any]] = {}
     by_source: dict[str, dict[str, Any]] = {}
@@ -913,6 +927,9 @@ class UsageStore:
             """,
             *args,
         )
+        # 部门归属只在下钻到具体成员时才显示（全员排行没有部门列），所以与明细
+        # 同理：未筛选员工时不查这张成员-部门快照表。
+        department_names = await self._employee_department_names(start_date, end_date, covered, employee_filter) if employee_filter else {}
         employees = [
             {
                 "employeeId": record["employee_id"],
@@ -930,6 +947,11 @@ class UsageStore:
                 },
                 "primarySource": record["primary_source"] or "其他",
                 "userIds": list(record["user_ids"] or []),
+                "departmentNames": _department_names_for(
+                    department_names,
+                    record["employee_email"],
+                    list(record["user_ids"] or []),
+                ),
                 "teamRole": "user",
             }
             for record in employee_records
@@ -961,6 +983,50 @@ class UsageStore:
             "dataQuality": {"summarySource": "database", "rankingSource": "database"},
             "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered),
         }
+
+    async def _employee_department_names(
+        self,
+        start_date: str,
+        end_date: str,
+        backend_ids: list[str],
+        employee_filter: str = "",
+    ) -> dict[str, list[str]]:
+        """返回 {user_id / employee_email: 部门名列表}，供成员下钻显示部门归属。
+
+        同一员工可能在多个后端有账号、也可能同时属于多个部门，所以按 user_id 和
+        邮箱两个维度都建索引：调用方先用邮箱查（跨后端账号合并后的身份），查不到
+        再退回 user_id。
+        """
+
+        conditions = [
+            "snapshot_date BETWEEN $1::date AND $2::date",
+            "backend_id = ANY($3::text[])",
+        ]
+        args: list[Any] = [_as_date(start_date), _as_date(end_date), backend_ids]
+        if employee_filter:
+            conditions.append(
+                "(position($4 IN lower(user_id)) > 0 OR position($4 IN lower(employee_email)) > 0 OR position($4 IN lower(employee_name)) > 0)"
+            )
+            args.append(employee_filter)
+        records = await self._require_pool().fetch(
+            "SELECT DISTINCT user_id, employee_email, team_id, team_name FROM usage_team_membership_daily WHERE "
+            + " AND ".join(conditions),
+            *args,
+        )
+        grouped: dict[str, list[str]] = {}
+        for record in records:
+            name = _clean_text(record["team_name"]) or _clean_text(record["team_id"])
+            if not name:
+                continue
+            for key in (_clean_text(record["user_id"]).lower(), _clean_text(record["employee_email"]).lower()):
+                if not key:
+                    continue
+                names = grouped.setdefault(key, [])
+                if name not in names:
+                    names.append(name)
+        for names in grouped.values():
+            names.sort()
+        return grouped
 
     @staticmethod
     def _employee_summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

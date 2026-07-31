@@ -211,7 +211,7 @@ def test_static_asset_version_bumped_for_sidebar_reveal_release() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
 
     # 不更新版本号线上用户会命中旧缓存，侧边栏仍会逐项蹦出。
-    assert 'src="/assets/app.js?v=20260730-usage-detail-skip"' in markup
+    assert 'src="/assets/app.js?v=20260731-admin-member-department"' in markup
 
 
 def test_billing_copy_avoids_upstream_provider_terms() -> None:

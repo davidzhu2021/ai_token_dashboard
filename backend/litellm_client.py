@@ -1982,6 +1982,9 @@ class LiteLLMClient:
         employee_filter = (employee or "").strip().lower()
         grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         employees: dict[str, dict[str, Any]] = {}
+        # 部门归属只在下钻到具体成员时显示，全员排行没有部门列。未筛选时不取
+        # team_map，避免为没人看的字段多发一次上游团队列表请求。
+        department_names: dict[str, list[str]] = {}
         max_pages = max(1, int(os.getenv("ADMIN_USAGE_LOG_MAX_PAGES", "30")))
         page_size = max(1, min(100, int(os.getenv("ADMIN_USAGE_PAGE_SIZE", "100"))))
         utc_start, utc_end = _local_date_window_as_utc_text(start_date, end_date)
@@ -1992,14 +1995,18 @@ class LiteLLMClient:
         for backend in self.backends:
             if backend.source and _source_filter_applies(source) and source != backend.source:
                 continue
-            # users 和 her_account_index 相互独立，并行获取
+            # users、team_map 和 her_account_index 相互独立，并行获取
             if backend.source == "Her":
-                users, account_index = await asyncio.gather(
+                users, account_index, team_map = await asyncio.gather(
                     self.users(backend),
                     self.her_account_index(backend),
+                    self._team_map_or_empty(backend, employee_filter),
                 )
             else:
-                users = await self.users(backend)
+                users, team_map = await asyncio.gather(
+                    self.users(backend),
+                    self._team_map_or_empty(backend, employee_filter),
+                )
                 account_index = None
             user_map = self._admin_user_map(users)
             backend_pages_read = 0
@@ -2037,6 +2044,8 @@ class LiteLLMClient:
 
                     employee_key = employee_info["id"]
                     employees.setdefault(employee_key, employee_info)
+                    if employee_filter:
+                        self._collect_department_name(department_names, employee_key, log, team_map)
                     model = self._usage_model_name(log)
                     day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
                     key = (day, employee_key, detected_source, model)
@@ -2062,7 +2071,7 @@ class LiteLLMClient:
         return {
             "rows": rows,
             "summaryRows": summary_rows or rows,
-            "employees": self._admin_employee_summaries(rows, employees),
+            "employees": self._admin_employee_summaries(rows, employees, department_names),
             "pageLimit": max_pages,
             "pageSize": page_size,
             "pagesRead": pages_read,
@@ -2633,6 +2642,9 @@ class LiteLLMClient:
             for user_id in item.get("userIds") or []:
                 if user_id not in existing["userIds"]:
                     existing["userIds"].append(user_id)
+            for name in item.get("departmentNames") or []:
+                if name not in existing["departmentNames"]:
+                    existing["departmentNames"].append(name)
 
         for employee_id, employee in employees.items():
             email = str(employee.get("email") or "").strip().lower()
@@ -2645,6 +2657,7 @@ class LiteLLMClient:
                     "employeeEmail": email,
                     "bindStatus": employee.get("bindStatus") or "未绑定邮箱",
                     "userIds": [],
+                    "departmentNames": [],
                     "promptTokens": 0,
                     "completionTokens": 0,
                     "totalTokens": 0,
@@ -2968,7 +2981,37 @@ class LiteLLMClient:
         values = [employee_info.get("id"), employee_info.get("name"), employee_info.get("email")]
         return any(employee_filter in str(value or "").lower() for value in values)
 
-    def _admin_employee_summaries(self, rows: list[dict[str, Any]], employees: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    async def _team_map_or_empty(self, backend: LiteLLMBackend, employee_filter: str) -> dict[str, dict[str, str]]:
+        """只有下钻到具体成员时才需要团队名，其余情况省掉这次上游请求。"""
+
+        if not employee_filter:
+            return {}
+        try:
+            return await self.team_map(backend)
+        except HTTPException:
+            return {}
+
+    def _collect_department_name(
+        self,
+        department_names: dict[str, list[str]],
+        employee_key: str,
+        log: dict[str, Any],
+        team_map: dict[str, dict[str, str]],
+    ) -> None:
+        info = self._department_info_from_log(log, team_map)
+        name = str(info.get("name") or "").strip()
+        if not name or info.get("id") == "unassigned":
+            return
+        names = department_names.setdefault(employee_key, [])
+        if name not in names:
+            names.append(name)
+
+    def _admin_employee_summaries(
+        self,
+        rows: list[dict[str, Any]],
+        employees: dict[str, dict[str, Any]],
+        department_names: dict[str, list[str]] | None = None,
+    ) -> list[dict[str, Any]]:
         grouped: dict[str, dict[str, Any]] = {}
         source_totals: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
         for row in rows:
@@ -2982,6 +3025,7 @@ class LiteLLMClient:
                     "employeeEmail": employee.get("email") or row.get("employeeEmail") or "",
                     "bindStatus": employee.get("bindStatus") or row.get("bindStatus") or "未绑定邮箱",
                     "userIds": list(employee.get("userIds") or []),
+                    "departmentNames": sorted((department_names or {}).get(employee_id, [])),
                     "promptTokens": 0,
                     "completionTokens": 0,
                     "totalTokens": 0,

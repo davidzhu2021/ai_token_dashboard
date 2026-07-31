@@ -1339,6 +1339,7 @@ class InMemoryOrganizationStore:
         for row in rows:
             member_id = str(row.get("employeeId") or "")
             member = state.members.get(member_id)
+            department = state.departments.get(member.department_id) if member else None
             summary = grouped.setdefault(
                 member_id,
                 {
@@ -1347,6 +1348,7 @@ class InMemoryOrganizationStore:
                     "employeeEmail": row.get("employeeEmail") or "",
                     "bindStatus": row.get("bindStatus") or "已绑定邮箱",
                     "userIds": [member_id],
+                    "departmentNames": [department.name] if department else [],
                     "teamRole": "admin" if member and member.team_role == "leader" else "user",
                     **self._empty_metrics(),
                     "primarySource": "其他",
