@@ -912,6 +912,12 @@
         box-shadow: 0 10px 24px rgba(6, 115, 210, 0.2);
       }
 
+      /* Action icons follow their button's foreground color instead of the default blue. */
+      .primary-btn .app-icon,
+      .danger-btn .app-icon {
+        color: currentColor;
+      }
+
       .primary-btn:hover {
         background: linear-gradient(180deg, #2b91f0, #0561b4);
         transform: translateY(-1px);
@@ -2954,6 +2960,153 @@
         margin-bottom: 18px;
       }
 
+      /* 企业额度沿用控制台的数据卡片节奏，但与个人支付流程完全隔离。 */
+      .organization-billing-workspace {
+        display: grid;
+        gap: 18px;
+      }
+
+      .organization-billing-hero {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(270px, 0.7fr);
+        gap: 28px;
+        align-items: end;
+        padding: 30px 32px;
+        border: 1px solid rgba(6, 115, 210, 0.25);
+        border-radius: var(--radius);
+        background:
+          radial-gradient(circle at 88% 0%, rgba(53, 153, 227, 0.2), transparent 42%),
+          linear-gradient(135deg, #e8f4fe 0%, #fafdff 58%, #eff8ff 100%);
+        box-shadow: var(--shadow-soft);
+      }
+
+      .organization-billing-hero .eyebrow,
+      .organization-billing-hero .organization-demo-badge {
+        margin-right: 8px;
+      }
+
+      .organization-billing-hero h2 {
+        margin: 10px 0 8px;
+        font-size: clamp(28px, 3vw, 40px);
+        letter-spacing: -0.04em;
+      }
+
+      .organization-billing-hero p {
+        max-width: 660px;
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.75;
+      }
+
+      .organization-billing-hero-balance {
+        display: grid;
+        gap: 8px;
+        justify-items: start;
+        padding: 22px;
+        border: 1px solid rgba(6, 115, 210, 0.16);
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.86);
+      }
+
+      .organization-billing-hero-balance > span:first-child {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .organization-billing-hero-balance strong {
+        color: #075eab;
+        font-size: clamp(34px, 4vw, 48px);
+        font-variant-numeric: tabular-nums;
+        letter-spacing: -0.05em;
+        line-height: 1;
+      }
+
+      .organization-billing-hero-balance .primary-btn {
+        margin-top: 8px;
+      }
+
+      .organization-billing-readonly {
+        margin-top: 8px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .organization-billing-metrics,
+      .organization-billing-usage-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .organization-billing-metric,
+      .organization-billing-usage-card {
+        display: grid;
+        gap: 7px;
+        min-width: 0;
+        padding: 20px 22px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--panel-strong);
+        box-shadow: var(--shadow-soft);
+      }
+
+      .organization-billing-metric.accent {
+        border-color: rgba(6, 115, 210, 0.22);
+        background: linear-gradient(140deg, var(--ice), var(--panel-strong));
+      }
+
+      .organization-billing-metric > span,
+      .organization-billing-usage-card > span,
+      .organization-billing-metric small,
+      .organization-billing-usage-card small,
+      .organization-billing-usage-card div {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .organization-billing-metric strong,
+      .organization-billing-usage-card strong {
+        font-size: 25px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .organization-billing-usage-card div {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px 10px;
+        margin-top: 3px;
+      }
+
+      .organization-billing-note {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        padding: 13px 16px;
+        border: 1px solid rgba(184, 135, 39, 0.22);
+        border-radius: var(--radius-sm);
+        background: rgba(255, 247, 226, 0.72);
+      }
+
+      .organization-billing-note .app-icon {
+        flex: 0 0 auto;
+        color: var(--gold);
+      }
+
+      .organization-billing-note p {
+        margin: 0;
+        color: #6f5520;
+        font-size: 13px;
+        line-height: 1.65;
+      }
+
+      .organization-billing-record-panel .table-wrap {
+        overflow-x: auto;
+      }
+
+      .organization-billing-record-panel table {
+        min-width: 720px;
+      }
+
       .billing-stat-card {
         display: grid;
         gap: 6px;
@@ -4639,6 +4792,24 @@
           grid-template-columns: 1fr;
         }
 
+        .organization-billing-hero {
+          grid-template-columns: 1fr;
+          padding: 22px;
+        }
+
+        .organization-billing-metrics,
+        .organization-billing-usage-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .organization-billing-hero-balance {
+          justify-items: stretch;
+        }
+
+        .organization-billing-hero-balance .primary-btn {
+          width: 100%;
+        }
+
         .billing-action-grid {
           grid-template-columns: 1fr;
         }
@@ -5127,11 +5298,6 @@
         font-size: 12px;
         font-weight: 800;
         white-space: nowrap;
-      }
-
-      .organization-role.owner {
-        color: #7a5312;
-        background: var(--gold-soft);
       }
 
       .organization-role.admin {
@@ -6004,6 +6170,10 @@
               <button id="customersTab" class="view-tab hidden" type="button" data-view="customers">
                 <span class="nav-icon"><svg><use href="#icon-team"></use></svg></span>
                 客户企业
+              </button>
+              <button id="organizationTab" class="view-tab hidden" type="button" data-view="organization">
+                <span class="nav-icon"><svg><use href="#icon-team"></use></svg></span>
+                企业管理
               </button>
               <button id="adminTab" class="view-tab hidden" type="button" data-view="admin">
                 <span class="nav-icon"><svg><use href="#icon-dashboard"></use></svg></span>
@@ -6890,11 +7060,10 @@
             <div class="organization-hero-copy">
               <span class="organization-demo-badge">演示数据</span>
               <h2 id="organizationTitle">企业组织</h2>
-              <p id="organizationSubtitle">在这里维护部门和成员。所有内容仅用于当前演示，重置后会恢复为初始样例。</p>
+              <p id="organizationSubtitle">在这里维护本企业的部门和成员，并进入企业范围看板与额度。</p>
             </div>
             <div class="organization-hero-actions">
               <button id="backToCustomersButton" class="ghost-btn hidden" type="button">返回客户企业</button>
-              <button id="resetOrganizationDemoButton" class="ghost-btn" type="button">重置演示数据</button>
               <button id="inviteOrganizationMemberButton" class="primary-btn" type="button">
                 <span class="app-icon"><svg><use href="#icon-team"></use></svg></span>
                 邀请成员
@@ -6902,11 +7071,12 @@
             </div>
           </section>
 
-          <div id="organizationUsageTabs" class="organization-usage-tabs hidden" role="tablist" aria-label="客户企业详情导航">
+          <div id="organizationUsageTabs" class="organization-usage-tabs hidden" role="tablist" aria-label="企业详情导航">
             <span id="organizationUsageScopeLabel" class="organization-usage-scope">企业</span>
             <button class="ghost-btn active" type="button" role="tab" data-organization-usage-view="info" aria-selected="true">组织信息</button>
             <button class="ghost-btn" type="button" role="tab" data-organization-usage-view="usage" aria-selected="false">全员看板</button>
             <button class="ghost-btn" type="button" role="tab" data-organization-usage-view="departments-usage" aria-selected="false">部门看板</button>
+            <button class="ghost-btn" type="button" role="tab" data-organization-usage-view="billing" aria-selected="false">企业额度</button>
           </div>
 
           <section class="organization-stats" aria-label="企业组织概览">
@@ -6971,7 +7141,6 @@
                   <label for="organizationRoleFilter">角色</label>
                   <select id="organizationRoleFilter" class="select">
                     <option value="">全部角色</option>
-                    <option value="owner">企业主</option>
                     <option value="admin">企业管理员</option>
                     <option value="member">成员</option>
                   </select>
@@ -7052,6 +7221,90 @@
         </section>
 
         <section id="billingView" class="view-section hidden">
+          <section id="organizationBillingWorkspace" class="organization-billing-workspace hidden" aria-labelledby="organizationBillingTitle">
+            <div id="customerBillingBreadcrumb" class="organization-detail-tools hidden" aria-label="客户企业额度导航">
+              <button id="backToCustomerOrganizationBillingButton" class="ghost-btn" type="button">返回企业详情</button>
+              <span id="customerBillingBreadcrumbLabel" class="organization-usage-scope">客户企业</span>
+            </div>
+
+            <section class="organization-billing-hero">
+              <div>
+                <span class="organization-demo-badge">演示数据</span>
+                <span class="eyebrow">企业额度</span>
+                <h2 id="organizationBillingTitle">企业账户余额</h2>
+                <p><strong id="organizationBillingScopeName">客户企业</strong> 的额度仅用于本地演示。演示用量不影响企业余额，也不会发起真实付款。</p>
+              </div>
+              <div class="organization-billing-hero-balance">
+                <span>当前可用余额</span>
+                <strong id="organizationBillingBalance">$0.00</strong>
+                <button id="openOrganizationTopupModalButton" class="primary-btn hidden" type="button">
+                  <span class="app-icon"><svg><use href="#icon-cost"></use></svg></span>
+                  模拟充值
+                </button>
+                <span id="organizationBillingReadOnlyHint" class="organization-billing-readonly hidden">平台视图仅供查看</span>
+              </div>
+            </section>
+
+            <section class="organization-billing-metrics" aria-label="企业额度概览">
+              <article class="organization-billing-metric accent">
+                <span>累计企业额度</span>
+                <strong id="organizationBillingTotalCredits">$0.00</strong>
+                <small>含初始企业额度与模拟充值</small>
+              </article>
+              <article class="organization-billing-metric">
+                <span>初始企业额度</span>
+                <strong id="organizationBillingInitialCredits">$0.00</strong>
+                <small>每家演示企业独立初始化</small>
+              </article>
+              <article class="organization-billing-metric">
+                <span>演示用量估算</span>
+                <strong id="organizationBillingUsageEstimate">$0.00</strong>
+                <small><span id="organizationBillingUsageTokens">0</span> Token · <span id="organizationBillingUsageRequests">0</span> 次请求</small>
+              </article>
+            </section>
+
+            <section class="organization-billing-note">
+              <span class="app-icon" aria-hidden="true"><svg><use href="#icon-shield"></use></svg></span>
+              <p>演示用量仅帮助查看企业使用情况，不会扣减企业账户余额。本页不包含支付方式、收款码、兑换码或真实订单。</p>
+            </section>
+
+            <section id="organizationBillingUsageCards" class="organization-billing-usage-grid" aria-label="企业用量统计"></section>
+
+            <section class="panel organization-billing-record-panel">
+              <div class="panel-header">
+                <div class="panel-heading">
+                  <span class="panel-icon"><svg><use href="#icon-table"></use></svg></span>
+                  <div>
+                    <h3 class="panel-title">额度变动记录</h3>
+                    <p class="panel-desc">记录初始企业额度与后续模拟充值。所有内容均为演示数据。</p>
+                  </div>
+                </div>
+                <span id="organizationBillingRecordCount" class="chip blue">0 条</span>
+              </div>
+              <div class="table-wrap">
+                <table aria-label="企业额度变动记录">
+                  <thead>
+                    <tr>
+                      <th>时间</th>
+                      <th>类型</th>
+                      <th class="num">额度</th>
+                      <th class="num">余额</th>
+                      <th>操作人</th>
+                      <th>状态</th>
+                    </tr>
+                  </thead>
+                  <tbody id="organizationBillingRecordBody"></tbody>
+                </table>
+              </div>
+              <div class="organization-pagination" aria-label="企业额度记录分页">
+                <button id="organizationBillingPreviousPageButton" class="ghost-btn" type="button">上一页</button>
+                <span id="organizationBillingPageInfo">第 1 / 1 页</span>
+                <button id="organizationBillingNextPageButton" class="ghost-btn" type="button">下一页</button>
+              </div>
+            </section>
+          </section>
+
+          <div id="personalBillingWorkspace">
           <section class="panel key-page-head">
             <div>
               <span class="eyebrow">额度账户</span>
@@ -7184,6 +7437,7 @@
               </table>
             </div>
           </section>
+          </div>
         </section>
 
         <section id="modelsView" class="view-section hidden">
@@ -7377,9 +7631,8 @@
           <select id="organizationMemberRoleInput" class="select" required>
             <option value="member">成员</option>
             <option value="admin">企业管理员</option>
-            <option value="owner">企业主</option>
           </select>
-          <p class="organization-modal-note">当前演示由卖方平台管理员维护客户部门和成员；不会发送真实邮件。</p>
+          <p class="organization-modal-note">企业管理员可维护本企业部门、成员与企业范围权限；不会发送真实邮件。</p>
         </div>
         <div id="organizationMemberStatusField" class="field hidden">
           <label for="organizationMemberStatusInput">访问状态</label>
@@ -7404,14 +7657,14 @@
           <label for="customerOrganizationNameInput">企业名称</label>
           <input id="customerOrganizationNameInput" class="input" type="text" maxlength="120" required autocomplete="off" placeholder="例如：星澜科技" />
         </div>
-        <div id="customerOrganizationOwnerNameField" class="field">
-          <label for="customerOrganizationOwnerNameInput">首位企业主姓名</label>
-          <input id="customerOrganizationOwnerNameInput" class="input" type="text" maxlength="120" required autocomplete="off" placeholder="例如：王敏" />
+        <div id="customerOrganizationAdminNameField" class="field">
+          <label for="customerOrganizationAdminNameInput">首位企业管理员姓名</label>
+          <input id="customerOrganizationAdminNameInput" class="input" type="text" maxlength="120" required autocomplete="off" placeholder="例如：王敏" />
         </div>
-        <div id="customerOrganizationOwnerEmailField" class="field">
-          <label for="customerOrganizationOwnerEmailInput">首位企业主邮箱</label>
-          <input id="customerOrganizationOwnerEmailInput" class="input" type="email" maxlength="254" required autocomplete="off" placeholder="owner@company.com" />
-          <p class="organization-modal-note">首位企业主会以已启用状态加入演示企业；不会发送真实邮件。</p>
+        <div id="customerOrganizationAdminEmailField" class="field">
+          <label for="customerOrganizationAdminEmailInput">首位企业管理员邮箱</label>
+          <input id="customerOrganizationAdminEmailInput" class="input" type="email" maxlength="254" required autocomplete="off" placeholder="admin@company.com" />
+          <p class="organization-modal-note">首位企业管理员会以已启用状态加入演示企业；不会发送真实邮件。</p>
         </div>
         <div class="modal-actions">
           <button id="cancelCustomerOrganizationButton" class="ghost-btn" type="button">取消</button>
@@ -7420,6 +7673,24 @@
       </form>
     </div>
 
-    <script src="/assets/app.js?v=20260731-admin-ranking-department"></script>
+    <div id="organizationTopupModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="organizationTopupModalTitle">
+      <form id="organizationTopupForm" class="modal organization-topup-modal" autocomplete="off">
+        <h3 id="organizationTopupModalTitle">模拟充值</h3>
+        <p>立即为当前企业增加演示额度，不会调用支付、收款、邮件或任何真实充值服务。</p>
+        <div id="organizationTopupOptions" class="billing-amount-options" role="group" aria-label="模拟充值快速金额"></div>
+        <div class="field">
+          <label for="organizationTopupAmount">自定义金额（美元）</label>
+          <input id="organizationTopupAmount" class="input" type="number" min="1" max="100000" step="0.01" inputmode="decimal" placeholder="请输入模拟充值金额" />
+          <p id="organizationTopupError" class="field-error" aria-live="polite"></p>
+        </div>
+        <p class="organization-modal-note">金额范围为 $1.00 至 $100,000.00，最多两位小数。提交成功后余额和记录会立即刷新。</p>
+        <div class="modal-actions">
+          <button id="cancelOrganizationTopupButton" class="ghost-btn" type="button">取消</button>
+          <button id="submitOrganizationTopupButton" class="primary-btn" type="submit">确认模拟充值</button>
+        </div>
+      </form>
+    </div>
+
+    <script src="/assets/app.js?v=20260731-organization-admin-merge"></script>
   </body>
 </html>

@@ -132,6 +132,17 @@ const NAVIGATION_REVEAL_TIMEOUT_MS = 800;
 let selectedTopupAmount = 0;
 let pendingTopupTradeNo = "";
 let topupPollTimer = null;
+// Enterprise demo billing is intentionally separate from the legacy personal
+// billing account. It never falls through to the personal payment endpoints.
+let organizationBillingData = null;
+let organizationBillingLoading = false;
+let organizationBillingLoadError = "";
+let organizationBillingPage = 1;
+const organizationBillingPageSize = 20;
+let organizationBillingScopeKey = "";
+let organizationBillingRequestId = 0;
+let isOrganizationTopupSaving = false;
+let selectedOrganizationTopupAmount = 0;
 let authConfig = {
   devLoginEnabled: false,
   oidcConfigured: false,
@@ -3248,7 +3259,279 @@ function renderTopupMethods() {
     .join("");
 }
 
+function organizationBillingField(record, camelCase, snakeCase = "") {
+  if (!record || typeof record !== "object") return undefined;
+  if (record[camelCase] !== undefined) return record[camelCase];
+  return snakeCase && record[snakeCase] !== undefined ? record[snakeCase] : undefined;
+}
+
+function organizationBillingAccount() {
+  const account = organizationBillingData?.account || {};
+  const number = (camelCase, snakeCase = "", fallback = 0) => {
+    const value = organizationBillingField(account, camelCase, snakeCase);
+    return Number.isFinite(Number(value)) ? Number(value) : fallback;
+  };
+  return {
+    initialBalanceUsd: number("initialBalanceUsd", "initial_balance_usd"),
+    totalTopupsUsd: number("totalTopupsUsd", "total_topups_usd"),
+    totalCreditsUsd: number("totalCreditsUsd", "total_credits_usd"),
+    availableBalanceUsd: number("availableBalanceUsd", "available_balance_usd"),
+  };
+}
+
+function organizationBillingUsage(period) {
+  const summary = organizationBillingData?.usageSummary || organizationBillingData?.usage_summary || {};
+  const value = summary?.[period] || {};
+  const number = (camelCase, snakeCase = "") => {
+    const raw = organizationBillingField(value, camelCase, snakeCase);
+    return Number.isFinite(Number(raw)) ? Number(raw) : 0;
+  };
+  return {
+    spend: number("spend", "spend"),
+    tokens: number("tokens", "total_tokens"),
+    requests: number("requests", "request_count"),
+  };
+}
+
+function organizationBillingRecords() {
+  const records = organizationBillingData?.records || {};
+  const items = Array.isArray(records) ? records : records?.items;
+  return Array.isArray(items) ? items : [];
+}
+
+function organizationBillingRecordTotal() {
+  const records = organizationBillingData?.records || {};
+  const total = Array.isArray(records) ? records.length : records?.total;
+  return Number.isFinite(Number(total)) ? Number(total) : organizationBillingRecords().length;
+}
+
+function organizationBillingRecordPage() {
+  const records = organizationBillingData?.records || {};
+  const page = Array.isArray(records) ? organizationBillingPage : Number(records?.page || organizationBillingPage || 1);
+  return Math.max(1, Math.floor(Number.isFinite(page) ? page : 1));
+}
+
+function organizationBillingRecordPageSize() {
+  const records = organizationBillingData?.records || {};
+  const pageSize = Array.isArray(records)
+    ? organizationBillingPageSize
+    : Number(records?.pageSize || organizationBillingPageSize);
+  return Math.max(1, Math.floor(Number.isFinite(pageSize) ? pageSize : organizationBillingPageSize));
+}
+
+function organizationBillingRecordTypeLabel(type) {
+  return String(type || "") === "initial_credit" ? "初始企业额度" : "模拟充值";
+}
+
+function organizationBillingRecordStatusLabel(status) {
+  return String(status || "") === "completed" ? "已完成" : String(status || "-");
+}
+
+function organizationBillingUsageCard(label, usage) {
+  return `<article class="organization-billing-usage-card">
+    <span>${escapeHtml(label)}</span>
+    <strong>${escapeHtml(money.format(usage.spend))}</strong>
+    <small>预估消耗</small>
+    <div><span>${escapeHtml(formatTokens(usage.tokens))} Token</span><span>${escapeHtml(fmt.format(usage.requests))} 次请求</span></div>
+  </article>`;
+}
+
+function renderOrganizationBilling() {
+  const context = organizationBillingContext();
+  const workspace = el("organizationBillingWorkspace");
+  const personalWorkspace = el("personalBillingWorkspace");
+  if (workspace) workspace.classList.toggle("hidden", !context);
+  if (personalWorkspace) personalWorkspace.classList.toggle("hidden", Boolean(context));
+  if (!context) return false;
+
+  const account = organizationBillingAccount();
+  const today = organizationBillingUsage("today");
+  const last7Days = organizationBillingUsage("last7Days");
+  const last30Days = organizationBillingUsage("last30Days");
+  const canTopup = !context.readOnly && canSimulateOrganizationTopup();
+  const organization = organizationBillingData?.organization || {};
+  const name = String(organization?.name || context.name || "客户企业");
+  const isLoading = organizationBillingLoading && !organizationBillingData;
+
+  setText("organizationBillingScopeName", name);
+  setText("organizationBillingBalance", isLoading ? "加载中" : money.format(account.availableBalanceUsd));
+  setText("organizationBillingBalanceChip", isLoading ? "企业额度加载中" : `余额 ${money.format(account.availableBalanceUsd)}`);
+  setText("organizationBillingTotalCredits", money.format(account.totalCreditsUsd));
+  setText("organizationBillingInitialCredits", money.format(account.initialBalanceUsd));
+  setText("organizationBillingUsageEstimate", money.format(last30Days.spend));
+  setText("organizationBillingUsageTokens", formatTokens(last30Days.tokens));
+  setText("organizationBillingUsageRequests", fmt.format(last30Days.requests));
+  setHtml(
+    "organizationBillingUsageCards",
+    [
+      organizationBillingUsageCard("今日", today),
+      organizationBillingUsageCard("近 7 天", last7Days),
+      organizationBillingUsageCard("近 30 天", last30Days),
+    ].join(""),
+  );
+  const topupButton = el("openOrganizationTopupModalButton");
+  if (topupButton) topupButton.classList.toggle("hidden", !canTopup);
+  const readOnlyHint = el("organizationBillingReadOnlyHint");
+  if (readOnlyHint) readOnlyHint.classList.toggle("hidden", canTopup);
+
+  const recordsBody = el("organizationBillingRecordBody");
+  const recordTotal = organizationBillingRecordTotal();
+  const recordPage = organizationBillingRecordPage();
+  const recordPageSize = organizationBillingRecordPageSize();
+  const totalPages = Math.max(1, Math.ceil(recordTotal / recordPageSize));
+  if (organizationBillingPage !== recordPage) organizationBillingPage = recordPage;
+  setText("organizationBillingRecordCount", `${fmt.format(recordTotal)} 条`);
+  setText("organizationBillingPageInfo", `第 ${recordPage} / ${totalPages} 页`);
+  const previousButton = el("organizationBillingPreviousPageButton");
+  const nextButton = el("organizationBillingNextPageButton");
+  if (previousButton) previousButton.disabled = recordPage <= 1 || organizationBillingLoading;
+  if (nextButton) nextButton.disabled = recordPage >= totalPages || organizationBillingLoading;
+  if (!recordsBody) return true;
+  if (organizationBillingLoadError) {
+    recordsBody.innerHTML = `<tr><td colspan="6" class="empty">${escapeHtml(organizationBillingLoadError)}</td></tr>`;
+    return true;
+  }
+  if (isLoading) {
+    recordsBody.innerHTML = '<tr><td colspan="6" class="empty">正在加载企业额度记录…</td></tr>';
+    return true;
+  }
+  const records = organizationBillingRecords();
+  if (!records.length) {
+    recordsBody.innerHTML = '<tr><td colspan="6" class="empty">暂无额度变动记录。</td></tr>';
+    return true;
+  }
+  recordsBody.innerHTML = records.map((record) => {
+    const timestamp = organizationBillingField(record, "timestamp", "timestamp") || organizationBillingField(record, "createdAt", "created_at");
+    const type = organizationBillingField(record, "type", "type");
+    const amount = Number(organizationBillingField(record, "amountUsd", "amount_usd") || 0);
+    const balance = Number(organizationBillingField(record, "balanceAfterUsd", "balance_after_usd") || 0);
+    const operator = organizationBillingField(record, "operator", "operator") || organizationBillingField(record, "operatorEmail", "operator_email") || "-";
+    const status = organizationBillingField(record, "status", "status");
+    return `<tr>
+      <td>${escapeHtml(formatBillingTime(timestamp))}</td>
+      <td>${escapeHtml(organizationBillingRecordTypeLabel(type))}</td>
+      <td class="num">${escapeHtml(money.format(amount))}</td>
+      <td class="num">${escapeHtml(money.format(balance))}</td>
+      <td>${escapeHtml(operator)}</td>
+      <td><span class="billing-order-status success">${escapeHtml(organizationBillingRecordStatusLabel(status))}</span></td>
+    </tr>`;
+  }).join("");
+  return true;
+}
+
+function organizationBillingUrl(context = organizationBillingContext()) {
+  if (!context) return "";
+  const params = new URLSearchParams({
+    page: String(organizationBillingPage),
+    pageSize: String(organizationBillingPageSize),
+  });
+  return `${context.path}?${params.toString()}`;
+}
+
+function resetOrganizationBillingData() {
+  organizationBillingRequestId += 1;
+  organizationBillingData = null;
+  organizationBillingLoading = false;
+  organizationBillingLoadError = "";
+  organizationBillingPage = 1;
+  organizationBillingScopeKey = "";
+  selectedOrganizationTopupAmount = 0;
+  isOrganizationTopupSaving = false;
+  el("organizationTopupModal")?.classList.add("hidden");
+}
+
+async function loadOrganizationBillingData() {
+  const context = organizationBillingContext();
+  if (!context || organizationBillingLoading) return;
+  const scopeKey = organizationBillingContextKey();
+  const requestId = ++organizationBillingRequestId;
+  organizationBillingLoading = true;
+  organizationBillingLoadError = "";
+  organizationBillingScopeKey = scopeKey;
+  renderOrganizationBilling();
+  try {
+    const payload = await api(organizationBillingUrl(context));
+    if (requestId !== organizationBillingRequestId || scopeKey !== organizationBillingContextKey()) return;
+    organizationBillingData = payload || null;
+  } catch (error) {
+    if (requestId !== organizationBillingRequestId || scopeKey !== organizationBillingContextKey()) return;
+    organizationBillingData = null;
+    organizationBillingLoadError = error.message || "企业额度加载失败，请稍后重试。";
+    showToast(organizationBillingLoadError);
+  } finally {
+    if (requestId !== organizationBillingRequestId) return;
+    organizationBillingLoading = false;
+    renderOrganizationBilling();
+  }
+}
+
+async function changeOrganizationBillingPage(direction) {
+  const totalPages = Math.max(1, Math.ceil(organizationBillingRecordTotal() / organizationBillingRecordPageSize()));
+  const nextPage = Math.min(totalPages, Math.max(1, organizationBillingRecordPage() + direction));
+  if (nextPage === organizationBillingPage || organizationBillingLoading) return;
+  organizationBillingPage = nextPage;
+  await loadOrganizationBillingData();
+}
+
+function renderOrganizationTopupOptions() {
+  const options = [500, 1000, 2000, 5000];
+  const container = el("organizationTopupOptions");
+  if (!container) return;
+  container.innerHTML = options.map((amount) => `
+    <button type="button" class="billing-amount-option${amount === selectedOrganizationTopupAmount ? " active" : ""}" data-organization-topup-amount="${amount}">$${amount.toLocaleString("en-US")}</button>
+  `).join("");
+}
+
+function closeOrganizationTopupModal(options = {}) {
+  if (isOrganizationTopupSaving && !options.force) return;
+  selectedOrganizationTopupAmount = 0;
+  el("organizationTopupForm")?.reset();
+  setFieldError("organizationTopupError", "");
+  el("organizationTopupModal")?.classList.add("hidden");
+}
+
+function openOrganizationTopupModal() {
+  const context = organizationBillingContext();
+  if (!context || context.readOnly || !canSimulateOrganizationTopup()) return;
+  selectedOrganizationTopupAmount = 0;
+  el("organizationTopupForm")?.reset();
+  setFieldError("organizationTopupError", "");
+  renderOrganizationTopupOptions();
+  el("organizationTopupModal")?.classList.remove("hidden");
+  window.setTimeout(() => el("organizationTopupAmount")?.focus(), 0);
+}
+
+async function submitOrganizationTopup(event) {
+  event.preventDefault();
+  const context = organizationBillingContext();
+  if (!context || context.readOnly || !canSimulateOrganizationTopup() || isOrganizationTopupSaving) return;
+  const amount = Number(el("organizationTopupAmount")?.value || 0);
+  setFieldError("organizationTopupError", "");
+  if (!Number.isFinite(amount) || amount < 1 || amount > 100000 || Math.round(amount * 100) !== amount * 100) {
+    setFieldError("organizationTopupError", "请输入 $1.00 至 $100,000.00 的金额，最多两位小数。");
+    return;
+  }
+  isOrganizationTopupSaving = true;
+  setButtonLoading("submitOrganizationTopupButton", true, "充值中");
+  try {
+    await ensureCsrfToken();
+    await api("/api/organization/current/billing/topups", {
+      method: "POST",
+      body: JSON.stringify({ amountUsd: amount }),
+    });
+    closeOrganizationTopupModal({ force: true });
+    await loadOrganizationBillingData();
+    showToast("模拟充值已完成，未发起真实付款。");
+  } catch (error) {
+    setFieldError("organizationTopupError", error.message || "模拟充值失败，请稍后重试。");
+  } finally {
+    isOrganizationTopupSaving = false;
+    setButtonLoading("submitOrganizationTopupButton", false);
+  }
+}
+
 function renderBilling() {
+  if (renderOrganizationBilling()) return;
   const balance = Number(billingAccount?.balanceUsd || 0);
   const topupTotal = Number(billingAccount?.topupTotalUsd || 0);
   const spent = Number.isFinite(Number(billingAccount?.spentUsd))
@@ -3313,6 +3596,13 @@ async function loadBillingData() {
 
 async function refreshBillingAvailability() {
   // 后端未开放充值时接口返回 404，据此决定导航项是否出现。
+  // Customer demo identities have a separate organization credit contract.
+  // Never use this legacy probe for them because it targets a personal account.
+  if (isMockCustomerIdentity()) {
+    billingAvailable = false;
+    updateBillingNav();
+    return;
+  }
   if (!currentUser?.id) {
     billingAvailable = false;
     updateBillingNav();
@@ -3333,7 +3623,6 @@ async function refreshBillingAvailability() {
 }
 
 function updateBillingNav() {
-  // 充值入口和其余导航项一起揭示，不再单独 toggle 自己那一项。
   syncNavigationVisibility();
   // 受限提示里的"前往充值"依赖 billingAvailable，可用性变化后要重渲染。
   renderAccountAccessState();
@@ -3530,7 +3819,7 @@ let isAdminBillingLoading = false;
 let isGeneratingRedemptions = false;
 
 function adminBillingVisible() {
-  return Boolean(currentUser?.isAdmin && billingAvailable && !isViewingCustomerOrganization());
+  return Boolean(isPlatformAdmin() && billingAvailable && !isViewingCustomerOrganization());
 }
 
 function renderAdminRedemptions() {
@@ -3811,7 +4100,6 @@ async function copyText(text, successMessage) {
 }
 
 const ORGANIZATION_ROLE_LABELS = {
-  owner: "企业主",
   admin: "企业管理员",
   member: "成员",
 };
@@ -3842,8 +4130,53 @@ function canViewCurrentOrganizationUsage() {
   // organization-wide boards while a server bundle is being upgraded.
   return Boolean(
     currentUser?.organizationDemoEnabled
-    && ["owner", "admin"].includes(String(currentUser?.organizationRole || "")),
+    && String(currentUser?.organizationRole || "") === "admin",
   );
+}
+
+function canViewOrganizationBilling() {
+  return Boolean(currentUser?.canViewOrganizationBilling);
+}
+
+function canSimulateOrganizationTopup() {
+  return Boolean(currentUser?.canSimulateOrganizationTopup);
+}
+
+function organizationBillingContext() {
+  if (isViewingCustomerOrganization()) {
+    const organizationId = selectedCustomerOrganizationId();
+    if (!organizationId) return null;
+    return {
+      kind: "platformCustomer",
+      organizationId,
+      name: selectedCustomerOrganizationName(),
+      readOnly: true,
+      path: `${customerOrganizationPath(organizationId)}/billing`,
+    };
+  }
+  if (!isMockCustomerIdentity() || !canViewOrganizationBilling()) return null;
+  return {
+    kind: "currentOrganization",
+    organizationId: String(currentUser?.organizationId || ""),
+    name: String(currentUser?.organization?.name || currentUser?.organizationName || "我的企业"),
+    readOnly: !canSimulateOrganizationTopup(),
+    path: "/api/organization/current/billing",
+  };
+}
+
+function organizationBillingContextKey() {
+  const context = organizationBillingContext();
+  return context ? `${context.kind}:${context.organizationId}` : "";
+}
+
+function isOrganizationBillingView() {
+  return Boolean(organizationBillingContext());
+}
+
+function canAccessBillingView() {
+  // Demo seller accounts keep only the global operations panel in the full
+  // employee board. They cannot open the customer-facing billing destination.
+  return Boolean(isOrganizationBillingView() || (billingAvailable && !currentUser?.organizationDemoEnabled));
 }
 
 function selectedCustomerOrganizationId() {
@@ -3933,7 +4266,7 @@ function organizationUsageScope() {
       // The auth bootstrap already has the tenant id, while the directory
       // snapshot is intentionally unavailable to ordinary customer members.
       // Prefer the resolved organization name when it exists so the company
-      // scope never flashes as a generic placeholder for an admin/owner.
+      // scope never flashes as a generic placeholder for an administrator.
       name: String(
         organizationSnapshot?.organization?.name
         || currentUser?.organization?.name
@@ -4002,14 +4335,22 @@ function isMockCustomerIdentity() {
 // 其余项随各自的探测请求陆续追加。这里改成整栏一次性揭示：权限没落地前导航保持
 // 骨架占位，落地后同一帧内决定全部 7 项。
 function syncNavigationVisibility() {
-  // 权限尚未落地时不动导航：否则先返回的探测会把自己那一项揭示到骨架旁边，又变成
-  // 逐项蹦出。revealNavigation() 负责放开这道闸。
+  // 权限尚未落地时不动导航：否则先返回的探测（如充值账本）会把自己那一项揭示到
+  // 骨架旁边，又变成逐项蹦出。revealNavigation() 负责放开这道闸。
   if (!isNavigationRevealed) return;
   const canBrowseCustomers = customerOrganizationsAvailable();
+  const canManageCurrentOrganization = Boolean(currentUser?.canManageOrganization);
   const canViewAdmin = canViewAdminUsage();
   const canViewDepartments = canViewDepartmentUsage();
   const isCustomer = isMockCustomerIdentity();
+  // A customer administrator gets an enterprise-credit entry. Seller accounts
+  // keep their global billing operations in the admin board, never in this
+  // customer-facing sidebar destination.
+  const canUseBillingSidebar = isCustomer
+    ? canViewOrganizationBilling()
+    : Boolean(billingAvailable && !currentUser?.organizationDemoEnabled);
   el("customersTab").classList.toggle("hidden", !canBrowseCustomers);
+  el("organizationTab")?.classList.toggle("hidden", !canManageCurrentOrganization);
   el("adminTab").classList.toggle("hidden", !canViewAdmin);
   el("departmentTab").classList.toggle("hidden", !canViewDepartments);
   el("teamTab").classList.toggle("hidden", !currentUser?.isTeamLeader);
@@ -4017,10 +4358,10 @@ function syncNavigationVisibility() {
   el("dashboardTab")?.classList.remove("hidden");
   // Customer identities use their demo-scoped views only; never expose
   // seller account functions that lack a customer-local contract.
-  document.querySelectorAll('[data-view="keys"], [data-view="billing"]').forEach((button) => {
+  document.querySelectorAll('[data-view="keys"]').forEach((button) => {
     button.classList.toggle("hidden", isCustomer);
   });
-  el("billingTab")?.classList.toggle("hidden", isCustomer || !billingAvailable);
+  el("billingTab")?.classList.toggle("hidden", !canUseBillingSidebar);
   document.querySelectorAll('[data-global-page="models"]').forEach((button) => {
     button.classList.toggle("hidden", isCustomer);
   });
@@ -4066,13 +4407,15 @@ function resetNavigationToPending() {
 }
 
 function renderCustomerUsageBreadcrumbs(view = currentView) {
-  const isCustomerUsage = isViewingCustomerOrganization() && ["admin", "department"].includes(view);
+  const isCustomerUsage = isViewingCustomerOrganization() && ["admin", "department", "billing"].includes(view);
   const scopeLabel = isCustomerUsage ? `客户企业：${selectedCustomerOrganizationName()}` : "";
   el("customerUsageBreadcrumb")?.classList.toggle("hidden", !(isCustomerUsage && view === "admin"));
   el("customerDepartmentBreadcrumb")?.classList.toggle("hidden", !(isCustomerUsage && view === "department"));
+  el("customerBillingBreadcrumb")?.classList.toggle("hidden", !(isCustomerUsage && view === "billing"));
   if (isCustomerUsage) {
     setText("customerUsageBreadcrumbLabel", scopeLabel);
     setText("customerDepartmentBreadcrumbLabel", scopeLabel);
+    setText("customerBillingBreadcrumbLabel", scopeLabel);
   }
 }
 
@@ -4150,10 +4493,7 @@ function organizationCanManage() {
 }
 
 function organizationCanView() {
-  // The organization detail is a seller-side customer-management surface.
-  // Customer identities use the organization-scoped usage boards instead;
-  // never expose the underlying member/department directory to them.
-  return isViewingCustomerOrganization();
+  return Boolean(isViewingCustomerOrganization() || currentUser?.canManageOrganization);
 }
 
 function renderOrganizationDepartmentOptions(selectId, selectedId = "", placeholder = "请选择部门") {
@@ -4365,6 +4705,7 @@ async function openCustomerOrganization(organizationId) {
   organizationMemberTotal = 0;
   organizationMemberPage = 1;
   organizationMemberFilters = { search: "", departmentId: "", role: "", status: "" };
+  resetOrganizationBillingData();
   customerOrganizationDetailTab = "info";
   syncNavigationVisibility();
   switchView("organization");
@@ -4374,6 +4715,7 @@ async function openCustomerOrganization(organizationId) {
 function closeCustomerOrganization() {
   selectedCustomerOrganization = null;
   resetOrganizationUsageViews();
+  resetOrganizationBillingData();
   organizationDataRequestId += 1;
   organizationMemberRequestId += 1;
   isOrganizationLoading = false;
@@ -4411,17 +4753,14 @@ function renderOrganization() {
   setText("organizationInvitedMemberCount", fmt.format(stats.invitedMemberCount));
   const createDepartmentButton = el("createOrganizationDepartmentButton");
   const inviteMemberButton = el("inviteOrganizationMemberButton");
-  const resetDemoButton = el("resetOrganizationDemoButton");
   if (createDepartmentButton) createDepartmentButton.disabled = !canManage;
   if (inviteMemberButton) inviteMemberButton.disabled = !canManage;
-  if (resetDemoButton) resetDemoButton.disabled = !canManage;
   el("backToCustomersButton")?.classList.toggle("hidden", !isPlatformCustomer);
-  if (resetDemoButton) resetDemoButton.classList.toggle("hidden", isPlatformCustomer);
   if (isPlatformCustomer && customerOrganizationStatus(selectedCustomerOrganization) === "archived") {
     setText("organizationSubtitle", `${name} · 已归档客户企业，仅可查看历史组织信息。`);
   }
   el("organizationUsageTabs")?.classList.toggle("hidden", !isPlatformCustomer && !canViewCurrentOrganizationUsage());
-  el("organizationManagementWorkspace")?.classList.toggle("hidden", !isPlatformCustomer && !currentUser?.canManageOrganization);
+  el("organizationManagementWorkspace")?.classList.toggle("hidden", !canManage);
   renderOrganizationUsageTabs();
   renderOrganizationFilters();
   renderOrganizationDepartments();
@@ -4453,18 +4792,22 @@ function renderOrganizationUsageTabs() {
     button.classList.toggle("active", isActive);
     button.setAttribute("aria-selected", isActive ? "true" : "false");
   });
+  const billingTab = tabs.querySelector('[data-organization-usage-view="billing"]');
+  if (billingTab) billingTab.classList.toggle("hidden", !isViewingCustomerOrganization() && !canViewOrganizationBilling());
   setText("organizationUsageScopeLabel", scope.kind === "platformCustomer" ? `客户：${scopeName}` : `企业：${scopeName}`);
 }
 
 function showOrganizationUsage(view) {
   const scope = organizationUsageScope();
   if (!scope) return;
-  customerOrganizationDetailTab = ["info", "usage", "departments-usage"].includes(view) ? view : "info";
+  customerOrganizationDetailTab = ["info", "usage", "departments-usage", "billing"].includes(view) ? view : "info";
   renderOrganizationUsageTabs();
   if (customerOrganizationDetailTab === "info") {
     switchView("organization");
   } else if (customerOrganizationDetailTab === "usage") {
     switchView("admin");
+  } else if (customerOrganizationDetailTab === "billing") {
+    switchView("billing");
   } else {
     switchView("department");
   }
@@ -4542,10 +4885,10 @@ function openCustomerOrganizationModal(organizationId = "") {
   editingCustomerOrganizationId = listItem ? customerOrganizationId(listItem) : "";
   el("customerOrganizationForm").reset();
   const isEditing = Boolean(editingCustomerOrganizationId);
-  el("customerOrganizationOwnerNameField").classList.toggle("hidden", isEditing);
-  el("customerOrganizationOwnerEmailField").classList.toggle("hidden", isEditing);
-  el("customerOrganizationOwnerNameInput").required = !isEditing;
-  el("customerOrganizationOwnerEmailInput").required = !isEditing;
+  el("customerOrganizationAdminNameField").classList.toggle("hidden", isEditing);
+  el("customerOrganizationAdminEmailField").classList.toggle("hidden", isEditing);
+  el("customerOrganizationAdminNameInput").required = !isEditing;
+  el("customerOrganizationAdminEmailInput").required = !isEditing;
   setText("customerOrganizationModalTitle", isEditing ? "修改客户企业名称" : "新增客户企业");
   setText(
     "customerOrganizationModalDescription",
@@ -4553,8 +4896,8 @@ function openCustomerOrganizationModal(organizationId = "") {
   );
   setText("submitCustomerOrganizationButton", isEditing ? "保存修改" : "创建企业");
   el("customerOrganizationNameInput").value = organization.name || "";
-  el("customerOrganizationOwnerNameInput").value = "";
-  el("customerOrganizationOwnerEmailInput").value = "";
+  el("customerOrganizationAdminNameInput").value = "";
+  el("customerOrganizationAdminEmailInput").value = "";
   el("customerOrganizationModal").classList.remove("hidden");
   window.setTimeout(() => el("customerOrganizationNameInput").focus(), 0);
 }
@@ -4708,11 +5051,14 @@ function switchView(view) {
   if (view === "department" && !canViewDepartmentUsage()) view = "dashboard";
   if (view === "team" && !currentUser?.isTeamLeader) view = "dashboard";
   if (view === "organization" && !organizationCanView()) view = "dashboard";
-  if (isMockCustomerIdentity() && (view === "keys" || view === "billing" || view === "models")) view = "dashboard";
-  if (view === "billing" && !billingAvailable) view = "dashboard";
+  if (isMockCustomerIdentity() && (view === "keys" || view === "models")) view = "dashboard";
+  if (view === "billing" && !canAccessBillingView()) view = "dashboard";
   if (currentView === "keys" && view !== "keys") clearRevealedKeys();
   // 离开充值页就停掉支付轮询与二维码，避免后台空转和收款码久留在页面上。
-  if (currentView === "billing" && view !== "billing") hideManualPayPanel();
+  if (currentView === "billing" && view !== "billing") {
+    hideManualPayPanel();
+    closeOrganizationTopupModal({ force: true });
+  }
   currentView = view;
   setGlobalPage(view === "models" ? "models" : "console");
   el("appShell").classList.toggle("models-layout", view === "models");
@@ -4728,7 +5074,7 @@ function switchView(view) {
   el("dashboardFilters").classList.toggle("hidden", view === "models" || view === "keys" || view === "billing" || view === "customers" || view === "organization");
   renderCustomerUsageBreadcrumbs(view);
   const isCustomerDetailView = isViewingCustomerOrganization()
-    && ["organization", "admin", "department"].includes(view);
+    && ["organization", "admin", "department", "billing"].includes(view);
   let activeButton = null;
   document.querySelectorAll("[data-view]").forEach((button) => {
     // Customer detail is a child workspace of the customer directory, not a
@@ -4760,7 +5106,9 @@ function switchView(view) {
   }
   if (view === "billing") {
     renderBilling();
-    if (!isBillingLoading) loadBillingData();
+    if (isOrganizationBillingView()) {
+      if (!organizationBillingLoading) loadOrganizationBillingData();
+    } else if (!isBillingLoading) loadBillingData();
   }
   if (view === "dashboard" && !usageData.length) loadDashboardData();
   if (view === "customers" && !isCustomerOrganizationsLoading) loadCustomerOrganizations();
@@ -4777,7 +5125,7 @@ function switchView(view) {
 async function loadCurrentViewData(forceRefresh = false) {
   if (currentView === "customers") return loadCustomerOrganizations();
   if (currentView === "keys") return loadKeys();
-  if (currentView === "billing") return loadBillingData();
+  if (currentView === "billing") return isOrganizationBillingView() ? loadOrganizationBillingData() : loadBillingData();
   if (currentView === "models") return loadModels();
   if (currentView === "admin") return loadAdminData(forceRefresh);
   if (currentView === "team") return loadTeamData(forceRefresh);
@@ -4925,7 +5273,7 @@ async function loadTeamRankingData(forceRefresh = false) {
   });
   if (selectedTeamRef) query.set("team_ref", selectedTeamRef);
   if (forceRefresh) query.set("refresh", "1");
-  const cacheKey = `${selectedTeamRef}|${startDate}|${endDate}|${source}`;
+  const cacheKey = `${organizationUsageScopeKey()}|${selectedTeamRef}|${startDate}|${endDate}|${source}`;
   const cached = !forceRefresh ? teamUsagePayloadCache.get(cacheKey) : null;
 
   try {
@@ -4977,7 +5325,7 @@ async function loadTeamData(forceRefresh = false) {
   });
   if (selectedTeamRef) query.set("team_ref", selectedTeamRef);
   if (forceRefresh) query.set("refresh", "1");
-  const cacheKey = `${selectedTeamRef}|${startDate}|${endDate}|${source}`;
+  const cacheKey = `${organizationUsageScopeKey()}|${selectedTeamRef}|${startDate}|${endDate}|${source}`;
   const cached = !forceRefresh ? teamUsagePayloadCache.get(cacheKey) : null;
 
   if (cached) {
@@ -5107,7 +5455,10 @@ async function showApp(user) {
   // 导航退回骨架态：本次身份的权限还没落地，先不揭示任何一项。
   resetNavigationToPending();
   scheduleNavigationRevealFallback();
-  el("userEmail").textContent = currentUser.email;
+  const organizationName = String(currentUser.organizationName || currentUser.organization?.name || "").trim();
+  el("userEmail").textContent = organizationName && currentUser.organizationRole
+    ? `${currentUser.email} · ${organizationName}`
+    : currentUser.email;
   el("userName").textContent = currentUser.name || currentUser.email;
   el("avatar").textContent = currentUser.avatar || initials(currentUser.email, currentUser.name);
   el("teamWelcomeTitle").textContent = `所选范围 · ${teamScopeLabel()}`;
@@ -5116,11 +5467,11 @@ async function showApp(user) {
   render();
   const isDemoCustomer = isMockCustomerIdentity();
   if (isDemoCustomer) {
-    // The Mock customer path is deliberately limited to personal, team and
-    // organization usage. Billing and model catalog requests would touch
-    // seller-only integrations and are rejected by the API.
+    // Customer Mock identities use only their tenant-safe usage and enterprise
+    // credit APIs. In particular, never probe the personal billing endpoint.
     billingAvailable = false;
     modelCatalog = [];
+    // 演示客户的导航项全部由 /api/auth/scope 的组织字段决定，等它落地即可揭示。
     const scopePromise = loadAuthScope();
     await Promise.all([loadCurrentViewData(), scopePromise]);
     return;
@@ -5146,7 +5497,7 @@ async function loadAuthScope() {
     Object.assign(currentUser, scope);
     leaderTeams = normalizeLeaderTeams(currentUser);
     selectedTeamRef = currentUser.team?.teamRef || leaderTeams[0]?.teamRef || "";
-    // 充值入口的可见性由 scope 里的零成本判断给出；老后端没有该字段时退回按需探测，
+    // 充值入口的可见性由这里的零成本判断给出；老后端没有该字段时退回按需探测，
     // 避免混合版本部署期间入口凭空消失。
     if (scope?.billingAvailable !== undefined) {
       billingAvailable = Boolean(scope.billingAvailable);
@@ -5208,6 +5559,7 @@ function showLogin() {
   selectedTopupAmount = 0;
   pendingTopupTradeNo = "";
   el("billingPayPanel")?.classList.add("hidden");
+  resetOrganizationBillingData();
   adminRedemptions = [];
   adminRedemptionTotal = 0;
   adminBillingOrders = [];
@@ -5575,24 +5927,43 @@ el("cancelCustomerOrganizationButton").addEventListener("click", closeCustomerOr
 el("backToCustomersButton").addEventListener("click", closeCustomerOrganization);
 el("backToCustomerOrganizationButton").addEventListener("click", () => showOrganizationUsage("info"));
 el("backToCustomerOrganizationDepartmentButton").addEventListener("click", () => showOrganizationUsage("info"));
+el("backToCustomerOrganizationBillingButton").addEventListener("click", () => showOrganizationUsage("info"));
 el("createOrganizationDepartmentButton").addEventListener("click", () => openOrganizationDepartmentModal());
 el("inviteOrganizationMemberButton").addEventListener("click", () => openOrganizationMemberModal());
 el("cancelOrganizationDepartmentButton").addEventListener("click", closeOrganizationDepartmentModal);
 el("cancelOrganizationMemberButton").addEventListener("click", closeOrganizationMemberModal);
+el("openOrganizationTopupModalButton").addEventListener("click", openOrganizationTopupModal);
+el("cancelOrganizationTopupButton").addEventListener("click", closeOrganizationTopupModal);
+el("organizationTopupForm").addEventListener("submit", submitOrganizationTopup);
+el("organizationTopupAmount").addEventListener("input", () => {
+  selectedOrganizationTopupAmount = 0;
+  renderOrganizationTopupOptions();
+  setFieldError("organizationTopupError", "");
+});
+el("organizationTopupOptions").addEventListener("click", (event) => {
+  const option = event.target.closest("[data-organization-topup-amount]");
+  if (!option) return;
+  selectedOrganizationTopupAmount = Number(option.dataset.organizationTopupAmount || 0);
+  el("organizationTopupAmount").value = String(selectedOrganizationTopupAmount);
+  renderOrganizationTopupOptions();
+  setFieldError("organizationTopupError", "");
+});
+el("organizationBillingPreviousPageButton").addEventListener("click", () => changeOrganizationBillingPage(-1));
+el("organizationBillingNextPageButton").addEventListener("click", () => changeOrganizationBillingPage(1));
 
 el("customerOrganizationForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (isCustomerOrganizationSaving || !customerOrganizationsAvailable()) return;
   const name = el("customerOrganizationNameInput").value.trim();
-  const ownerName = el("customerOrganizationOwnerNameInput").value.trim();
-  const ownerEmail = el("customerOrganizationOwnerEmailInput").value.trim();
-  if (!name || !ownerName) {
-    showToast("请填写企业名称和首位企业主姓名");
+  const adminName = el("customerOrganizationAdminNameInput").value.trim();
+  const adminEmail = el("customerOrganizationAdminEmailInput").value.trim();
+  if (!name || !adminName) {
+    showToast("请填写企业名称和首位企业管理员姓名");
     return;
   }
-  if (!validEmail(ownerEmail)) {
-    showToast("请输入有效的首位企业主邮箱");
-    el("customerOrganizationOwnerEmailInput").focus();
+  if (!validEmail(adminEmail)) {
+    showToast("请输入有效的首位企业管理员邮箱");
+    el("customerOrganizationAdminEmailInput").focus();
     return;
   }
   const isEditing = Boolean(editingCustomerOrganizationId);
@@ -5604,7 +5975,7 @@ el("customerOrganizationForm").addEventListener("submit", async (event) => {
       isEditing ? customerOrganizationPath(editingCustomerOrganizationId) : "/api/platform/organizations",
       {
         method: isEditing ? "PATCH" : "POST",
-        body: JSON.stringify(isEditing ? { name } : { name, ownerName, ownerEmail }),
+        body: JSON.stringify(isEditing ? { name } : { name, adminName, adminEmail }),
       },
     );
     const created = payload?.organization || payload;
@@ -5818,23 +6189,6 @@ el("organizationNextPageButton").addEventListener("click", () => {
   if (organizationMemberPage * organizationMemberPageSize >= organizationMemberTotal) return;
   organizationMemberPage += 1;
   loadOrganizationMembers();
-});
-
-el("resetOrganizationDemoButton").addEventListener("click", async () => {
-  if (!organizationCanManage() || !window.confirm("重置后会清除本次演示中的部门与成员变更，并恢复初始样例。确定继续吗？")) return;
-  setButtonLoading("resetOrganizationDemoButton", true, "重置中");
-  try {
-    await ensureCsrfToken();
-    await api("/api/organization/current/demo/reset", { method: "POST", body: JSON.stringify({}) });
-    organizationMemberPage = 1;
-    organizationMemberFilters = { search: "", departmentId: "", role: "", status: "" };
-    await loadOrganizationData();
-    showToast("演示数据已重置");
-  } catch (error) {
-    showToast(error.message || "演示数据重置失败");
-  } finally {
-    setButtonLoading("resetOrganizationDemoButton", false);
-  }
 });
 
 document.querySelectorAll("[data-organization-usage-view]").forEach((button) => {
@@ -6334,6 +6688,7 @@ document.querySelectorAll(".modal-backdrop").forEach((backdrop) => {
     if (backdrop.id === "customerOrganizationModal") closeCustomerOrganizationModal();
     if (backdrop.id === "organizationDepartmentModal") closeOrganizationDepartmentModal();
     if (backdrop.id === "organizationMemberModal") closeOrganizationMemberModal();
+    if (backdrop.id === "organizationTopupModal") closeOrganizationTopupModal();
   });
 });
 
@@ -6346,6 +6701,7 @@ document.addEventListener("keydown", (event) => {
   else if (!el("customerOrganizationModal").classList.contains("hidden")) closeCustomerOrganizationModal();
   else if (!el("organizationMemberModal").classList.contains("hidden")) closeOrganizationMemberModal();
   else if (!el("organizationDepartmentModal").classList.contains("hidden")) closeOrganizationDepartmentModal();
+  else if (!el("organizationTopupModal").classList.contains("hidden")) closeOrganizationTopupModal();
 });
 
 document.addEventListener("visibilitychange", () => {

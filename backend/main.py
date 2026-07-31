@@ -12,6 +12,7 @@ import socket
 import ssl
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from base64 import urlsafe_b64encode
 from email.message import EmailMessage
 from html import unescape
@@ -155,6 +156,9 @@ department_usage_cache = TTLCache()
 team_auth_cache = TTLCache()
 team_usage_cache = TTLCache()
 team_member_usage_cache = TTLCache()
+# Generated customer-demo boards are isolated from the production board
+# caches. Their keys are derived from the server-resolved organization scope.
+organization_usage_cache = TTLCache()
 _litellm_client: LiteLLMClient | None = None
 _key_vault: KeyVault | None = None
 _usage_store: UsageStore | None = UsageStore.from_environment()
@@ -641,8 +645,8 @@ def organization_access_fields(
 ) -> dict[str, Any]:
     """Return customer-org capabilities without changing platform privileges.
 
-    The old V1 mock elevated a platform admin to an owner of a synthetic
-    customer.  V2 deliberately removes that shortcut: seller admins browse
+    The old V1 mock elevated a platform admin to a synthetic customer.  V2
+    deliberately removes that shortcut: seller admins browse
     customers through /api/platform/organizations and are not members of any
     customer organization.
     """
@@ -650,7 +654,7 @@ def organization_access_fields(
     enabled = organization_demo_enabled()
     active_membership = membership if isinstance(membership, dict) and membership.get("status") == "active" else None
     role = str(active_membership.get("role") or "") if active_membership else None
-    if role not in {"owner", "admin", "member"}:
+    if role not in {"admin", "member"}:
         role = None
     organization_id = str(
         (active_membership or {}).get("organizationId")
@@ -663,9 +667,9 @@ def organization_access_fields(
         else None
     )
     organization_name = str((organization or {}).get("name") or "")
-    # Customer admins have company-wide analytics access.  Master-data writes
-    # stay seller-only in Mock V2, so the old field remains false on purpose.
-    can_view_usage = role in {"owner", "admin"}
+    # Enterprise administrators own the complete customer-scoped workspace.
+    can_view_usage = role == "admin"
+    can_view_billing = role == "admin"
     return {
         "organizationDemoEnabled": enabled,
         "isPlatformAdmin": bool(user.get("isPlatformAdmin")),
@@ -677,7 +681,9 @@ def organization_access_fields(
         "organizationName": organization_name or None,
         "organizationRole": role,
         "canViewOrganizationUsage": can_view_usage,
-        "canManageOrganization": False,
+        "canViewOrganizationBilling": can_view_billing,
+        "canSimulateOrganizationTopup": can_view_billing,
+        "canManageOrganization": bool(enabled and role == "admin"),
         # Keep the explicit V2 capability separate from the legacy alias while
         # older browser bundles are still in circulation.
         "canManageCustomerOrganizations": bool(enabled and user.get("isPlatformAdmin")),
@@ -840,6 +846,24 @@ async def require_organization_usage_viewer(request: Request) -> dict[str, Any]:
     return user
 
 
+async def require_organization_billing_viewer(request: Request) -> dict[str, Any]:
+    """Require an active customer administrator for Mock enterprise credit."""
+
+    user = await organization_user(request)
+    if not user.get("canViewOrganizationBilling"):
+        raise auth_http_error(403, "当前成员没有企业额度查看权限", "ORGANIZATION_BILLING_FORBIDDEN")
+    return user
+
+
+async def require_organization_billing_topup_operator(request: Request) -> dict[str, Any]:
+    """Keep simulated top-up authorization independent from analytics roles."""
+
+    user = await require_organization_billing_viewer(request)
+    if not user.get("canSimulateOrganizationTopup"):
+        raise auth_http_error(403, "当前成员没有企业额度充值权限", "ORGANIZATION_TOPUP_FORBIDDEN")
+    return user
+
+
 async def require_organization_directory_viewer(request: Request) -> dict[str, Any]:
     """Allow the customer directory only to the company's analytics roles.
 
@@ -856,10 +880,12 @@ async def require_organization_directory_viewer(request: Request) -> dict[str, A
 
 
 async def require_organization_demo_manager(request: Request) -> dict[str, Any]:
-    """Compatibility gate: V2 leaves customer master-data mutation to seller admins."""
+    """Require an active customer administrator for scoped directory writes."""
 
     user = await organization_user(request)
-    raise auth_http_error(403, "客户企业资料仅可由平台管理员维护", "ORGANIZATION_MANAGE_FORBIDDEN")
+    if not user.get("canManageOrganization"):
+        raise auth_http_error(403, "当前成员没有企业组织管理权限", "ORGANIZATION_MANAGE_FORBIDDEN")
+    return user
 
 
 def organization_current_member(user: dict[str, Any]) -> dict[str, Any]:
@@ -905,6 +931,90 @@ async def platform_organization_store_call(method: str, *args: Any, **kwargs: An
     """Call a V2 seller-side store operation and keep failures typed."""
 
     return await organization_store_call(method, *args, **kwargs)
+
+
+async def organization_usage_cache_key(
+    organization_id: str,
+    method: str,
+    *,
+    start_date: str,
+    end_date: str,
+    source: str,
+    **filters: Any,
+) -> str:
+    """Build a server-owned cache key for one generated customer board.
+
+    The organization is resolved from the session or a platform URL before
+    this helper is reached.  Include the store's private revision so member
+    and department changes cannot leave a stale board visible for the normal
+    cache TTL.
+    """
+
+    try:
+        revision = await organization_scoped_store_call(
+            organization_id, "usage_cache_fingerprint"
+        )
+    except AttributeError:
+        # Older test doubles have no revision API. They must still never share
+        # a key across organizations or request shapes.
+        revision = organization_id
+    normalized_filters = ":".join(
+        f"{key}={str(value or '').strip().casefold()}"
+        for key, value in sorted(filters.items())
+    )
+    return (
+        f"organization-usage:v1:{method}:{revision}:{start_date}:{end_date}:"
+        f"{str(source or 'all').strip().casefold()}:{normalized_filters}"
+    )
+
+
+def invalidate_organization_usage_cache() -> None:
+    """Clear generated Mock board data after a seller-side directory write."""
+
+    organization_usage_cache.clear()
+
+
+async def cached_mock_organization_usage_payload(
+    method: str,
+    organization_id: str,
+    *,
+    start_date: str,
+    end_date: str,
+    source: str,
+    refresh: bool = False,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Cache only company/department boards, never personal or team access."""
+
+    cache_key = await organization_usage_cache_key(
+        organization_id,
+        method,
+        start_date=start_date,
+        end_date=end_date,
+        source=source,
+        **kwargs,
+    )
+    if not refresh:
+        hit, value, ttl_seconds = organization_usage_cache.get(cache_key)
+        if hit:
+            payload = dict(value)
+            payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+            return payload
+    payload = await mock_usage_payload(
+        method,
+        organization_id,
+        start_date=start_date,
+        end_date=end_date,
+        source=source,
+        **kwargs,
+    )
+    stored = dict(payload)
+    organization_usage_cache.set(
+        cache_key, stored, env_int("ORGANIZATION_USAGE_CACHE_TTL_SECONDS", 120)
+    )
+    result = dict(stored)
+    result["cache"] = {"hit": False, "ttlSeconds": 0}
+    return result
 
 
 async def require_platform_organization(request: Request, organization_id: str) -> dict[str, Any]:
@@ -2489,7 +2599,7 @@ class OrganizationMemberCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     email: str = Field(min_length=3, max_length=254)
     departmentId: str = Field(min_length=1, max_length=128)
-    role: Literal["owner", "admin", "member"] = "member"
+    role: Literal["admin", "member"] = "member"
 
     @field_validator("name", "email", "departmentId")
     @classmethod
@@ -2504,7 +2614,7 @@ class OrganizationMemberUpdateRequest(BaseModel):
 
     name: str | None = Field(default=None, min_length=1, max_length=120)
     departmentId: str | None = Field(default=None, min_length=1, max_length=128)
-    role: Literal["owner", "admin", "member"] | None = None
+    role: Literal["admin", "member"] | None = None
     status: Literal["invited", "pending", "active", "suspended"] | None = None
 
     @field_validator("name", "departmentId")
@@ -2533,15 +2643,43 @@ class PlatformOrganizationRequest(BaseModel):
 
 
 class PlatformOrganizationCreateRequest(PlatformOrganizationRequest):
-    """Create one customer and its first active customer owner atomically."""
+    """Create one customer and its first active customer administrator atomically."""
 
-    ownerName: str = Field(min_length=1, max_length=120)
-    ownerEmail: str = Field(min_length=3, max_length=254)
+    adminName: str = Field(min_length=1, max_length=120)
+    adminEmail: str = Field(min_length=3, max_length=254)
 
-    @field_validator("ownerName", "ownerEmail")
+    @field_validator("adminName", "adminEmail")
     @classmethod
-    def strip_owner_text(cls, value: str) -> str:
+    def strip_admin_text(cls, value: str) -> str:
         return value.strip()
+
+
+class OrganizationBillingTopupRequest(BaseModel):
+    """Strict payload for a local-only Mock enterprise credit simulation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    amountUsd: Decimal
+
+    @field_validator("amountUsd", mode="before")
+    @classmethod
+    def require_numeric_amount_usd(cls, value: Any) -> Any:
+        # A quoted amount looks harmless but weakens the public JSON contract.
+        # Keep this Mock endpoint strict so it can later map to a real API.
+        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+            raise ValueError("amountUsd must be a number")
+        return value
+
+    @field_validator("amountUsd")
+    @classmethod
+    def validate_amount_usd(cls, value: Decimal) -> Decimal:
+        if not value.is_finite():
+            raise ValueError("amountUsd must be a finite number")
+        if value.as_tuple().exponent < -2:
+            raise ValueError("amountUsd must have at most two decimal places")
+        if value < Decimal("1.00") or value > Decimal("100000.00"):
+            raise ValueError("amountUsd must be between 1.00 and 100000.00")
+        return value.quantize(Decimal("0.01"))
 
 
 def write_key_audit(event: str, email: str, key_id: str, request: Request, result: str) -> None:
@@ -3054,6 +3192,19 @@ def self_service_billing_available(user: dict[str, Any]) -> bool:
 @app.get("/api/auth/scope")
 async def auth_scope(request: Request) -> dict[str, Any]:
     user = require_user(request)
+    if organization_demo_enabled() and user.get("isPlatformAdmin"):
+        # The seller's local customer-console demo is fully side-effect free.
+        # Do not wait on the legacy upstream team resolver merely to bootstrap
+        # a platform administrator who has no customer membership or team
+        # scope in this mode.
+        return {
+            "isTeamLeader": False,
+            "teamBoardStatus": "none",
+            "team": None,
+            "leaderTeams": [],
+            **(await organization_scope_fields_for_user(user)),
+            "billingAvailable": self_service_billing_available(user),
+        }
     if await is_demo_customer_user(user):
         # A demo customer settles through its enterprise credit contract, so the
         # personal top-up destination stays hidden for them by construction.
@@ -3268,6 +3419,7 @@ async def organization_current_usage(
     end_date: str | None = None,
     source: str = Query("all"),
     employee: str | None = Query(None, max_length=320),
+    refresh: bool = Query(False),
 ) -> dict[str, Any]:
     """Return Mock full-member usage for the authenticated customer only."""
 
@@ -3275,13 +3427,14 @@ async def organization_current_usage(
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
     organization_id = organization_identifier(organization_current_member(user))
-    payload = await mock_usage_payload(
+    payload = await cached_mock_organization_usage_payload(
         "mock_organization_usage",
         organization_id,
         start_date=start_date,
         end_date=end_date,
         source=source,
         employee=(employee or "").strip(),
+        refresh=refresh,
     )
     return {
         "organization": {"id": organization_id},
@@ -3300,6 +3453,7 @@ async def organization_current_department_usage(
     end_date: str | None = None,
     source: str = Query("all"),
     department: str | None = Query(None, max_length=128),
+    refresh: bool = Query(False),
 ) -> dict[str, Any]:
     """Return Mock department usage scoped to the authenticated customer."""
 
@@ -3307,13 +3461,14 @@ async def organization_current_department_usage(
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
     organization_id = organization_identifier(organization_current_member(user))
-    payload = await mock_usage_payload(
+    payload = await cached_mock_organization_usage_payload(
         "mock_department_usage",
         organization_id,
         start_date=start_date,
         end_date=end_date,
         source=source,
         department=(department or "").strip(),
+        refresh=refresh,
     )
     return {
         "organization": {"id": organization_id},
@@ -3325,14 +3480,65 @@ async def organization_current_department_usage(
     }
 
 
+@app.get("/api/organization/current/billing")
+async def organization_current_billing(
+    request: Request,
+    page: int = Query(1, ge=1, le=100000),
+    pageSize: int = Query(20, ge=1, le=100),
+) -> dict[str, Any]:
+    """Return a customer administrator's isolated Mock enterprise credit balance."""
+
+    user = await require_organization_billing_viewer(request)
+    organization_id = organization_identifier(organization_current_member(user))
+    try:
+        return await organization_scoped_store_call(
+            organization_id,
+            "billing_payload",
+            page=page,
+            page_size=pageSize,
+        )
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+
+
+@app.post("/api/organization/current/billing/topups")
+async def organization_current_billing_topup(
+    data: OrganizationBillingTopupRequest,
+    request: Request,
+    page: int = Query(1, ge=1, le=100000),
+    pageSize: int = Query(20, ge=1, le=100),
+) -> dict[str, Any]:
+    """Credit only the session-derived customer balance; never take payment."""
+
+    await enforce_csrf(request)
+    user = await require_organization_billing_topup_operator(request)
+    organization_id = organization_identifier(organization_current_member(user))
+    try:
+        result = await organization_scoped_store_call(
+            organization_id,
+            "simulate_billing_topup",
+            data.amountUsd,
+            operator=str(user.get("name") or user.get("email") or "Customer administrator"),
+            operator_email=str(user.get("email") or ""),
+            page=page,
+            page_size=pageSize,
+        )
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    return {"ok": True, **result}
+
+
 @app.post("/api/organization/current/departments")
 async def organization_create_department(data: OrganizationDepartmentRequest, request: Request) -> dict[str, Any]:
     await enforce_csrf(request)
-    await require_organization_demo_manager(request)
+    user = await require_organization_demo_manager(request)
     try:
-        department = await organization_store_call("create_department", data.name)
+        department = await organization_scoped_store_call(
+            organization_identifier(organization_current_member(user)), "create_department", data.name
+        )
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
+    invalidate_organization_usage_cache()
     return {"department": department}
 
 
@@ -3341,11 +3547,14 @@ async def organization_update_department(
     department_id: str, data: OrganizationDepartmentRequest, request: Request
 ) -> dict[str, Any]:
     await enforce_csrf(request)
-    await require_organization_demo_manager(request)
+    user = await require_organization_demo_manager(request)
     try:
-        department = await organization_store_call("update_department", department_id, data.name)
+        department = await organization_scoped_store_call(
+            organization_identifier(organization_current_member(user)), "update_department", department_id, data.name
+        )
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
+    invalidate_organization_usage_cache()
     return {"department": department}
 
 
@@ -3356,20 +3565,24 @@ async def organization_archive_department(
     _data: OrganizationEmptyRequest | None = None,
 ) -> dict[str, Any]:
     await enforce_csrf(request)
-    await require_organization_demo_manager(request)
+    user = await require_organization_demo_manager(request)
     try:
-        department = await organization_store_call("archive_department", department_id)
+        department = await organization_scoped_store_call(
+            organization_identifier(organization_current_member(user)), "archive_department", department_id
+        )
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
+    invalidate_organization_usage_cache()
     return {"department": department}
 
 
 @app.post("/api/organization/current/members")
 async def organization_create_member(data: OrganizationMemberCreateRequest, request: Request) -> dict[str, Any]:
     await enforce_csrf(request)
-    await require_organization_demo_manager(request)
+    user = await require_organization_demo_manager(request)
     try:
-        member = await organization_store_call(
+        member = await organization_scoped_store_call(
+            organization_identifier(organization_current_member(user)),
             "create_member",
             data.name,
             data.email,
@@ -3378,6 +3591,7 @@ async def organization_create_member(data: OrganizationMemberCreateRequest, requ
         )
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
+    invalidate_organization_usage_cache()
     return {"member": member}
 
 
@@ -3386,7 +3600,7 @@ async def organization_update_member(
     member_id: str, data: OrganizationMemberUpdateRequest, request: Request
 ) -> dict[str, Any]:
     await enforce_csrf(request)
-    await require_organization_demo_manager(request)
+    user = await require_organization_demo_manager(request)
     fields = data.model_fields_set
     if not fields:
         raise auth_http_error(400, "请至少填写一项需要更新的成员信息", "ORGANIZATION_INVALID_INPUT")
@@ -3400,24 +3614,13 @@ async def organization_update_member(
     if "status" in fields:
         updates["status"] = "invited" if data.status == "pending" else data.status
     try:
-        member = await organization_store_call("update_member", member_id, **updates)
+        member = await organization_scoped_store_call(
+            organization_identifier(organization_current_member(user)), "update_member", member_id, **updates
+        )
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
+    invalidate_organization_usage_cache()
     return {"member": member}
-
-
-@app.post("/api/organization/current/demo/reset")
-async def organization_reset_demo(
-    request: Request,
-    _data: OrganizationEmptyRequest | None = None,
-) -> dict[str, Any]:
-    user = await require_organization_demo_manager(request)
-    await enforce_csrf(request)
-    try:
-        await organization_store_call("reset")
-    except OrganizationStoreError as exc:
-        raise organization_store_error(exc) from exc
-    return {"ok": True, **await organization_current_payload(user)}
 
 
 @app.get("/api/platform/organizations")
@@ -3451,7 +3654,7 @@ async def platform_create_organization(
     data: PlatformOrganizationCreateRequest,
     request: Request,
 ) -> dict[str, Any]:
-    """Create a Mock customer with its default department and first owner."""
+    """Create a Mock customer with its default department and first administrator."""
 
     if not organization_demo_enabled():
         raise HTTPException(status_code=404, detail="客户企业演示功能尚未启用")
@@ -3459,13 +3662,14 @@ async def platform_create_organization(
     require_platform_admin(request)
     try:
         created = await platform_organization_store_call(
-            "create_organization_with_owner",
+            "create_organization_with_admin",
             data.name,
-            data.ownerName,
-            data.ownerEmail,
+            data.adminName,
+            data.adminEmail,
         )
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
+    invalidate_organization_usage_cache()
     return created
 
 
@@ -3494,6 +3698,7 @@ async def platform_update_organization(
         )
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
+    invalidate_organization_usage_cache()
     return {"organization": organization}
 
 
@@ -3509,6 +3714,7 @@ async def platform_archive_organization(
         organization = await platform_organization_store_call("archive_organization", organization_id)
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
+    invalidate_organization_usage_cache()
     return {"organization": organization}
 
 
@@ -3550,6 +3756,7 @@ async def platform_create_department(
         department = await organization_scoped_store_call(organization_id, "create_department", data.name)
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
+    invalidate_organization_usage_cache()
     return {"department": department}
 
 
@@ -3568,6 +3775,7 @@ async def platform_update_department(
         )
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
+    invalidate_organization_usage_cache()
     return {"department": department}
 
 
@@ -3586,6 +3794,7 @@ async def platform_archive_department(
         )
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
+    invalidate_organization_usage_cache()
     return {"department": department}
 
 
@@ -3601,6 +3810,7 @@ async def platform_create_member(
         )
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
+    invalidate_organization_usage_cache()
     return {"member": member}
 
 
@@ -3631,6 +3841,7 @@ async def platform_update_member(
         )
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
+    invalidate_organization_usage_cache()
     return {"member": member}
 
 
@@ -3642,19 +3853,42 @@ async def platform_organization_usage(
     end_date: str | None = None,
     source: str = Query("all"),
     employee: str | None = Query(None, max_length=320),
+    refresh: bool = Query(False),
 ) -> dict[str, Any]:
     await require_platform_organization(request, organization_id)
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
-    payload = await mock_usage_payload(
+    payload = await cached_mock_organization_usage_payload(
         "mock_organization_usage",
         organization_id,
         start_date=start_date,
         end_date=end_date,
         source=source,
         employee=(employee or "").strip(),
+        refresh=refresh,
     )
     return {"startDate": start_date, "endDate": end_date, "source": source, "employee": (employee or "").strip(), **payload}
+
+
+@app.get("/api/platform/organizations/{organization_id}/billing")
+async def platform_organization_billing(
+    organization_id: str,
+    request: Request,
+    page: int = Query(1, ge=1, le=100000),
+    pageSize: int = Query(20, ge=1, le=100),
+) -> dict[str, Any]:
+    """Allow the seller to read one customer's Mock credit history only."""
+
+    selected = await require_platform_organization(request, organization_id)
+    try:
+        return await organization_scoped_store_call(
+            str(selected["selectedOrganizationId"]),
+            "billing_payload",
+            page=page,
+            page_size=pageSize,
+        )
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
 
 
 @app.get("/api/platform/organizations/{organization_id}/departments/usage")
@@ -3665,17 +3899,19 @@ async def platform_organization_department_usage(
     end_date: str | None = None,
     source: str = Query("all"),
     department: str | None = Query(None, max_length=128),
+    refresh: bool = Query(False),
 ) -> dict[str, Any]:
     await require_platform_organization(request, organization_id)
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
-    payload = await mock_usage_payload(
+    payload = await cached_mock_organization_usage_payload(
         "mock_department_usage",
         organization_id,
         start_date=start_date,
         end_date=end_date,
         source=source,
         department=(department or "").strip(),
+        refresh=refresh,
     )
     return {"startDate": start_date, "endDate": end_date, "source": source, "department": (department or "").strip(), **payload}
 
@@ -3690,6 +3926,7 @@ async def platform_reset_organization_demo(
     require_platform_admin(request)
     try:
         await platform_organization_store_call("reset_all")
+        invalidate_organization_usage_cache()
         return {"ok": True, **await platform_organization_store_call("list_organizations")}
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc

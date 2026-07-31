@@ -44,11 +44,21 @@ def test_user_page_has_no_redemption_entry() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
     source = APP_JS.read_text(encoding="utf-8")
     billing_markup = markup[markup.index('id="billingView"') : markup.index('id="modelsView"')]
+    personal_billing_markup = billing_markup[
+        billing_markup.index('id="personalBillingWorkspace"') :
+    ]
+    organization_billing_markup = billing_markup[
+        billing_markup.index('id="organizationBillingWorkspace"') : billing_markup.index('id="personalBillingWorkspace"')
+    ]
 
-    # 兑换码只给管理员发放，用户页面不显示兑换入口。
-    assert 'id="redeemForm"' not in billing_markup
-    assert 'id="redeemCode"' not in billing_markup
-    assert "兑换" not in billing_markup
+    # 兑换码只给卖方平台运营面板发放；个人充值与企业 Mock 额度页都
+    # 不能提供兑换入口。企业页可以明确说明“不包含兑换码”，因此不能
+    # 再把说明文字本身误判成一个入口。
+    assert 'id="redeemForm"' not in personal_billing_markup
+    assert 'id="redeemCode"' not in personal_billing_markup
+    assert 'id="redeemForm"' not in organization_billing_markup
+    assert 'id="redeemCode"' not in organization_billing_markup
+    assert "本页不包含支付方式、收款码、兑换码或真实订单。" in organization_billing_markup
     assert "submitRedeem" not in source
 
 
@@ -90,12 +100,7 @@ def test_billing_view_is_reachable_without_entitlement() -> None:
     # showApp 在权限受限时会提前 return；充值可见性必须在那之前由轻量
     # /api/auth/scope 解析，不能等待真实账本余额或订单请求。
     assert "const scopePromise = loadAuthScope();" in source
-    assert (
-        "if (accountAccessCopy(currentUser)) {\n"
-        "    // 权限受限的新用户照样要看到充值入口——他们正是靠充值开通。\n"
-        "    await scopePromise;\n"
-        "    return;\n  }"
-    ) in source
+    assert "if (accountAccessCopy(currentUser)) {\n    // 权限受限的新用户照样要看到充值入口——他们正是靠充值开通。\n    await scopePromise;\n    return;\n  }" in source
     assert "if (scope?.billingAvailable !== undefined) {\n      billingAvailable = Boolean(scope.billingAvailable);\n    }" in source
     assert 'el("accountAccessTopupButton").addEventListener("click", () => switchView("billing"));' in source
 
@@ -103,9 +108,13 @@ def test_billing_view_is_reachable_without_entitlement() -> None:
 def test_topup_entry_hidden_when_billing_unavailable() -> None:
     source = APP_JS.read_text(encoding="utf-8")
 
-    # 充值未开放时不能给出走不通的入口。
+    # 个人充值未开放，或当前身份不具备企业额度能力时，直接切换到
+    # 充值页也必须回退到我的用量。
     assert 'el("accountAccessTopupButton").classList.toggle("hidden", !(state.topup && billingAvailable));' in source
-    assert 'if (view === "billing" && !billingAvailable) view = "dashboard";' in source
+    assert 'if (view === "billing" && !canAccessBillingView()) view = "dashboard";' in source
+    access_guard = source[source.index("function canAccessBillingView()") : source.index("function selectedCustomerOrganizationId()")]
+    assert "isOrganizationBillingView()" in access_guard
+    assert "billingAvailable && !currentUser?.organizationDemoEnabled" in access_guard
 
 
 def test_online_panel_hidden_until_a_channel_is_configured() -> None:
@@ -186,7 +195,11 @@ def test_admin_review_queue_supports_confirm_and_reject() -> None:
 def test_polling_stops_when_leaving_billing_view() -> None:
     source = APP_JS.read_text(encoding="utf-8")
 
-    assert 'if (currentView === "billing" && view !== "billing") hideManualPayPanel();' in source
+    # Leaving either billing workspace stops legacy payment polling and closes
+    # the Mock top-up modal, so no billing UI survives a view transition.
+    leaving_billing = source[source.index('if (currentView === "billing" && view !== "billing")') : source.index("currentView = view;")]
+    assert "hideManualPayPanel();" in leaving_billing
+    assert "closeOrganizationTopupModal({ force: true });" in leaving_billing
     assert "stopTopupPolling();" in source[source.index("function hideManualPayPanel()") :][:200]
     # 人工确认比自动回调慢，轮询窗口相应放宽。
     assert "attempts > 100" in source
@@ -207,11 +220,12 @@ def test_logout_clears_billing_state() -> None:
         assert cleared in source
 
 
-def test_static_asset_version_bumped_for_sidebar_reveal_release() -> None:
+def test_static_asset_version_bumped_for_organization_admin_merge_release() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
 
-    # 不更新版本号线上用户会命中旧缓存，侧边栏仍会逐项蹦出。
-    assert 'src="/assets/app.js?v=20260731-admin-ranking-department"' in markup
+    # 不更新版本号线上用户会命中旧缓存：甲方管理员看不到「企业管理」入口，
+    # 「企业主」角色标签也会残留在成员表和筛选器里。
+    assert 'src="/assets/app.js?v=20260731-organization-admin-merge"' in markup
 
 
 def test_billing_copy_avoids_upstream_provider_terms() -> None:
@@ -223,3 +237,86 @@ def test_billing_copy_avoids_upstream_provider_terms() -> None:
     for term in ("LiteLLM", "Virtual Key", "max_budget", "Proxy", "proxy"):
         assert term not in billing_markup, f"充值页面文案不应暴露 {term}"
         assert term not in billing_source, f"充值前端逻辑不应暴露 {term}"
+
+
+def test_organization_billing_has_a_separate_mock_contract_and_payment_free_workspace() -> None:
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    for required in (
+        'id="organizationBillingWorkspace"',
+        'id="organizationTopupModal"',
+        'id="organizationBillingRecordBody"',
+        'id="openOrganizationTopupModalButton"',
+        'data-organization-usage-view="billing"',
+    ):
+        assert required in markup
+    assert 'path: "/api/organization/current/billing"' in source
+    assert 'path: `${customerOrganizationPath(organizationId)}/billing`' in source
+    assert 'api("/api/organization/current/billing/topups"' in source
+    assert "body: JSON.stringify({ amountUsd: amount })" in source
+    assert "function organizationBillingContext()" in source
+    assert "function renderOrganizationBilling()" in source
+    assert "function submitOrganizationTopup(event)" in source
+
+
+def test_organization_billing_workspace_hides_personal_payment_ui() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    render_billing = source[source.index("function renderOrganizationBilling()") : source.index("function organizationBillingUrl(")]
+    assert 'workspace.classList.toggle("hidden", !context);' in render_billing
+    assert 'personalWorkspace.classList.toggle("hidden", Boolean(context));' in render_billing
+    assert "if (renderOrganizationBilling()) return;" in source
+
+
+def test_organization_billing_records_can_page_beyond_the_initial_response() -> None:
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert 'id="organizationBillingPreviousPageButton"' in markup
+    assert 'id="organizationBillingNextPageButton"' in markup
+    assert 'id="organizationBillingPageInfo"' in markup
+    assert "function changeOrganizationBillingPage(direction)" in source
+    assert 'changeOrganizationBillingPage(-1)' in source
+    assert 'changeOrganizationBillingPage(1)' in source
+
+
+def test_mock_billing_sidebar_requires_customer_capability_not_platform_admin() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    navigation = source[source.index("function syncNavigationVisibility()") : source.index("function renderCustomerUsageBreadcrumbs")]
+    assert "const canUseBillingSidebar = isCustomer" in navigation
+    assert "? canViewOrganizationBilling()" in navigation
+    assert ": Boolean(billingAvailable && !currentUser?.organizationDemoEnabled);" in navigation
+    assert 'el("billingTab")?.classList.toggle("hidden", !canUseBillingSidebar);' in navigation
+
+
+def test_organization_topup_modal_closes_only_via_existing_safe_modal_contract() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    backdrop = source[source.index('document.querySelectorAll(".modal-backdrop")') : source.index('document.addEventListener("keydown"')]
+    assert "if (event.target !== backdrop) return;" in backdrop
+    assert 'backdrop.id === "organizationTopupModal"' in backdrop
+    keyboard = source[source.index('document.addEventListener("keydown"') : source.index('document.addEventListener("visibilitychange"')]
+    assert 'if (event.key !== "Escape") return;' in keyboard
+    assert '!el("organizationTopupModal").classList.contains("hidden")' in keyboard
+
+
+def test_mock_customer_billing_never_falls_back_to_personal_billing() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    billing_refresh = source[source.index("async function refreshBillingAvailability()") : source.index("function updateBillingNav()")]
+    assert "if (isMockCustomerIdentity())" in billing_refresh
+    assert "billingAvailable = false;" in billing_refresh
+    switch_view = source[source.index("function switchView(view)") : source.index("async function loadCurrentViewData")]
+    assert "if (isOrganizationBillingView())" in switch_view
+    assert "loadOrganizationBillingData()" in switch_view
+    assert "else if (!isBillingLoading) loadBillingData();" in switch_view
+
+
+def test_organization_topup_modal_uses_existing_keyboard_and_backdrop_contract() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert 'backdrop.id === "organizationTopupModal"' in source
+    assert '!el("organizationTopupModal").classList.contains("hidden")' in source
+    assert "closeOrganizationTopupModal()" in source

@@ -89,7 +89,8 @@ def test_platform_and_customer_roles_are_never_mixed(monkeypatch) -> None:
     assert customer_me.json()["organization"]["id"] == "org-demo"
     assert customer_me.json()["organization"]["name"] == "Demo Company"
     assert customer_me.json()["canViewOrganizationUsage"] is True
-    assert customer_me.json()["canManageOrganization"] is False
+    # 甲方企业管理员现在可以维护本企业组织资料，但绝不获得乙方的客户目录。
+    assert customer_me.json()["canManageOrganization"] is True
     assert customer_me.json()["canManageCustomerOrganizations"] is False
     assert customer_me.json()["isKnownDemoCustomerIdentity"] is True
     assert customer_me.json()["organizationAccessStatus"] == "active"
@@ -113,35 +114,54 @@ def test_platform_customer_directory_filters_paginates_and_is_platform_only(monk
     assert denied.status_code == 403
 
 
-def test_platform_create_sets_default_department_and_active_owner(monkeypatch) -> None:
+def test_platform_create_sets_default_department_and_active_admin(monkeypatch) -> None:
     client = organization_client(monkeypatch, email=PLATFORM_EMAIL, platform_admin=True)
 
     created = client.post(
         "/api/platform/organizations",
         json={
             "name": "新客户企业",
-            "ownerName": "Initial Owner",
-            "ownerEmail": "initial.owner@customer.example",
+            "adminName": "Initial Admin",
+            "adminEmail": "initial.admin@customer.example",
         },
         headers=write_headers(),
     )
 
     assert created.status_code == 200
     payload = created.json()
-    organization_id = payload["organization"]["id"]
     assert payload["department"]["name"] == "企业管理"
-    assert payload["owner"]["role"] == "owner"
-    assert payload["owner"]["status"] == "active"
+    assert payload["admin"]["role"] == "admin"
+    assert payload["admin"]["status"] == "active"
+    assert "owner" not in payload
     assert payload["stats"]["departmentCount"] == 1
     assert payload["stats"]["activeMemberCount"] == 1
+
+
+def test_platform_create_rejects_the_removed_owner_fields(monkeypatch) -> None:
+    """`ownerName` / `ownerEmail` 已被 `adminName` / `adminEmail` 取代，不留兼容层。"""
+
+    client = organization_client(monkeypatch, email=PLATFORM_EMAIL, platform_admin=True)
+
+    legacy = client.post(
+        "/api/platform/organizations",
+        json={
+            "name": "Legacy Owner Customer",
+            "ownerName": "Legacy Owner",
+            "ownerEmail": "legacy.owner@customer.example",
+        },
+        headers=write_headers(),
+    )
+
+    assert legacy.status_code == 422
+    assert client.get("/api/platform/organizations?search=Legacy").json()["total"] == 0
 
 
 def test_platform_create_rejects_client_organization_id_and_requires_csrf(monkeypatch) -> None:
     client = organization_client(monkeypatch, email=PLATFORM_EMAIL, platform_admin=True)
     body = {
         "name": "Strict Customer",
-        "ownerName": "Strict Owner",
-        "ownerEmail": "strict.owner@customer.example",
+        "adminName": "Strict Admin",
+        "adminEmail": "strict.admin@customer.example",
     }
 
     missing_csrf = client.post("/api/platform/organizations", json=body)
@@ -213,15 +233,17 @@ def test_customer_member_cannot_access_company_boards_or_platform_directory(monk
     assert customers.status_code == 403
 
 
-def test_customer_master_data_writes_are_platform_only(monkeypatch) -> None:
-    customer_client = organization_client(monkeypatch, email="owner@demo.example")
+def test_both_parties_can_maintain_customer_master_data(monkeypatch) -> None:
+    """甲方管理员维护本企业资料，乙方平台管理员保留跨企业协助入口。"""
+
+    customer_client = organization_client(monkeypatch, email="admin@demo.example")
     platform_client = organization_client(
         monkeypatch, email=PLATFORM_EMAIL, platform_admin=True
     )
 
     customer_write = customer_client.post(
         "/api/organization/current/departments",
-        json={"name": "Blocked Customer Department"},
+        json={"name": "Customer Managed Department"},
         headers=write_headers(),
     )
     platform_write = platform_client.post(
@@ -230,10 +252,65 @@ def test_customer_master_data_writes_are_platform_only(monkeypatch) -> None:
         headers=write_headers(),
     )
 
-    assert customer_write.status_code == 403
-    assert error_code(customer_write) == "ORGANIZATION_MANAGE_FORBIDDEN"
+    assert customer_write.status_code == 200
+    assert customer_write.json()["department"]["name"] == "Customer Managed Department"
     assert platform_write.status_code == 200
     assert platform_write.json()["department"]["name"] == "Seller Managed Department"
+
+
+def test_customer_admin_writes_stay_inside_the_session_tenant(monkeypatch) -> None:
+    """甲方管理员的写操作范围由服务端从会话解析，客户端无法指定别家企业。"""
+
+    client = organization_client(monkeypatch, email="admin@demo.example")
+
+    created = client.post(
+        "/api/organization/current/departments",
+        json={"name": "Scoped Department", "organizationId": "org-aurora"},
+        headers=write_headers(),
+    )
+    cross_tenant_member = client.patch(
+        "/api/organization/current/members/member-aurora-001",
+        json={"status": "suspended"},
+        headers=write_headers(),
+    )
+
+    # 多余的 organizationId 被请求模型拒绝，不会静默落到别家企业。
+    assert created.status_code == 422
+    # 北辰的成员 id 在本企业范围内查不到。
+    assert cross_tenant_member.status_code == 404
+    assert error_code(cross_tenant_member) == "ORGANIZATION_NOT_FOUND"
+
+
+def test_customer_admin_cannot_touch_customer_lifecycle(monkeypatch) -> None:
+    """企业创建、改名、状态、归档和全局演示重置仍然只属于乙方。"""
+
+    client = organization_client(monkeypatch, email="admin@demo.example")
+
+    create = client.post(
+        "/api/platform/organizations",
+        json={
+            "name": "甲方越权开户",
+            "adminName": "Escalated Admin",
+            "adminEmail": "escalated.admin@customer.example",
+        },
+        headers=write_headers(),
+    )
+    rename = client.patch(
+        "/api/platform/organizations/org-demo",
+        json={"name": "Renamed By Customer"},
+        headers=write_headers(),
+    )
+    archive = client.post(
+        "/api/platform/organizations/org-demo/archive", json={}, headers=write_headers()
+    )
+    reset = client.post(
+        "/api/platform/organizations/demo/reset", json={}, headers=write_headers()
+    )
+
+    assert create.status_code == 403
+    assert rename.status_code == 403
+    assert archive.status_code == 403
+    assert reset.status_code == 403
 
 
 def test_platform_cross_customer_member_id_is_not_found(monkeypatch) -> None:
@@ -255,8 +332,8 @@ def test_platform_reset_restores_all_seed_customers(monkeypatch) -> None:
         "/api/platform/organizations",
         json={
             "name": "Temporary Customer",
-            "ownerName": "Temporary Owner",
-            "ownerEmail": "temporary.owner@customer.example",
+            "adminName": "Temporary Admin",
+            "adminEmail": "temporary.admin@customer.example",
         },
         headers=write_headers(),
     )

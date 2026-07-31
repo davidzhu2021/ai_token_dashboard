@@ -15,15 +15,23 @@ import re
 import threading
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Protocol
 
 
-ORGANIZATION_ROLES = frozenset({"owner", "admin", "member"})
+ORGANIZATION_ROLES = frozenset({"admin", "member"})
 MEMBER_STATUSES = frozenset({"invited", "active", "suspended"})
 ORGANIZATION_STATUSES = frozenset({"active", "suspended", "archived"})
 TEAM_ROLES = frozenset({"leader", "member"})
 ACTIVE_DEPARTMENT_MEMBER_STATUSES = frozenset({"invited", "active"})
+
+# This is deliberately separate from the production billing ledger.  Mock
+# organizations receive a deterministic opening credit that is never reduced
+# by generated usage data.
+INITIAL_ORGANIZATION_BALANCE_USD = Decimal("5000.00")
+MIN_SIMULATED_TOPUP_USD = Decimal("1.00")
+MAX_SIMULATED_TOPUP_USD = Decimal("100000.00")
 
 _SEED_TIMESTAMP = "2026-01-01T00:00:00+00:00"
 _UNSET = object()
@@ -78,19 +86,13 @@ class OrganizationStore(Protocol):
 
     def get_organization_snapshot(self, organization_id: str) -> dict[str, Any]: ...
 
-    def create_organization(
-        self,
-        name: str,
-        *,
-        organization_id: str | None = None,
-        status: str = "active",
-    ) -> dict[str, Any]: ...
+    def usage_cache_fingerprint(self, organization_id: str) -> str: ...
 
-    def create_organization_with_owner(
+    def create_organization_with_admin(
         self,
         name: str,
-        owner_name: str,
-        owner_email: str,
+        admin_name: str,
+        admin_email: str,
         *,
         default_department_name: str = "企业管理",
         organization_id: str | None = None,
@@ -173,6 +175,25 @@ class OrganizationStore(Protocol):
         organization_id: str | None = None,
     ) -> dict[str, Any]: ...
 
+    def billing_payload(
+        self,
+        organization_id: str,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict[str, Any]: ...
+
+    def simulate_billing_topup(
+        self,
+        organization_id: str,
+        amount_usd: Decimal,
+        *,
+        operator: str,
+        operator_email: str,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict[str, Any]: ...
+
     def reset(self, organization_id: str | None = None) -> dict[str, Any]: ...
 
 
@@ -204,10 +225,35 @@ class _Member:
 
 
 @dataclass
+class _BillingRecord:
+    identifier: str
+    timestamp: str
+    record_type: str
+    amount_usd: Decimal
+    balance_after_usd: Decimal
+    operator: str
+    operator_email: str
+    status: str = "completed"
+
+
+@dataclass
+class _OrganizationBilling:
+    initial_balance_usd: Decimal
+    total_topups_usd: Decimal
+    available_balance_usd: Decimal
+    records: list[_BillingRecord]
+
+
+@dataclass
 class _OrganizationState:
     organization: dict[str, Any]
     departments: dict[str, _Department]
     members: dict[str, _Member]
+    billing: _OrganizationBilling
+    # This private counter changes with directory mutations.  It lets the
+    # HTTP layer safely cache generated board data without exposing a mutable
+    # organization id or relying on second-resolution timestamps.
+    usage_cache_version: int = 1
 
 
 class InMemoryOrganizationStore:
@@ -224,6 +270,7 @@ class InMemoryOrganizationStore:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._organizations: dict[str, _OrganizationState] = {}
+        self._usage_cache_namespace = uuid.uuid4().hex
         self._load_seed()
 
     # ------------------------------------------------------------------
@@ -310,7 +357,7 @@ class InMemoryOrganizationStore:
     @classmethod
     def _validate_role(cls, value: Any) -> str:
         if not isinstance(value, str) or value not in ORGANIZATION_ROLES:
-            raise OrganizationValidationError("role must be owner, admin, or member")
+            raise OrganizationValidationError("role must be admin or member")
         return value
 
     @classmethod
@@ -350,6 +397,7 @@ class InMemoryOrganizationStore:
         departments: tuple[tuple[str, str], ...],
         members: tuple[tuple[str, str, str, str, str, str, str], ...],
     ) -> _OrganizationState:
+        billing = InMemoryOrganizationStore._seed_billing()
         return _OrganizationState(
             organization={
                 "id": organization_id,
@@ -378,6 +426,28 @@ class InMemoryOrganizationStore:
                 )
                 for identifier, member_name, email, department_id, role, status, team_role in members
             },
+            billing=billing,
+        )
+
+    @staticmethod
+    def _seed_billing() -> _OrganizationBilling:
+        """Return a fresh deterministic opening balance for one customer."""
+
+        return _OrganizationBilling(
+            initial_balance_usd=INITIAL_ORGANIZATION_BALANCE_USD,
+            total_topups_usd=Decimal("0.00"),
+            available_balance_usd=INITIAL_ORGANIZATION_BALANCE_USD,
+            records=[
+                _BillingRecord(
+                    identifier="billing-initial-credit",
+                    timestamp=_SEED_TIMESTAMP,
+                    record_type="initial_credit",
+                    amount_usd=INITIAL_ORGANIZATION_BALANCE_USD,
+                    balance_after_usd=INITIAL_ORGANIZATION_BALANCE_USD,
+                    operator="System",
+                    operator_email="",
+                )
+            ],
         )
 
     def _seed_organizations(self) -> dict[str, _OrganizationState]:
@@ -392,7 +462,7 @@ class InMemoryOrganizationStore:
                 ("dept-operations", "Operations"),
             ),
             (
-                ("member-owner", "Demo Owner", "owner@demo.example", "dept-engineering", "owner", "active", "leader"),
+                ("member-admin-primary", "Demo Admin", "owner@demo.example", "dept-engineering", "admin", "active", "leader"),
                 ("member-admin", "Demo Admin", "admin@demo.example", "dept-product", "admin", "active", "leader"),
                 ("member-001", "Avery Chen", "avery.chen@demo.example", "dept-engineering", "member", "active", "member"),
                 ("member-002", "Blake Kim", "blake.kim@demo.example", "dept-product", "member", "active", "member"),
@@ -415,7 +485,7 @@ class InMemoryOrganizationStore:
                 ("dept-aurora-service", "客户成功部"),
             ),
             (
-                ("member-aurora-owner", "沈宁", "ning.shen@aurora.example", "dept-aurora-research", "owner", "active", "leader"),
+                ("member-aurora-admin-primary", "沈宁", "ning.shen@aurora.example", "dept-aurora-research", "admin", "active", "leader"),
                 ("member-aurora-admin", "吴迪", "di.wu@aurora.example", "dept-aurora-supply", "admin", "active", "leader"),
                 ("member-aurora-001", "林舟", "zhou.lin@aurora.example", "dept-aurora-research", "member", "active", "member"),
                 ("member-aurora-002", "周苒", "ran.zhou@aurora.example", "dept-aurora-research", "member", "active", "member"),
@@ -434,7 +504,7 @@ class InMemoryOrganizationStore:
                 ("dept-harbor-stores", "门店运营部"),
             ),
             (
-                ("member-harbor-owner", "许岚", "lan.xu@harbor.example", "dept-harbor-digital", "owner", "active", "leader"),
+                ("member-harbor-admin-primary", "许岚", "lan.xu@harbor.example", "dept-harbor-digital", "admin", "active", "leader"),
                 ("member-harbor-admin", "陆川", "chuan.lu@harbor.example", "dept-harbor-growth", "admin", "active", "leader"),
                 ("member-harbor-001", "唐悦", "yue.tang@harbor.example", "dept-harbor-digital", "member", "active", "member"),
                 ("member-harbor-002", "苏晴", "qing.su@harbor.example", "dept-harbor-growth", "member", "active", "member"),
@@ -450,6 +520,9 @@ class InMemoryOrganizationStore:
         """Replace all state with fixed, side-effect-free customer demo data."""
 
         self._organizations = self._seed_organizations()
+        # A platform reset must not reuse a generated-board cache entry from
+        # the previous in-memory dataset, even when both use the same seed id.
+        self._usage_cache_namespace = uuid.uuid4().hex
 
     # ------------------------------------------------------------------
     # State lookup and serialisation helpers
@@ -461,6 +534,23 @@ class InMemoryOrganizationStore:
         if state is None:
             raise OrganizationNotFoundError("organization was not found")
         return state
+
+    def usage_cache_fingerprint(self, organization_id: str) -> str:
+        """Return an internal revision for one customer's generated boards."""
+
+        with self._lock:
+            state = self._organization_or_raise(organization_id)
+            return (
+                f"{self._usage_cache_namespace}:"
+                f"{state.organization.get('id', '')}:{state.usage_cache_version}"
+            )
+
+    @staticmethod
+    def _touch_usage_scope(state: _OrganizationState, timestamp: str) -> None:
+        """Advance the board revision whenever its visible organization changes."""
+
+        state.usage_cache_version += 1
+        state.organization["updatedAt"] = timestamp
 
     def _state_for(self, organization_id: str | None) -> _OrganizationState:
         return self._organization_or_raise(organization_id or self.organization_id)
@@ -537,10 +627,7 @@ class InMemoryOrganizationStore:
             "activeMemberCount": sum(member.status == "active" for member in members),
             "invitedMemberCount": sum(member.status == "invited" for member in members),
             "suspendedMemberCount": sum(member.status == "suspended" for member in members),
-            "activeAdminCount": sum(
-                member.status == "active" and member.role in {"owner", "admin"}
-                for member in members
-            ),
+            "activeAdminCount": sum(member.status == "active" and member.role == "admin" for member in members),
         }
 
     @staticmethod
@@ -560,6 +647,102 @@ class InMemoryOrganizationStore:
             "organization": self._organization_payload(state),
             "departments": departments,
             "stats": self._stats_payload(state),
+        }
+
+    @staticmethod
+    def _money(value: Decimal) -> float:
+        """Return a JSON-friendly monetary value rounded to cents."""
+
+        return float(value.quantize(Decimal("0.01")))
+
+    @classmethod
+    def _billing_record_payload(cls, record: _BillingRecord) -> dict[str, Any]:
+        return {
+            "id": record.identifier,
+            "timestamp": record.timestamp,
+            "type": record.record_type,
+            "amountUsd": cls._money(record.amount_usd),
+            "balanceAfterUsd": cls._money(record.balance_after_usd),
+            "operator": record.operator,
+            "operatorEmail": record.operator_email,
+            "status": record.status,
+        }
+
+    @classmethod
+    def _topup_amount(cls, value: Any) -> Decimal:
+        """Require an exact finite USD amount with no sub-cent precision."""
+
+        if isinstance(value, bool):
+            raise OrganizationValidationError("amountUsd must be a number")
+        try:
+            amount = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise OrganizationValidationError("amountUsd must be a number") from exc
+        if not amount.is_finite():
+            raise OrganizationValidationError("amountUsd must be a finite number")
+        if amount.as_tuple().exponent < -2:
+            raise OrganizationValidationError("amountUsd must have at most two decimal places")
+        if amount < MIN_SIMULATED_TOPUP_USD or amount > MAX_SIMULATED_TOPUP_USD:
+            raise OrganizationValidationError("amountUsd must be between 1.00 and 100000.00")
+        return amount.quantize(Decimal("0.01"))
+
+    def _billing_usage_summary(self, state: _OrganizationState) -> dict[str, Any]:
+        """Aggregate deterministic usage for display without touching balance."""
+
+        end_date = date.today()
+        periods = {
+            "today": 1,
+            "last7Days": 7,
+            "last30Days": 30,
+        }
+        summary: dict[str, dict[str, Any]] = {}
+        for key, days in periods.items():
+            start_date = end_date - timedelta(days=days - 1)
+            rows = self._usage_rows_for_state(
+                state,
+                [start_date + timedelta(days=offset) for offset in range(days)],
+                "all",
+            )
+            summary[key] = {
+                "spend": round(sum(float(row.get("spend") or 0.0) for row in rows), 6),
+                "tokens": sum(int(row.get("totalTokens") or 0) for row in rows),
+                "requests": sum(int(row.get("requestCount") or 0) for row in rows),
+            }
+            # Preserve the field names used by existing usage widgets while
+            # giving the billing page compact aliases for its cards.
+            summary[key]["totalTokens"] = summary[key]["tokens"]
+            summary[key]["requestCount"] = summary[key]["requests"]
+        return summary
+
+    def _billing_payload(
+        self,
+        state: _OrganizationState,
+        *,
+        page: int,
+        page_size: int,
+    ) -> dict[str, Any]:
+        current_page = self._page_value(page, "page", 100000)
+        current_page_size = self._page_value(page_size, "page_size", 100)
+        billing = state.billing
+        records = sorted(billing.records, key=lambda item: (item.timestamp, item.identifier), reverse=True)
+        start = (current_page - 1) * current_page_size
+        return {
+            "organization": self._organization_payload(state),
+            "account": {
+                "initialBalanceUsd": self._money(billing.initial_balance_usd),
+                "totalTopupsUsd": self._money(billing.total_topups_usd),
+                "totalCreditsUsd": self._money(billing.initial_balance_usd + billing.total_topups_usd),
+                "availableBalanceUsd": self._money(billing.available_balance_usd),
+            },
+            "usageSummary": self._billing_usage_summary(state),
+            "records": {
+                "items": [self._billing_record_payload(item) for item in records[start : start + current_page_size]],
+                "total": len(records),
+                "page": current_page,
+                "pageSize": current_page_size,
+            },
+            "isDemo": True,
+            "usageDoesNotAffectBalance": True,
         }
 
     @staticmethod
@@ -583,7 +766,7 @@ class InMemoryOrganizationStore:
             for identifier, state in self._organizations.items()
         )
 
-    def _member_email_owner(self, normalized_email: str) -> tuple[str, _OrganizationState, _Member] | None:
+    def _member_email_assignment(self, normalized_email: str) -> tuple[str, _OrganizationState, _Member] | None:
         """Return the only customer assignment for a mock identity, if any."""
 
         for organization_id, state in self._organizations.items():
@@ -606,25 +789,16 @@ class InMemoryOrganizationStore:
     def _ensure_privileged_member_remains(
         state: _OrganizationState, member: _Member, role: str, status: str
     ) -> None:
-        """Keep a live owner and at least one live management account per customer."""
+        """Keep at least one active enterprise administrator per customer."""
 
         if member.status != "active":
             return
-        active_owners = sum(
-            item.status == "active" and item.role == "owner" for item in state.members.values()
+        active_admins = sum(
+            item.status == "active" and item.role == "admin" for item in state.members.values()
         )
-        active_managers = sum(
-            item.status == "active" and item.role in {"owner", "admin"}
-            for item in state.members.values()
-        )
-        leaves_owner_role = member.role == "owner" and (role != "owner" or status != "active")
-        leaves_manager_role = member.role in {"owner", "admin"} and (
-            role not in {"owner", "admin"} or status != "active"
-        )
-        if leaves_owner_role and active_owners <= 1:
-            raise OrganizationConflictError("at least one active owner must remain")
-        if leaves_manager_role and active_managers <= 1:
-            raise OrganizationConflictError("at least one active owner or admin must remain")
+        leaves_admin_role = member.role == "admin" and (role != "admin" or status != "active")
+        if leaves_admin_role and active_admins <= 1:
+            raise OrganizationConflictError("at least one active enterprise administrator must remain")
 
     # ------------------------------------------------------------------
     # Platform customer directory
@@ -679,58 +853,20 @@ class InMemoryOrganizationStore:
         with self._lock:
             return self._organization_snapshot(self._organization_or_raise(organization_id))
 
-    def create_organization(
+    def create_organization_with_admin(
         self,
         name: str,
-        *,
-        organization_id: str | None = None,
-        status: str = "active",
-    ) -> dict[str, Any]:
-        normalized_name = self._required_text(name, "organization name", 120)
-        normalized_status = self._validate_organization_status(status)
-        identifier = (
-            self._valid_identifier(organization_id, "organization_id")
-            if organization_id is not None
-            else f"org-{uuid.uuid4().hex}"
-        )
-        with self._lock:
-            # The plain create operation has no owner identity.  Seller-email
-            # rejection belongs in create_organization_with_owner below.
-            if identifier in self._organizations:
-                raise OrganizationConflictError("an organization with this id already exists")
-            if self._has_duplicate_organization_name(normalized_name):
-                raise OrganizationConflictError("an active organization with this name already exists")
-            now = self._now()
-            state = _OrganizationState(
-                organization={
-                    "id": identifier,
-                    "name": normalized_name,
-                    "status": normalized_status,
-                    "isDemo": True,
-                    "createdAt": now,
-                    "updatedAt": now,
-                    "archivedAt": now if normalized_status == "archived" else None,
-                },
-                departments={},
-                members={},
-            )
-            self._organizations[identifier] = state
-            return self._organization_summary_payload(state)
-
-    def create_organization_with_owner(
-        self,
-        name: str,
-        owner_name: str,
-        owner_email: str,
+        admin_name: str,
+        admin_email: str,
         *,
         default_department_name: str = "企业管理",
         organization_id: str | None = None,
     ) -> dict[str, Any]:
-        """Atomically create a customer, its default department, and owner."""
+        """Atomically create a customer, its default department, and administrator."""
 
         normalized_name = self._required_text(name, "organization name", 120)
-        normalized_owner_name = self._required_text(owner_name, "member name", 120)
-        normalized_owner_email = self.normalize_email(owner_email)
+        normalized_admin_name = self._required_text(admin_name, "member name", 120)
+        normalized_admin_email = self.normalize_email(admin_email)
         normalized_department_name = self._required_text(
             default_department_name, "department name", 80
         )
@@ -740,15 +876,13 @@ class InMemoryOrganizationStore:
             else f"org-{uuid.uuid4().hex}"
         )
         with self._lock:
-            # A seller platform operator must never acquire a second identity
-            # as a customer owner in the deterministic demo.
-            if normalized_owner_email in self._platform_admin_emails():
-                raise OrganizationConflictError("a platform administrator cannot be a customer owner")
+            if normalized_admin_email in self._platform_admin_emails():
+                raise OrganizationConflictError("a platform administrator cannot be a customer administrator")
             if identifier in self._organizations:
                 raise OrganizationConflictError("an organization with this id already exists")
             if self._has_duplicate_organization_name(normalized_name):
                 raise OrganizationConflictError("an active organization with this name already exists")
-            if self._member_email_owner(normalized_owner_email) is not None:
+            if self._member_email_assignment(normalized_admin_email) is not None:
                 raise DuplicateMemberEmailError(
                     "a member with this email already exists in a customer organization"
                 )
@@ -761,12 +895,12 @@ class InMemoryOrganizationStore:
                 now,
                 now,
             )
-            owner = _Member(
+            admin = _Member(
                 f"member-{identifier}-{uuid.uuid4().hex}",
-                normalized_owner_name,
-                normalized_owner_email,
+                normalized_admin_name,
+                normalized_admin_email,
                 department_id,
-                "owner",
+                "admin",
                 "active",
                 now,
                 now,
@@ -784,13 +918,14 @@ class InMemoryOrganizationStore:
                     "archivedAt": None,
                 },
                 departments={department_id: department},
-                members={owner.identifier: owner},
+                members={admin.identifier: admin},
+                billing=self._seed_billing(),
             )
             self._organizations[identifier] = state
             return {
                 "organization": self._organization_summary_payload(state),
                 "department": self._department_payload(state, department),
-                "owner": self._member_payload(state, owner),
+                "admin": self._member_payload(state, admin),
                 **self._organization_snapshot(state),
             }
 
@@ -822,11 +957,11 @@ class InMemoryOrganizationStore:
                 now = self._now()
                 state.organization["name"] = proposed_name
                 state.organization["status"] = proposed_status
-                state.organization["updatedAt"] = now
                 if proposed_status == "archived":
                     state.organization["archivedAt"] = now
                 elif "archivedAt" in state.organization:
                     state.organization["archivedAt"] = None
+                self._touch_usage_scope(state, now)
             return self._organization_summary_payload(state)
 
     def archive_organization(self, organization_id: str) -> dict[str, Any]:
@@ -836,9 +971,73 @@ class InMemoryOrganizationStore:
                 return self._organization_summary_payload(state)
             now = self._now()
             state.organization["status"] = "archived"
-            state.organization["updatedAt"] = now
             state.organization["archivedAt"] = now
+            self._touch_usage_scope(state, now)
             return self._organization_summary_payload(state)
+
+    # ------------------------------------------------------------------
+    # Mock organization billing
+    # ------------------------------------------------------------------
+
+    def billing_payload(
+        self,
+        organization_id: str,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict[str, Any]:
+        """Return one tenant's presentation-only organization balance.
+
+        This method intentionally has no dependency on ``BillingStore``, a
+        payment provider, mail, or an upstream client.  Seller routes may read
+        archived customer history; customer authorization is enforced by the
+        HTTP layer before this method is called.
+        """
+
+        with self._lock:
+            return self._billing_payload(
+                self._organization_or_raise(organization_id),
+                page=page,
+                page_size=page_size,
+            )
+
+    def simulate_billing_topup(
+        self,
+        organization_id: str,
+        amount_usd: Decimal,
+        *,
+        operator: str,
+        operator_email: str,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict[str, Any]:
+        """Immediately credit a customer-local, non-payment demo balance."""
+
+        amount = self._topup_amount(amount_usd)
+        normalized_operator = self._required_text(operator, "operator", 120)
+        normalized_email = self.normalize_email(operator_email)
+        with self._lock:
+            state = self._organization_or_raise(organization_id)
+            if state.organization.get("status") != "active":
+                raise OrganizationConflictError("billing cannot be changed for an inactive organization")
+            billing = state.billing
+            billing.total_topups_usd += amount
+            billing.available_balance_usd += amount
+            record = _BillingRecord(
+                identifier=f"billing-topup-{uuid.uuid4().hex}",
+                timestamp=self._now(),
+                record_type="simulated_topup",
+                amount_usd=amount,
+                balance_after_usd=billing.available_balance_usd,
+                operator=normalized_operator,
+                operator_email=normalized_email,
+            )
+            billing.records.append(record)
+            self._touch_usage_scope(state, record.timestamp)
+            return {
+                "record": self._billing_record_payload(record),
+                **self._billing_payload(state, page=page, page_size=page_size),
+            }
 
     def for_organization(self, organization_id: str) -> "OrganizationScope":
         """Return a small tenant facade for route handlers with a selected customer."""
@@ -895,7 +1094,7 @@ class InMemoryOrganizationStore:
                 f"dept-{organization_identifier}-{uuid.uuid4().hex}", normalized, "active", now, now
             )
             state.departments[department.identifier] = department
-            state.organization["updatedAt"] = now
+            self._touch_usage_scope(state, now)
             return self._department_payload(state, department)
 
     def update_department(
@@ -915,7 +1114,7 @@ class InMemoryOrganizationStore:
                 now = self._now()
                 department.name = normalized
                 department.updated_at = now
-                state.organization["updatedAt"] = now
+                self._touch_usage_scope(state, now)
             return self._department_payload(state, department)
 
     def rename_department(
@@ -948,7 +1147,7 @@ class InMemoryOrganizationStore:
             department.status = "archived"
             department.archived_at = now
             department.updated_at = now
-            state.organization["updatedAt"] = now
+            self._touch_usage_scope(state, now)
             return self._department_payload(state, department)
 
     # ------------------------------------------------------------------
@@ -1042,7 +1241,7 @@ class InMemoryOrganizationStore:
         except OrganizationValidationError:
             return None
         with self._lock:
-            match = self._member_email_owner(normalized)
+            match = self._member_email_assignment(normalized)
             if match is None:
                 return None
             organization_id, state, member = match
@@ -1075,14 +1274,14 @@ class InMemoryOrganizationStore:
         normalized_team_role = self._validate_team_role(team_role)
         with self._lock:
             # Keep platform and customer identity namespaces disjoint. This is
-            # also checked when a first customer owner is created above.
+            # also checked when a first customer administrator is created above.
             if normalized_email in self._platform_admin_emails():
                 raise OrganizationConflictError("a platform administrator cannot be a customer member")
             state = self._state_for(organization_id)
             if state.organization.get("status") != "active":
                 raise OrganizationConflictError("members cannot be changed for an inactive organization")
             department = self._active_department_or_raise(state, department_id)
-            existing = self._member_email_owner(normalized_email)
+            existing = self._member_email_assignment(normalized_email)
             if existing is not None:
                 raise DuplicateMemberEmailError("a member with this email already exists in a customer organization")
             now = self._now()
@@ -1100,7 +1299,7 @@ class InMemoryOrganizationStore:
                 False,
             )
             state.members[member.identifier] = member
-            state.organization["updatedAt"] = now
+            self._touch_usage_scope(state, now)
             return self._member_payload(state, member)
 
     def update_member(
@@ -1161,7 +1360,7 @@ class InMemoryOrganizationStore:
                 member.status = proposed_status
                 member.team_role = proposed_team_role
                 member.updated_at = now
-                state.organization["updatedAt"] = now
+                self._touch_usage_scope(state, now)
             return self._member_payload(state, member)
 
     # ------------------------------------------------------------------
@@ -1688,6 +1887,9 @@ class InMemoryOrganizationStore:
             if seeded is None:
                 raise OrganizationNotFoundError("organization has no deterministic seed data")
             self._organizations[identifier] = seeded
+            # A single-customer reset replaces the object behind a stable id,
+            # so use a new namespace instead of ever reviving an old cache key.
+            self._usage_cache_namespace = uuid.uuid4().hex
             return self._organization_snapshot(seeded)
 
     def reset_all(self) -> dict[str, Any]:
@@ -1789,6 +1991,9 @@ class OrganizationScope:
     def get_organization(self) -> dict[str, Any] | None:
         return self._store.get_organization(self.organization_id)
 
+    def usage_cache_fingerprint(self) -> str:
+        return self._store.usage_cache_fingerprint(self.organization_id)
+
     def list_departments(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
         return self._store.list_departments(
             include_archived=include_archived, organization_id=self.organization_id
@@ -1878,6 +2083,27 @@ class OrganizationScope:
 
     def organization_snapshot(self) -> dict[str, Any]:
         return self._store.get_organization_snapshot(self.organization_id)
+
+    def billing_payload(self, *, page: int = 1, page_size: int = 20) -> dict[str, Any]:
+        return self._store.billing_payload(self.organization_id, page=page, page_size=page_size)
+
+    def simulate_billing_topup(
+        self,
+        amount_usd: Decimal,
+        *,
+        operator: str,
+        operator_email: str,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict[str, Any]:
+        return self._store.simulate_billing_topup(
+            self.organization_id,
+            amount_usd,
+            operator=operator,
+            operator_email=operator_email,
+            page=page,
+            page_size=page_size,
+        )
 
     def mock_organization_usage(self, **kwargs: Any) -> dict[str, Any]:
         return self._store.mock_organization_usage(self.organization_id, **kwargs)

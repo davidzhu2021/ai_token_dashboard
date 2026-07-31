@@ -11,17 +11,66 @@ APP_JS = Path(__file__).parents[1] / "assets" / "app.js"
 INDEX_HTML = Path(__file__).parents[1] / "index.html"
 
 
-def test_customer_directory_is_the_only_organization_sidebar_entry() -> None:
+def test_both_parties_reach_the_same_organization_workspace_from_their_own_entry() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
     source = APP_JS.read_text(encoding="utf-8")
 
+    # 乙方从「客户企业」目录下钻，甲方管理员有自己的「企业管理」入口，两者复用
+    # 同一个 organizationView，只是 API 基址不同。
     assert 'id="customersTab" class="view-tab hidden"' in markup
-    assert 'id="organizationTab"' not in markup
+    assert 'id="organizationTab" class="view-tab hidden"' in markup
     assert 'id="organizationView" class="view-section organization-view hidden"' in markup
+    assert 'el("organizationTab")?.classList.toggle("hidden", !canManageCurrentOrganization);' in source
+    assert 'const canManageCurrentOrganization = Boolean(currentUser?.canManageOrganization);' in source
     assert 'const isCustomerDetailView = isViewingCustomerOrganization()' in source
     assert 'button.dataset.view === "customers"' in source
     assert 'function organizationCanView()' in source
     assert 'function organizationCanManage()' in source
+
+
+def test_organization_api_base_switches_between_current_tenant_and_named_customer() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    base = source[source.index("function organizationApiBasePath()") : source.index("function organizationApiPath(")]
+    # 甲方永远走服务端从会话解析出的 current 范围，不接受客户端指定企业 id。
+    assert "return customerOrganizationPath(customerOrganizationId);" in base
+    assert 'return "/api/organization/current";' in base
+    assert "if (customerOrganizationsAvailable() && customerOrganizationId)" in base
+
+
+def test_enterprise_admin_workspace_hides_customer_lifecycle_controls() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    # 企业名称修改、归档、返回客户目录、重置演示数据都是乙方生命周期操作，
+    # 甲方管理员进入同一个工作区时不得出现。
+    assert 'el("backToCustomersButton")?.classList.toggle("hidden", !isPlatformCustomer);' in source
+    assert "async function resetCustomerOrganizationsDemo() {\n  if (!customerOrganizationsAvailable()) return;" in source
+    assert 'const isPlatformCustomer = customerOrganizationsAvailable() && Boolean(selectedCustomerOrganizationId());' in source
+
+
+def test_member_roles_are_only_enterprise_admin_and_member() -> None:
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    labels = source[source.index("const ORGANIZATION_ROLE_LABELS") : source.index("const ORGANIZATION_STATUS_LABELS")]
+    assert labels.count("admin: \"企业管理员\"") == 1
+    assert labels.count("member: \"成员\"") == 1
+    assert "owner" not in labels
+
+    # 「企业主」文案、owner 选项和筛选项都不应留在前端。
+    assert "企业主" not in markup
+    assert "企业主" not in source
+    assert '<option value="owner"' not in markup
+
+    role_filter = markup[markup.index('id="organizationRoleFilter"') :]
+    role_filter = role_filter[: role_filter.index("</select>")]
+    assert '<option value="admin">企业管理员</option>' in role_filter
+    assert '<option value="member">成员</option>' in role_filter
+
+    role_input = markup[markup.index('id="organizationMemberRoleInput"') :]
+    role_input = role_input[: role_input.index("</select>")]
+    assert '<option value="admin">企业管理员</option>' in role_input
+    assert '<option value="member">成员</option>' in role_input
 
 
 def test_organization_page_keeps_members_read_only_and_uses_current_scope_contract() -> None:
@@ -79,8 +128,25 @@ def test_customer_usage_detail_hides_platform_billing_management() -> None:
 
     # A seller admin viewing a customer's usage must not load or render the
     # platform-wide redemption and billing management panel in that scope.
+    # The V2 capability deliberately does not reuse ``isAdmin`` as an
+    # enterprise role, because a customer detail is a tenant-scoped view.
     assert "function adminBillingVisible()" in source
-    assert "currentUser?.isAdmin && billingAvailable && !isViewingCustomerOrganization()" in source
+    assert "isPlatformAdmin() && billingAvailable && !isViewingCustomerOrganization()" in source
+    assert "if (adminBillingVisible() && !adminRedemptions.length && !adminBillingOrders.length) loadAdminBillingData();" in source
+
+
+def test_customer_billing_detail_is_read_only_and_stays_in_customer_scope() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    context = source[source.index("function organizationBillingContext()") : source.index("function organizationBillingContextKey()")]
+    assert 'kind: "platformCustomer"' in context
+    assert "readOnly: true" in context
+    assert 'path: `${customerOrganizationPath(organizationId)}/billing`' in context
+    assert 'path: "/api/organization/current/billing"' in context
+
+    # The customer-detail tab cannot surface the seller's payment workflow.
+    assert "if (!context || context.readOnly || !canSimulateOrganizationTopup()) return;" in source
+    assert "if (!context || context.readOnly || !canSimulateOrganizationTopup() || isOrganizationTopupSaving) return;" in source
 
 
 def test_inactive_mock_customer_identity_has_a_clear_limited_access_state() -> None:
@@ -114,3 +180,11 @@ def test_index_includes_organization_view() -> None:
 
     assert response.status_code == 200
     assert 'id="organizationView"' in response.text
+
+
+def test_customer_identity_labels_the_current_company_and_scopes_team_cache() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert 'const organizationName = String(currentUser.organizationName || currentUser.organization?.name || "").trim();' in source
+    assert '? `${currentUser.email} · ${organizationName}`' in source
+    assert source.count('`${organizationUsageScopeKey()}|${selectedTeamRef}|${startDate}|${endDate}|${source}`') == 2

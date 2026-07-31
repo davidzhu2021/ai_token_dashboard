@@ -32,7 +32,8 @@ def test_seed_is_deterministic_and_reset_restores_it() -> None:
         "activeAdminCount": 2,
     }
     members = store.list_members(page_size=50)["items"]
-    assert {member["role"] for member in members} == {"owner", "admin", "member"}
+    # 甲方角色只剩企业管理员与成员，种子里不再有「企业主」这一层。
+    assert {member["role"] for member in members} == {"admin", "member"}
     assert {member["status"] for member in members} == {"active", "invited", "suspended"}
 
     store.create_department("Temporary")
@@ -129,20 +130,29 @@ def test_archived_department_rejects_new_live_members() -> None:
         store.update_member(suspended["id"], status="active")
 
 
-def test_last_active_owner_and_manager_protections() -> None:
+def test_last_active_enterprise_administrator_cannot_be_removed_or_demoted() -> None:
+    """企业里必须始终留一名启用的企业管理员，否则甲方会把自己锁在门外。"""
+
     store = InMemoryOrganizationStore()
 
-    with pytest.raises(OrganizationConflictError, match="active owner"):
-        store.update_member("member-owner", role="admin")
-    with pytest.raises(OrganizationConflictError, match="active owner"):
-        store.update_member("member-owner", status="suspended")
+    # 种子里有两名启用管理员，先把其中一名降级，剩下的那名就成为最后一道防线。
+    store.update_member("member-admin", role="member")
+    assert store.get_current()["stats"]["activeAdminCount"] == 1
 
-    second_owner = store.create_member("Second Owner", "second.owner@example.com", "dept-product", role="owner")
-    store.update_member(second_owner["id"], status="active")
-    first_owner = store.update_member("member-owner", status="suspended")
-    assert first_owner["status"] == "suspended"
-    with pytest.raises(OrganizationConflictError, match="active owner"):
-        store.update_member(second_owner["id"], role="member")
+    with pytest.raises(OrganizationConflictError, match="active enterprise administrator"):
+        store.update_member("member-admin-primary", role="member")
+    with pytest.raises(OrganizationConflictError, match="active enterprise administrator"):
+        store.update_member("member-admin-primary", status="suspended")
+
+    # 新增并启用第二名管理员后即可完成交接。
+    successor = store.create_member("Second Admin", "second.admin@example.com", "dept-product", role="admin")
+    store.update_member(successor["id"], status="active")
+    handed_over = store.update_member("member-admin-primary", status="suspended")
+    assert handed_over["status"] == "suspended"
+
+    # 交接完成后，接任者又变成最后一名启用管理员，同样受保护。
+    with pytest.raises(OrganizationConflictError, match="active enterprise administrator"):
+        store.update_member(successor["id"], role="member")
 
 
 def test_member_filters_and_pagination_are_scoped_to_the_one_tenant() -> None:
@@ -155,7 +165,10 @@ def test_member_filters_and_pagination_are_scoped_to_the_one_tenant() -> None:
     assert page["page"] == 1
     assert page["pageSize"] == 1
     assert store.list_members(status="suspended", page_size=50)["total"] == 2
-    assert store.list_members(role="owner", page_size=50)["total"] == 1
+    assert store.list_members(role="admin", page_size=50)["total"] == 4
+    assert store.list_members(role="member", page_size=50)["total"] == 8
+    with pytest.raises(OrganizationValidationError):
+        store.list_members(role="owner", page_size=50)
     with pytest.raises(OrganizationNotFoundError):
         store.list_members(department_id="missing", page_size=50)
     with pytest.raises(OrganizationValidationError):
