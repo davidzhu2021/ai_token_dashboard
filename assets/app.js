@@ -2045,6 +2045,9 @@ function employeeSummariesFromRows(rows) {
 function renderEmployeeRanking(tableId, countId, employees, emptyText) {
   const sorted = sortedRankingRows(tableId, employees, employeeRankingName);
   const isTeamTable = tableId === "teamUserTable";
+  // 只有全员看板的排行表有部门列：部门看板已经按部门下钻（整表同属一个部门），
+  // 团队看板的表头位置留给了团队角色。列数必须与 index.html 的表头一致。
+  const showDepartment = tableId === "adminUserTable";
   updateRankingSortIndicators(tableId);
   el(countId).textContent = `${sorted.length} 人`;
   el(tableId).innerHTML = sorted.length
@@ -2056,6 +2059,7 @@ function renderEmployeeRanking(tableId, countId, employees, emptyText) {
             <tr class="admin-employee-row ${tableId === "teamUserTable" && selectedTeamEmployee === (item.employeeEmail || item.employeeId) ? "active" : ""}" data-employee="${escapeHtml(item.employeeEmail || item.employeeId)}">
               <td><strong>${item.employeeName || item.employeeId}</strong></td>
               <td>${item.employeeEmail || "未绑定邮箱"}</td>
+              ${showDepartment ? `<td>${escapeHtml(employeeDepartmentText(item))}</td>` : ""}
               <td>${displaySource(item.primarySource || "其他")}</td>
               ${isTeamTable ? `<td>${item.teamRole === "admin" ? "负责人" : "成员"}</td>` : ""}
               <td class="num">${fmt.format(requests)}</td>
@@ -2067,7 +2071,7 @@ function renderEmployeeRanking(tableId, countId, employees, emptyText) {
           `;
         })
         .join("")
-    : `<tr><td colspan="${isTeamTable ? 9 : 8}" style="text-align:center;color:var(--muted);padding:26px">${emptyText}</td></tr>`;
+    : `<tr><td colspan="${isTeamTable || showDepartment ? 9 : 8}" style="text-align:center;color:var(--muted);padding:26px">${emptyText}</td></tr>`;
 }
 
 function renderDepartmentRanking(tableId, countId, departments, emptyText) {
@@ -2347,7 +2351,7 @@ function renderAdminLoading() {
   toggleTrendGrid("adminTrendGrid");
   renderDonutSkeleton("adminDonutTotal", "adminSourceLegend");
   renderBarsSkeleton("adminModelBars");
-  renderTableSkeleton("adminUserTable", "adminUserCount", 8);
+  renderTableSkeleton("adminUserTable", "adminUserCount", 9);
   renderAdminDetailCard();
 }
 

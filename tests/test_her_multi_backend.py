@@ -50,8 +50,12 @@ def test_admin_usage_rows_merges_her_logs_into_employees() -> None:
             raise HTTPException(status_code=404, detail="no summary")
         raise AssertionError(f"unexpected call {backend.id} {method} {path}")
 
+    async def fake_team_map(backend: LiteLLMBackend | None = None) -> dict[str, dict[str, str]]:
+        return {}
+
     client.users = fake_users  # type: ignore[assignment]
     client.her_account_index = fake_her_account_index  # type: ignore[assignment]
+    client.team_map = fake_team_map  # type: ignore[assignment]
     client.request_backend = fake_request_backend  # type: ignore[assignment]
 
     payload = asyncio.run(client.admin_usage_rows("2026-06-01", "2026-06-30", "all", None))
@@ -259,8 +263,12 @@ def test_source_filter_behavior_for_her_and_all() -> None:
             raise HTTPException(status_code=404, detail="no summary")
         raise AssertionError(f"unexpected call {backend.id} {method} {path}")
 
+    async def fake_team_map(backend: LiteLLMBackend | None = None) -> dict[str, dict[str, str]]:
+        return {}
+
     client.users = fake_users  # type: ignore[assignment]
     client.her_account_index = fake_her_account_index  # type: ignore[assignment]
+    client.team_map = fake_team_map  # type: ignore[assignment]
     client.request_backend = fake_request_backend  # type: ignore[assignment]
 
     only_her = asyncio.run(client.admin_usage_rows("2026-06-01", "2026-06-30", "Her", None))

@@ -1982,8 +1982,8 @@ class LiteLLMClient:
         employee_filter = (employee or "").strip().lower()
         grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         employees: dict[str, dict[str, Any]] = {}
-        # 部门归属只在下钻到具体成员时显示，全员排行没有部门列。未筛选时不取
-        # team_map，避免为没人看的字段多发一次上游团队列表请求。
+        # 员工排行有部门列，所以每一行都要部门归属。team_map 与 users 并行取，
+        # 且 teams() 自带 TTL 缓存，不会给每次看板刷新都加一次串行往返。
         department_names: dict[str, list[str]] = {}
         max_pages = max(1, int(os.getenv("ADMIN_USAGE_LOG_MAX_PAGES", "30")))
         page_size = max(1, min(100, int(os.getenv("ADMIN_USAGE_PAGE_SIZE", "100"))))
@@ -2000,12 +2000,12 @@ class LiteLLMClient:
                 users, account_index, team_map = await asyncio.gather(
                     self.users(backend),
                     self.her_account_index(backend),
-                    self._team_map_or_empty(backend, employee_filter),
+                    self._team_map_or_empty(backend),
                 )
             else:
                 users, team_map = await asyncio.gather(
                     self.users(backend),
-                    self._team_map_or_empty(backend, employee_filter),
+                    self._team_map_or_empty(backend),
                 )
                 account_index = None
             user_map = self._admin_user_map(users)
@@ -2044,8 +2044,7 @@ class LiteLLMClient:
 
                     employee_key = employee_info["id"]
                     employees.setdefault(employee_key, employee_info)
-                    if employee_filter:
-                        self._collect_department_name(department_names, employee_key, log, team_map)
+                    self._collect_department_name(department_names, employee_key, log, team_map)
                     model = self._usage_model_name(log)
                     day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
                     key = (day, employee_key, detected_source, model)
@@ -2981,11 +2980,9 @@ class LiteLLMClient:
         values = [employee_info.get("id"), employee_info.get("name"), employee_info.get("email")]
         return any(employee_filter in str(value or "").lower() for value in values)
 
-    async def _team_map_or_empty(self, backend: LiteLLMBackend, employee_filter: str) -> dict[str, dict[str, str]]:
-        """只有下钻到具体成员时才需要团队名，其余情况省掉这次上游请求。"""
+    async def _team_map_or_empty(self, backend: LiteLLMBackend) -> dict[str, dict[str, str]]:
+        """团队列表拿不到时退回空表，部门列显示"未绑定部门"，不牵连整个看板。"""
 
-        if not employee_filter:
-            return {}
         try:
             return await self.team_map(backend)
         except HTTPException:

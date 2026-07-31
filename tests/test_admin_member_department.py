@@ -17,6 +17,7 @@ from backend.usage_store import UsageStore, _department_names_for
 
 
 APP_JS = Path(__file__).parents[1] / "assets" / "app.js"
+INDEX_HTML = Path(__file__).parents[1] / "index.html"
 
 
 # ----------------------------------------------------------------------
@@ -90,15 +91,35 @@ def test_admin_rows_returns_department_names_for_a_selected_employee() -> None:
     assert payload["employees"][0]["departmentNames"] == ["研发部", "算法部"]
 
 
-def test_admin_rows_skips_the_department_query_without_an_employee_filter() -> None:
-    pool = _FakePool()
+def test_admin_rows_still_resolves_departments_without_an_employee_filter() -> None:
+    """排行榜每一行都有部门列，所以未筛选时也必须查部门（与逐员工明细不同）。"""
+
+    pool = _FakePool(
+        [{"user_id": "alice-primary", "employee_email": "alice@example.com", "team_id": "team-a", "team_name": "研发部"}]
+    )
     store = _store_with(pool)
 
     payload = asyncio.run(store.admin_rows("2026-07-01", "2026-07-30", "all", None, ["primary", "her"]))
 
     assert payload is not None
-    assert pool.membership_queries() == [], "未筛选成员时仍查询了成员-部门快照"
-    assert payload["employees"][0]["departmentNames"] == []
+    assert len(pool.membership_queries()) == 1, "全员排行需要且只需要一次成员-部门查询"
+    assert payload["employees"][0]["departmentNames"] == ["研发部"]
+
+
+def test_admin_rows_keeps_skipping_the_per_employee_detail_without_a_filter() -> None:
+    """加部门列不能顺手把"未筛选时不查明细"那条优化弄没了。"""
+
+    pool = _FakePool()
+    store = _store_with(pool)
+
+    asyncio.run(store.admin_rows("2026-07-01", "2026-07-30", "all", None, ["primary", "her"]))
+
+    detail = [
+        q
+        for q in pool.queries
+        if "GROUP BY" in q and "user_id" in q.split("GROUP BY", 1)[1] and "WITH filtered" not in q
+    ]
+    assert detail == [], "未筛选成员时仍查询了逐员工明细"
 
 
 def test_admin_rows_reports_no_department_when_the_member_has_no_team() -> None:
@@ -182,15 +203,17 @@ def test_upstream_admin_usage_rows_attach_department_names_when_drilling_down() 
     assert calls == ["primary"]
 
 
-def test_upstream_admin_usage_rows_skip_the_team_list_request_without_a_filter() -> None:
+def test_upstream_admin_usage_rows_resolve_departments_without_a_filter() -> None:
+    """全员排行也要部门列，且每个后端只取一次团队列表。"""
+
     client = _upstream_client()
     calls: list[str] = []
     _install_upstream_fakes(client, calls)
 
     payload = asyncio.run(client.admin_usage_rows("2026-07-01", "2026-07-30", "all", None))
 
-    assert calls == [], "未筛选成员时仍向上游请求了团队列表"
-    assert payload["employees"][0]["departmentNames"] == []
+    assert calls == ["primary"]
+    assert payload["employees"][0]["departmentNames"] == ["研发部"]
 
 
 def test_upstream_department_names_survive_a_failing_team_list() -> None:
@@ -236,3 +259,51 @@ def test_admin_detail_card_renders_the_member_department() -> None:
     assert "function employeeDepartmentText(employee)" in source
     assert '`${identity} · 部门：${employeeDepartmentText(employee)}`' in source
     assert 'names.length ? names.join("、") : "未绑定部门"' in source
+
+
+def _column_count(thead_markup: str) -> int:
+    """数 <th> 单元格，注意别把 <thead> 本身算进去。"""
+
+    return thead_markup.count("<th>") + thead_markup.count('<th class=')
+
+
+def test_only_the_admin_ranking_gets_a_department_column() -> None:
+    """部门看板整表同属一个部门，团队看板那一列留给团队角色，都不加部门列。"""
+
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert 'const showDepartment = tableId === "adminUserTable"' in source
+    assert '${showDepartment ? `<td>${escapeHtml(employeeDepartmentText(item))}</td>` : ""}' in source
+    # 空表提示要跨满新的列数，否则会短一格。
+    assert 'colspan="${isTeamTable || showDepartment ? 9 : 8}"' in source
+
+
+def test_admin_ranking_header_and_skeleton_match_the_new_column_count() -> None:
+    """表头、渲染、骨架屏三处列数必须一致，否则加载态会错位。"""
+
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    header_start = markup.index('<tbody id="adminUserTable">')
+    header = markup[markup.rindex("<thead>", 0, header_start) : header_start]
+    assert _column_count(header) == 9, "全员排行表头列数应为 9"
+    assert header.index("<th>部门</th>") > header.index("<th>邮箱</th>"), "部门列应紧随邮箱列"
+
+    assert 'renderTableSkeleton("adminUserTable", "adminUserCount", 9)' in source
+
+    # 另两张表没加列，表头保持原样。
+    for table_id, expected in (("departmentUserTable", 8), ("teamUserTable", 9)):
+        start = markup.index(f'<tbody id="{table_id}">')
+        block = markup[markup.rindex("<thead>", 0, start) : start]
+        assert _column_count(block) == expected, f"{table_id} 表头列数被意外改动"
+        assert "<th>部门</th>" not in block, f"{table_id} 不应有部门列"
+
+
+def test_department_column_escapes_upstream_department_names() -> None:
+    """部门名来自上游团队别名，渲染进 innerHTML 前必须转义。"""
+
+    source = APP_JS.read_text(encoding="utf-8")
+    row_start = source.index("function renderEmployeeRanking(")
+    row_block = source[row_start : source.index("function renderDepartmentRanking(", row_start)]
+
+    assert "escapeHtml(employeeDepartmentText(item))" in row_block

@@ -927,9 +927,11 @@ class UsageStore:
             """,
             *args,
         )
-        # 部门归属只在下钻到具体成员时才显示（全员排行没有部门列），所以与明细
-        # 同理：未筛选员工时不查这张成员-部门快照表。
-        department_names = await self._employee_department_names(start_date, end_date, covered, employee_filter) if employee_filter else {}
+        # 员工排行有部门列，所以每一行都要部门归属，不能像逐员工明细那样只在
+        # 筛选后才查。这张快照表按 (backend_id, snapshot_date, team_id, user_id)
+        # 建主键，DISTINCT 后的结果集是成员数量级（不是用量行数量级），近 30 天
+        # 全员也只有几百行。
+        department_names = await self._employee_department_names(start_date, end_date, covered, employee_filter)
         employees = [
             {
                 "employeeId": record["employee_id"],
