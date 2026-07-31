@@ -4381,6 +4381,9 @@ function syncNavigationVisibility() {
     : Boolean(billingAvailable && !currentUser?.organizationDemoEnabled);
   el("customersTab").classList.toggle("hidden", !canBrowseCustomers);
   el("organizationTab")?.classList.toggle("hidden", !canManageCurrentOrganization);
+  // 企业令牌是甲方管理员的一级目的地。乙方运营不在侧边栏出现，他们从客户企业
+  // 下钻后在企业详情标签里只读查看。
+  el("organizationTokensTab")?.classList.toggle("hidden", !canManageCurrentOrganization);
   el("adminTab").classList.toggle("hidden", !canViewAdmin);
   el("departmentTab").classList.toggle("hidden", !canViewDepartments);
   el("teamTab").classList.toggle("hidden", !currentUser?.isTeamLeader);
@@ -4829,8 +4832,9 @@ function renderOrganizationUsageTabs() {
   });
   const billingTab = tabs.querySelector('[data-organization-usage-view="billing"]');
   if (billingTab) billingTab.classList.toggle("hidden", !isViewingCustomerOrganization() && !canViewOrganizationBilling());
+  // 甲方管理员的令牌管理已经是侧边栏的一级目的地，这里只为乙方下钻保留只读入口。
   const tokensTab = tabs.querySelector('[data-organization-usage-view="tokens"]');
-  if (tokensTab) tokensTab.classList.toggle("hidden", !canViewOrganizationTokens());
+  if (tokensTab) tokensTab.classList.toggle("hidden", !isViewingCustomerOrganization());
   setText("organizationUsageScopeLabel", scope.kind === "platformCustomer" ? `客户：${scopeName}` : `企业：${scopeName}`);
 }
 
@@ -5481,15 +5485,12 @@ function switchView(view) {
   const isCustomerDetailView = isViewingCustomerOrganization()
     && ["organization", "organization-tokens", "admin", "department", "billing"].includes(view);
   let activeButton = null;
-  // Token management is a tab inside the enterprise workspace, so it keeps the
-  // organization entry highlighted instead of adding a sidebar destination.
-  const sidebarView = view === "organization-tokens" ? "organization" : view;
   document.querySelectorAll("[data-view]").forEach((button) => {
     // Customer detail is a child workspace of the customer directory, not a
     // second top-level destination in the sidebar.
     const isActive = isCustomerDetailView
       ? button.dataset.view === "customers"
-      : button.dataset.view === sidebarView;
+      : button.dataset.view === view;
     button.classList.toggle("active", isActive);
     if (isActive) {
       activeButton = button;

@@ -21,6 +21,7 @@ SIDEBAR_TABS = (
     "teamTab",
     "dashboardTab",
     "keysTab",
+    "organizationTokensTab",
     "billingTab",
 )
 
@@ -41,7 +42,7 @@ def test_every_sidebar_tab_starts_hidden_behind_a_skeleton() -> None:
     assert 'class="view-tabs nav-pending"' in sidebar
     assert 'aria-busy="true"' in sidebar
 
-    # 八项全部初始隐藏——包括过去静态可见的「我的用量」和「令牌管理」。
+    # 九项全部初始隐藏——包括过去静态可见的「我的用量」和「令牌管理」。
     for tab_id in SIDEBAR_TABS:
         marker = f'id="{tab_id}"'
         assert marker in sidebar, f"缺少侧边栏标签 {tab_id}"

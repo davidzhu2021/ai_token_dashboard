@@ -220,12 +220,12 @@ def test_logout_clears_billing_state() -> None:
         assert cleared in source
 
 
-def test_static_asset_version_bumped_for_organization_token_management_release() -> None:
+def test_static_asset_version_bumped_for_organization_token_sidebar_release() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
 
-    # 不更新版本号线上用户会命中旧缓存：旧 app.js 没有令牌视图的渲染与事件绑定，
-    # 新增的 organizationTokensView 与两个弹窗会变成点不动的空壳。
-    assert 'src="/assets/app.js?v=20260731-organization-token-management"' in markup
+    # 不更新版本号线上用户会命中旧缓存：旧 app.js 会把新的侧边栏令牌项当成未知
+    # 目的地，点进去被 switchView 打回「我的用量」。
+    assert 'src="/assets/app.js?v=20260731-organization-token-sidebar"' in markup
 
 
 def test_billing_copy_avoids_upstream_provider_terms() -> None:

@@ -219,20 +219,32 @@ def test_member_identity_styles_do_not_deform_the_avatar_letter() -> None:
     assert ".organization-member-name strong," not in markup
 
 
-def test_token_management_is_a_tab_inside_the_enterprise_workspace() -> None:
+def test_token_management_is_a_sidebar_destination_for_the_customer_admin() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
     source = APP_JS.read_text(encoding="utf-8")
 
-    # 令牌管理是企业工作区的第 5 个子页，不是侧边栏的新目的地：所以既要有 tab，
-    # 也要让 organization 那一项在令牌页保持高亮。
-    assert 'data-organization-usage-view="tokens"' in markup
+    # 甲方管理员从侧边栏一级项进入令牌管理，企业详情页上方不再重复这一项。
+    assert 'id="organizationTokensTab" class="view-tab hidden" type="button" data-view="organization-tokens"' in markup
     assert 'id="organizationTokensView" class="view-section organization-view hidden"' in markup
-    assert '["info", "usage", "departments-usage", "billing", "tokens"].includes(view)' in source
-    assert 'switchView("organization-tokens");' in source
-    assert 'const sidebarView = view === "organization-tokens" ? "organization" : view;' in source
+    assert 'el("organizationTokensTab")?.classList.toggle("hidden", !canManageCurrentOrganization);' in source
+
+    # 令牌项自己高亮，不再借用 organization 那一项。
+    assert "const sidebarView" not in source
     assert 'el("organizationTokensView")?.classList.toggle("hidden", view !== "organization-tokens");' in source
     assert 'if (view === "organization-tokens" && !canViewOrganizationTokens()) view = "dashboard";' in source
     assert 'if (currentView === "organization-tokens") return loadOrganizationTokens();' in source
+
+
+def test_platform_drilldown_keeps_a_token_tab_inside_the_customer_workspace() -> None:
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    # 乙方运营的侧边栏没有企业管理，只能从客户企业下钻，所以那条标签是他们唯一的
+    # 只读入口，必须保留并且只对下钻场景可见。
+    assert 'id="organizationTokensScopeTab" class="ghost-btn hidden" type="button" role="tab" data-organization-usage-view="tokens"' in markup
+    assert 'if (tokensTab) tokensTab.classList.toggle("hidden", !isViewingCustomerOrganization());' in source
+    assert '["info", "usage", "departments-usage", "billing", "tokens"].includes(view)' in source
+    assert 'switchView("organization-tokens");' in source
 
 
 def test_token_requests_stay_in_the_resolved_organization_scope() -> None:

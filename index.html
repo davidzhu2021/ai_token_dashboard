@@ -6237,6 +6237,10 @@
                 <span class="nav-icon"><svg><use href="#icon-key"></use></svg></span>
                 令牌管理
               </button>
+              <button id="organizationTokensTab" class="view-tab hidden" type="button" data-view="organization-tokens">
+                <span class="nav-icon"><svg><use href="#icon-key"></use></svg></span>
+                令牌管理
+              </button>
               <button id="billingTab" class="view-tab hidden" type="button" data-view="billing">
                 <span class="nav-icon"><svg><use href="#icon-cost"></use></svg></span>
                 充值中心
@@ -7119,7 +7123,9 @@
             <button class="ghost-btn" type="button" role="tab" data-organization-usage-view="usage" aria-selected="false">全员看板</button>
             <button class="ghost-btn" type="button" role="tab" data-organization-usage-view="departments-usage" aria-selected="false">部门看板</button>
             <button class="ghost-btn" type="button" role="tab" data-organization-usage-view="billing" aria-selected="false">企业额度</button>
-            <button id="organizationTokensTab" class="ghost-btn hidden" type="button" role="tab" data-organization-usage-view="tokens" aria-selected="false">令牌管理</button>
+            <!-- 甲方管理员从侧边栏进入令牌管理，所以这个标签只在乙方下钻客户时出现，
+                 用来保住平台侧的只读入口。 -->
+            <button id="organizationTokensScopeTab" class="ghost-btn hidden" type="button" role="tab" data-organization-usage-view="tokens" aria-selected="false">令牌管理</button>
           </div>
 
           <section class="organization-stats" aria-label="企业组织概览">
@@ -7912,6 +7918,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260731-organization-token-management"></script>
+    <script src="/assets/app.js?v=20260731-organization-token-sidebar"></script>
   </body>
 </html>
