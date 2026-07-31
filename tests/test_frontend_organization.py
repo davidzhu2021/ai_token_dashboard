@@ -194,7 +194,7 @@ def test_member_avatars_are_round_and_tone_varied_per_member() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
     source = APP_JS.read_text(encoding="utf-8")
     avatar_style = markup[
-        markup.index(".organization-member-avatar {") : markup.index(".organization-member-name strong,")
+        markup.index(".organization-member-avatar {") : markup.index(".organization-member-identity strong,")
     ]
 
     # 整列同一个浅蓝方块看起来很呆板；圆形 + 按邮箱确定性取色让成员行更容易区分。
@@ -205,3 +205,15 @@ def test_member_avatars_are_round_and_tone_varied_per_member() -> None:
     assert 'class="organization-member-avatar ${avatarTone(member.email || name)}"' in source
     assert "const AVATAR_TONE_COUNT = 5;" in source
     assert "return `tone-${(total % AVATAR_TONE_COUNT) + 1}`;" in source
+
+
+def test_member_identity_styles_do_not_deform_the_avatar_letter() -> None:
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    # 头像本身就是 .organization-member-name 的直接 span 子元素，之前笼统匹配
+    # `.organization-member-name span` 的规则权重更高，把 display: grid 覆盖成
+    # block，字母因此跌到左上角。姓名/邮箱的排版必须限定在内层容器上。
+    assert '<div class="organization-member-identity">' in source
+    assert ".organization-member-name span {" not in markup
+    assert ".organization-member-name strong," not in markup

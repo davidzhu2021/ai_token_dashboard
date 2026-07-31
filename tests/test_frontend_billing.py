@@ -220,12 +220,12 @@ def test_logout_clears_billing_state() -> None:
         assert cleared in source
 
 
-def test_static_asset_version_bumped_for_organization_member_avatar_release() -> None:
+def test_static_asset_version_bumped_for_organization_avatar_centered_release() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
 
-    # 不更新版本号线上用户会命中旧缓存：成员头像仍是旧的浅蓝方块，
-    # 新增的 tone-* 配色类在旧 app.js 里也不会被渲染出来。
-    assert 'src="/assets/app.js?v=20260731-organization-member-avatar"' in markup
+    # 不更新版本号线上用户会命中旧缓存：旧 app.js 不会输出
+    # organization-member-identity 容器，新 CSS 就找不到姓名/邮箱的排版目标。
+    assert 'src="/assets/app.js?v=20260731-organization-avatar-centered"' in markup
 
 
 def test_billing_copy_avoids_upstream_provider_terms() -> None:

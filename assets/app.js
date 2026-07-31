@@ -4605,7 +4605,7 @@ function renderOrganizationMembers() {
         <td>
           <div class="organization-member-name">
             <span class="organization-member-avatar ${avatarTone(member.email || name)}" aria-hidden="true">${escapeHtml(initials(email, name))}</span>
-            <div><strong>${escapeHtml(name)}</strong><span>${escapeHtml(email)}</span></div>
+            <div class="organization-member-identity"><strong>${escapeHtml(name)}</strong><span>${escapeHtml(email)}</span></div>
           </div>
         </td>
         <td>${escapeHtml(departmentName)}</td>
