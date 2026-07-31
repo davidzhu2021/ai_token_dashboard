@@ -1233,6 +1233,7 @@ class LiteLLMClient:
                 continue
             metadata = _metadata_dict(_first(item, "metadata", default={}))
             alias = _clean_text(metadata.get("display_name") or item.get("key_alias")) or "个人访问密钥"
+            key_alias = _clean_text(item.get("key_alias"))
             expires = _first(item, "expires", default=None)
             if _first(item, "blocked", "deleted", default=False):
                 status = "已禁用"
@@ -1299,6 +1300,8 @@ class LiteLLMClient:
                     "spend": _as_number(_first(item, "spend", "total_spend")),
                     "status": status,
                     "_rotation": {
+                        # Keep the upstream alias private so a replacement key preserves identity.
+                        "key_alias": key_alias,
                         "metadata": metadata,
                         "models": [str(model) for model in models if model],
                         "expires": expires,
@@ -1715,12 +1718,13 @@ class LiteLLMClient:
         metadata["created_via"] = "ai-usage-center"
         metadata["replaces_key_id"] = key_id
         body: dict[str, Any] = {
-            "key_alias": f"ai-usage-{secrets.token_hex(8)}",
             "key_type": "llm_api",
             "user_id": raw_user_id,
             "models": effective_models,
             "metadata": metadata,
         }
+        if key_alias := _clean_text(rotation.get("key_alias")):
+            body["key_alias"] = key_alias
         duration = self._remaining_key_duration(rotation.get("expires"))
         if duration:
             body["duration"] = duration

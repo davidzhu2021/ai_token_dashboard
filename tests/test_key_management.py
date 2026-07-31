@@ -59,6 +59,7 @@ def test_key_list_only_returns_mask_and_hash_identifier(monkeypatch) -> None:
     assert keys[0]["models"] == ["gpt-5"]
     assert keys[0]["_backendId"] == "primary"
     assert keys[0]["_userId"] == "user-1"
+    assert keys[0]["_rotation"]["key_alias"] == "internal-alias"
 
 
 def test_key_list_does_not_fake_suffix_from_hash(monkeypatch) -> None:
@@ -740,6 +741,7 @@ def test_replacement_key_intersects_models_inherits_limits_and_forces_llm_type(m
             "name": "工作密钥",
             "purpose": "Codex",
             "_rotation": {
+                "key_alias": "stable-internal-alias",
                 "models": ["gpt-5", "removed-model"],
                 "metadata": {"owner": "me"},
                 "max_budget": 10,
@@ -776,6 +778,7 @@ def test_replacement_key_intersects_models_inherits_limits_and_forces_llm_type(m
     assert body["spend"] == 3.25
     assert body["budget_duration"] == "1d"
     assert body["rpm_limit"] == 20
+    assert body["key_alias"] == "stable-internal-alias"
     assert body["metadata"]["display_name"] == "工作密钥"
     assert body["metadata"]["purpose"] == "Codex"
     assert requests[1]["json"] == {"key": "new-hash", "max_budget": 10, "budget_duration": "1d"}
@@ -816,6 +819,7 @@ def test_replacement_key_defaults_budget_when_old_key_has_no_budget(monkeypatch)
 
     assert requests[0]["json"]["max_budget"] == 100
     assert requests[0]["json"]["budget_duration"] == "1d"
+    assert "key_alias" not in requests[0]["json"]
     assert requests[1]["json"] == {"key": "new-hash", "max_budget": 100, "budget_duration": "1d"}
 
 
