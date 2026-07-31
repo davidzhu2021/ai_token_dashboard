@@ -188,3 +188,20 @@ def test_customer_identity_labels_the_current_company_and_scopes_team_cache() ->
     assert 'const organizationName = String(currentUser.organizationName || currentUser.organization?.name || "").trim();' in source
     assert '? `${currentUser.email} · ${organizationName}`' in source
     assert source.count('`${organizationUsageScopeKey()}|${selectedTeamRef}|${startDate}|${endDate}|${source}`') == 2
+
+
+def test_member_avatars_are_round_and_tone_varied_per_member() -> None:
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+    avatar_style = markup[
+        markup.index(".organization-member-avatar {") : markup.index(".organization-member-name strong,")
+    ]
+
+    # 整列同一个浅蓝方块看起来很呆板；圆形 + 按邮箱确定性取色让成员行更容易区分。
+    assert "border-radius: 50%;" in avatar_style
+    assert "linear-gradient" not in avatar_style
+    for tone in range(1, 6):
+        assert f".organization-member-avatar.tone-{tone} {{" in avatar_style
+    assert 'class="organization-member-avatar ${avatarTone(member.email || name)}"' in source
+    assert "const AVATAR_TONE_COUNT = 5;" in source
+    assert "return `tone-${(total % AVATAR_TONE_COUNT) + 1}`;" in source

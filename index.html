@@ -5260,17 +5260,43 @@
       }
 
       .organization-member-avatar {
-        width: 32px;
-        height: 32px;
-        flex: 0 0 32px;
+        width: 28px;
+        height: 28px;
+        flex: 0 0 28px;
         display: grid;
         place-items: center;
-        border-radius: 10px;
-        color: #0a5cad;
-        background: linear-gradient(145deg, #e7f3fd, #f7fbff);
-        border: 1px solid rgba(6, 115, 210, 0.14);
-        font-size: 13px;
-        font-weight: 900;
+        border-radius: 50%;
+        color: #445a72;
+        background: #eef2f7;
+        box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.06);
+        font-size: 12px;
+        font-weight: 700;
+        line-height: 1;
+      }
+
+      .organization-member-avatar.tone-1 {
+        color: #1f5f9e;
+        background: #e8f1fb;
+      }
+
+      .organization-member-avatar.tone-2 {
+        color: #2b6b48;
+        background: #e9f5ee;
+      }
+
+      .organization-member-avatar.tone-3 {
+        color: #8f5518;
+        background: #fbf1e4;
+      }
+
+      .organization-member-avatar.tone-4 {
+        color: #55429b;
+        background: #f1eefb;
+      }
+
+      .organization-member-avatar.tone-5 {
+        color: #97364f;
+        background: #fbeef1;
       }
 
       .organization-member-name strong,
@@ -7691,6 +7717,6 @@
       </form>
     </div>
 
-    <script src="/assets/app.js?v=20260731-organization-admin-merge"></script>
+    <script src="/assets/app.js?v=20260731-organization-member-avatar"></script>
   </body>
 </html>

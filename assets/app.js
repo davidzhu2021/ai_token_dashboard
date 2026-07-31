@@ -198,6 +198,18 @@ function initials(email, name) {
   return prefix.slice(0, 1).toUpperCase();
 }
 
+const AVATAR_TONE_COUNT = 5;
+
+function avatarTone(seed) {
+  const text = String(seed || "").trim().toLowerCase();
+  if (!text) return "tone-1";
+  let total = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    total = (total * 31 + text.charCodeAt(index)) % 9973;
+  }
+  return `tone-${(total % AVATAR_TONE_COUNT) + 1}`;
+}
+
 function showToast(message) {
   const toast = el("toast");
   toast.textContent = message;
@@ -4592,7 +4604,7 @@ function renderOrganizationMembers() {
       <tr>
         <td>
           <div class="organization-member-name">
-            <span class="organization-member-avatar" aria-hidden="true">${escapeHtml(initials(email, name))}</span>
+            <span class="organization-member-avatar ${avatarTone(member.email || name)}" aria-hidden="true">${escapeHtml(initials(email, name))}</span>
             <div><strong>${escapeHtml(name)}</strong><span>${escapeHtml(email)}</span></div>
           </div>
         </td>
