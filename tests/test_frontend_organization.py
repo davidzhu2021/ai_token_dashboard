@@ -217,3 +217,118 @@ def test_member_identity_styles_do_not_deform_the_avatar_letter() -> None:
     assert '<div class="organization-member-identity">' in source
     assert ".organization-member-name span {" not in markup
     assert ".organization-member-name strong," not in markup
+
+
+def test_token_management_is_a_tab_inside_the_enterprise_workspace() -> None:
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    # 令牌管理是企业工作区的第 5 个子页，不是侧边栏的新目的地：所以既要有 tab，
+    # 也要让 organization 那一项在令牌页保持高亮。
+    assert 'data-organization-usage-view="tokens"' in markup
+    assert 'id="organizationTokensView" class="view-section organization-view hidden"' in markup
+    assert '["info", "usage", "departments-usage", "billing", "tokens"].includes(view)' in source
+    assert 'switchView("organization-tokens");' in source
+    assert 'const sidebarView = view === "organization-tokens" ? "organization" : view;' in source
+    assert 'el("organizationTokensView")?.classList.toggle("hidden", view !== "organization-tokens");' in source
+    assert 'if (view === "organization-tokens" && !canViewOrganizationTokens()) view = "dashboard";' in source
+    assert 'if (currentView === "organization-tokens") return loadOrganizationTokens();' in source
+
+
+def test_token_requests_stay_in_the_resolved_organization_scope() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    url = source[source.index("function organizationTokensUrl()") : source.index("function resetOrganizationTokenData()")]
+    # 列表读取复用 organizationApiPath，甲方走 current、乙方走下钻路径，
+    # 客户端始终不发送自己的企业 id。
+    assert 'return `${organizationApiPath("/tokens")}?${params.toString()}`;' in url
+    assert '"/api/platform/organizations' not in url
+
+    # 写操作只有甲方自己的 current 路径，乙方没有对应入口。
+    assert 'await api("/api/organization/current/tokens", {' in source
+    assert "await api(`/api/organization/current/tokens/${encodeURIComponent(tokenId)}/revoke`, {" in source
+
+    # 切换客户会作废在途响应，避免上一家企业的令牌串到当前列表里。
+    assert "if (requestId !== organizationTokenRequestId || scopeKey !== organizationUsageScopeKey()) return;" in source
+    assert "resetOrganizationTokenData();" in source
+
+
+def test_platform_drilldown_sees_tokens_as_read_only() -> None:
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert 'id="organizationTokenReadOnlyHint" class="organization-billing-readonly hidden"' in markup
+    assert "function organizationTokenReadOnly() {\n  return isViewingCustomerOrganization();\n}" in source
+    assert "return Boolean(!organizationTokenReadOnly() && organizationCanManage());" in source
+    assert "if (!organizationTokenCanManage()) return;" in source
+    assert "if (!organizationTokenCanManage() || isOrganizationTokenSaving) return;" in source
+    assert "if (!organizationTokenCanManage() || !revokingOrganizationTokenId || isOrganizationTokenRevoking) return;" in source
+
+
+def test_token_creation_lets_the_admin_pick_models_member_duration_and_budget() -> None:
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    modal = markup[markup.index('id="organizationTokenModal"') : markup.index('id="organizationTokenSecretModal"')]
+    assert 'id="organizationTokenModelChoices" class="model-choice-list"' in modal
+    assert '<option value="">企业共享（不绑定成员）</option>' in modal
+    for duration in ('value="never"', 'value="30d"', 'value="90d"'):
+        assert duration in modal
+    assert 'id="organizationTokenBudgetInput" class="input" type="number" min="1" max="5000"' in modal
+
+    assert 'name="organizationTokenModel"' in source
+    assert "body: JSON.stringify({ name, models, memberId, duration, dailyBudgetUsd: budget })," in source
+    assert '"请至少选择一个可用模型。"' in source
+
+
+def test_new_token_secret_is_shown_once_and_never_re_rendered_from_the_list() -> None:
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    secret_modal = markup[
+        markup.index('id="organizationTokenSecretModal"') : markup.index('id="organizationTokenRevokeModal"')
+    ]
+    assert "完整令牌只展示这一次" in secret_modal
+    assert 'id="organizationTokenSecretValue" class="new-key-value"' in secret_modal
+    assert 'id="closeOrganizationTokenSecret" class="primary-btn"' in secret_modal
+
+    # 关闭弹窗即丢弃明文；列表渲染只用后端返回的 masked，绝不拼接 secret。
+    assert 'setText("organizationTokenSecretValue", "");' in source
+    tokens_render = source[
+        source.index("function renderOrganizationTokens()") : source.index("async function loadOrganizationTokens()")
+    ]
+    assert "secret" not in tokens_render
+    assert 'organizationField(token, "masked", "masked") || "sk-...----"' in tokens_render
+
+
+def test_token_table_escapes_every_rendered_value() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    tokens_render = source[
+        source.index("function renderOrganizationTokens()") : source.index("async function loadOrganizationTokens()")
+    ]
+    # 令牌名称与绑定成员由管理员自由填写，任何未转义插值都会变成存储型 XSS。
+    for expression in (
+        "${escapeHtml(name)}",
+        "${escapeHtml(masked)}",
+        "${escapeHtml(model)}",
+        "${escapeHtml(memberName)}",
+        "${escapeHtml(id)}",
+    ):
+        assert expression in tokens_render
+    assert "${name}" not in tokens_render
+    assert "${masked}" not in tokens_render
+
+
+def test_token_copy_does_not_expose_backend_provider_terms() -> None:
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+    token_markup = markup[markup.index('id="organizationTokensView"') : markup.index('id="keysView"')]
+    token_source = source[
+        source.index("const ORGANIZATION_TOKEN_STATUS_LABELS")
+        : source.index("function closeCustomerOrganizationModal(")
+    ]
+
+    for term in ("LiteLLM", "Proxy", "Virtual Key", "upstream", "admin key"):
+        assert term not in token_markup
+        assert term not in token_source

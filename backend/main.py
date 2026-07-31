@@ -70,6 +70,10 @@ from .billing_store import (
 from .litellm_client import LiteLLMClient, default_date_range, mask_key, normalize_model_display_name, usage_today
 from .key_vault import KeyVault, KeyVaultError
 from .organization_store import (
+    DEFAULT_TOKEN_DAILY_BUDGET_USD,
+    MAX_MODELS_PER_TOKEN,
+    MAX_TOKEN_DAILY_BUDGET_USD,
+    MIN_TOKEN_DAILY_BUDGET_USD,
     DuplicateMemberEmailError,
     InMemoryOrganizationStore,
     OrganizationConflictError,
@@ -1197,6 +1201,19 @@ def organization_store_error(exc: OrganizationStoreError) -> HTTPException:
         return auth_http_error(400, "请检查部门或成员信息后重试", "ORGANIZATION_INVALID_INPUT")
     logger.warning("organization demo store error type=%s", exc.__class__.__name__)
     return auth_http_error(400, "企业组织数据处理失败，请检查输入后重试", "ORGANIZATION_STORE_ERROR")
+
+
+def organization_token_store_error(exc: OrganizationStoreError) -> HTTPException:
+    """Map token failures to token-specific copy without reusing member wording."""
+
+    if isinstance(exc, OrganizationNotFoundError):
+        return auth_http_error(404, "未找到对应的令牌或成员", "ORGANIZATION_TOKEN_NOT_FOUND")
+    if isinstance(exc, OrganizationConflictError):
+        return auth_http_error(409, "当前令牌状态不允许此操作", "ORGANIZATION_TOKEN_CONFLICT")
+    if isinstance(exc, OrganizationValidationError):
+        return auth_http_error(400, "请检查令牌名称、模型或额度后重试", "ORGANIZATION_TOKEN_INVALID_INPUT")
+    logger.warning("organization token store error type=%s", exc.__class__.__name__)
+    return auth_http_error(400, "令牌数据处理失败，请检查输入后重试", "ORGANIZATION_TOKEN_STORE_ERROR")
 
 
 async def organization_current_payload(user: dict[str, Any]) -> dict[str, Any]:
@@ -2682,6 +2699,57 @@ class OrganizationBillingTopupRequest(BaseModel):
         return value.quantize(Decimal("0.01"))
 
 
+class OrganizationTokenCreateRequest(BaseModel):
+    """Strict payload for issuing one customer-scoped demo access token."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=80)
+    models: list[str] = Field(min_length=1, max_length=MAX_MODELS_PER_TOKEN)
+    memberId: str = Field(default="", max_length=128)
+    duration: Literal["never", "30d", "90d"] = "never"
+    dailyBudgetUsd: Decimal = DEFAULT_TOKEN_DAILY_BUDGET_USD
+
+    @field_validator("name", "memberId")
+    @classmethod
+    def strip_token_text(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("models")
+    @classmethod
+    def validate_token_models(cls, value: list[str]) -> list[str]:
+        selected: list[str] = []
+        for item in value:
+            name = item.strip()
+            if not name:
+                raise ValueError("models must not contain empty entries")
+            if name not in selected:
+                selected.append(name)
+        if not selected:
+            raise ValueError("select at least one model")
+        return selected
+
+    @field_validator("dailyBudgetUsd", mode="before")
+    @classmethod
+    def require_numeric_daily_budget(cls, value: Any) -> Any:
+        # Match the top-up contract: a quoted number would silently widen the
+        # public JSON shape this Mock endpoint must keep stable.
+        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+            raise ValueError("dailyBudgetUsd must be a number")
+        return value
+
+    @field_validator("dailyBudgetUsd")
+    @classmethod
+    def validate_daily_budget(cls, value: Decimal) -> Decimal:
+        if not value.is_finite():
+            raise ValueError("dailyBudgetUsd must be a finite number")
+        if value.as_tuple().exponent < -2:
+            raise ValueError("dailyBudgetUsd must have at most two decimal places")
+        if value < MIN_TOKEN_DAILY_BUDGET_USD or value > MAX_TOKEN_DAILY_BUDGET_USD:
+            raise ValueError("dailyBudgetUsd must be between 1.00 and 5000.00")
+        return value.quantize(Decimal("0.01"))
+
+
 def write_key_audit(event: str, email: str, key_id: str, request: Request, result: str) -> None:
     audit_key_id = hashlib.sha256(key_id.encode("utf-8")).hexdigest() if key_id.startswith("sk-") else key_id
     safe_id = re.sub(r"[^A-Za-z0-9_-]", "", audit_key_id)[:64] or "-"
@@ -3623,6 +3691,81 @@ async def organization_update_member(
     return {"member": member}
 
 
+@app.get("/api/organization/current/tokens")
+async def organization_current_tokens(
+    request: Request,
+    search: str = Query("", max_length=120),
+    status: str = Query("", max_length=16),
+    memberId: str = Query("", max_length=128),
+    page: int = Query(1, ge=1, le=100000),
+    pageSize: int = Query(20, ge=1, le=100),
+) -> dict[str, Any]:
+    """List the authenticated customer's own tokens, masked values only."""
+
+    user = await require_organization_demo_manager(request)
+    try:
+        return await organization_scoped_store_call(
+            organization_identifier(organization_current_member(user)),
+            "list_tokens",
+            keyword=search,
+            status=status,
+            member_id=memberId,
+            page=page,
+            page_size=pageSize,
+        )
+    except OrganizationStoreError as exc:
+        raise organization_token_store_error(exc) from exc
+
+
+@app.post("/api/organization/current/tokens")
+async def organization_create_token(
+    data: OrganizationTokenCreateRequest, request: Request
+) -> JSONResponse:
+    """Issue one token for the session-derived customer and reveal it once."""
+
+    await enforce_csrf(request)
+    user = await require_organization_demo_manager(request)
+    try:
+        result = await organization_scoped_store_call(
+            organization_identifier(organization_current_member(user)),
+            "create_token",
+            data.name,
+            data.models,
+            member_id=data.memberId,
+            duration=data.duration,
+            daily_budget_usd=data.dailyBudgetUsd,
+        )
+    except OrganizationStoreError as exc:
+        raise organization_token_store_error(exc) from exc
+    # The plaintext value exists only in this response body, so it must never
+    # be stored by a shared cache or an intermediate proxy.
+    return JSONResponse(
+        {"ok": True, **result},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/api/organization/current/tokens/{token_id}/revoke")
+async def organization_revoke_token(
+    token_id: str,
+    request: Request,
+    _data: OrganizationEmptyRequest | None = None,
+) -> dict[str, Any]:
+    """Disable one of the authenticated customer's tokens."""
+
+    await enforce_csrf(request)
+    user = await require_organization_demo_manager(request)
+    try:
+        token = await organization_scoped_store_call(
+            organization_identifier(organization_current_member(user)),
+            "revoke_token",
+            token_id,
+        )
+    except OrganizationStoreError as exc:
+        raise organization_token_store_error(exc) from exc
+    return {"ok": True, "token": token}
+
+
 @app.get("/api/platform/organizations")
 async def platform_organizations(
     request: Request,
@@ -3889,6 +4032,37 @@ async def platform_organization_billing(
         )
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
+
+
+@app.get("/api/platform/organizations/{organization_id}/tokens")
+async def platform_organization_tokens(
+    organization_id: str,
+    request: Request,
+    search: str = Query("", max_length=120),
+    status: str = Query("", max_length=16),
+    memberId: str = Query("", max_length=128),
+    page: int = Query(1, ge=1, le=100000),
+    pageSize: int = Query(20, ge=1, le=100),
+) -> dict[str, Any]:
+    """Let the seller read one customer's token list for support only.
+
+    There is deliberately no seller-side create or revoke route: issuing a
+    customer's token stays with that customer's own administrator.
+    """
+
+    selected = await require_platform_organization(request, organization_id)
+    try:
+        return await organization_scoped_store_call(
+            str(selected["selectedOrganizationId"]),
+            "list_tokens",
+            keyword=search,
+            status=status,
+            member_id=memberId,
+            page=page,
+            page_size=pageSize,
+        )
+    except OrganizationStoreError as exc:
+        raise organization_token_store_error(exc) from exc
 
 
 @app.get("/api/platform/organizations/{organization_id}/departments/usage")

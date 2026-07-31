@@ -5381,6 +5381,22 @@
         line-height: 1.65;
       }
 
+      /* Access tokens list one chip per granted model, so the cell has to wrap
+         instead of stretching the enterprise table. */
+      .organization-token-models {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        max-width: 260px;
+      }
+
+      .organization-member-identity code {
+        display: inline-block;
+        margin-top: 4px;
+        color: var(--muted);
+        font-size: 11px;
+      }
+
       /* Seller-side customer directory. A customer opens into the shared
          organization detail workspace so department/member UI stays reusable. */
       .customer-view {
@@ -7103,6 +7119,7 @@
             <button class="ghost-btn" type="button" role="tab" data-organization-usage-view="usage" aria-selected="false">全员看板</button>
             <button class="ghost-btn" type="button" role="tab" data-organization-usage-view="departments-usage" aria-selected="false">部门看板</button>
             <button class="ghost-btn" type="button" role="tab" data-organization-usage-view="billing" aria-selected="false">企业额度</button>
+            <button id="organizationTokensTab" class="ghost-btn hidden" type="button" role="tab" data-organization-usage-view="tokens" aria-selected="false">令牌管理</button>
           </div>
 
           <section class="organization-stats" aria-label="企业组织概览">
@@ -7205,6 +7222,104 @@
                 <button id="organizationNextPageButton" class="ghost-btn" type="button">下一页</button>
               </div>
             </section>
+          </section>
+        </section>
+
+        <section id="organizationTokensView" class="view-section organization-view hidden" aria-labelledby="organizationTokenTitle">
+          <div id="organizationTokenBreadcrumb" class="organization-detail-tools hidden" aria-label="客户企业令牌导航">
+            <button id="backToCustomerOrganizationTokensButton" class="ghost-btn" type="button">返回企业详情</button>
+            <span id="organizationTokenBreadcrumbLabel" class="organization-usage-scope">客户企业</span>
+          </div>
+
+          <section class="organization-hero">
+            <div class="organization-hero-copy">
+              <span class="organization-demo-badge">演示数据</span>
+              <h2 id="organizationTokenTitle">令牌管理</h2>
+              <p id="organizationTokenSubtitle">为本企业签发调用令牌，并指定每个令牌可以使用的模型。令牌完整值仅在创建成功时展示一次。</p>
+            </div>
+            <div class="organization-hero-actions">
+              <button id="createOrganizationTokenButton" class="primary-btn" type="button">
+                <span class="app-icon"><svg><use href="#icon-key"></use></svg></span>
+                新增令牌
+              </button>
+              <span id="organizationTokenReadOnlyHint" class="organization-billing-readonly hidden">平台视图仅供查看</span>
+            </div>
+          </section>
+
+          <section class="organization-stats" aria-label="企业令牌概览">
+            <article class="organization-stat accent">
+              <span>令牌总数</span>
+              <strong id="organizationTokenTotalCount">0</strong>
+              <small>每家企业最多 <span id="organizationTokenMaxCount">20</span> 个</small>
+            </article>
+            <article class="organization-stat">
+              <span>生效中</span>
+              <strong id="organizationTokenActiveCount">0</strong>
+              <small>可以正常调用模型</small>
+            </article>
+            <article class="organization-stat">
+              <span>已撤销</span>
+              <strong id="organizationTokenRevokedCount">0</strong>
+              <small>撤销后立即失效</small>
+            </article>
+            <article class="organization-stat">
+              <span>绑定成员</span>
+              <strong id="organizationTokenBoundMemberCount">0</strong>
+              <small>其余为企业共享令牌</small>
+            </article>
+          </section>
+
+          <section class="panel organization-member-panel" aria-labelledby="organizationTokenListTitle">
+            <div class="panel-header">
+              <div class="panel-heading">
+                <span class="panel-icon"><svg><use href="#icon-key"></use></svg></span>
+                <div>
+                  <h3 id="organizationTokenListTitle" class="panel-title">令牌列表</h3>
+                  <p class="panel-desc">令牌可留作企业共享，也可绑定到某位成员，方便区分用途与责任人。</p>
+                </div>
+              </div>
+              <span id="organizationTokenCountChip" class="chip blue">0 个</span>
+            </div>
+            <div class="organization-member-toolbar" aria-label="令牌筛选">
+              <div class="organization-filter-field">
+                <label for="organizationTokenSearch">搜索</label>
+                <input id="organizationTokenSearch" class="input" type="search" placeholder="令牌名称或模型" autocomplete="off" />
+              </div>
+              <div class="organization-filter-field">
+                <label for="organizationTokenStatusFilter">状态</label>
+                <select id="organizationTokenStatusFilter" class="select">
+                  <option value="">全部状态</option>
+                  <option value="active">生效中</option>
+                  <option value="expired">已过期</option>
+                  <option value="revoked">已撤销</option>
+                </select>
+              </div>
+              <div class="organization-filter-actions">
+                <button id="resetOrganizationTokenFiltersButton" class="ghost-btn" type="button">重置筛选</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table aria-label="企业令牌列表">
+                <thead>
+                  <tr>
+                    <th>令牌</th>
+                    <th>可用模型</th>
+                    <th>使用人</th>
+                    <th class="num">每日额度</th>
+                    <th>状态</th>
+                    <th>创建时间</th>
+                    <th>过期时间</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="organizationTokenTable"></tbody>
+              </table>
+            </div>
+            <div class="organization-pagination" aria-label="令牌分页">
+              <button id="organizationTokenPreviousPageButton" class="ghost-btn" type="button">上一页</button>
+              <span id="organizationTokenPageInfo">第 1 / 1 页</span>
+              <button id="organizationTokenNextPageButton" class="ghost-btn" type="button">下一页</button>
+            </div>
           </section>
         </section>
 
@@ -7717,6 +7832,86 @@
       </form>
     </div>
 
-    <script src="/assets/app.js?v=20260731-organization-avatar-centered"></script>
+    <div id="organizationTokenModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="organizationTokenModalTitle">
+      <form id="organizationTokenForm" class="modal" autocomplete="off">
+        <h3 id="organizationTokenModalTitle">新增令牌</h3>
+        <p>令牌属于本企业，可留作企业共享或绑定到某位成员。完整值只在创建成功后展示一次。</p>
+        <div class="field">
+          <label for="organizationTokenNameInput">令牌名称</label>
+          <input id="organizationTokenNameInput" class="input" type="text" maxlength="80" required autocomplete="off" placeholder="例如：研发流水线令牌" />
+        </div>
+        <div class="field">
+          <label for="organizationTokenModelChoices">可用模型</label>
+          <div id="organizationTokenModelChoices" class="model-choice-list"></div>
+          <p class="organization-modal-note">至少选择一个模型。令牌只能调用这里勾选的模型。</p>
+        </div>
+        <div class="field">
+          <label for="organizationTokenMemberInput">使用人</label>
+          <select id="organizationTokenMemberInput" class="select">
+            <option value="">企业共享（不绑定成员）</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="organizationTokenDurationInput">有效期</label>
+          <select id="organizationTokenDurationInput" class="select">
+            <option value="never" selected>永不过期</option>
+            <option value="30d">30 天</option>
+            <option value="90d">90 天</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="organizationTokenBudgetInput">每日额度上限（美元）</label>
+          <input id="organizationTokenBudgetInput" class="input" type="number" min="1" max="5000" step="0.01" inputmode="decimal" value="100" />
+          <p id="organizationTokenError" class="field-error" aria-live="polite"></p>
+          <p class="organization-modal-note">额度范围为 $1.00 至 $5,000.00，最多两位小数，每天自动重置。</p>
+        </div>
+        <div class="modal-actions">
+          <button id="cancelOrganizationTokenButton" class="ghost-btn" type="button">取消</button>
+          <button id="submitOrganizationTokenButton" class="primary-btn" type="submit">创建令牌</button>
+        </div>
+      </form>
+    </div>
+
+    <div id="organizationTokenSecretModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="organizationTokenSecretTitle">
+      <div class="modal">
+        <h3 id="organizationTokenSecretTitle">请立即保存新令牌</h3>
+        <div class="warning-box">
+          <span class="app-icon"><svg><use href="#icon-warning"></use></svg></span>
+          <span>完整令牌只展示这一次，关闭后无法再次查看。请复制并保存到安全的位置，再交给使用人配置到工具中。</span>
+        </div>
+        <div class="new-key-box">
+          <span class="hint">完整令牌</span>
+          <div id="organizationTokenSecretValue" class="new-key-value"></div>
+          <span id="organizationTokenSecretMeta" class="hint"></span>
+        </div>
+        <div class="modal-actions">
+          <button id="copyOrganizationTokenSecret" class="copy-btn" type="button">
+            <span class="app-icon"><svg><use href="#icon-copy"></use></svg></span>
+            复制完整令牌
+          </button>
+          <button id="closeOrganizationTokenSecret" class="primary-btn" type="button">我已保存</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="organizationTokenRevokeModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="organizationTokenRevokeTitle">
+      <div class="modal">
+        <h3 id="organizationTokenRevokeTitle">撤销令牌</h3>
+        <div class="warning-box">
+          <span class="app-icon"><svg><use href="#icon-warning"></use></svg></span>
+          <span>撤销后该令牌立即失效，正在使用它的工具将无法继续访问，且无法恢复。</span>
+        </div>
+        <div class="delete-key-summary">
+          <div><span>令牌名称</span><strong id="organizationTokenRevokeName">-</strong></div>
+          <div><span>令牌</span><code id="organizationTokenRevokeMasked">sk-...----</code></div>
+        </div>
+        <div class="modal-actions">
+          <button id="cancelOrganizationTokenRevokeButton" class="ghost-btn" type="button">取消</button>
+          <button id="confirmOrganizationTokenRevokeButton" class="danger-btn" type="button">确认撤销</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/assets/app.js?v=20260731-organization-token-management"></script>
   </body>
 </html>

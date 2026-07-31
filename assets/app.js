@@ -143,6 +143,24 @@ let organizationBillingScopeKey = "";
 let organizationBillingRequestId = 0;
 let isOrganizationTopupSaving = false;
 let selectedOrganizationTopupAmount = 0;
+// Customer-scoped access tokens. These live entirely inside the enterprise
+// workspace and never reuse the personal access-key state above.
+let organizationTokens = [];
+let organizationTokenTotal = 0;
+let organizationTokenStats = null;
+let organizationTokenPage = 1;
+const organizationTokenPageSize = 20;
+let organizationTokenFilters = { search: "", status: "" };
+let organizationTokenModels = [];
+let organizationTokenBindableMembers = [];
+let isOrganizationTokenLoading = false;
+let isOrganizationTokenSaving = false;
+let isOrganizationTokenRevoking = false;
+let organizationTokenLoadError = "";
+let organizationTokenScopeKey = "";
+let organizationTokenRequestId = 0;
+let organizationTokenSearchTimer = null;
+let revokingOrganizationTokenId = "";
 let authConfig = {
   devLoginEnabled: false,
   oidcConfigured: false,
@@ -4419,15 +4437,18 @@ function resetNavigationToPending() {
 }
 
 function renderCustomerUsageBreadcrumbs(view = currentView) {
-  const isCustomerUsage = isViewingCustomerOrganization() && ["admin", "department", "billing"].includes(view);
+  const isCustomerUsage = isViewingCustomerOrganization()
+    && ["admin", "department", "billing", "organization-tokens"].includes(view);
   const scopeLabel = isCustomerUsage ? `客户企业：${selectedCustomerOrganizationName()}` : "";
   el("customerUsageBreadcrumb")?.classList.toggle("hidden", !(isCustomerUsage && view === "admin"));
   el("customerDepartmentBreadcrumb")?.classList.toggle("hidden", !(isCustomerUsage && view === "department"));
   el("customerBillingBreadcrumb")?.classList.toggle("hidden", !(isCustomerUsage && view === "billing"));
+  el("organizationTokenBreadcrumb")?.classList.toggle("hidden", !(isCustomerUsage && view === "organization-tokens"));
   if (isCustomerUsage) {
     setText("customerUsageBreadcrumbLabel", scopeLabel);
     setText("customerDepartmentBreadcrumbLabel", scopeLabel);
     setText("customerBillingBreadcrumbLabel", scopeLabel);
+    setText("organizationTokenBreadcrumbLabel", scopeLabel);
   }
 }
 
@@ -4718,6 +4739,7 @@ async function openCustomerOrganization(organizationId) {
   organizationMemberPage = 1;
   organizationMemberFilters = { search: "", departmentId: "", role: "", status: "" };
   resetOrganizationBillingData();
+  resetOrganizationTokenData();
   customerOrganizationDetailTab = "info";
   syncNavigationVisibility();
   switchView("organization");
@@ -4728,6 +4750,7 @@ function closeCustomerOrganization() {
   selectedCustomerOrganization = null;
   resetOrganizationUsageViews();
   resetOrganizationBillingData();
+  resetOrganizationTokenData();
   organizationDataRequestId += 1;
   organizationMemberRequestId += 1;
   isOrganizationLoading = false;
@@ -4806,13 +4829,17 @@ function renderOrganizationUsageTabs() {
   });
   const billingTab = tabs.querySelector('[data-organization-usage-view="billing"]');
   if (billingTab) billingTab.classList.toggle("hidden", !isViewingCustomerOrganization() && !canViewOrganizationBilling());
+  const tokensTab = tabs.querySelector('[data-organization-usage-view="tokens"]');
+  if (tokensTab) tokensTab.classList.toggle("hidden", !canViewOrganizationTokens());
   setText("organizationUsageScopeLabel", scope.kind === "platformCustomer" ? `客户：${scopeName}` : `企业：${scopeName}`);
 }
 
 function showOrganizationUsage(view) {
   const scope = organizationUsageScope();
   if (!scope) return;
-  customerOrganizationDetailTab = ["info", "usage", "departments-usage", "billing"].includes(view) ? view : "info";
+  customerOrganizationDetailTab = ["info", "usage", "departments-usage", "billing", "tokens"].includes(view)
+    ? view
+    : "info";
   renderOrganizationUsageTabs();
   if (customerOrganizationDetailTab === "info") {
     switchView("organization");
@@ -4820,6 +4847,8 @@ function showOrganizationUsage(view) {
     switchView("admin");
   } else if (customerOrganizationDetailTab === "billing") {
     switchView("billing");
+  } else if (customerOrganizationDetailTab === "tokens") {
+    switchView("organization-tokens");
   } else {
     switchView("department");
   }
@@ -4879,6 +4908,368 @@ async function loadOrganizationData() {
     isOrganizationLoading = false;
     organizationDataLoadingScopeKey = "";
     renderOrganization();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Customer enterprise access tokens
+// ---------------------------------------------------------------------------
+
+const ORGANIZATION_TOKEN_STATUS_LABELS = {
+  active: "生效中",
+  expired: "已过期",
+  revoked: "已撤销",
+};
+
+function organizationTokenStatusLabel(status) {
+  return ORGANIZATION_TOKEN_STATUS_LABELS[String(status || "")] || "未知";
+}
+
+function organizationTokenStatusTone(status) {
+  if (status === "active") return "active";
+  if (status === "revoked") return "suspended";
+  return "invited";
+}
+
+function canViewOrganizationTokens() {
+  // A seller operator drilled into a customer may read the list; a customer's
+  // own administrator is the only identity that may also create or revoke.
+  return Boolean(isViewingCustomerOrganization() || currentUser?.canManageOrganization);
+}
+
+function organizationTokenReadOnly() {
+  return isViewingCustomerOrganization();
+}
+
+function organizationTokenCanManage() {
+  return Boolean(!organizationTokenReadOnly() && organizationCanManage());
+}
+
+function organizationTokensUrl() {
+  const params = new URLSearchParams({
+    page: String(organizationTokenPage),
+    pageSize: String(organizationTokenPageSize),
+  });
+  if (organizationTokenFilters.search) params.set("search", organizationTokenFilters.search);
+  if (organizationTokenFilters.status) params.set("status", organizationTokenFilters.status);
+  return `${organizationApiPath("/tokens")}?${params.toString()}`;
+}
+
+function resetOrganizationTokenData() {
+  organizationTokenRequestId += 1;
+  organizationTokens = [];
+  organizationTokenTotal = 0;
+  organizationTokenStats = null;
+  organizationTokenPage = 1;
+  organizationTokenFilters = { search: "", status: "" };
+  organizationTokenModels = [];
+  organizationTokenBindableMembers = [];
+  isOrganizationTokenLoading = false;
+  isOrganizationTokenSaving = false;
+  isOrganizationTokenRevoking = false;
+  organizationTokenLoadError = "";
+  organizationTokenScopeKey = "";
+  revokingOrganizationTokenId = "";
+  window.clearTimeout(organizationTokenSearchTimer);
+  organizationTokenSearchTimer = null;
+  const search = el("organizationTokenSearch");
+  if (search) search.value = "";
+  const statusFilter = el("organizationTokenStatusFilter");
+  if (statusFilter) statusFilter.value = "";
+  el("organizationTokenModal")?.classList.add("hidden");
+  el("organizationTokenSecretModal")?.classList.add("hidden");
+  el("organizationTokenRevokeModal")?.classList.add("hidden");
+}
+
+function renderOrganizationTokenFilters() {
+  const search = el("organizationTokenSearch");
+  if (search && search.value !== organizationTokenFilters.search) search.value = organizationTokenFilters.search;
+  const statusFilter = el("organizationTokenStatusFilter");
+  if (statusFilter && statusFilter.value !== organizationTokenFilters.status) {
+    statusFilter.value = organizationTokenFilters.status;
+  }
+}
+
+function renderOrganizationTokens() {
+  if (!canViewOrganizationTokens()) return;
+  const readOnly = organizationTokenReadOnly();
+  const canManage = organizationTokenCanManage();
+  const stats = organizationTokenStats || {};
+  const scopeName = organizationUsageScope()?.name || "本企业";
+  setText("organizationTokenTitle", readOnly ? `${scopeName} · 令牌管理` : "令牌管理");
+  setText(
+    "organizationTokenSubtitle",
+    readOnly
+      ? `${scopeName} 的令牌列表仅供运营协助查看。签发和撤销由该企业的管理员自行操作。`
+      : "为本企业签发调用令牌，并指定每个令牌可以使用的模型。令牌完整值仅在创建成功时展示一次。",
+  );
+  const createButton = el("createOrganizationTokenButton");
+  if (createButton) {
+    createButton.classList.toggle("hidden", readOnly);
+    createButton.disabled = !canManage;
+  }
+  el("organizationTokenReadOnlyHint")?.classList.toggle("hidden", !readOnly);
+  setText("organizationTokenTotalCount", fmt.format(Number(stats.total || organizationTokenTotal || 0)));
+  setText("organizationTokenMaxCount", fmt.format(Number(stats.maxTokenCount || 20)));
+  setText("organizationTokenActiveCount", fmt.format(Number(stats.activeCount || 0)));
+  setText("organizationTokenRevokedCount", fmt.format(Number(stats.revokedCount || 0)));
+  setText("organizationTokenBoundMemberCount", fmt.format(Number(stats.boundMemberCount || 0)));
+  setText("organizationTokenCountChip", `${fmt.format(organizationTokenTotal)} 个`);
+  renderOrganizationTokenFilters();
+
+  const table = el("organizationTokenTable");
+  const totalPages = Math.max(1, Math.ceil(organizationTokenTotal / organizationTokenPageSize));
+  const page = Math.min(organizationTokenPage, totalPages);
+  if (organizationTokenPage !== page) organizationTokenPage = page;
+  setText("organizationTokenPageInfo", `第 ${page} / ${totalPages} 页`);
+  const previousButton = el("organizationTokenPreviousPageButton");
+  const nextButton = el("organizationTokenNextPageButton");
+  if (previousButton) previousButton.disabled = page <= 1 || isOrganizationTokenLoading;
+  if (nextButton) nextButton.disabled = page >= totalPages || isOrganizationTokenLoading;
+  if (!table) return;
+  if (organizationTokenLoadError) {
+    table.innerHTML = `<tr><td colspan="8"><div class="organization-empty">${escapeHtml(organizationTokenLoadError)}</div></td></tr>`;
+    return;
+  }
+  if (isOrganizationTokenLoading && !organizationTokens.length) {
+    table.innerHTML = '<tr><td colspan="8"><div class="organization-empty">正在加载令牌…</div></td></tr>';
+    return;
+  }
+  if (!organizationTokens.length) {
+    table.innerHTML = `<tr><td colspan="8"><div class="organization-empty">${
+      readOnly ? "该企业还没有令牌。" : "还没有令牌。点击「新增令牌」为本企业签发第一个令牌。"
+    }</div></td></tr>`;
+    return;
+  }
+  table.innerHTML = organizationTokens.map((token) => {
+    const id = String(organizationField(token, "id", "token_id") || "");
+    const name = organizationField(token, "name", "name") || "未命名令牌";
+    const masked = organizationField(token, "masked", "masked") || "sk-...----";
+    const models = Array.isArray(token.models) ? token.models : [];
+    const memberName = organizationField(token, "memberName", "member_name") || "";
+    const memberEmail = organizationField(token, "memberEmail", "member_email") || "";
+    const departmentName = organizationField(token, "departmentName", "department_name") || "";
+    const status = String(organizationField(token, "status", "status") || "active");
+    const budget = Number(organizationField(token, "dailyBudgetUsd", "daily_budget_usd") || 0);
+    const createdAt = organizationField(token, "createdAt", "created_at");
+    const expiresAt = organizationField(token, "expiresAt", "expires_at");
+    const modelChips = models.length
+      ? models.map((model) => `<span class="chip">${escapeHtml(model)}</span>`).join("")
+      : '<span class="chip">未指定</span>';
+    const owner = memberName
+      ? `<div class="organization-member-identity"><strong>${escapeHtml(memberName)}</strong><span>${escapeHtml(
+          departmentName ? `${departmentName} · ${memberEmail}` : memberEmail,
+        )}</span></div>`
+      : '<span class="chip blue">企业共享</span>';
+    const canRevoke = canManage && status === "active";
+    return `
+      <tr>
+        <td>
+          <div class="organization-member-identity"><strong>${escapeHtml(name)}</strong><code>${escapeHtml(masked)}</code></div>
+        </td>
+        <td><div class="organization-token-models">${modelChips}</div></td>
+        <td>${owner}</td>
+        <td class="num">${escapeHtml(money.format(budget))}</td>
+        <td><span class="organization-status ${escapeHtml(organizationTokenStatusTone(status))}">${escapeHtml(organizationTokenStatusLabel(status))}</span></td>
+        <td>${escapeHtml(organizationDate(createdAt))}</td>
+        <td>${escapeHtml(expiresAt ? organizationDate(expiresAt) : "永不过期")}</td>
+        <td>
+          <div class="organization-member-actions">
+            <button class="danger-outline-btn" type="button" data-organization-token-revoke="${escapeHtml(id)}" ${canRevoke ? "" : "disabled"}>撤销</button>
+          </div>
+        </td>
+      </tr>
+    `;
+  }).join("");
+}
+
+async function loadOrganizationTokens() {
+  const scopeKey = organizationUsageScopeKey();
+  if (!canViewOrganizationTokens() || isOrganizationTokenLoading) return;
+  const requestId = ++organizationTokenRequestId;
+  isOrganizationTokenLoading = true;
+  organizationTokenLoadError = "";
+  organizationTokenScopeKey = scopeKey;
+  renderOrganizationTokens();
+  try {
+    const payload = await api(organizationTokensUrl());
+    // Discard a response for a customer the operator has since left.
+    if (requestId !== organizationTokenRequestId || scopeKey !== organizationUsageScopeKey()) return;
+    organizationTokens = Array.isArray(payload?.items) ? payload.items : [];
+    organizationTokenTotal = Number(payload?.total || 0);
+    organizationTokenPage = Number(payload?.page || organizationTokenPage || 1);
+    organizationTokenStats = payload?.stats && typeof payload.stats === "object" ? payload.stats : null;
+    organizationTokenModels = Array.isArray(payload?.availableModels) ? payload.availableModels : [];
+    organizationTokenBindableMembers = Array.isArray(payload?.bindableMembers) ? payload.bindableMembers : [];
+  } catch (error) {
+    if (requestId !== organizationTokenRequestId || scopeKey !== organizationUsageScopeKey()) return;
+    organizationTokens = [];
+    organizationTokenTotal = 0;
+    organizationTokenStats = null;
+    organizationTokenLoadError = error.message || "令牌列表加载失败，请稍后重试。";
+    showToast(organizationTokenLoadError);
+  } finally {
+    if (requestId !== organizationTokenRequestId) return;
+    isOrganizationTokenLoading = false;
+    renderOrganizationTokens();
+  }
+}
+
+function renderOrganizationTokenModelChoices() {
+  const choices = el("organizationTokenModelChoices");
+  if (!choices) return;
+  if (!organizationTokenModels.length) {
+    choices.innerHTML = '<div class="key-model-empty">当前没有可选的模型，请稍后重试。</div>';
+    return;
+  }
+  choices.innerHTML = organizationTokenModels.map((model) => `
+    <label class="model-choice">
+      <input type="checkbox" name="organizationTokenModel" value="${escapeHtml(model)}" />
+      <span>${escapeHtml(model)}</span>
+    </label>
+  `).join("");
+}
+
+function renderOrganizationTokenMemberOptions() {
+  const select = el("organizationTokenMemberInput");
+  if (!select) return;
+  const options = organizationTokenBindableMembers.map((member) => {
+    const id = String(organizationField(member, "id", "member_id") || "");
+    const name = organizationField(member, "name", "name") || "未命名成员";
+    const departmentName = organizationField(member, "departmentName", "department_name") || "";
+    const label = departmentName ? `${name}（${departmentName}）` : name;
+    return `<option value="${escapeHtml(id)}">${escapeHtml(label)}</option>`;
+  }).join("");
+  select.innerHTML = `<option value="">企业共享（不绑定成员）</option>${options}`;
+}
+
+function selectedOrganizationTokenModels() {
+  return Array.from(
+    document.querySelectorAll('#organizationTokenModelChoices input[name="organizationTokenModel"]:checked'),
+  ).map((input) => input.value);
+}
+
+function closeOrganizationTokenModal(options = {}) {
+  if (isOrganizationTokenSaving && !options.force) return;
+  el("organizationTokenForm")?.reset();
+  setFieldError("organizationTokenError", "");
+  el("organizationTokenModal")?.classList.add("hidden");
+}
+
+function openOrganizationTokenModal() {
+  if (!organizationTokenCanManage()) return;
+  el("organizationTokenForm")?.reset();
+  setFieldError("organizationTokenError", "");
+  renderOrganizationTokenModelChoices();
+  renderOrganizationTokenMemberOptions();
+  const budgetInput = el("organizationTokenBudgetInput");
+  if (budgetInput) budgetInput.value = "100";
+  el("organizationTokenModal")?.classList.remove("hidden");
+  window.setTimeout(() => el("organizationTokenNameInput")?.focus(), 0);
+}
+
+function closeOrganizationTokenSecretModal() {
+  // The plaintext value exists only in this dialog, so drop it on close.
+  setText("organizationTokenSecretValue", "");
+  setText("organizationTokenSecretMeta", "");
+  el("organizationTokenSecretModal")?.classList.add("hidden");
+}
+
+function showOrganizationTokenSecret(secret, token) {
+  const value = String(secret || "");
+  setText("organizationTokenSecretValue", value);
+  const name = organizationField(token, "name", "name") || "新令牌";
+  const models = Array.isArray(token?.models) ? token.models : [];
+  const expiresAt = organizationField(token, "expiresAt", "expires_at");
+  setText(
+    "organizationTokenSecretMeta",
+    `${name} · ${models.length ? models.join("、") : "未指定模型"} · ${
+      expiresAt ? `${organizationDate(expiresAt)} 过期` : "永不过期"
+    }`,
+  );
+  el("organizationTokenSecretModal")?.classList.remove("hidden");
+}
+
+async function submitOrganizationToken(event) {
+  event.preventDefault();
+  if (!organizationTokenCanManage() || isOrganizationTokenSaving) return;
+  const name = String(el("organizationTokenNameInput")?.value || "").trim();
+  const models = selectedOrganizationTokenModels();
+  const memberId = String(el("organizationTokenMemberInput")?.value || "");
+  const duration = String(el("organizationTokenDurationInput")?.value || "never");
+  const budget = Number(el("organizationTokenBudgetInput")?.value || 0);
+  setFieldError("organizationTokenError", "");
+  if (!name) {
+    setFieldError("organizationTokenError", "请填写令牌名称。");
+    return;
+  }
+  if (!models.length) {
+    setFieldError("organizationTokenError", "请至少选择一个可用模型。");
+    return;
+  }
+  if (!Number.isFinite(budget) || budget < 1 || budget > 5000 || Math.round(budget * 100) !== budget * 100) {
+    setFieldError("organizationTokenError", "请输入 $1.00 至 $5,000.00 的每日额度，最多两位小数。");
+    return;
+  }
+  isOrganizationTokenSaving = true;
+  setButtonLoading("submitOrganizationTokenButton", true, "创建中");
+  try {
+    await ensureCsrfToken();
+    const payload = await api("/api/organization/current/tokens", {
+      method: "POST",
+      body: JSON.stringify({ name, models, memberId, duration, dailyBudgetUsd: budget }),
+    });
+    closeOrganizationTokenModal({ force: true });
+    showOrganizationTokenSecret(payload?.secret, payload?.token);
+    organizationTokenPage = 1;
+    await loadOrganizationTokens();
+    showToast("令牌已创建，请立即保存完整令牌。");
+  } catch (error) {
+    setFieldError("organizationTokenError", error.message || "令牌创建失败，请稍后重试。");
+  } finally {
+    isOrganizationTokenSaving = false;
+    setButtonLoading("submitOrganizationTokenButton", false);
+  }
+}
+
+function closeOrganizationTokenRevokeModal(options = {}) {
+  if (isOrganizationTokenRevoking && !options.force) return;
+  revokingOrganizationTokenId = "";
+  el("organizationTokenRevokeModal")?.classList.add("hidden");
+}
+
+function openOrganizationTokenRevokeModal(tokenId) {
+  if (!organizationTokenCanManage() || !tokenId) return;
+  const token = organizationTokens.find(
+    (item) => String(organizationField(item, "id", "token_id") || "") === String(tokenId),
+  );
+  if (!token) return;
+  revokingOrganizationTokenId = String(tokenId);
+  setText("organizationTokenRevokeName", organizationField(token, "name", "name") || "未命名令牌");
+  setText("organizationTokenRevokeMasked", organizationField(token, "masked", "masked") || "sk-...----");
+  el("organizationTokenRevokeModal")?.classList.remove("hidden");
+}
+
+async function confirmOrganizationTokenRevoke() {
+  if (!organizationTokenCanManage() || !revokingOrganizationTokenId || isOrganizationTokenRevoking) return;
+  const tokenId = revokingOrganizationTokenId;
+  isOrganizationTokenRevoking = true;
+  setButtonLoading("confirmOrganizationTokenRevokeButton", true, "撤销中");
+  try {
+    await ensureCsrfToken();
+    await api(`/api/organization/current/tokens/${encodeURIComponent(tokenId)}/revoke`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    isOrganizationTokenRevoking = false;
+    closeOrganizationTokenRevokeModal({ force: true });
+    await loadOrganizationTokens();
+    showToast("令牌已撤销，立即失效。");
+  } catch (error) {
+    showToast(error.message || "令牌撤销失败，请稍后重试。");
+  } finally {
+    isOrganizationTokenRevoking = false;
+    setButtonLoading("confirmOrganizationTokenRevokeButton", false);
   }
 }
 
@@ -5063,6 +5454,7 @@ function switchView(view) {
   if (view === "department" && !canViewDepartmentUsage()) view = "dashboard";
   if (view === "team" && !currentUser?.isTeamLeader) view = "dashboard";
   if (view === "organization" && !organizationCanView()) view = "dashboard";
+  if (view === "organization-tokens" && !canViewOrganizationTokens()) view = "dashboard";
   if (isMockCustomerIdentity() && (view === "keys" || view === "models")) view = "dashboard";
   if (view === "billing" && !canAccessBillingView()) view = "dashboard";
   if (currentView === "keys" && view !== "keys") clearRevealedKeys();
@@ -5080,20 +5472,24 @@ function switchView(view) {
   el("departmentView").classList.toggle("hidden", view !== "department");
   el("customersView").classList.toggle("hidden", view !== "customers");
   el("organizationView").classList.toggle("hidden", view !== "organization");
+  el("organizationTokensView")?.classList.toggle("hidden", view !== "organization-tokens");
   el("keysView").classList.toggle("hidden", view !== "keys");
   el("billingView").classList.toggle("hidden", view !== "billing");
   el("modelsView").classList.toggle("hidden", view !== "models");
-  el("dashboardFilters").classList.toggle("hidden", view === "models" || view === "keys" || view === "billing" || view === "customers" || view === "organization");
+  el("dashboardFilters").classList.toggle("hidden", view === "models" || view === "keys" || view === "billing" || view === "customers" || view === "organization" || view === "organization-tokens");
   renderCustomerUsageBreadcrumbs(view);
   const isCustomerDetailView = isViewingCustomerOrganization()
-    && ["organization", "admin", "department", "billing"].includes(view);
+    && ["organization", "organization-tokens", "admin", "department", "billing"].includes(view);
   let activeButton = null;
+  // Token management is a tab inside the enterprise workspace, so it keeps the
+  // organization entry highlighted instead of adding a sidebar destination.
+  const sidebarView = view === "organization-tokens" ? "organization" : view;
   document.querySelectorAll("[data-view]").forEach((button) => {
     // Customer detail is a child workspace of the customer directory, not a
     // second top-level destination in the sidebar.
     const isActive = isCustomerDetailView
       ? button.dataset.view === "customers"
-      : button.dataset.view === view;
+      : button.dataset.view === sidebarView;
     button.classList.toggle("active", isActive);
     if (isActive) {
       activeButton = button;
@@ -5132,6 +5528,15 @@ function switchView(view) {
   if (view === "team" && currentUser?.isTeamLeader && !teamUsageData.length) loadTeamData();
   if (view === "department" && (!departmentUsageData.length || departmentUsageScopeKey !== organizationUsageScopeKey())) loadDepartmentData();
   if (view === "organization" && !organizationSnapshot && !isOrganizationLoading) loadOrganizationData();
+  if (view === "organization-tokens") {
+    renderOrganizationTokens();
+    if (
+      !isOrganizationTokenLoading
+      && (!organizationTokens.length || organizationTokenScopeKey !== organizationUsageScopeKey())
+    ) {
+      loadOrganizationTokens();
+    }
+  }
 }
 
 async function loadCurrentViewData(forceRefresh = false) {
@@ -5143,6 +5548,7 @@ async function loadCurrentViewData(forceRefresh = false) {
   if (currentView === "team") return loadTeamData(forceRefresh);
   if (currentView === "department") return loadDepartmentData(forceRefresh);
   if (currentView === "organization") return loadOrganizationData();
+  if (currentView === "organization-tokens") return loadOrganizationTokens();
   return loadDashboardData(forceRefresh);
 }
 
@@ -5572,6 +5978,7 @@ function showLogin() {
   pendingTopupTradeNo = "";
   el("billingPayPanel")?.classList.add("hidden");
   resetOrganizationBillingData();
+  resetOrganizationTokenData();
   adminRedemptions = [];
   adminRedemptionTotal = 0;
   adminBillingOrders = [];
@@ -6205,6 +6612,57 @@ el("organizationNextPageButton").addEventListener("click", () => {
 
 document.querySelectorAll("[data-organization-usage-view]").forEach((button) => {
   button.addEventListener("click", () => showOrganizationUsage(button.dataset.organizationUsageView));
+});
+
+el("backToCustomerOrganizationTokensButton").addEventListener("click", () => showOrganizationUsage("info"));
+el("createOrganizationTokenButton").addEventListener("click", openOrganizationTokenModal);
+el("cancelOrganizationTokenButton").addEventListener("click", () => closeOrganizationTokenModal());
+el("organizationTokenForm").addEventListener("submit", submitOrganizationToken);
+el("closeOrganizationTokenSecret").addEventListener("click", closeOrganizationTokenSecretModal);
+el("copyOrganizationTokenSecret").addEventListener("click", () => {
+  const value = String(el("organizationTokenSecretValue")?.textContent || "");
+  if (value) copyText(value, "完整令牌已复制");
+});
+el("cancelOrganizationTokenRevokeButton").addEventListener("click", () => closeOrganizationTokenRevokeModal());
+el("confirmOrganizationTokenRevokeButton").addEventListener("click", confirmOrganizationTokenRevoke);
+
+el("organizationTokenTable").addEventListener("click", (event) => {
+  const revokeButton = event.target.closest("[data-organization-token-revoke]");
+  if (revokeButton) openOrganizationTokenRevokeModal(revokeButton.dataset.organizationTokenRevoke);
+});
+
+el("organizationTokenSearch").addEventListener("input", () => {
+  window.clearTimeout(organizationTokenSearchTimer);
+  organizationTokenSearchTimer = window.setTimeout(() => {
+    organizationTokenFilters.search = el("organizationTokenSearch").value.trim();
+    organizationTokenPage = 1;
+    loadOrganizationTokens();
+  }, 260);
+});
+
+el("organizationTokenStatusFilter").addEventListener("change", () => {
+  organizationTokenFilters.status = el("organizationTokenStatusFilter").value;
+  organizationTokenPage = 1;
+  loadOrganizationTokens();
+});
+
+el("resetOrganizationTokenFiltersButton").addEventListener("click", () => {
+  organizationTokenFilters = { search: "", status: "" };
+  organizationTokenPage = 1;
+  renderOrganizationTokenFilters();
+  loadOrganizationTokens();
+});
+
+el("organizationTokenPreviousPageButton").addEventListener("click", () => {
+  if (organizationTokenPage <= 1) return;
+  organizationTokenPage -= 1;
+  loadOrganizationTokens();
+});
+
+el("organizationTokenNextPageButton").addEventListener("click", () => {
+  if (organizationTokenPage * organizationTokenPageSize >= organizationTokenTotal) return;
+  organizationTokenPage += 1;
+  loadOrganizationTokens();
 });
 
 el("adminRedemptionForm").addEventListener("submit", generateRedemptions);

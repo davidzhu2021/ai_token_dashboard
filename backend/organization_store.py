@@ -12,9 +12,10 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import secrets
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Protocol
@@ -32,6 +33,25 @@ ACTIVE_DEPARTMENT_MEMBER_STATUSES = frozenset({"invited", "active"})
 INITIAL_ORGANIZATION_BALANCE_USD = Decimal("5000.00")
 MIN_SIMULATED_TOPUP_USD = Decimal("1.00")
 MAX_SIMULATED_TOPUP_USD = Decimal("100000.00")
+
+# Access tokens are demo-only: the models a customer admin may pick come from
+# this fixed catalog instead of an upstream model list, so token management
+# never needs a gateway call for a mock identity.
+ORGANIZATION_TOKEN_MODELS = (
+    "claude-opus-5",
+    "claude-sonnet-4-6",
+    "gpt-5.2",
+    "qwen3-coder-plus",
+    "gemini-3-pro",
+)
+TOKEN_STATUSES = frozenset({"active", "revoked", "expired"})
+TOKEN_DURATIONS = ("never", "30d", "90d")
+TOKEN_DURATION_DAYS = {"30d": 30, "90d": 90}
+MAX_TOKENS_PER_ORGANIZATION = 20
+MAX_MODELS_PER_TOKEN = len(ORGANIZATION_TOKEN_MODELS)
+MIN_TOKEN_DAILY_BUDGET_USD = Decimal("1.00")
+MAX_TOKEN_DAILY_BUDGET_USD = Decimal("5000.00")
+DEFAULT_TOKEN_DAILY_BUDGET_USD = Decimal("100.00")
 
 _SEED_TIMESTAMP = "2026-01-01T00:00:00+00:00"
 _UNSET = object()
@@ -194,6 +214,32 @@ class OrganizationStore(Protocol):
         page_size: int = 20,
     ) -> dict[str, Any]: ...
 
+    def available_token_models(self) -> list[str]: ...
+
+    def list_tokens(
+        self,
+        organization_id: str,
+        *,
+        keyword: str = "",
+        status: str = "",
+        member_id: str = "",
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict[str, Any]: ...
+
+    def create_token(
+        self,
+        organization_id: str,
+        name: str,
+        models: Any,
+        *,
+        member_id: str = "",
+        duration: str = "never",
+        daily_budget_usd: Any = DEFAULT_TOKEN_DAILY_BUDGET_USD,
+    ) -> dict[str, Any]: ...
+
+    def revoke_token(self, organization_id: str, token_id: str) -> dict[str, Any]: ...
+
     def reset(self, organization_id: str | None = None) -> dict[str, Any]: ...
 
 
@@ -245,11 +291,32 @@ class _OrganizationBilling:
 
 
 @dataclass
+class _AccessToken:
+    identifier: str
+    name: str
+    # An empty tuple means the token may call every model in the catalog.
+    models: tuple[str, ...]
+    # An empty member id means the token is shared by the whole organization.
+    member_id: str
+    status: str
+    daily_budget_usd: Decimal
+    duration: str
+    # Only the masked form is ever persisted; the plaintext value is returned
+    # once at creation time and then discarded.
+    masked: str
+    created_at: str
+    updated_at: str
+    expires_at: str = ""
+    revoked_at: str = ""
+
+
+@dataclass
 class _OrganizationState:
     organization: dict[str, Any]
     departments: dict[str, _Department]
     members: dict[str, _Member]
     billing: _OrganizationBilling
+    tokens: dict[str, _AccessToken] = field(default_factory=dict)
     # This private counter changes with directory mutations.  It lets the
     # HTTP layer safely cache generated board data without exposing a mutable
     # organization id or relying on second-resolution timestamps.
@@ -396,6 +463,7 @@ class InMemoryOrganizationStore:
         name: str,
         departments: tuple[tuple[str, str], ...],
         members: tuple[tuple[str, str, str, str, str, str, str], ...],
+        tokens: tuple[tuple[str, str, tuple[str, ...], str, str, str, str], ...] = (),
     ) -> _OrganizationState:
         billing = InMemoryOrganizationStore._seed_billing()
         return _OrganizationState(
@@ -427,6 +495,27 @@ class InMemoryOrganizationStore:
                 for identifier, member_name, email, department_id, role, status, team_role in members
             },
             billing=billing,
+            tokens={
+                identifier: _AccessToken(
+                    identifier=identifier,
+                    name=token_name,
+                    models=token_models,
+                    member_id=member_id,
+                    status=status,
+                    daily_budget_usd=Decimal(daily_budget),
+                    duration=duration,
+                    masked=InMemoryOrganizationStore._seed_masked_value(
+                        f"{organization_id}:{identifier}"
+                    ),
+                    created_at=_SEED_TIMESTAMP,
+                    updated_at=_SEED_TIMESTAMP,
+                    expires_at=InMemoryOrganizationStore._expiry_timestamp(
+                        _SEED_TIMESTAMP, duration
+                    ),
+                    revoked_at=_SEED_TIMESTAMP if status == "revoked" else "",
+                )
+                for identifier, token_name, token_models, member_id, status, duration, daily_budget in tokens
+            },
         )
 
     @staticmethod
@@ -475,6 +564,35 @@ class InMemoryOrganizationStore:
                 ("member-009", "Indigo Xu", "indigo.xu@demo.example", "dept-operations", "member", "suspended", "member"),
                 ("member-010", "Jules Qian", "jules.qian@demo.example", "dept-engineering", "admin", "suspended", "leader"),
             ),
+            (
+                (
+                    "token-demo-001",
+                    "研发流水线令牌",
+                    ("claude-sonnet-4-6", "gpt-5.2"),
+                    "member-001",
+                    "active",
+                    "never",
+                    "200.00",
+                ),
+                (
+                    "token-demo-002",
+                    "企业共享评测令牌",
+                    ("claude-opus-5", "claude-sonnet-4-6", "gpt-5.2", "qwen3-coder-plus"),
+                    "",
+                    "active",
+                    "never",
+                    "500.00",
+                ),
+                (
+                    "token-demo-003",
+                    "临时试用令牌",
+                    ("qwen3-coder-plus",),
+                    "member-002",
+                    "revoked",
+                    "90d",
+                    "50.00",
+                ),
+            ),
         )
         aurora = self._seed_state(
             "org-aurora",
@@ -494,6 +612,35 @@ class InMemoryOrganizationStore:
                 ("member-aurora-005", "李澄", "cheng.li@aurora.example", "dept-aurora-service", "member", "invited", "member"),
                 ("member-aurora-006", "方齐", "qi.fang@aurora.example", "dept-aurora-supply", "member", "suspended", "member"),
             ),
+            (
+                (
+                    "token-aurora-001",
+                    "智能研发主令牌",
+                    ("claude-opus-5", "claude-sonnet-4-6"),
+                    "member-aurora-001",
+                    "active",
+                    "never",
+                    "300.00",
+                ),
+                (
+                    "token-aurora-002",
+                    "供应链共享令牌",
+                    ("gpt-5.2", "qwen3-coder-plus"),
+                    "",
+                    "active",
+                    "never",
+                    "150.00",
+                ),
+                (
+                    "token-aurora-003",
+                    "已停用集成令牌",
+                    ("gemini-3-pro",),
+                    "member-aurora-003",
+                    "revoked",
+                    "30d",
+                    "80.00",
+                ),
+            ),
         )
         harbor = self._seed_state(
             "org-harbor",
@@ -512,6 +659,35 @@ class InMemoryOrganizationStore:
                 ("member-harbor-004", "韩雪", "xue.han@harbor.example", "dept-harbor-stores", "member", "active", "member"),
                 ("member-harbor-005", "朱颜", "yan.zhu@harbor.example", "dept-harbor-growth", "member", "invited", "member"),
                 ("member-harbor-006", "白宁", "ning.bai@harbor.example", "dept-harbor-digital", "admin", "suspended", "leader"),
+            ),
+            (
+                (
+                    "token-harbor-001",
+                    "数字化中台令牌",
+                    ("gpt-5.2", "gemini-3-pro"),
+                    "member-harbor-001",
+                    "active",
+                    "never",
+                    "250.00",
+                ),
+                (
+                    "token-harbor-002",
+                    "门店助手共享令牌",
+                    ("claude-sonnet-4-6", "qwen3-coder-plus"),
+                    "",
+                    "active",
+                    "never",
+                    "120.00",
+                ),
+                (
+                    "token-harbor-003",
+                    "增长实验旧令牌",
+                    ("claude-opus-5",),
+                    "member-harbor-002",
+                    "revoked",
+                    "90d",
+                    "60.00",
+                ),
             ),
         )
         return {demo.organization["id"]: demo, aurora.organization["id"]: aurora, harbor.organization["id"]: harbor}
@@ -744,6 +920,169 @@ class InMemoryOrganizationStore:
             "isDemo": True,
             "usageDoesNotAffectBalance": True,
         }
+
+    # ------------------------------------------------------------------
+    # Access token helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mask_token_value(value: str) -> str:
+        """Return the only token representation the store is allowed to keep."""
+
+        return f"sk-...{value[-4:]}"
+
+    @staticmethod
+    def _seed_masked_value(identifier: str) -> str:
+        digest = hashlib.sha256(identifier.encode("utf-8")).hexdigest()
+        return f"sk-...{digest[:4]}"
+
+    @staticmethod
+    def _expiry_timestamp(created_at: str, duration: str) -> str:
+        days = TOKEN_DURATION_DAYS.get(duration)
+        if days is None:
+            return ""
+        created = datetime.fromisoformat(created_at)
+        return (created + timedelta(days=days)).replace(microsecond=0).isoformat()
+
+    @staticmethod
+    def _effective_token_status(token: _AccessToken) -> str:
+        """Derive the displayed status so expiry needs no scheduled job."""
+
+        if token.status == "revoked":
+            return "revoked"
+        if token.expires_at and datetime.fromisoformat(token.expires_at) <= datetime.now(timezone.utc):
+            return "expired"
+        return token.status
+
+    @classmethod
+    def _validate_token_models(cls, value: Any) -> tuple[str, ...]:
+        if isinstance(value, str) or not isinstance(value, (list, tuple)):
+            raise OrganizationValidationError("models must be a list of model names")
+        selected: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                raise OrganizationValidationError("models must be a list of model names")
+            name = item.strip()
+            if name not in ORGANIZATION_TOKEN_MODELS:
+                raise OrganizationValidationError("models contains an unavailable model")
+            if name not in selected:
+                selected.append(name)
+        if not selected:
+            raise OrganizationValidationError("select at least one model")
+        if len(selected) > MAX_MODELS_PER_TOKEN:
+            raise OrganizationValidationError(
+                f"models must contain at most {MAX_MODELS_PER_TOKEN} entries"
+            )
+        # Keep catalog order so two identical selections always serialise alike.
+        return tuple(name for name in ORGANIZATION_TOKEN_MODELS if name in selected)
+
+    @staticmethod
+    def _validate_token_duration(value: Any) -> str:
+        if not isinstance(value, str) or value not in TOKEN_DURATIONS:
+            raise OrganizationValidationError("duration must be never, 30d, or 90d")
+        return value
+
+    @staticmethod
+    def _validate_token_status(value: Any) -> str:
+        if not isinstance(value, str) or value not in TOKEN_STATUSES:
+            raise OrganizationValidationError("status must be active, revoked, or expired")
+        return value
+
+    @classmethod
+    def _token_daily_budget(cls, value: Any) -> Decimal:
+        if isinstance(value, bool):
+            raise OrganizationValidationError("dailyBudgetUsd must be a number")
+        try:
+            amount = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise OrganizationValidationError("dailyBudgetUsd must be a number") from exc
+        if not amount.is_finite():
+            raise OrganizationValidationError("dailyBudgetUsd must be a finite number")
+        if amount.as_tuple().exponent < -2:
+            raise OrganizationValidationError("dailyBudgetUsd must have at most two decimal places")
+        if amount < MIN_TOKEN_DAILY_BUDGET_USD or amount > MAX_TOKEN_DAILY_BUDGET_USD:
+            raise OrganizationValidationError("dailyBudgetUsd must be between 1.00 and 5000.00")
+        return amount.quantize(Decimal("0.01"))
+
+    def _token_payload(self, state: _OrganizationState, token: _AccessToken) -> dict[str, Any]:
+        member = state.members.get(token.member_id) if token.member_id else None
+        department = state.departments.get(member.department_id) if member is not None else None
+        return {
+            "id": token.identifier,
+            "name": token.name,
+            "models": list(token.models),
+            "memberId": token.member_id,
+            "memberName": member.name if member is not None else "",
+            "memberEmail": member.email if member is not None else "",
+            "departmentName": department.name if department is not None else "",
+            "isShared": not token.member_id,
+            "status": self._effective_token_status(token),
+            "dailyBudgetUsd": self._money(token.daily_budget_usd),
+            "duration": token.duration,
+            "masked": token.masked,
+            "createdAt": token.created_at,
+            "updatedAt": token.updated_at,
+            "expiresAt": token.expires_at or None,
+            "revokedAt": token.revoked_at or None,
+        }
+
+    def _token_stats_payload(self, state: _OrganizationState) -> dict[str, Any]:
+        statuses = [self._effective_token_status(token) for token in state.tokens.values()]
+        bound_members = {
+            token.member_id
+            for token in state.tokens.values()
+            if token.member_id and self._effective_token_status(token) == "active"
+        }
+        return {
+            "total": len(statuses),
+            "activeCount": statuses.count("active"),
+            "revokedCount": statuses.count("revoked"),
+            "expiredCount": statuses.count("expired"),
+            "boundMemberCount": len(bound_members),
+            "maxTokenCount": MAX_TOKENS_PER_ORGANIZATION,
+        }
+
+    def _bindable_members_payload(self, state: _OrganizationState) -> list[dict[str, Any]]:
+        """Return the members a customer admin may attach a new token to."""
+
+        members = [
+            member
+            for member in state.members.values()
+            if member.status in ACTIVE_DEPARTMENT_MEMBER_STATUSES
+        ]
+        members.sort(key=lambda item: (item.name.casefold(), item.identifier))
+        result: list[dict[str, Any]] = []
+        for member in members:
+            department = state.departments.get(member.department_id)
+            result.append(
+                {
+                    "id": member.identifier,
+                    "name": member.name,
+                    "email": member.email,
+                    "departmentName": department.name if department is not None else "",
+                }
+            )
+        return result
+
+    @staticmethod
+    def _has_duplicate_token_name(
+        state: _OrganizationState, name: str, exclude_id: str = ""
+    ) -> bool:
+        normalized = name.casefold()
+        return any(
+            token.identifier != exclude_id
+            and token.status != "revoked"
+            and token.name.casefold() == normalized
+            for token in state.tokens.values()
+        )
+
+    @staticmethod
+    def _token_or_raise(state: _OrganizationState, token_id: Any) -> _AccessToken:
+        identifier = InMemoryOrganizationStore._required_identifier(token_id, "token_id")
+        token = state.tokens.get(identifier)
+        if token is None:
+            raise OrganizationNotFoundError("access token was not found")
+        return token
 
     @staticmethod
     def _has_duplicate_department_name(
@@ -1038,6 +1377,139 @@ class InMemoryOrganizationStore:
                 "record": self._billing_record_payload(record),
                 **self._billing_payload(state, page=page, page_size=page_size),
             }
+
+    # ------------------------------------------------------------------
+    # Mock organization access tokens
+    # ------------------------------------------------------------------
+
+    def available_token_models(self) -> list[str]:
+        """Return the demo model catalog a customer admin may grant."""
+
+        return list(ORGANIZATION_TOKEN_MODELS)
+
+    def list_tokens(
+        self,
+        organization_id: str,
+        *,
+        keyword: str = "",
+        status: str = "",
+        member_id: str = "",
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict[str, Any]:
+        """Return one customer's tokens; never includes a plaintext value."""
+
+        needle = self._normalized_optional_filter(keyword, "keyword").casefold()
+        target_status = self._normalized_optional_filter(status, "status")
+        target_member_id = self._normalized_optional_filter(member_id, "member_id")
+        if target_status:
+            self._validate_token_status(target_status)
+        current_page = self._page_value(page, "page", 100000)
+        current_page_size = self._page_value(page_size, "page_size", 100)
+        with self._lock:
+            state = self._organization_or_raise(organization_id)
+            if target_member_id and target_member_id not in state.members:
+                raise OrganizationNotFoundError("member was not found")
+            tokens = sorted(
+                state.tokens.values(),
+                key=lambda item: (item.created_at, item.identifier),
+                reverse=True,
+            )
+            if needle:
+                tokens = [
+                    token
+                    for token in tokens
+                    if needle in token.name.casefold()
+                    or any(needle in model.casefold() for model in token.models)
+                ]
+            if target_status:
+                tokens = [token for token in tokens if self._effective_token_status(token) == target_status]
+            if target_member_id:
+                tokens = [token for token in tokens if token.member_id == target_member_id]
+            total = len(tokens)
+            start = (current_page - 1) * current_page_size
+            return {
+                "organization": self._organization_payload(state),
+                "items": [
+                    self._token_payload(state, token)
+                    for token in tokens[start : start + current_page_size]
+                ],
+                "total": total,
+                "page": current_page,
+                "pageSize": current_page_size,
+                "stats": self._token_stats_payload(state),
+                "availableModels": list(ORGANIZATION_TOKEN_MODELS),
+                "bindableMembers": self._bindable_members_payload(state),
+                "isDemo": True,
+            }
+
+    def create_token(
+        self,
+        organization_id: str,
+        name: str,
+        models: Any,
+        *,
+        member_id: str = "",
+        duration: str = "never",
+        daily_budget_usd: Any = DEFAULT_TOKEN_DAILY_BUDGET_USD,
+    ) -> dict[str, Any]:
+        """Issue one demo token and return its plaintext value exactly once."""
+
+        normalized_name = self._required_text(name, "token name", 80)
+        selected_models = self._validate_token_models(models)
+        normalized_duration = self._validate_token_duration(duration)
+        budget = self._token_daily_budget(daily_budget_usd)
+        normalized_member_id = self._normalized_optional_filter(member_id, "member_id")
+        with self._lock:
+            state = self._organization_or_raise(organization_id)
+            if state.organization.get("status") != "active":
+                raise OrganizationConflictError("tokens cannot be created for an inactive organization")
+            if len(state.tokens) >= MAX_TOKENS_PER_ORGANIZATION:
+                raise OrganizationConflictError(
+                    f"an organization may hold at most {MAX_TOKENS_PER_ORGANIZATION} tokens"
+                )
+            if self._has_duplicate_token_name(state, normalized_name):
+                raise OrganizationConflictError("a token with this name already exists")
+            if normalized_member_id:
+                member = self._member_or_raise(state, normalized_member_id)
+                if member.status not in ACTIVE_DEPARTMENT_MEMBER_STATUSES:
+                    raise OrganizationConflictError("a suspended member cannot hold a token")
+            now = self._now()
+            organization_identifier = str(state.organization.get("id") or "org")
+            # The plaintext value is generated here and never stored, so a
+            # later read can only ever return the masked form.
+            secret_value = f"sk-{secrets.token_hex(24)}"
+            token = _AccessToken(
+                identifier=f"token-{organization_identifier}-{uuid.uuid4().hex}",
+                name=normalized_name,
+                models=selected_models,
+                member_id=normalized_member_id,
+                status="active",
+                daily_budget_usd=budget,
+                duration=normalized_duration,
+                masked=self._mask_token_value(secret_value),
+                created_at=now,
+                updated_at=now,
+                expires_at=self._expiry_timestamp(now, normalized_duration),
+            )
+            state.tokens[token.identifier] = token
+            return {"token": self._token_payload(state, token), "secret": secret_value}
+
+    def revoke_token(self, organization_id: str, token_id: str) -> dict[str, Any]:
+        """Permanently disable one token without deleting its audit row."""
+
+        with self._lock:
+            state = self._organization_or_raise(organization_id)
+            if state.organization.get("status") != "active":
+                raise OrganizationConflictError("tokens cannot be changed for an inactive organization")
+            token = self._token_or_raise(state, token_id)
+            if token.status == "revoked":
+                raise OrganizationConflictError("this token has already been revoked")
+            now = self._now()
+            token.status = "revoked"
+            token.revoked_at = now
+            token.updated_at = now
+            return self._token_payload(state, token)
 
     def for_organization(self, organization_id: str) -> "OrganizationScope":
         """Return a small tenant facade for route handlers with a selected customer."""
@@ -2104,6 +2576,18 @@ class OrganizationScope:
             page=page,
             page_size=page_size,
         )
+
+    def available_token_models(self) -> list[str]:
+        return self._store.available_token_models()
+
+    def list_tokens(self, **kwargs: Any) -> dict[str, Any]:
+        return self._store.list_tokens(self.organization_id, **kwargs)
+
+    def create_token(self, name: str, models: Any, **kwargs: Any) -> dict[str, Any]:
+        return self._store.create_token(self.organization_id, name, models, **kwargs)
+
+    def revoke_token(self, token_id: str) -> dict[str, Any]:
+        return self._store.revoke_token(self.organization_id, token_id)
 
     def mock_organization_usage(self, **kwargs: Any) -> dict[str, Any]:
         return self._store.mock_organization_usage(self.organization_id, **kwargs)
