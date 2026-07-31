@@ -293,6 +293,38 @@ def test_token_creation_lets_the_admin_pick_models_member_duration_and_budget() 
     assert '"请至少选择一个可用模型。"' in source
 
 
+def test_model_choices_show_sanitized_names_and_submit_raw_gateway_names() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    normalize = source[
+        source.index("function normalizeOrganizationTokenModels(payload)") : source.index(
+            "function renderOrganizationTokenModelChoices()"
+        )
+    ]
+    # 新契约优先，旧字段保留：浏览器缓存着上一版 bundle 的用户不会看到空目录。
+    assert "payload?.availableModelOptions" in normalize
+    assert "payload?.availableModels" in normalize
+
+    choices = source[
+        source.index("function renderOrganizationTokenModelChoices()") : source.index(
+            "function renderOrganizationTokenMemberOptions()"
+        )
+    ]
+    # 可见文本是脱敏名，value 是目录下标——原始模型名不出现在 DOM 里。
+    assert "${escapeHtml(model.displayName)}" in choices
+    assert 'value="${index}"' in choices
+    assert "model.names" not in choices
+
+    selected = source[
+        source.index("function selectedOrganizationTokenModels()") : source.index(
+            "function closeOrganizationTokenModal(options = {})"
+        )
+    ]
+    # 提交时展开成该选项覆盖的全部上游原始名：同一模型的多条线路一起授权。
+    assert "organizationTokenModels[Number(input.value)]" in selected
+    assert "option?.names" in selected
+
+
 def test_new_token_secret_is_shown_once_and_never_re_rendered_from_the_list() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
     source = APP_JS.read_text(encoding="utf-8")
@@ -323,13 +355,15 @@ def test_token_table_escapes_every_rendered_value() -> None:
     for expression in (
         "${escapeHtml(name)}",
         "${escapeHtml(masked)}",
-        "${escapeHtml(model)}",
+        # 模型标签来自上游目录，同样不可信。
+        "${escapeHtml(label)}",
         "${escapeHtml(memberName)}",
         "${escapeHtml(id)}",
     ):
         assert expression in tokens_render
     assert "${name}" not in tokens_render
     assert "${masked}" not in tokens_render
+    assert "${label}" not in tokens_render
 
 
 def test_token_copy_does_not_expose_backend_provider_terms() -> None:

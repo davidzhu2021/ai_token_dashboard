@@ -220,12 +220,12 @@ def test_logout_clears_billing_state() -> None:
         assert cleared in source
 
 
-def test_static_asset_version_bumped_for_organization_token_sidebar_release() -> None:
+def test_static_asset_version_bumped_for_organization_token_real_models_release() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
 
-    # 不更新版本号线上用户会命中旧缓存：旧 app.js 会把新的侧边栏令牌项当成未知
-    # 目的地，点进去被 switchView 打回「我的用量」。
-    assert 'src="/assets/app.js?v=20260731-organization-token-sidebar"' in markup
+    # 不更新版本号线上用户会命中旧缓存：旧 app.js 把勾选框 value 当成模型名直接提交，
+    # 而新契约的 value 是目录下标，会被后端判成「不存在的模型」。
+    assert 'src="/assets/app.js?v=20260731-organization-token-real-models"' in markup
 
 
 def test_billing_copy_avoids_upstream_provider_terms() -> None:

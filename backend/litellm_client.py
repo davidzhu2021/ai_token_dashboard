@@ -1340,12 +1340,36 @@ class LiteLLMClient:
         return sorted({_clean_text(model) for model in models if _clean_text(model)})
 
     async def _proxy_model_names(self, backend: LiteLLMBackend) -> list[str]:
+        cache_key = f"proxy_model_names:{backend.id}"
+        hit, value, _ = self._model_cache.get(cache_key)
+        if hit:
+            return value
         payload = await self.request_backend(backend, "GET", "/models")
         model_names = {
             _clean_text(_first(item, "id", "model_name", "model", default=""))
             for item in _records(payload)
         }
-        return sorted(model for model in model_names if model)
+        names = sorted(model for model in model_names if model)
+        self._model_cache.set(cache_key, names, _env_int("MODEL_CACHE_TTL_SECONDS", 1800))
+        return names
+
+    async def organization_token_models(self) -> list[str]:
+        """网关上真实存在的模型名，供企业令牌的可选目录使用。
+
+        返回的是**上游原始名**：内部线路别名正是调用时唯一可用的模型名，只有展示
+        才需要 ``model_display_name()`` 脱敏。单个 backend 失败不影响其余，全部失
+        败时返回空列表，由调用方决定回落策略。
+        """
+        names: set[str] = set()
+        for backend in self.backends:
+            try:
+                names.update(await self._proxy_model_names(backend))
+            except HTTPException:
+                continue
+            except Exception:
+                logger.warning("organization token model catalog failed for backend %s", backend.id)
+                continue
+        return sorted(names)
 
     def _team_ids_from_user_info(self, user_info: dict[str, Any]) -> list[str]:
         raw_values: list[Any] = []

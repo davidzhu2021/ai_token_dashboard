@@ -18,6 +18,8 @@ def make_client() -> tuple[LiteLLMClient, LiteLLMBackend]:
     client.backends = [backend]
     client._backend_map = {backend.id: backend}
     client._key_cache = TTLCache()
+    # 真实构造函数总会建这个缓存；模型目录查询要用它。
+    client._model_cache = TTLCache()
     return client, backend
 
 

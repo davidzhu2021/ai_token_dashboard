@@ -67,13 +67,21 @@ from .billing_store import (
     SYNC_DONE,
     SYNC_PENDING,
 )
-from .litellm_client import LiteLLMClient, default_date_range, mask_key, normalize_model_display_name, usage_today
+from .litellm_client import (
+    LiteLLMClient,
+    default_date_range,
+    mask_key,
+    model_display_name,
+    normalize_model_display_name,
+    usage_today,
+)
 from .key_vault import KeyVault, KeyVaultError
 from .organization_store import (
     DEFAULT_TOKEN_DAILY_BUDGET_USD,
     MAX_MODELS_PER_TOKEN,
     MAX_TOKEN_DAILY_BUDGET_USD,
     MIN_TOKEN_DAILY_BUDGET_USD,
+    ORGANIZATION_TOKEN_MODELS,
     DuplicateMemberEmailError,
     InMemoryOrganizationStore,
     OrganizationConflictError,
@@ -1214,6 +1222,70 @@ def organization_token_store_error(exc: OrganizationStoreError) -> HTTPException
         return auth_http_error(400, "请检查令牌名称、模型或额度后重试", "ORGANIZATION_TOKEN_INVALID_INPUT")
     logger.warning("organization token store error type=%s", exc.__class__.__name__)
     return auth_http_error(400, "令牌数据处理失败，请检查输入后重试", "ORGANIZATION_TOKEN_STORE_ERROR")
+
+
+async def organization_token_model_catalog() -> tuple[str, ...]:
+    """企业令牌可选模型目录：网关真实模型名，取不到时回落内置清单。
+
+    企业组织本身仍是演示数据，只有这份目录来自真实上游。取目录失败不能让令牌管理
+    整页不可用——``client()`` 在未配置 ``LITELLM_BASE_URL`` 时直接抛 500，而演示环境
+    常常没有上游凭据，所以这里把所有失败都收敛成回落。
+    """
+    try:
+        names = await client().organization_token_models()
+    except HTTPException:
+        # 未配置上游：演示环境的常态，不值得记 error。
+        return ORGANIZATION_TOKEN_MODELS
+    except Exception:
+        logger.warning("organization token model catalog unavailable; using the built-in list")
+        return ORGANIZATION_TOKEN_MODELS
+    catalog = tuple(name for name in names if name)
+    return catalog or ORGANIZATION_TOKEN_MODELS
+
+
+def organization_token_model_options(catalog: tuple[str, ...]) -> list[dict[str, Any]]:
+    """把原始模型名按脱敏展示名归组。
+
+    同一个模型在网关上常有多条线路部署（``wangsu-claude-opus-5`` 与 ``claude-opus-5``
+    的展示名相同），逐条列出会在弹窗里出现两个看不出区别的勾选框——而按产品边界又
+    不能靠线路代号区分它们。所以一个展示名就是一个选项，勾选即授权它名下的全部线路：
+
+    - ``displayName`` 是唯一可见文本；
+    - ``names`` 是该选项覆盖的全部上游原始名，也是令牌实际存储的值。
+    """
+    grouped: dict[str, list[str]] = {}
+    for name in catalog:
+        label = model_display_name(name) or name
+        grouped.setdefault(label, []).append(name)
+    return [
+        {"displayName": label, "names": names}
+        for label, names in sorted(grouped.items())
+    ]
+
+
+def organization_token_list_payload(payload: dict[str, Any], catalog: tuple[str, ...]) -> dict[str, Any]:
+    """给列表补上脱敏展示名。
+
+    已签发令牌引用的模型可能已经不在当前目录里（上游下线、或早期演示数据），它仍然
+    是历史事实要照原样展示，所以每条令牌都单独算展示名，而不是只依赖目录。同一令牌
+    里属于同一模型的多条线路合并成一个标签，与创建弹窗的选项粒度保持一致。
+    """
+    items = payload.get("items")
+    if isinstance(items, list):
+        enriched = []
+        for item in items:
+            if not isinstance(item, dict):
+                enriched.append(item)
+                continue
+            models = item.get("models") if isinstance(item.get("models"), list) else []
+            labels: list[str] = []
+            for model in models:
+                label = model_display_name(str(model)) or str(model)
+                if label not in labels:
+                    labels.append(label)
+            enriched.append({**item, "modelLabels": labels})
+        payload = {**payload, "items": enriched}
+    return {**payload, "availableModelOptions": organization_token_model_options(catalog)}
 
 
 async def organization_current_payload(user: dict[str, Any]) -> dict[str, Any]:
@@ -3703,8 +3775,9 @@ async def organization_current_tokens(
     """List the authenticated customer's own tokens, masked values only."""
 
     user = await require_organization_demo_manager(request)
+    catalog = await organization_token_model_catalog()
     try:
-        return await organization_scoped_store_call(
+        payload = await organization_scoped_store_call(
             organization_identifier(organization_current_member(user)),
             "list_tokens",
             keyword=search,
@@ -3712,9 +3785,11 @@ async def organization_current_tokens(
             member_id=memberId,
             page=page,
             page_size=pageSize,
+            available_models=catalog,
         )
     except OrganizationStoreError as exc:
         raise organization_token_store_error(exc) from exc
+    return organization_token_list_payload(payload, catalog)
 
 
 @app.post("/api/organization/current/tokens")
@@ -3725,6 +3800,7 @@ async def organization_create_token(
 
     await enforce_csrf(request)
     user = await require_organization_demo_manager(request)
+    catalog = await organization_token_model_catalog()
     try:
         result = await organization_scoped_store_call(
             organization_identifier(organization_current_member(user)),
@@ -3734,6 +3810,7 @@ async def organization_create_token(
             member_id=data.memberId,
             duration=data.duration,
             daily_budget_usd=data.dailyBudgetUsd,
+            available_models=catalog,
         )
     except OrganizationStoreError as exc:
         raise organization_token_store_error(exc) from exc
@@ -4051,8 +4128,9 @@ async def platform_organization_tokens(
     """
 
     selected = await require_platform_organization(request, organization_id)
+    catalog = await organization_token_model_catalog()
     try:
-        return await organization_scoped_store_call(
+        payload = await organization_scoped_store_call(
             str(selected["selectedOrganizationId"]),
             "list_tokens",
             keyword=search,
@@ -4060,9 +4138,11 @@ async def platform_organization_tokens(
             member_id=memberId,
             page=page,
             page_size=pageSize,
+            available_models=catalog,
         )
     except OrganizationStoreError as exc:
         raise organization_token_store_error(exc) from exc
+    return organization_token_list_payload(payload, catalog)
 
 
 @app.get("/api/platform/organizations/{organization_id}/departments/usage")

@@ -5057,8 +5057,13 @@ function renderOrganizationTokens() {
     const budget = Number(organizationField(token, "dailyBudgetUsd", "daily_budget_usd") || 0);
     const createdAt = organizationField(token, "createdAt", "created_at");
     const expiresAt = organizationField(token, "expiresAt", "expires_at");
-    const modelChips = models.length
-      ? models.map((model) => `<span class="chip">${escapeHtml(model)}</span>`).join("")
+    // 展示名由后端按每条令牌单独算并合并同一模型的多条线路：已签发令牌可能引用了
+    // 当前目录里已经没有的模型，它仍然是历史事实。旧 bundle 回落到原始名。
+    const modelLabels = Array.isArray(token.modelLabels) && token.modelLabels.length
+      ? token.modelLabels
+      : models;
+    const modelChips = modelLabels.length
+      ? modelLabels.map((label) => `<span class="chip">${escapeHtml(label)}</span>`).join("")
       : '<span class="chip">未指定</span>';
     const owner = memberName
       ? `<div class="organization-member-identity"><strong>${escapeHtml(memberName)}</strong><span>${escapeHtml(
@@ -5103,7 +5108,7 @@ async function loadOrganizationTokens() {
     organizationTokenTotal = Number(payload?.total || 0);
     organizationTokenPage = Number(payload?.page || organizationTokenPage || 1);
     organizationTokenStats = payload?.stats && typeof payload.stats === "object" ? payload.stats : null;
-    organizationTokenModels = Array.isArray(payload?.availableModels) ? payload.availableModels : [];
+    organizationTokenModels = normalizeOrganizationTokenModels(payload);
     organizationTokenBindableMembers = Array.isArray(payload?.bindableMembers) ? payload.bindableMembers : [];
   } catch (error) {
     if (requestId !== organizationTokenRequestId || scopeKey !== organizationUsageScopeKey()) return;
@@ -5119,6 +5124,25 @@ async function loadOrganizationTokens() {
   }
 }
 
+// 可选模型来自网关真实目录。一个选项 = 一个展示名，背后可能是同一模型的多条线路，
+// 勾选即授权它名下全部原始模型名（原始名才是调用时可用的值，但按产品边界不可见）。
+// 旧字段 availableModels 仍然接受，浏览器缓存着上一版 app.js 的用户不会看到空目录。
+function normalizeOrganizationTokenModels(payload) {
+  const options = Array.isArray(payload?.availableModelOptions) ? payload.availableModelOptions : null;
+  if (options) {
+    return options
+      .map((option) => ({
+        displayName: String(option?.displayName || ""),
+        names: (Array.isArray(option?.names) ? option.names : []).map((name) => String(name)).filter(Boolean),
+      }))
+      .filter((option) => option.displayName && option.names.length);
+  }
+  const names = Array.isArray(payload?.availableModels) ? payload.availableModels : [];
+  return names
+    .map((name) => ({ displayName: String(name), names: [String(name)] }))
+    .filter((option) => option.displayName);
+}
+
 function renderOrganizationTokenModelChoices() {
   const choices = el("organizationTokenModelChoices");
   if (!choices) return;
@@ -5126,10 +5150,10 @@ function renderOrganizationTokenModelChoices() {
     choices.innerHTML = '<div class="key-model-empty">当前没有可选的模型，请稍后重试。</div>';
     return;
   }
-  choices.innerHTML = organizationTokenModels.map((model) => `
+  choices.innerHTML = organizationTokenModels.map((model, index) => `
     <label class="model-choice">
-      <input type="checkbox" name="organizationTokenModel" value="${escapeHtml(model)}" />
-      <span>${escapeHtml(model)}</span>
+      <input type="checkbox" name="organizationTokenModel" value="${index}" />
+      <span>${escapeHtml(model.displayName)}</span>
     </label>
   `).join("");
 }
@@ -5147,10 +5171,18 @@ function renderOrganizationTokenMemberOptions() {
   select.innerHTML = `<option value="">企业共享（不绑定成员）</option>${options}`;
 }
 
+// 勾选框的 value 是目录下标，展开成该选项覆盖的全部上游原始名后再提交。
 function selectedOrganizationTokenModels() {
-  return Array.from(
-    document.querySelectorAll('#organizationTokenModelChoices input[name="organizationTokenModel"]:checked'),
-  ).map((input) => input.value);
+  const selected = [];
+  document
+    .querySelectorAll('#organizationTokenModelChoices input[name="organizationTokenModel"]:checked')
+    .forEach((input) => {
+      const option = organizationTokenModels[Number(input.value)];
+      (option?.names || []).forEach((name) => {
+        if (!selected.includes(name)) selected.push(name);
+      });
+    });
+  return selected;
 }
 
 function closeOrganizationTokenModal(options = {}) {

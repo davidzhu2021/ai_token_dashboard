@@ -34,9 +34,9 @@ INITIAL_ORGANIZATION_BALANCE_USD = Decimal("5000.00")
 MIN_SIMULATED_TOPUP_USD = Decimal("1.00")
 MAX_SIMULATED_TOPUP_USD = Decimal("100000.00")
 
-# Access tokens are demo-only: the models a customer admin may pick come from
-# this fixed catalog instead of an upstream model list, so token management
-# never needs a gateway call for a mock identity.
+# 可选模型目录的正常来源是网关真实模型列表，由路由层注入（见
+# main.organization_token_model_catalog）。这份内置清单只是回落值：store 契约不允许
+# 发起任何上游调用，未配置上游或上游不可用时靠它保证令牌管理仍然可用。
 ORGANIZATION_TOKEN_MODELS = (
     "claude-opus-5",
     "claude-sonnet-4-6",
@@ -48,7 +48,9 @@ TOKEN_STATUSES = frozenset({"active", "revoked", "expired"})
 TOKEN_DURATIONS = ("never", "30d", "90d")
 TOKEN_DURATION_DAYS = {"30d": 30, "90d": 90}
 MAX_TOKENS_PER_ORGANIZATION = 20
-MAX_MODELS_PER_TOKEN = len(ORGANIZATION_TOKEN_MODELS)
+# 不与内置清单长度挂钩：真实网关目录远多于回落清单，绑死会让请求体在 Pydantic 层
+# 就被截断，管理员选不满自己有权使用的模型。
+MAX_MODELS_PER_TOKEN = 50
 MIN_TOKEN_DAILY_BUDGET_USD = Decimal("1.00")
 MAX_TOKEN_DAILY_BUDGET_USD = Decimal("5000.00")
 DEFAULT_TOKEN_DAILY_BUDGET_USD = Decimal("100.00")
@@ -225,6 +227,7 @@ class OrganizationStore(Protocol):
         member_id: str = "",
         page: int = 1,
         page_size: int = 20,
+        available_models: Any = None,
     ) -> dict[str, Any]: ...
 
     def create_token(
@@ -236,6 +239,7 @@ class OrganizationStore(Protocol):
         member_id: str = "",
         duration: str = "never",
         daily_budget_usd: Any = DEFAULT_TOKEN_DAILY_BUDGET_USD,
+        available_models: Any = None,
     ) -> dict[str, Any]: ...
 
     def revoke_token(self, organization_id: str, token_id: str) -> dict[str, Any]: ...
@@ -955,7 +959,26 @@ class InMemoryOrganizationStore:
         return token.status
 
     @classmethod
-    def _validate_token_models(cls, value: Any) -> tuple[str, ...]:
+    def _token_model_catalog(cls, available_models: Any = None) -> tuple[str, ...]:
+        """解析可选模型目录。
+
+        目录由路由层注入（上游网关的真实模型名）。store 本身不发任何请求，所以
+        缺省时回落到内置常量，让离线单测与未配置上游的部署仍然可用。
+        """
+        if available_models is None:
+            return ORGANIZATION_TOKEN_MODELS
+        if isinstance(available_models, str) or not isinstance(available_models, (list, tuple)):
+            raise OrganizationValidationError("available_models must be a list of model names")
+        catalog: list[str] = []
+        for item in available_models:
+            name = item.strip() if isinstance(item, str) else ""
+            if name and name not in catalog:
+                catalog.append(name)
+        return tuple(catalog) or ORGANIZATION_TOKEN_MODELS
+
+    @classmethod
+    def _validate_token_models(cls, value: Any, available_models: Any = None) -> tuple[str, ...]:
+        catalog = cls._token_model_catalog(available_models)
         if isinstance(value, str) or not isinstance(value, (list, tuple)):
             raise OrganizationValidationError("models must be a list of model names")
         selected: list[str] = []
@@ -963,7 +986,7 @@ class InMemoryOrganizationStore:
             if not isinstance(item, str):
                 raise OrganizationValidationError("models must be a list of model names")
             name = item.strip()
-            if name not in ORGANIZATION_TOKEN_MODELS:
+            if name not in catalog:
                 raise OrganizationValidationError("models contains an unavailable model")
             if name not in selected:
                 selected.append(name)
@@ -974,7 +997,7 @@ class InMemoryOrganizationStore:
                 f"models must contain at most {MAX_MODELS_PER_TOKEN} entries"
             )
         # Keep catalog order so two identical selections always serialise alike.
-        return tuple(name for name in ORGANIZATION_TOKEN_MODELS if name in selected)
+        return tuple(name for name in catalog if name in selected)
 
     @staticmethod
     def _validate_token_duration(value: Any) -> str:
@@ -1396,6 +1419,7 @@ class InMemoryOrganizationStore:
         member_id: str = "",
         page: int = 1,
         page_size: int = 20,
+        available_models: Any = None,
     ) -> dict[str, Any]:
         """Return one customer's tokens; never includes a plaintext value."""
 
@@ -1438,7 +1462,9 @@ class InMemoryOrganizationStore:
                 "page": current_page,
                 "pageSize": current_page_size,
                 "stats": self._token_stats_payload(state),
-                "availableModels": list(ORGANIZATION_TOKEN_MODELS),
+                # 目录只约束「新建」。已签发令牌引用的模型是历史事实，即使上游把它
+                # 下线了也照原样返回，所以上面的 items 不受目录过滤。
+                "availableModels": list(self._token_model_catalog(available_models)),
                 "bindableMembers": self._bindable_members_payload(state),
                 "isDemo": True,
             }
@@ -1452,11 +1478,12 @@ class InMemoryOrganizationStore:
         member_id: str = "",
         duration: str = "never",
         daily_budget_usd: Any = DEFAULT_TOKEN_DAILY_BUDGET_USD,
+        available_models: Any = None,
     ) -> dict[str, Any]:
         """Issue one demo token and return its plaintext value exactly once."""
 
         normalized_name = self._required_text(name, "token name", 80)
-        selected_models = self._validate_token_models(models)
+        selected_models = self._validate_token_models(models, available_models)
         normalized_duration = self._validate_token_duration(duration)
         budget = self._token_daily_budget(daily_budget_usd)
         normalized_member_id = self._normalized_optional_filter(member_id, "member_id")
