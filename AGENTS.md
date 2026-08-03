@@ -52,6 +52,33 @@ Do not expose any LiteLLM branding or implementation details in user-facing fron
 
 Before making code changes, review the relevant LiteLLM behavior against the local official project checkout at `D:\litellm` and the LiteLLM Proxy UI documentation at `https://docs.litellm.ai/docs/proxy/ui`. Prefer the local source for implementation details and the official documentation for product/API intent. Do not guess LiteLLM endpoint names, request fields, or response shapes when they can be confirmed from those sources.
 
+## LiteLLM Deployment Reference
+
+The upstream LiteLLM service is deployed separately from this dashboard. Do not confuse the LiteLLM cluster with this dashboard's production host `JSZX-AI-03 / 10.68.13.188`.
+
+- JumpServer asset: `AIYJY-litellm`
+- K3s control-plane node: `10.68.13.198` (`aiyjy-litellm`)
+- K3s standby/worker node: `10.68.13.225` (`aiyjy-litellm-standby`)
+- Production Kubernetes namespace: `litellm-product`
+- Production service/workload: `litellm-proxy`
+- Supporting services: `litellm-db` and `litellm-redis`
+- Production proxy replicas are scheduled across both K3s nodes. The host's `docker ps` output is not authoritative for LiteLLM because the workloads run under K3s/containerd
+- Development and staging namespaces on the same cluster are `litellm-dev` and `litellm-staging`; use `litellm-product` for production checks
+
+When implementing or debugging LiteLLM integration, use `D:\litellm` as the local source reference first, then use the server only for read-only verification of deployed behavior. Run JumpServer commands from Windows PowerShell through WSL:
+
+```powershell
+wsl bash -lc "cd /home/zhuyida/codes/carher-admin/scripts && ./jms ssh AIYJY-litellm '<remote command>'"
+```
+
+Useful read-only checks:
+
+```powershell
+wsl bash -lc "cd /home/zhuyida/codes/carher-admin/scripts && ./jms ssh AIYJY-litellm 'kubectl get nodes -o wide && kubectl get deploy,statefulset,svc -n litellm-product -o wide && kubectl get pods -n litellm-product -l app=litellm-proxy -o wide && kubectl get endpoints -n litellm-product litellm-proxy -o wide'"
+```
+
+Before changing integration code, compare endpoint paths, request fields, response shapes, authentication headers, and deployment configuration against `D:\litellm`. Never print or copy Kubernetes Secrets, LiteLLM master keys, provider keys, database credentials, JumpServer credentials, or any server `.env` contents. Do not make production changes through this dashboard repository; changes belong in the appropriate source repository and must follow the production deployment procedure below.
+
 
 ## Testing Guidelines
 
