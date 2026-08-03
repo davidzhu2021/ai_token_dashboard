@@ -316,6 +316,32 @@ async def run_sync_once(client: LiteLLMClient, store: UsageStore, days: int) -> 
     return await UsageSynchronizer(client, store).sync(start_date, end_date)
 
 
+async def run_sync_with_recent_refresh(
+    client: LiteLLMClient, store: UsageStore, days: int
+) -> dict[str, Any]:
+    result = await run_sync_once(client, store, days)
+    if result.get("status") != "ok" or not _env_bool("USAGE_SYNC_LOG_TIMEZONE_ENABLED", True):
+        return result
+
+    recent_days = min(days, max(1, _env_int("USAGE_SYNC_LOG_MAX_WINDOW_DAYS", 3)))
+    if recent_days >= days:
+        return result
+
+    # Long backfills use upstream daily aggregates for speed. Refresh the recent
+    # window from request logs so an incomplete current-day aggregate cannot
+    # overwrite the more accurate incremental snapshot.
+    recent_result = await run_sync_once(client, store, recent_days)
+    output = dict(result)
+    output["recentRefresh"] = {"days": recent_days, **recent_result}
+    if recent_result.get("status") != "ok":
+        output["status"] = "partial"
+        output["errors"] = [
+            *list(result.get("errors") or []),
+            *list(recent_result.get("errors") or []),
+        ]
+    return output
+
+
 async def _run_cli(days: int) -> int:
     store = UsageStore.from_environment()
     if store is None:
@@ -325,7 +351,7 @@ async def _run_cli(days: int) -> int:
     try:
         client = LiteLLMClient()
         await store.connect()
-        result = await run_sync_once(client, store, days)
+        result = await run_sync_with_recent_refresh(client, store, days)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0 if result.get("status") == "ok" else 1
     except Exception as exc:

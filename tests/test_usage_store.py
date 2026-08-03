@@ -363,6 +363,82 @@ def test_usage_sync_cli_returns_nonzero_for_partial_result(monkeypatch, capsys) 
     assert '"status": "partial"' in capsys.readouterr().out
 
 
+def test_usage_sync_cli_refreshes_recent_log_window_after_long_backfill(monkeypatch, capsys) -> None:
+    from backend import usage_sync
+
+    class Store:
+        async def connect(self):
+            return None
+
+        async def close(self):
+            return None
+
+    class Client:
+        async def close(self):
+            return None
+
+    calls: list[tuple[str, str]] = []
+
+    class Synchronizer:
+        def __init__(self, _client, _store):
+            pass
+
+        @staticmethod
+        def date_range(days):
+            return {
+                90: ("2026-05-06", "2026-08-03"),
+                3: ("2026-08-01", "2026-08-03"),
+            }[days]
+
+        async def sync(self, start_date, end_date):
+            calls.append((start_date, end_date))
+            return {
+                "status": "ok",
+                "rowCount": 100 if start_date == "2026-05-06" else 12,
+                "backendCount": 2,
+                "errors": [],
+            }
+
+    monkeypatch.setenv("USAGE_SYNC_LOG_TIMEZONE_ENABLED", "true")
+    monkeypatch.setenv("USAGE_SYNC_LOG_MAX_WINDOW_DAYS", "3")
+    monkeypatch.setattr(usage_sync.UsageStore, "from_environment", lambda: Store())
+    monkeypatch.setattr(usage_sync, "LiteLLMClient", Client)
+    monkeypatch.setattr(usage_sync, "UsageSynchronizer", Synchronizer)
+
+    assert asyncio.run(usage_sync._run_cli(90)) == 0
+    assert calls == [
+        ("2026-05-06", "2026-08-03"),
+        ("2026-08-01", "2026-08-03"),
+    ]
+    output = capsys.readouterr().out
+    assert '"status": "ok"' in output
+    assert '"recentRefresh": {"backendCount": 2, "days": 3' in output
+
+
+def test_usage_sync_cli_fails_when_recent_refresh_is_partial(monkeypatch) -> None:
+    from backend import usage_sync
+
+    results = [
+        {"status": "ok", "rowCount": 100, "backendCount": 2, "errors": []},
+        {"status": "partial", "rowCount": 10, "backendCount": 1, "errors": ["primary: RuntimeError"]},
+    ]
+
+    async def fake_run_sync_once(_client, _store, _days):
+        return results.pop(0)
+
+    monkeypatch.setenv("USAGE_SYNC_LOG_TIMEZONE_ENABLED", "true")
+    monkeypatch.setenv("USAGE_SYNC_LOG_MAX_WINDOW_DAYS", "3")
+    monkeypatch.setattr(usage_sync, "run_sync_once", fake_run_sync_once)
+
+    result = asyncio.run(
+        usage_sync.run_sync_with_recent_refresh(object(), object(), 90)
+    )
+
+    assert result["status"] == "partial"
+    assert result["errors"] == ["primary: RuntimeError"]
+    assert result["recentRefresh"]["days"] == 3
+
+
 def test_usage_store_date_values_are_asyncpg_compatible() -> None:
     usage_record = UsageStore._usage_record(
         "primary",

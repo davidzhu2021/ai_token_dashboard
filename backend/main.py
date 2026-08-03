@@ -92,7 +92,7 @@ from .organization_store import (
     OrganizationValidationError,
 )
 from .usage_store import UsageStore
-from .usage_sync import UsageSynchronizer
+from .usage_sync import UsageSynchronizer, run_sync_with_recent_refresh
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -442,9 +442,7 @@ async def run_usage_sync(days: int) -> dict[str, Any]:
         return {"status": "disabled", "rowCount": 0, "backendCount": 0}
     try:
         await store.connect()
-        result = await UsageSynchronizer(client(), store).sync(
-            *UsageSynchronizer.date_range(days),
-        )
+        result = await run_sync_with_recent_refresh(client(), store, days)
         _usage_sync_status.update(
             {
                 "status": result.get("status", "ok"),
