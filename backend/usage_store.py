@@ -14,17 +14,6 @@ except ImportError:  # pragma: no cover - optional for local development
 from .litellm_client import department_key, normalize_model_display_name, normalize_team_text
 
 
-def _model_normalize_sql(column: str) -> str:
-    """生成规范化模型名称的 SQL 表达式：去掉路由、账号别名和供应商前缀。
-
-    与 normalize_model_display_name() 保持一致，确保 SQL GROUP BY 阶段
-    就把同一模型（如 openrouter/anthropic/claude-opus-5 与 claude-opus-5）聚合为一条。
-    """
-    path_stripped = f"regexp_replace({column}, '^.*/', '')"
-    account_stripped = f"regexp_replace({path_stripped}, '^[A-Za-z][A-Za-z0-9]*-acct-[0-9]+-', '', 'i')"
-    return f"regexp_replace({account_stripped}, '^[A-Za-z][A-Za-z0-9]*\\.', '', 'i')"
-
-
 USAGE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS usage_daily (
     backend_id TEXT NOT NULL,
@@ -294,7 +283,7 @@ class UsageStore:
         covered = sorted(set(backend_ids))
         if not backend_ids or not await self.has_complete_coverage(start_date, end_date, covered):
             return None
-        model_sql = _model_normalize_sql("u.model")
+        model_sql = "u.model"
         records = await self._require_pool().fetch(
             f"""
             WITH scope(backend_id, team_id) AS (SELECT * FROM unnest($1::text[], $2::text[])),
@@ -622,7 +611,7 @@ class UsageStore:
             *args,
         )
         rows = [self._usage_row(record) for record in records]
-        return self._merge_rows_by(rows, ("_backendId", "date", "_userId", "source", "model"))
+        return self._canonical_usage_rows(rows, ("_backendId", "date", "_userId", "source", "model"))
 
     @staticmethod
     def _usage_row(record: Any) -> dict[str, Any]:
@@ -645,7 +634,27 @@ class UsageStore:
 
     @staticmethod
     def _public_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [{key: value for key, value in row.items() if not key.startswith("_")} for row in rows]
+        identity_fields = [
+            field
+            for field in ("_backendId", "_userId", "employeeId", "departmentId", "departmentKey")
+            if any(field in row for row in rows)
+        ]
+        canonical = UsageStore._canonical_usage_rows(
+            rows,
+            tuple(identity_fields + ["date", "source", "model"]),
+        )
+        return [{key: value for key, value in row.items() if not key.startswith("_")} for row in canonical]
+
+    @classmethod
+    def _canonical_usage_rows(
+        cls, rows: list[dict[str, Any]], key_fields: tuple[str, ...]
+    ) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["model"] = normalize_model_display_name(item.get("model")) or "未知模型"
+            normalized.append(item)
+        return cls._merge_rows_by(normalized, key_fields)
 
     @staticmethod
     def _merge_rows_by(rows: list[dict[str, Any]], key_fields: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -663,6 +672,7 @@ class UsageStore:
 
     @staticmethod
     def _group_rows(rows: list[dict[str, Any]], key_fields: tuple[str, ...]) -> list[dict[str, Any]]:
+        rows = UsageStore._canonical_usage_rows(rows, key_fields)
         grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
         for row in rows:
             key = tuple(row.get(field, "") for field in key_fields)
@@ -823,7 +833,7 @@ class UsageStore:
         if team_id:
             args.append(team_id)
             conditions.append(f"m.team_id = ${len(args)}")
-        model_sql = _model_normalize_sql("u.model")
+        model_sql = "u.model"
         records = await self._require_pool().fetch(
             f"""
             SELECT u.backend_id, u.usage_date, u.user_id,
@@ -857,7 +867,7 @@ class UsageStore:
             args.append(employee_filter)
         where_sql = " AND ".join(conditions)
         pool = self._require_pool()
-        model_sql = _model_normalize_sql("model")
+        model_sql = "model"
         # 每员工×每天×每模型的明细只在筛选了某个员工时才有人看：未筛选时前端的
         # 趋势图走 summaryRows、排行榜走 employees，明细仅喂按 source/model 聚合的
         # 饼图与条形图，而那两张图从 summaryRows 能算出同样的结果。近 30 天这份明细
@@ -970,6 +980,7 @@ class UsageStore:
             *args,
         )
         summary_rows = [self._aggregated_usage_row(record, include_identity=False) for record in summary_records]
+        summary_rows = self._group_rows(summary_rows, ("date", "source", "model"))
         public_rows = self._public_rows(enriched)
         return {
             "rows": public_rows,
@@ -1092,7 +1103,7 @@ class UsageStore:
                 )
             ))
         """
-        model_sql = _model_normalize_sql("u.model")
+        model_sql = "u.model"
         pool = self._require_pool()
         # 与 admin_rows 同理：部门看板只在选中某个部门后才渲染逐员工明细，未选中时
         # 画的是部门排行（departmentRankings）与聚合趋势，明细纯属白传。
@@ -1244,6 +1255,7 @@ class UsageStore:
             *args,
         )
         summary_rows = [self._aggregated_usage_row(record, include_identity=False) for record in summary_records]
+        summary_rows = self._group_rows(summary_rows, ("date", "source", "model"))
         public_rows = self._public_rows(rows)
         return {
             "rows": public_rows,
@@ -1278,7 +1290,7 @@ class UsageStore:
         if not latest_members:
             return None
         args: list[Any] = [backend_id, team_id, _as_date(start_date), _as_date(end_date), source or "all"]
-        model_sql = _model_normalize_sql("u.model")
+        model_sql = "u.model"
         records = await pool.fetch(
             f"""
             SELECT u.backend_id, u.usage_date, u.user_id,
@@ -1401,6 +1413,7 @@ class UsageStore:
             *args,
         )
         summary_rows = [self._aggregated_usage_row(record, include_identity=False) for record in summary_records]
+        summary_rows = self._group_rows(summary_rows, ("date", "source", "model"))
         public_rows = self._public_rows(rows)
         return {
             "rows": public_rows,
@@ -1468,7 +1481,7 @@ class UsageStore:
         selected_user_ids = [str(member["user_id"]) for member in members]
         selected_emails = sorted({str(member["employee_email"]).strip().lower() for member in members if member["employee_email"]})
         args: list[Any] = [backend_id, team_id, _as_date(start_date), _as_date(end_date), source or "all", selected_user_ids, selected_emails]
-        model_sql = _model_normalize_sql("u.model")
+        model_sql = "u.model"
         records = await pool.fetch(
             f"""
             SELECT u.backend_id, u.usage_date, u.user_id,
@@ -1541,7 +1554,7 @@ class UsageStore:
             possible_backend, possible_user = normalized.split(":", 1)
             if possible_backend in covered:
                 selected_backend, selected_user = possible_backend, possible_user
-        model_sql = _model_normalize_sql("u.model")
+        model_sql = "u.model"
         records = await self._require_pool().fetch(
             f"""
             WITH scope(backend_id, team_id) AS (SELECT * FROM unnest($1::text[], $2::text[])),
@@ -1597,6 +1610,7 @@ class UsageStore:
                 }
             )
             rows.append(self._public_rows([row])[0])
+        rows = self._group_rows(rows, ("date", "source", "model", "employeeId"))
         first = members[0]
         user_ids = [f"{item['backend_id']}:{item['user_id']}" for item in members]
         selected = {

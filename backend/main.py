@@ -975,7 +975,7 @@ async def organization_usage_cache_key(
         for key, value in sorted(filters.items())
     )
     return (
-        f"organization-usage:v1:{method}:{revision}:{start_date}:{end_date}:"
+        f"organization-usage:v2:{method}:{revision}:{start_date}:{end_date}:"
         f"{str(source or 'all').strip().casefold()}:{normalized_filters}"
     )
 
@@ -1806,19 +1806,19 @@ async def cached_resolve_user(email: str, name: str | None = None, refresh: bool
 
 
 def personal_usage_cache_key(email: str, start_date: str, end_date: str, source: str) -> str:
-    return f"usage:v6:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
+    return f"usage:v7:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def local_personal_usage_cache_key(user_id: str, start_date: str, end_date: str, source: str) -> str:
-    return f"usage:local:v1:{user_id}:{start_date}:{end_date}:{source or 'all'}"
+    return f"usage:local:v2:{user_id}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def admin_usage_cache_key(email: str, start_date: str, end_date: str, source: str, employee: str | None) -> str:
-    return f"admin-usage:v4:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(employee or '').strip().lower()}"
+    return f"admin-usage:v5:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(employee or '').strip().lower()}"
 
 
 def department_usage_cache_key(email: str, start_date: str, end_date: str, source: str, department: str | None) -> str:
-    return f"department-usage:v5:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(department or '').strip().lower()}"
+    return f"department-usage:v6:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(department or '').strip().lower()}"
 
 
 def team_auth_cache_key(email: str, name: str | None) -> str:
@@ -1842,11 +1842,11 @@ def team_scope_fingerprint(team: dict[str, Any]) -> str:
 
 
 def team_usage_cache_key(email: str, team: dict[str, Any], start_date: str, end_date: str, source: str) -> str:
-    return f"team-usage:v8:{email.strip().lower()}:{team_scope_fingerprint(team)}:{start_date}:{end_date}:{source or 'all'}"
+    return f"team-usage:v9:{email.strip().lower()}:{team_scope_fingerprint(team)}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def team_member_usage_cache_key(email: str, team: dict[str, Any], employee: str, start_date: str, end_date: str, source: str) -> str:
-    return f"team-member-usage:v7:{email.strip().lower()}:{team_scope_fingerprint(team)}:{employee.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
+    return f"team-member-usage:v8:{email.strip().lower()}:{team_scope_fingerprint(team)}:{employee.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def team_ref(team: dict[str, Any]) -> str:

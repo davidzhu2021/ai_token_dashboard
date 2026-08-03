@@ -1071,15 +1071,7 @@ function escapeHtml(value) {
 }
 
 function normalizeModelKey(model) {
-  // 与后端 normalize_model_display_name 保持一致：
-  // 去掉路由、账号别名和供应商前缀，使同一模型聚合为一条。
-  let name = String(model ?? "").trim();
-  if (!name) return "";
-  // 上游路由可能有多层 provider/ 前缀，模型名始终取最后一段。
-  name = name.split("/").pop().trim() || name;
-  name = name.replace(/^[A-Za-z][A-Za-z0-9]*-acct-\d+-/i, "");
-  name = name.replace(/^[A-Za-z][A-Za-z0-9]*\./i, "");
-  return name;
+  return String(model ?? "").trim();
 }
 
 function displayModelName(model) {
@@ -1673,7 +1665,7 @@ function renderDonutTo(svgId, totalId, legendId, data) {
 function renderModelBarsTo(containerId, data) {
   const container = el(containerId);
   if (!container) return;
-  // 按规范化后的模型名称聚合，合并带不同供应商/账号前缀的同一模型。
+  // The API owns canonical model names; the browser only combines identical rows.
   const grouped = {};
   data.forEach((item) => {
     const key = normalizeModelKey(item.model) || "未知模型";

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
+import json
 import logging
+import os
+import sys
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
@@ -14,8 +18,6 @@ logger = logging.getLogger("ai-token-dashboard.usage-sync")
 
 
 def _env_int(name: str, default: int) -> int:
-    import os
-
     try:
         return int(os.getenv(name, str(default)))
     except ValueError:
@@ -23,8 +25,6 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_bool(name: str, default: bool) -> bool:
-    import os
-
     raw = os.getenv(name)
     if raw is None or not raw.strip():
         return default
@@ -314,3 +314,38 @@ class UsageSynchronizer:
 async def run_sync_once(client: LiteLLMClient, store: UsageStore, days: int) -> dict[str, Any]:
     start_date, end_date = UsageSynchronizer.date_range(days)
     return await UsageSynchronizer(client, store).sync(start_date, end_date)
+
+
+async def _run_cli(days: int) -> int:
+    store = UsageStore.from_environment()
+    if store is None:
+        print(json.dumps({"status": "disabled", "error": "USAGE_DATABASE_URL is not configured"}))
+        return 2
+    client: LiteLLMClient | None = None
+    try:
+        client = LiteLLMClient()
+        await store.connect()
+        result = await run_sync_once(client, store, days)
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0 if result.get("status") == "ok" else 1
+    except Exception as exc:
+        logger.exception("one-shot usage sync failed")
+        print(json.dumps({"status": "failed", "error": exc.__class__.__name__}))
+        return 1
+    finally:
+        if client is not None:
+            await client.close()
+        await store.close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Safely rebuild usage snapshots.")
+    parser.add_argument("--days", type=int, required=True, help="Inclusive number of days to rebuild.")
+    args = parser.parse_args(argv)
+    if args.days < 1:
+        parser.error("--days must be at least 1")
+    return asyncio.run(_run_cli(args.days))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

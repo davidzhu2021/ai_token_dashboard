@@ -288,6 +288,32 @@ def test_deployments_sharing_a_display_name_collapse_to_the_canonical_one() -> N
     assert catalog["gpt-5.5"]["modelName"] == "gpt-5.5"
 
 
+def test_catalog_uses_model_directory_mapping_but_keeps_callable_name() -> None:
+    client = make_client()
+    _stub(
+        client,
+        models={"primary": [{"id": "chatgpt-acct-91-gpt-5.6-sol"}]},
+        infos={
+            "primary": [
+                {
+                    "model_name": "router-group",
+                    "model_info": {
+                        "id": "chatgpt-acct-91-gpt-5.6-sol",
+                        "input_cost_per_token": 5e-06,
+                        "output_cost_per_token": 3e-05,
+                    },
+                    "litellm_params": {"model": "openai/gpt-5.6-luna"},
+                }
+            ]
+        },
+    )
+
+    catalog = _catalog(client)
+
+    assert list(catalog) == ["gpt-5.6-luna"]
+    assert catalog["gpt-5.6-luna"]["modelName"] == "chatgpt-acct-91-gpt-5.6-sol"
+
+
 def test_alias_only_display_group_keeps_the_highest_priced_deployment() -> None:
     client = make_client()
     _stub(

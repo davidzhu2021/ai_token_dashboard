@@ -7,10 +7,12 @@ from pathlib import Path
 APP_JS = Path(__file__).parents[1] / "assets" / "app.js"
 
 
-def test_frontend_model_normalization_handles_provider_prefixes() -> None:
+def test_frontend_trusts_backend_canonical_model_names() -> None:
     source = APP_JS.read_text(encoding="utf-8")
 
-    assert 'name = name.split("/").pop().trim() || name;' in source
+    assert 'return String(model ?? "").trim();' in source
+    assert "acct-\\d+" not in source
+    assert '.split("/").pop()' not in source
 
     script = f"""
 const source = {json.dumps(source)};
@@ -36,13 +38,13 @@ console.log(JSON.stringify([
     finally:
         Path(script_path).unlink(missing_ok=True)
     assert json.loads(result.stdout) == [
+        "anthropic.claude-opus-4-8",
         "claude-opus-4-8",
-        "claude-opus-4-8",
-        "claude-opus-4-8",
-        "claude-opus-4-8",
-        "claude-opus-4-7",
-        "claude-opus-5",
-        "claude-haiku-4-5",
+        "bedrock/anthropic.claude-opus-4-8",
+        "bedrock/chatgpt-acct-84-anthropic.claude-opus-4-8",
+        "bedrock/claude-opus-4-7",
+        "openrouter/anthropic/claude-opus-5",
+        "wangsu-direct5/claude-haiku-4-5",
         "",
     ]
 
@@ -52,3 +54,4 @@ def test_frontend_model_normalization_keeps_model_body_specific() -> None:
 
     # Model names remain specific and are not matched by fuzzy substrings.
     assert "return normalized;" in source
+    assert "The API owns canonical model names" in source

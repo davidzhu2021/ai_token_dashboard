@@ -152,30 +152,8 @@ def _clean_text(value: Any) -> str:
     return str(value or "").strip()
 
 
-_ACCOUNT_ALIAS_PREFIX_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*-acct-\d+-", re.IGNORECASE)
-_VENDOR_PREFIX_RE = re.compile(r"^[a-z][a-z0-9]*\.", re.IGNORECASE)
-
-
 def normalize_model_display_name(value: Any) -> str:
-    """隐藏路由、账号别名和供应商前缀，使同一模型在用量统计中聚合为一条。
-
-    示例:
-    - openrouter/anthropic/claude-opus-5 -> claude-opus-5
-    - wangsu-direct5/claude-haiku-4-5 -> claude-haiku-4-5
-    - chatgpt-acct-84-gpt-4 -> gpt-4
-    - anthropic.claude-opus-4-8 -> claude-opus-4-8
-    - openai.gpt-4 -> gpt-4
-    """
-    text = _clean_text(value)
-    if not text:
-        return ""
-    # 上游路由可能有多层 provider/ 前缀，模型名始终取最后一段。
-    stripped = text.rsplit("/", 1)[-1].strip() or text
-    # 移除账号别名前缀。
-    stripped = _ACCOUNT_ALIAS_PREFIX_RE.sub("", stripped, count=1)
-    # 移除供应商前缀
-    stripped = _VENDOR_PREFIX_RE.sub("", stripped, count=1)
-    return stripped or text
+    return resolve_canonical_model_name(value)
 
 
 def _normal_email(value: Any) -> str:
@@ -378,10 +356,20 @@ def model_family(model_name: str) -> tuple[str, str]:
     return "other", "其他"
 
 
-# 上游把同一模型按账号/线路配了多份部署别名（wangsu-、zerokey-、kuaihui- 等）。
-# 这些词元是内部网关代号，按前端产品边界不得出现在展示名里；但别名本身仍是
-# 员工唯一能调用的模型名，所以只从展示名里剥离，不据此丢弃模型（见 model_display_name）。
-_INTERNAL_ALIAS_TOKENS = frozenset(
+_CANONICAL_VENDOR_TOKENS = frozenset(
+    {
+        "anthropic",
+        "openai",
+        "google",
+        "custom_openai",
+        "bedrock",
+        "azure",
+        "vertex_ai",
+        "dashscope",
+        "baai",
+    }
+)
+_CANONICAL_ALIAS_TOKENS = frozenset(
     {
         "wangsu",
         "wangsu5",
@@ -394,60 +382,116 @@ _INTERNAL_ALIAS_TOKENS = frozenset(
         "chatgpt",
         "liuguoxian",
         "cheliantianxia1",
+        "direct",
+        "secondary",
     }
 )
-# 词元必须足够具体：`max`/`pool` 只出现在 zai-max-*、zerokey-pool-* 这类别名里，
-# 而它们已被 zai/zerokey 拦下，单独列会误杀 qwen3.7-max 这样的正常主名。
-# 供应商前缀形如 `anthropic.claude-opus-4-8`。要求点号后紧跟字母，否则
-# `gpt-5.2` 这类带小数点的正常模型名会被误判成别名。
-_VENDOR_DOT_PREFIX_RE = re.compile(r"^[a-z][a-z0-9]*\.[a-z]", re.IGNORECASE)
-# `pool` 是上游线路池的内部编排概念，对员工无意义，仅在别名里剥掉。
-# 刻意不剥 `max`：它是真实档位（zai-max-glm-5.2 与 zai-glm-5.2 是两个不同部署、
-# 价格不同），剥掉会让两者撞成同一个展示名而丢掉一个。
-_ALIAS_POOL_TOKENS = frozenset({"pool"})
+_CANONICAL_ACCOUNT_ALIAS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*-acct-\d+-", re.IGNORECASE)
+_CANONICAL_ZK_ALIAS_RE = re.compile(r"^zk-\d+-", re.IGNORECASE)
+_CANONICAL_MODEL_HINT_RE = re.compile(
+    r"^(?:gpt|o[134]|claude|gemini|qwen|deepseek|glm|kimi|moonshot|mistral|llama|"
+    r"bge|text-embedding|codex|minimax|doubao|ernie)(?:[-.]|\d)",
+    re.IGNORECASE,
+)
+_UNKNOWN_MODEL_NAMES_LOGGED: set[str] = set()
+
+
+def _canonical_model_fallback(value: Any) -> tuple[str, bool]:
+    """Strip only syntax that is explicitly known to be an internal alias."""
+
+    text = _clean_text(value)
+    if not text:
+        return "", False
+    path_segments = [segment.strip() for segment in text.split("/") if segment.strip()]
+    body = path_segments[-1] if path_segments else text
+    route_segments = path_segments[:-1]
+    route_tokens = {
+        token.casefold()
+        for segment in route_segments
+        for token in re.split(r"[.-]", segment)
+        if token
+    }
+    confirmed_alias = bool(
+        route_tokens.intersection(_CANONICAL_VENDOR_TOKENS | _CANONICAL_ALIAS_TOKENS)
+    )
+    if route_segments and _CANONICAL_MODEL_HINT_RE.match(body):
+        confirmed_alias = True
+    while True:
+        candidate = _CANONICAL_ACCOUNT_ALIAS_RE.sub("", body, count=1)
+        candidate = _CANONICAL_ZK_ALIAS_RE.sub("", candidate, count=1)
+        if candidate == body:
+            break
+        body = candidate
+        confirmed_alias = True
+    while True:
+        head, dot, rest = body.partition(".")
+        if not dot or not rest or (
+            head.casefold() not in _CANONICAL_VENDOR_TOKENS
+            and head.casefold() not in _CANONICAL_ALIAS_TOKENS
+        ):
+            break
+        body = rest
+        confirmed_alias = True
+    segments = body.split("-")
+    if any(segment.casefold() in _CANONICAL_ALIAS_TOKENS for segment in segments):
+        body = "-".join(
+            segment
+            for segment in segments
+            if segment and segment.casefold() not in _CANONICAL_ALIAS_TOKENS and segment.casefold() != "pool"
+        )
+        confirmed_alias = True
+    if len(path_segments) > 1 and not confirmed_alias and not _CANONICAL_MODEL_HINT_RE.match(body):
+        return text, False
+    return body or text, confirmed_alias
+
+
+def _log_unknown_model_once(value: Any) -> None:
+    text = _clean_text(value)
+    key = text.casefold()
+    if text and key not in _UNKNOWN_MODEL_NAMES_LOGGED:
+        _UNKNOWN_MODEL_NAMES_LOGGED.add(key)
+        logger.info("unrecognized model name kept unchanged: %s", text)
+
+
+def resolve_canonical_model_name(
+    value: Any,
+    *,
+    deployment_map: dict[str, str] | None = None,
+    diagnose_unknown: bool = False,
+) -> str:
+    """Return the conservative canonical display name used by every report."""
+
+    text = _clean_text(value)
+    if not text:
+        return ""
+    if deployment_map:
+        mapped = deployment_map.get(text.casefold())
+        if mapped:
+            return resolve_canonical_model_name(mapped, diagnose_unknown=diagnose_unknown)
+    candidate, confirmed_alias = _canonical_model_fallback(text)
+    recognized_model = bool(_CANONICAL_MODEL_HINT_RE.match(candidate))
+    if diagnose_unknown and not confirmed_alias and not recognized_model:
+        _log_unknown_model_once(text)
+    return candidate.casefold() if recognized_model else candidate or text
+
+
+def _is_recognizable_deployment_name(value: Any) -> bool:
+    candidate, confirmed_alias = _canonical_model_fallback(value)
+    return bool(candidate and (confirmed_alias or _CANONICAL_MODEL_HINT_RE.match(candidate)))
 
 
 def is_internal_model_alias(model_name: str) -> bool:
-    """判断模型名是否带内部网关线路标记（展示名需要脱敏，不代表该模型不可用）。"""
-    name = _clean_text(model_name).lower()
-    if not name:
+    """Return whether the shared resolver recognized internal routing syntax."""
+
+    text = _clean_text(model_name)
+    if not text:
         return True
-    if "/" in name or _VENDOR_DOT_PREFIX_RE.match(name):
-        return True
-    return bool(_INTERNAL_ALIAS_TOKENS.intersection(name.split("-")))
+    _, confirmed_alias = _canonical_model_fallback(text)
+    return confirmed_alias
 
 
 def model_display_name(model_name: str) -> str:
-    """把内部部署别名转成可展示的模型名（剥掉线路/供应商代号）。
-
-    员工调用时必须填上游原始名，所以这里只影响展示，复制按钮仍用原始名。
-    剥离后可能与其他别名重名（wangsu-gpt-5.5 与 kuaihui-gpt-5.5 都变成
-    gpt-5.5），去重由 `LiteLLMClient._priced_catalog` 负责。
-    """
-    name = _clean_text(model_name)
-    if not name:
-        return ""
-    body = name.split("/")[-1]
-    # 供应商前缀可能有多层，如 anthropic.openrouter.claude-opus-4-6。逐层剥，
-    # 只剥已知的供应商/线路代号，`gpt-5.2` 的小数点因此不受影响。
-    while True:
-        head, dot, rest = body.partition(".")
-        if not dot or not rest or not _is_vendor_token(head):
-            break
-        body = rest
-    segments = body.split("-")
-    kept = [segment for segment in segments if segment.lower() not in _INTERNAL_ALIAS_TOKENS]
-    if len(kept) != len(segments):
-        # 只有确认是别名时才剥线路池标记，正常主名里的 max 要留着。
-        kept = [segment for segment in kept if segment.lower() not in _ALIAS_POOL_TOKENS]
-    display = "-".join(segment for segment in kept if segment)
-    return display or name
-
-
-def _is_vendor_token(token: str) -> bool:
-    """点号前缀是否是供应商/线路代号（而非 gpt-5.2 这类小数点）。"""
-    value = token.lower()
-    return value in _INTERNAL_ALIAS_TOKENS or value in {"anthropic", "openai", "google", "custom_openai"}
+    return resolve_canonical_model_name(model_name)
 
 
 class LiteLLMClient:
@@ -474,6 +518,7 @@ class LiteLLMClient:
         self._key_cache = TTLCache()
         self._model_cache = TTLCache()
         self._model_usage_cache = TTLCache()
+        self._deployment_model_maps: dict[str, dict[str, str]] = {}
         self._account_index_cache = TTLCache()
         self._team_details_cache = TTLCache()
 
@@ -625,12 +670,28 @@ class LiteLLMClient:
             return self._backend_map.get(backend_id, self.backends[0]), user_id
         return self.backends[0], account_id
 
-    @staticmethod
-    def _usage_model_name(record: dict[str, Any], fallback: str = "未知模型") -> str:
-        for field in ("model_id", "litellm_model_name", "model", "model_group"):
+    def _usage_model_name(
+        self,
+        record: dict[str, Any],
+        fallback: str = "未知模型",
+        backend: LiteLLMBackend | None = None,
+    ) -> str:
+        backend = backend or self.backends[0]
+        deployment_map = getattr(self, "_deployment_model_maps", {}).get(backend.id, {})
+        model_id = _clean_text(_first(record, "model_id", default=""))
+        if model_id:
+            mapped = deployment_map.get(model_id.casefold())
+            if mapped:
+                return resolve_canonical_model_name(mapped, diagnose_unknown=True)
+        for field in ("litellm_model_name", "model"):
             value = _clean_text(_first(record, field, default=""))
             if value:
-                return normalize_model_display_name(value)
+                return resolve_canonical_model_name(value, diagnose_unknown=True)
+        if model_id and _is_recognizable_deployment_name(model_id):
+            return resolve_canonical_model_name(model_id, diagnose_unknown=True)
+        model_group = _clean_text(_first(record, "model_group", default=""))
+        if model_group:
+            return resolve_canonical_model_name(model_group, diagnose_unknown=True)
         breakdown = record.get("breakdown") if isinstance(record.get("breakdown"), dict) else {}
         for field in ("models", "model_groups"):
             bucket = breakdown.get(field)
@@ -638,8 +699,38 @@ class LiteLLMClient:
                 for name in bucket.keys():
                     value = _clean_text(name)
                     if value:
-                        return normalize_model_display_name(value)
+                        return resolve_canonical_model_name(value, diagnose_unknown=True)
+        if model_id:
+            return resolve_canonical_model_name(model_id, diagnose_unknown=True)
         return fallback
+
+    async def _deployment_model_map(self, backend: LiteLLMBackend) -> dict[str, str]:
+        if not hasattr(self, "_deployment_model_maps"):
+            self._deployment_model_maps = {}
+        cache_key = f"deployment-model-map:v1:{backend.id}"
+        hit, value, _ = self._model_cache.get(cache_key)
+        if hit:
+            self._deployment_model_maps[backend.id] = value
+            return value
+        payload = await self.request_backend(backend, "GET", "/model/info")
+        mapping: dict[str, str] = {}
+        for item in _records(payload):
+            info = item.get("model_info") if isinstance(item.get("model_info"), dict) else {}
+            params = item.get("litellm_params") if isinstance(item.get("litellm_params"), dict) else {}
+            deployment_id = _clean_text(info.get("id") or item.get("model_info_id"))
+            actual_model = _clean_text(params.get("model"))
+            if deployment_id and actual_model:
+                mapping[deployment_id.casefold()] = actual_model
+        self._deployment_model_maps[backend.id] = mapping
+        self._model_cache.set(cache_key, mapping, _env_int("MODEL_CACHE_TTL_SECONDS", 1800))
+        return mapping
+
+    async def _ensure_deployment_model_map(self, backend: LiteLLMBackend) -> dict[str, str]:
+        try:
+            return await self._deployment_model_map(backend)
+        except Exception:
+            logger.warning("model directory query failed for backend %s", backend.id)
+            return getattr(self, "_deployment_model_maps", {}).get(backend.id, {})
 
     def _is_backend_usage_account(self, backend: LiteLLMBackend, user_id: Any) -> bool:
         text = _clean_text(user_id).lower()
@@ -1069,6 +1160,7 @@ class LiteLLMClient:
 
     async def _usage_from_logs(self, user_id: str, start_date: str, end_date: str, source: str | None, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
         backend = backend or self.backends[0]
+        await self._ensure_deployment_model_map(backend)
         max_pages = max(1, int(os.getenv("USAGE_LOG_MAX_PAGES", "20")))
         utc_start, utc_end = _local_date_window_as_utc_text(start_date, end_date)
         grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -1094,7 +1186,7 @@ class LiteLLMClient:
                 detected_source = backend.source or detect_source(log)
                 if source and source != "all" and detected_source != source:
                     continue
-                model = self._usage_model_name(log)
+                model = self._usage_model_name(log, backend=backend)
                 day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
                 key = (day, detected_source, model)
                 row = grouped.setdefault(key, self._empty_usage_row(day, detected_source, model))
@@ -1133,9 +1225,15 @@ class LiteLLMClient:
         else:
             row["successCount"] += 1
 
-    def _row_from_daily_activity_item(self, item: dict[str, Any], source: str, fallback_model: str = "全部模型") -> dict[str, Any]:
+    def _row_from_daily_activity_item(
+        self,
+        item: dict[str, Any],
+        source: str,
+        fallback_model: str = "全部模型",
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
         metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else item
-        model = self._usage_model_name(item, fallback_model)
+        model = self._usage_model_name(item, fallback_model, backend)
         prompt = _as_int(_first(metrics, "prompt_tokens", "promptTokens", "total_prompt_tokens"))
         completion = _as_int(_first(metrics, "completion_tokens", "completionTokens", "total_completion_tokens"))
         total = _as_int(_first(metrics, "total_tokens", "totalTokens", default=prompt + completion))
@@ -1157,14 +1255,21 @@ class LiteLLMClient:
             "spend": _as_number(_first(metrics, "spend", "total_spend")),
         }
 
-    def _rows_from_daily_activity_item(self, item: dict[str, Any], source: str) -> list[dict[str, Any]]:
+    def _rows_from_daily_activity_item(
+        self, item: dict[str, Any], source: str, backend: LiteLLMBackend | None = None
+    ) -> list[dict[str, Any]]:
         breakdown = item.get("breakdown") if isinstance(item.get("breakdown"), dict) else {}
         models = breakdown.get("models") if isinstance(breakdown.get("models"), dict) else {}
         if models:
             day = _date_text(_first(item, "date", "day"))
             grouped: dict[str, dict[str, Any]] = {}
             for model_name, model_value in models.items():
-                model = normalize_model_display_name(model_name)
+                resolved_backend = backend or self.backends[0]
+                model = resolve_canonical_model_name(
+                    model_name,
+                    deployment_map=getattr(self, "_deployment_model_maps", {}).get(resolved_backend.id, {}),
+                    diagnose_unknown=True,
+                )
                 if not model:
                     continue
                 metrics = _metrics_dict(model_value)
@@ -1186,7 +1291,7 @@ class LiteLLMClient:
                 row["spend"] += _as_number(_first(metrics, "spend", "total_spend"))
             if grouped:
                 return list(grouped.values())
-        return [self._row_from_daily_activity_item(item, source)]
+        return [self._row_from_daily_activity_item(item, source, backend=backend)]
 
     async def _usage_from_daily_activity(
         self,
@@ -1201,6 +1306,7 @@ class LiteLLMClient:
         if _source_filter_applies(source):
             return []
         backend = backend or self.backends[0]
+        await self._ensure_deployment_model_map(backend)
         params = {"user_id": user_id, "start_date": start_date, "end_date": end_date, "page": 1, "page_size": 1000}
         if api_key:
             params["api_key"] = api_key
@@ -1210,7 +1316,7 @@ class LiteLLMClient:
             payload = await self.request_backend(backend, "GET", "/user/daily/activity", params=params)
         rows = []
         for item in _records(payload):
-            rows.extend(self._rows_from_daily_activity_item(item, source_override or "其他"))
+            rows.extend(self._rows_from_daily_activity_item(item, source_override or "其他", backend))
         return rows
 
     async def keys_for_user(self, user_id: str, backend: LiteLLMBackend | None = None, refresh: bool = False) -> list[dict[str, Any]]:
@@ -3086,7 +3192,9 @@ class LiteLLMClient:
         return _clean_text(value).casefold()
 
     @staticmethod
-    def _model_usage_from_activity(payload: Any) -> dict[str, int]:
+    def _model_usage_from_activity(
+        payload: Any, deployment_map: dict[str, str] | None = None
+    ) -> dict[str, int]:
         usage: dict[str, int] = defaultdict(int)
         for item in _records(payload):
             breakdown = item.get("breakdown") if isinstance(item.get("breakdown"), dict) else {}
@@ -3094,7 +3202,13 @@ class LiteLLMClient:
             models = breakdown.get("models") if isinstance(breakdown.get("models"), dict) else {}
             buckets = models or model_groups
             for model_name, value in buckets.items():
-                normalized_name = LiteLLMClient._normalized_model_name(model_name)
+                normalized_name = LiteLLMClient._normalized_model_name(
+                    resolve_canonical_model_name(
+                        model_name,
+                        deployment_map=deployment_map,
+                        diagnose_unknown=True,
+                    )
+                )
                 if not normalized_name or not isinstance(value, dict):
                     continue
                 metrics = value.get("metrics") if isinstance(value.get("metrics"), dict) else value
@@ -3106,13 +3220,14 @@ class LiteLLMClient:
         if model_usage_cache is None:
             model_usage_cache = TTLCache()
             self._model_usage_cache = model_usage_cache
-        cache_key = f"model-usage:{start_date}:{end_date}:tz{usage_timezone_offset_minutes()}"
+        cache_key = f"model-usage:v2:{start_date}:{end_date}:tz{usage_timezone_offset_minutes()}"
         hit, value, _ = model_usage_cache.get(cache_key)
         if hit:
             return value
 
         async def load_backend(backend: LiteLLMBackend) -> dict[str, int] | None:
             try:
+                deployment_map = await self._ensure_deployment_model_map(backend)
                 payload = await self.request_backend(
                     backend,
                     "GET",
@@ -3124,11 +3239,11 @@ class LiteLLMClient:
                     },
                 )
                 if isinstance(payload, list):
-                    return self._model_usage_from_activity(payload)
+                    return self._model_usage_from_activity(payload, deployment_map)
                 if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
                     logger.warning("model usage query returned an invalid response for backend %s", backend.id)
                     return None
-                return self._model_usage_from_activity(payload)
+                return self._model_usage_from_activity(payload, deployment_map)
             except HTTPException as exc:
                 logger.warning("model usage query failed for backend %s: HTTP %s", backend.id, exc.status_code)
                 return None
@@ -3172,11 +3287,12 @@ class LiteLLMClient:
         部署填了 `max_input_tokens`。若跟着「输入价最高」的那一份取，恰好那份
         没填时 1M 窗口会显示成「未标注」，所以按模型名单独取非零最大值。
         """
-        hit, value, _ = self._model_cache.get("model_pricing")
+        hit, value, _ = self._model_cache.get("model_pricing:v2")
         if hit:
             return value
 
         pricing: dict[str, dict[str, Any]] = {}
+        deployment_input_prices: dict[str, float] = {}
         context_windows: dict[str, int] = {}
         successful_backends = 0
         for backend in self.backends:
@@ -3188,11 +3304,21 @@ class LiteLLMClient:
                 logger.warning("model pricing query failed for backend %s", backend.id)
                 continue
             successful_backends += 1
+            deployment_map: dict[str, str] = {}
             for item in _records(payload):
-                normalized_name = self._normalized_model_name(_first(item, "model_name", "model", "id"))
+                info = item.get("model_info") if isinstance(item.get("model_info"), dict) else {}
+                params = item.get("litellm_params") if isinstance(item.get("litellm_params"), dict) else {}
+                deployment_id = _clean_text(info.get("id") or item.get("model_info_id"))
+                actual_model = _clean_text(params.get("model"))
+                if deployment_id and actual_model:
+                    deployment_map[deployment_id.casefold()] = actual_model
+                canonical_name = resolve_canonical_model_name(
+                    actual_model or _first(item, "model_name", "model", "id"),
+                    deployment_map=deployment_map,
+                )
+                normalized_name = self._normalized_model_name(canonical_name)
                 if not normalized_name:
                     continue
-                info = item.get("model_info") if isinstance(item.get("model_info"), dict) else {}
                 # 窗口要在价格过滤之前收集：没配价的透传部署常常反而填了窗口。
                 max_input_tokens = _as_int(info.get("max_input_tokens"))
                 if max_input_tokens > context_windows.get(normalized_name, 0):
@@ -3201,6 +3327,13 @@ class LiteLLMClient:
                 output_price = self._price_per_million(info.get("output_cost_per_token"))
                 if input_price is None and output_price is None:
                     continue
+                raw_names = {
+                    self._normalized_model_name(_first(item, "model_name", "model", "id")),
+                    self._normalized_model_name(deployment_id),
+                }
+                for raw_name in raw_names:
+                    if raw_name:
+                        deployment_input_prices[raw_name] = input_price or 0
                 current = pricing.get(normalized_name)
                 if current is not None and (current.get("inputPricePerMillion") or 0) >= (input_price or 0):
                     continue
@@ -3215,13 +3348,23 @@ class LiteLLMClient:
                     "supportsFunctionCalling": bool(info.get("supports_function_calling")),
                     "isEmbedding": _clean_text(info.get("mode")) == "embedding",
                 }
+            if not hasattr(self, "_deployment_model_maps"):
+                self._deployment_model_maps = {}
+            self._deployment_model_maps[backend.id] = deployment_map
+            self._model_cache.set(
+                f"deployment-model-map:v1:{backend.id}",
+                deployment_map,
+                _env_int("MODEL_CACHE_TTL_SECONDS", 1800),
+            )
+
+        self._deployment_input_prices = deployment_input_prices
 
         for normalized_name, entry in pricing.items():
             window = context_windows.get(normalized_name, 0)
             entry["contextWindow"] = window if window > 0 else None
 
         if successful_backends:
-            self._model_cache.set("model_pricing", pricing, _env_int("MODEL_CACHE_TTL_SECONDS", 1800))
+            self._model_cache.set("model_pricing:v2", pricing, _env_int("MODEL_CACHE_TTL_SECONDS", 1800))
         return pricing
 
     @staticmethod
@@ -3238,7 +3381,7 @@ class LiteLLMClient:
         return capabilities or ["通用"]
 
     async def models(self, usage_counts: dict[str, int] | None = None) -> list[dict[str, Any]]:
-        hit, value, _ = self._model_cache.get("models")
+        hit, value, _ = self._model_cache.get("models:v2")
         if hit:
             models = value
         else:
@@ -3274,9 +3417,10 @@ class LiteLLMClient:
                             "contextWindow": str(_first(item, "max_input_tokens", "context_window", "contextWindow", default="未标注")),
                             "status": "可用",
                             "recommendedFor": str(_first(item, "recommended_for", default="按任务需求复制模型名称后使用")),
+                            "_backendId": backend.id,
                         }
                     )
-            self._model_cache.set("models", models, _env_int("MODEL_CACHE_TTL_SECONDS", 1800))
+            self._model_cache.set("models:v2", models, _env_int("MODEL_CACHE_TTL_SECONDS", 1800))
 
         catalog = await self._priced_catalog(models)
 
@@ -3286,14 +3430,11 @@ class LiteLLMClient:
         # The production route supplies database counts. Keep the upstream call as
         # a compatibility fallback for local deployments without the snapshot DB.
         usage = usage_counts if usage_counts is not None else await self.model_usage_counts(start_date, end_date)
-        # 用量按上游原始名统计，而目录已按展示名合并了多条线路部署，所以热度要把
-        # 同一展示名下所有别名的调用量加起来，否则合并后的卡片会被低估排到后面。
         usage_by_display: dict[str, int] = defaultdict(int)
-        for model in models:
-            model_name = _clean_text(model.get("modelName"))
-            display_key = self._normalized_model_name(model_display_name(model_name))
+        for model_name, request_count in usage.items():
+            display_key = self._normalized_model_name(resolve_canonical_model_name(model_name))
             if display_key:
-                usage_by_display[display_key] += usage.get(self._normalized_model_name(model_name), 0)
+                usage_by_display[display_key] += request_count
         return sorted(
             catalog,
             key=lambda item: (
@@ -3323,7 +3464,11 @@ class LiteLLMClient:
         grouped: dict[str, dict[str, Any]] = {}
         for model in models:
             model_name = _clean_text(model.get("modelName"))
-            display_name = model_display_name(model_name)
+            backend_id = _clean_text(model.get("_backendId"))
+            display_name = resolve_canonical_model_name(
+                model_name,
+                deployment_map=getattr(self, "_deployment_model_maps", {}).get(backend_id, {}),
+            )
             if not display_name:
                 continue
             family_key, family_label = model_family(model_name)
@@ -3333,8 +3478,11 @@ class LiteLLMClient:
                 "displayName": display_name,
                 "familyKey": family_key,
                 "familyLabel": family_label,
+                "_selectionInputPrice": getattr(self, "_deployment_input_prices", {}).get(
+                    self._normalized_model_name(model_name), 0
+                ),
             }
-            price = pricing.get(self._normalized_model_name(model_name))
+            price = pricing.get(self._normalized_model_name(display_name))
             if price is None and pricing:
                 continue
             if price is not None:
@@ -3354,11 +3502,17 @@ class LiteLLMClient:
                 entry["contextWindow"] = str(window)
             if key not in grouped or self._prefer_catalog_entry(entry, grouped[key]):
                 grouped[key] = entry
-        return list(grouped.values())
+        return [
+            {
+                key: value
+                for key, value in entry.items()
+                if key not in {"_selectionInputPrice", "_backendId"}
+            }
+            for entry in grouped.values()
+        ]
 
-    @classmethod
     def _context_windows_by_display_name(
-        cls, models: list[dict[str, Any]], pricing: dict[str, dict[str, Any]]
+        self, models: list[dict[str, Any]], pricing: dict[str, dict[str, Any]]
     ) -> dict[str, int]:
         """按展示名汇总上下文窗口，取同组各线路部署里的非零最大值。
 
@@ -3374,11 +3528,17 @@ class LiteLLMClient:
 
         for model in models:
             model_name = _clean_text(model.get("modelName"))
-            display_key = cls._normalized_model_name(model_display_name(model_name))
+            backend_id = _clean_text(model.get("_backendId"))
+            display_key = self._normalized_model_name(
+                resolve_canonical_model_name(
+                    model_name,
+                    deployment_map=getattr(self, "_deployment_model_maps", {}).get(backend_id, {}),
+                )
+            )
             if not display_key:
                 continue
             record(display_key, model.get("contextWindow"))
-            price = pricing.get(cls._normalized_model_name(model_name))
+            price = pricing.get(display_key)
             if price:
                 record(display_key, price.get("contextWindow"))
         return windows
@@ -3389,7 +3549,7 @@ class LiteLLMClient:
 
         def rank(entry: dict[str, Any]) -> tuple[int, float]:
             is_canonical = LiteLLMClient._normalized_model_name(entry.get("modelName")) == LiteLLMClient._normalized_model_name(entry.get("displayName"))
-            return (1 if is_canonical else 0, _as_number(entry.get("inputPricePerMillion")))
+            return (1 if is_canonical else 0, _as_number(entry.get("_selectionInputPrice")))
 
         return rank(candidate) > rank(current)
 

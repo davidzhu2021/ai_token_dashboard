@@ -5,7 +5,13 @@ from typing import Any
 import pytest
 from fastapi import HTTPException
 
-from backend.litellm_client import LiteLLMBackend, LiteLLMClient, normalize_model_display_name
+from backend.litellm_client import (
+    LiteLLMBackend,
+    LiteLLMClient,
+    normalize_model_display_name,
+    resolve_canonical_model_name,
+)
+import backend.litellm_client as litellm_client_module
 from backend.cache import TTLCache
 
 
@@ -170,8 +176,8 @@ def test_usage_from_logs_prefers_actual_model_id_and_falls_back_in_order() -> No
     rows = asyncio.run(client._usage_from_logs("user-1", "2026-07-01", "2026-07-01", "all"))
 
     assert [(row["model"], row["totalTokens"]) for row in rows] == [
-        ("claude-sonnet-4-deploy", 15),
         ("fallback-group", 2),
+        ("gpt-4o", 15),
         ("provider-model", 5),
     ]
 
@@ -497,7 +503,7 @@ def test_models_keep_catalog_when_one_usage_source_fails(monkeypatch: pytest.Mon
     [
         ("chatgpt-acct-84-gpt-5.6-terra", "gpt-5.6-terra"),
         ("claude-acct-2-sonnet-x", "sonnet-x"),
-        ("ChatGPT-Acct-12-GPT-5.6", "GPT-5.6"),
+        ("ChatGPT-Acct-12-GPT-5.6", "gpt-5.6"),
         ("  chatgpt-acct-84-gpt-5.6-terra  ", "gpt-5.6-terra"),
         ("openrouter/anthropic/claude-opus-5", "claude-opus-5"),
         ("wangsu-direct5/claude-haiku-4-5", "claude-haiku-4-5"),
@@ -512,6 +518,142 @@ def test_models_keep_catalog_when_one_usage_source_fails(monkeypatch: pytest.Mon
 )
 def test_normalize_model_display_name_strips_account_alias_prefixes(raw: Any, expected: str) -> None:
     assert normalize_model_display_name(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("chatgpt-gpt-5.6-sol", "gpt-5.6-sol"),
+        ("openai/chatgpt-gpt-5.6-sol", "gpt-5.6-sol"),
+        ("chatgpt-acct-91-chatgpt-gpt-5.6-sol", "gpt-5.6-sol"),
+        ("zk-100-gpt-5.6-terra", "gpt-5.6-terra"),
+        ("route/provider/openai/chatgpt-gpt-5.6-luna", "gpt-5.6-luna"),
+        ("chatgpt-acct-91-chatgpt-acct-92-chatgpt-gpt-5.6-sol", "gpt-5.6-sol"),
+        ("GPT-5.6-SOL", "gpt-5.6-sol"),
+    ],
+)
+def test_canonical_model_resolver_handles_known_alias_grammar(raw: str, expected: str) -> None:
+    assert normalize_model_display_name(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "qwen3.7-max",
+        "model-primary-edition",
+        "edition-bridge-tail",
+        "unknown-edition-tail",
+        "customer/private-model-primary-edition",
+    ],
+)
+def test_canonical_model_resolver_does_not_guess_by_suffix(model: str) -> None:
+    assert normalize_model_display_name(model) == model
+
+
+def test_canonical_model_resolver_logs_unknown_name_once(caplog: pytest.LogCaptureFixture) -> None:
+    model = "customer/private-model-primary-edition"
+    litellm_client_module._UNKNOWN_MODEL_NAMES_LOGGED.discard(model.casefold())
+
+    with caplog.at_level("INFO", logger="ai-token-dashboard.litellm"):
+        assert resolve_canonical_model_name(model, diagnose_unknown=True) == model
+        assert resolve_canonical_model_name(model, diagnose_unknown=True) == model
+
+    messages = [record.message for record in caplog.records if "unrecognized model name" in record.message]
+    assert messages == [f"unrecognized model name kept unchanged: {model}"]
+
+
+def test_model_directory_mapping_wins_over_deployment_id_guess() -> None:
+    client = make_client()
+    backend = client.backends[0]
+    client._deployment_model_maps = {}
+    client._deployment_model_maps[backend.id] = {
+        "chatgpt-acct-91-gpt-5.6-sol": "openai/gpt-5.6-luna"
+    }
+
+    assert client._usage_model_name(
+        {
+            "model_id": "chatgpt-acct-91-gpt-5.6-sol",
+            "litellm_model_name": "gpt-5.6-terra",
+            "model_group": "gpt-5.6-sol",
+        },
+        backend=backend,
+    ) == "gpt-5.6-luna"
+
+
+def test_daily_model_usage_uses_directory_mapping_and_merges_case_aliases() -> None:
+    payload = {
+        "results": [
+            _daily_item(
+                "2026-08-03",
+                models={
+                    "chatgpt-acct-91-gpt-5.6-sol": 3,
+                    "OPENAI/GPT-5.6-LUNA": 2,
+                },
+            )
+        ]
+    }
+
+    counts = LiteLLMClient._model_usage_from_activity(
+        payload,
+        {"chatgpt-acct-91-gpt-5.6-sol": "openai/gpt-5.6-luna"},
+    )
+
+    assert counts == {"gpt-5.6-luna": 5}
+
+
+def test_model_directory_map_uses_model_info_id_and_litellm_params_model() -> None:
+    client = make_client()
+    backend = client.backends[0]
+    client._deployment_model_maps = {}
+
+    async def fake_request_backend(_backend, _method, path, **_kwargs):
+        assert path == "/model/info"
+        return {
+            "data": [
+                {
+                    "model_name": "router-group",
+                    "model_info": {"id": "chatgpt-acct-91-gpt-5.6-sol"},
+                    "litellm_params": {"model": "openai/gpt-5.6-sol"},
+                }
+            ]
+        }
+
+    client.request_backend = fake_request_backend  # type: ignore[assignment]
+
+    mapping = asyncio.run(client._deployment_model_map(backend))
+
+    assert mapping == {"chatgpt-acct-91-gpt-5.6-sol": "openai/gpt-5.6-sol"}
+
+
+def test_model_directory_unavailable_keeps_conservative_fallback() -> None:
+    client = make_client()
+    backend = client.backends[0]
+
+    async def fail_request_backend(*_args, **_kwargs):
+        raise HTTPException(status_code=503, detail="unavailable")
+
+    client.request_backend = fail_request_backend  # type: ignore[assignment]
+
+    assert asyncio.run(client._ensure_deployment_model_map(backend)) == {}
+    assert client._usage_model_name({"model_id": "zk-100-gpt-5.6-terra"}, backend=backend) == "gpt-5.6-terra"
+
+
+def test_usage_model_selection_prefers_actual_name_then_deployment_then_group() -> None:
+    client = make_client()
+    backend = client.backends[0]
+
+    assert client._usage_model_name(
+        {"model_id": "opaque-id", "litellm_model_name": "openai/gpt-5.6-luna", "model_group": "gpt-5.6-sol"},
+        backend=backend,
+    ) == "gpt-5.6-luna"
+    assert client._usage_model_name(
+        {"model_id": "zk-100-gpt-5.6-terra", "model_group": "gpt-5.6-sol"},
+        backend=backend,
+    ) == "gpt-5.6-terra"
+    assert client._usage_model_name({"model_group": "gpt-5.6-sol"}, backend=backend) == "gpt-5.6-sol"
 
 
 def test_usage_from_logs_merges_account_alias_models() -> None:

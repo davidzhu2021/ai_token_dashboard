@@ -273,6 +273,42 @@ def test_merge_rows_by_sums_duplicate_normalized_models() -> None:
     assert by_model["claude-opus-4-8"]["totalTokens"] == 4
 
 
+def test_canonical_usage_rows_merge_historical_aliases_and_all_metrics() -> None:
+    rows = [
+        {
+            "date": "2026-08-03", "source": "Codex", "model": "gpt-5.6-sol",
+            "promptTokens": 2, "completionTokens": 3, "totalTokens": 5,
+            "requestCount": 1, "successCount": 1, "failureCount": 0, "spend": 0.1,
+        },
+        {
+            "date": "2026-08-03", "source": "Codex", "model": "openai/chatgpt-gpt-5.6-sol",
+            "promptTokens": 7, "completionTokens": 11, "totalTokens": 18,
+            "requestCount": 2, "successCount": 1, "failureCount": 1, "spend": 0.3,
+        },
+    ]
+
+    result = UsageStore._canonical_usage_rows(rows, ("date", "source", "model"))
+
+    assert len(result) == 1
+    assert result[0]["model"] == "gpt-5.6-sol"
+    assert result[0]["promptTokens"] == 9
+    assert result[0]["completionTokens"] == 14
+    assert result[0]["totalTokens"] == 23
+    assert result[0]["requestCount"] == 3
+    assert result[0]["successCount"] == 2
+    assert result[0]["failureCount"] == 1
+    assert result[0]["spend"] == pytest.approx(0.4)
+
+
+def test_usage_queries_group_raw_model_names_before_python_canonicalization() -> None:
+    import inspect
+
+    source = inspect.getsource(UsageStore._query_aggregated_rows)
+
+    assert 'model_sql = "u.model"' in source
+    assert "regexp_replace" not in source
+
+
 def test_usage_sync_date_range_uses_inclusive_days() -> None:
     start, end = UsageSynchronizer.date_range(3, date(2026, 7, 22))
     assert start == "2026-07-20"
@@ -289,6 +325,42 @@ def test_usage_store_environment_requires_both_enable_flag_and_dsn(monkeypatch) 
     monkeypatch.setenv("USAGE_SYNC_ENABLED", "true")
     monkeypatch.delenv("USAGE_DATABASE_URL", raising=False)
     assert UsageStore.from_environment() is None
+
+
+def test_usage_sync_cli_returns_nonzero_for_partial_result(monkeypatch, capsys) -> None:
+    from backend import usage_sync
+
+    class Store:
+        async def connect(self):
+            return None
+
+        async def close(self):
+            return None
+
+    class Client:
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(usage_sync.UsageStore, "from_environment", lambda: Store())
+    monkeypatch.setattr(usage_sync, "LiteLLMClient", Client)
+
+    class Synchronizer:
+        def __init__(self, _client, _store):
+            pass
+
+        @staticmethod
+        def date_range(days):
+            assert days == 90
+            return "2026-05-06", "2026-08-03"
+
+        async def sync(self, start_date, end_date):
+            assert (start_date, end_date) == ("2026-05-06", "2026-08-03")
+            return {"status": "partial", "rowCount": 3, "backendCount": 1}
+
+    monkeypatch.setattr(usage_sync, "UsageSynchronizer", Synchronizer)
+
+    assert asyncio.run(usage_sync._run_cli(90)) == 1
+    assert '"status": "partial"' in capsys.readouterr().out
 
 
 def test_usage_store_date_values_are_asyncpg_compatible() -> None:
