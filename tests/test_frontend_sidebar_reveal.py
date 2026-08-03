@@ -104,7 +104,7 @@ def test_billing_visibility_comes_from_the_scope_response() -> None:
     assert "if (scope?.billingAvailable !== undefined) {" in source
     assert "billingAvailable = Boolean(scope.billingAvailable);" in source
     # 老后端没有该字段时退回按需探测，混合版本部署期间入口不会凭空消失。
-    assert 'if (scope?.billingAvailable === undefined && !isMockCustomerIdentity()) {' in source
+    assert 'if (scope?.billingAvailable === undefined && !isOrganizationCustomerIdentity()) {' in source
 
     # 引导路径上不再串行等待个人充值账本。
     assert "const billingPromise = refreshBillingAvailability();" not in source

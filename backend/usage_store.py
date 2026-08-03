@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 from collections import defaultdict
 from datetime import date, datetime, timezone
@@ -19,6 +20,12 @@ CREATE TABLE IF NOT EXISTS usage_daily (
     backend_id TEXT NOT NULL,
     usage_date DATE NOT NULL,
     user_id TEXT NOT NULL,
+    organization_id TEXT NOT NULL DEFAULT '',
+    team_id TEXT NOT NULL DEFAULT '',
+    key_id TEXT NOT NULL DEFAULT '',
+    principal_id TEXT NOT NULL DEFAULT '',
+    attribution_source TEXT NOT NULL DEFAULT 'unattributed',
+    billing_eligible BOOLEAN NOT NULL DEFAULT FALSE,
     employee_email TEXT NOT NULL DEFAULT '',
     employee_name TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL,
@@ -31,7 +38,11 @@ CREATE TABLE IF NOT EXISTS usage_daily (
     failure_count BIGINT NOT NULL DEFAULT 0,
     spend DOUBLE PRECISION NOT NULL DEFAULT 0,
     collected_at TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (backend_id, usage_date, user_id, source, model)
+    PRIMARY KEY (
+        backend_id, usage_date, user_id, source, model,
+        organization_id, team_id, key_id, principal_id, attribution_source,
+        billing_eligible
+    )
 );
 
 CREATE INDEX IF NOT EXISTS usage_daily_employee_date_idx
@@ -40,8 +51,33 @@ CREATE INDEX IF NOT EXISTS usage_daily_date_idx
     ON usage_daily (usage_date);
 CREATE INDEX IF NOT EXISTS usage_daily_date_backend_user_idx
     ON usage_daily (usage_date, backend_id, user_id);
+CREATE INDEX IF NOT EXISTS usage_daily_org_date_idx
+    ON usage_daily (organization_id, usage_date, backend_id);
+CREATE INDEX IF NOT EXISTS usage_daily_team_date_idx
+    ON usage_daily (team_id, usage_date, backend_id);
+CREATE INDEX IF NOT EXISTS usage_daily_key_date_idx
+    ON usage_daily (key_id, usage_date, backend_id);
 CREATE INDEX IF NOT EXISTS usage_daily_date_source_model_idx
     ON usage_daily (usage_date, source, model);
+
+-- Keep deployments created before organization mode compatible with the
+-- richer attribution snapshot. Existing aggregate rows remain queryable with
+-- empty attribution fields until the next sync fills them.
+ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS organization_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS team_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS key_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS principal_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS attribution_source TEXT NOT NULL DEFAULT 'unattributed';
+ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS billing_eligible BOOLEAN NOT NULL DEFAULT FALSE;
+-- Older deployments keyed aggregates only by user/source/model, which makes
+-- two enterprise tokens overwrite one another. Rebuild the key so event-time
+-- attribution remains stable across team moves and key rotation.
+ALTER TABLE usage_daily DROP CONSTRAINT IF EXISTS usage_daily_pkey;
+ALTER TABLE usage_daily ADD CONSTRAINT usage_daily_pkey PRIMARY KEY (
+    backend_id, usage_date, user_id, source, model,
+    organization_id, team_id, key_id, principal_id, attribution_source,
+    billing_eligible
+);
 
 CREATE TABLE IF NOT EXISTS usage_sync_coverage (
     backend_id TEXT NOT NULL,
@@ -85,11 +121,121 @@ CREATE TABLE IF NOT EXISTS usage_sync_runs (
 
 CREATE INDEX IF NOT EXISTS usage_sync_runs_dates_idx
     ON usage_sync_runs (start_date, end_date, status, finished_at DESC);
+
+-- Non-content request metadata used for historical attribution and intraday
+-- billing cutoffs. Prompts, responses, and plaintext credentials are omitted.
+CREATE TABLE IF NOT EXISTS usage_event_attribution (
+    backend_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    event_time TIMESTAMPTZ NOT NULL,
+    usage_date DATE NOT NULL,
+    raw_user_id TEXT NOT NULL DEFAULT '',
+    organization_id TEXT NOT NULL DEFAULT '',
+    team_id TEXT NOT NULL DEFAULT '',
+    key_id TEXT NOT NULL DEFAULT '',
+    principal_id TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    prompt_tokens BIGINT NOT NULL DEFAULT 0,
+    completion_tokens BIGINT NOT NULL DEFAULT 0,
+    total_tokens BIGINT NOT NULL DEFAULT 0,
+    request_count BIGINT NOT NULL DEFAULT 0,
+    success_count BIGINT NOT NULL DEFAULT 0,
+    failure_count BIGINT NOT NULL DEFAULT 0,
+    spend NUMERIC(16,6) NOT NULL DEFAULT 0,
+    attribution_source TEXT NOT NULL DEFAULT 'unattributed',
+    billing_eligible BOOLEAN NOT NULL DEFAULT FALSE,
+    collected_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (backend_id, request_id)
+);
+ALTER TABLE usage_event_attribution ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS usage_event_attribution_org_time_idx
+    ON usage_event_attribution (organization_id, event_time)
+    WHERE organization_id <> '';
+CREATE INDEX IF NOT EXISTS usage_event_attribution_key_time_idx
+    ON usage_event_attribution (key_id, event_time)
+    WHERE key_id <> '';
 """
 
 
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _record_value(record: Any, key: str, default: Any = None) -> Any:
+    try:
+        return record[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def _first_nonempty(row: dict[str, Any], *keys: str) -> str:
+    """Return the first explicit attribution value present in a usage row."""
+
+    for key in keys:
+        value = _clean_text(row.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _usage_attribution(row: dict[str, Any]) -> tuple[str, str, str, str, str, bool]:
+    """Resolve org/team/key attribution without inferring from email.
+
+    Rows produced from request logs carry the explicit fields first.  The
+    token/user mapping fallbacks are accepted only when callers provide them
+    explicitly (for example ``tokenOrganizationId`` or ``userOrganizationId``).
+    """
+
+    organization_id = _first_nonempty(
+        row,
+        "organizationId",
+        "organization_id",
+        "orgId",
+        "org_id",
+        "tokenOrganizationId",
+        "token_organization_id",
+        "userOrganizationId",
+        "user_organization_id",
+    )
+    team_id = _first_nonempty(
+        row,
+        "teamId",
+        "team_id",
+        "tokenTeamId",
+        "token_team_id",
+        "userTeamId",
+        "user_team_id",
+    )
+    key_id = _first_nonempty(
+        row,
+        "keyId",
+        "key_id",
+        "tokenKeyId",
+        "token_key_id",
+    )
+    principal_id = _first_nonempty(row, "principalId", "principal_id")
+    attribution_source = _first_nonempty(
+        row, "attributionSource", "attribution_source"
+    )
+    if not attribution_source:
+        attribution_source = "explicit" if organization_id else "unattributed"
+    billing_eligible = row.get("billingEligible", row.get("billing_eligible"))
+    if billing_eligible is None:
+        # Existing explicit and managed-token attribution remains billable.
+        billing_eligible = bool(organization_id) and attribution_source not in {
+            "legacy_report_only",
+            "tenant_mapping_conflict",
+            "unattributed",
+        }
+    return (
+        organization_id,
+        team_id,
+        key_id,
+        principal_id,
+        attribution_source,
+        bool(billing_eligible),
+    )
 
 
 def _as_int(value: Any) -> int:
@@ -371,6 +517,14 @@ class UsageStore:
     @staticmethod
     def _usage_record(backend_id: str, row: dict[str, Any], collected_at: datetime) -> tuple[Any, ...]:
         user_id = _clean_text(row.get("_userId") or row.get("userId")) or "unknown"
+        (
+            organization_id,
+            team_id,
+            key_id,
+            principal_id,
+            attribution_source,
+            billing_eligible,
+        ) = _usage_attribution(row)
         return (
             backend_id,
             _as_date(row.get("date")),
@@ -387,18 +541,38 @@ class UsageStore:
             _as_int(row.get("failureCount")),
             _as_float(row.get("spend")),
             collected_at,
+            organization_id,
+            team_id,
+            key_id,
+            principal_id,
+            attribution_source,
+            billing_eligible,
         )
 
     @staticmethod
     def _coalesce_usage_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        grouped: dict[tuple[str, ...], dict[str, Any]] = {}
         for row in rows:
             model = normalize_model_display_name(row.get("model")) or "未知模型"
+            (
+                organization_id,
+                team_id,
+                key_id,
+                principal_id,
+                attribution_source,
+                billing_eligible,
+            ) = _usage_attribution(row)
             key = (
                 _clean_text(row.get("date")),
                 _clean_text(row.get("_userId") or row.get("userId")) or "unknown",
                 _clean_text(row.get("source")) or "其他",
                 model,
+                organization_id,
+                team_id,
+                key_id,
+                principal_id,
+                attribution_source,
+                str(billing_eligible),
             )
             current = grouped.get(key)
             if current is None:
@@ -411,6 +585,16 @@ class UsageStore:
                 current["employeeEmail"] = row["employeeEmail"]
             if not current.get("employeeName") and row.get("employeeName"):
                 current["employeeName"] = row["employeeName"]
+            for field, value in (
+                ("organizationId", organization_id),
+                ("teamId", team_id),
+                ("keyId", key_id),
+                ("principalId", principal_id),
+                ("attributionSource", attribution_source),
+                ("billingEligible", billing_eligible),
+            ):
+                if value and not _clean_text(current.get(field)):
+                    current[field] = value
         return list(grouped.values())
 
     @staticmethod
@@ -426,6 +610,71 @@ class UsageStore:
             _clean_text(row.get("teamRole")) or "user",
         )
 
+    @staticmethod
+    def _event_record(
+        backend_id: str, row: dict[str, Any], collected_at: datetime
+    ) -> tuple[Any, ...] | None:
+        event_time_text = _clean_text(
+            row.get("eventTime") or row.get("event_time")
+        )
+        if not event_time_text:
+            return None
+        try:
+            event_time = datetime.fromisoformat(
+                event_time_text.replace("Z", "+00:00")
+            )
+        except ValueError:
+            return None
+        if event_time.tzinfo is None:
+            event_time = event_time.replace(tzinfo=timezone.utc)
+        event_time = event_time.astimezone(timezone.utc)
+        (
+            organization_id,
+            team_id,
+            key_id,
+            principal_id,
+            attribution_source,
+            billing_eligible,
+        ) = _usage_attribution(row)
+        raw_user_id = _clean_text(row.get("_userId") or row.get("userId"))
+        request_id = _clean_text(row.get("requestId") or row.get("request_id"))
+        if not request_id:
+            request_id = hashlib.sha256(
+                "\x1f".join(
+                    (
+                        event_time.isoformat(),
+                        raw_user_id,
+                        key_id,
+                        _clean_text(row.get("model")),
+                        str(_as_float(row.get("spend"))),
+                        str(_as_int(row.get("totalTokens"))),
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+        return (
+            backend_id,
+            request_id[:256],
+            event_time,
+            _as_date(row.get("date") or event_time.date()),
+            raw_user_id[:256],
+            organization_id[:256],
+            team_id[:256],
+            key_id[:256],
+            principal_id[:256],
+            _clean_text(row.get("source"))[:120],
+            (normalize_model_display_name(row.get("model")) or "未知模型")[:256],
+            _as_int(row.get("promptTokens")),
+            _as_int(row.get("completionTokens")),
+            _as_int(row.get("totalTokens")),
+            _as_int(row.get("requestCount")),
+            _as_int(row.get("successCount")),
+            _as_int(row.get("failureCount")),
+            str(_as_float(row.get("spend"))),
+            attribution_source[:64],
+            billing_eligible,
+            collected_at,
+        )
+
     async def replace_backend_snapshot(
         self,
         backend_id: str,
@@ -433,6 +682,8 @@ class UsageStore:
         end_date: str,
         rows: list[dict[str, Any]],
         memberships: list[dict[str, Any]],
+        *,
+        events: list[dict[str, Any]] | None = None,
     ) -> int:
         pool = self._require_pool()
         collected_at = datetime.now(timezone.utc)
@@ -442,6 +693,11 @@ class UsageStore:
             if row.get("date")
         ]
         membership_records = [self._membership_record(backend_id, row) for row in memberships if row.get("snapshotDate") and row.get("teamId")]
+        event_records = [
+            record
+            for row in (events or [])
+            if (record := self._event_record(backend_id, row, collected_at))
+        ]
         async with pool.acquire() as connection:
             async with connection.transaction():
                 await connection.execute(
@@ -462,15 +718,35 @@ class UsageStore:
                     _as_date(start_date),
                     _as_date(end_date),
                 )
+                if events is not None:
+                    await connection.execute(
+                        "DELETE FROM usage_event_attribution WHERE backend_id=$1 "
+                        "AND usage_date BETWEEN $2::date AND $3::date",
+                        backend_id,
+                        _as_date(start_date),
+                        _as_date(end_date),
+                    )
                 if usage_records:
                     await connection.executemany(
                         """
                         INSERT INTO usage_daily (
                             backend_id, usage_date, user_id, employee_email, employee_name,
                             source, model, prompt_tokens, completion_tokens, total_tokens,
-                            request_count, success_count, failure_count, spend, collected_at
-                        ) VALUES ($1, $2::date, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-                        ON CONFLICT (backend_id, usage_date, user_id, source, model) DO UPDATE SET
+                            request_count, success_count, failure_count, spend, collected_at,
+                            organization_id, team_id, key_id, principal_id,
+                            attribution_source, billing_eligible
+                        ) VALUES ($1, $2::date, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+                        ON CONFLICT (
+                            backend_id, usage_date, user_id, source, model,
+                            organization_id, team_id, key_id, principal_id,
+                            attribution_source, billing_eligible
+                        ) DO UPDATE SET
+                            organization_id = EXCLUDED.organization_id,
+                            team_id = EXCLUDED.team_id,
+                            key_id = EXCLUDED.key_id,
+                            principal_id = EXCLUDED.principal_id,
+                            attribution_source = EXCLUDED.attribution_source,
+                            billing_eligible = EXCLUDED.billing_eligible,
                             employee_email = EXCLUDED.employee_email,
                             employee_name = EXCLUDED.employee_name,
                             prompt_tokens = EXCLUDED.prompt_tokens,
@@ -498,6 +774,43 @@ class UsageStore:
                             team_role = EXCLUDED.team_role
                         """,
                         membership_records,
+                    )
+                if event_records:
+                    await connection.executemany(
+                        """
+                        INSERT INTO usage_event_attribution (
+                            backend_id, request_id, event_time, usage_date,
+                            raw_user_id, organization_id, team_id, key_id,
+                            principal_id, source, model, prompt_tokens,
+                            completion_tokens, total_tokens, request_count,
+                            success_count, failure_count, spend,
+                            attribution_source, billing_eligible, collected_at
+                        ) VALUES (
+                            $1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,
+                            $14,$15,$16,$17,$18::numeric,$19,$20,$21
+                        )
+                        ON CONFLICT (backend_id, request_id) DO UPDATE SET
+                            event_time=EXCLUDED.event_time,
+                            usage_date=EXCLUDED.usage_date,
+                            raw_user_id=EXCLUDED.raw_user_id,
+                            organization_id=EXCLUDED.organization_id,
+                            team_id=EXCLUDED.team_id,
+                            key_id=EXCLUDED.key_id,
+                            principal_id=EXCLUDED.principal_id,
+                            source=EXCLUDED.source,
+                            model=EXCLUDED.model,
+                            prompt_tokens=EXCLUDED.prompt_tokens,
+                            completion_tokens=EXCLUDED.completion_tokens,
+                            total_tokens=EXCLUDED.total_tokens,
+                            request_count=EXCLUDED.request_count,
+                            success_count=EXCLUDED.success_count,
+                            failure_count=EXCLUDED.failure_count,
+                            spend=EXCLUDED.spend,
+                            attribution_source=EXCLUDED.attribution_source,
+                            billing_eligible=EXCLUDED.billing_eligible,
+                            collected_at=EXCLUDED.collected_at
+                        """,
+                        event_records,
                     )
                 await connection.execute(
                     """
@@ -540,6 +853,73 @@ class UsageStore:
             _as_date(start_date),
             _as_date(end_date),
         )
+
+    async def organization_daily_spend(
+        self,
+        start_date: str,
+        end_date: str,
+        backend_ids: list[str] | None = None,
+        *,
+        billing_effective_at_by_organization: dict[str, datetime] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return authoritative organization spend grouped by event date.
+
+        Only explicitly attributed rows participate. Unmapped requests remain
+        visible through data-quality metrics and can never be charged to a
+        customer by email or another inferred identity.
+        """
+
+        backend_filter = ""
+        args: list[Any] = [_as_date(start_date), _as_date(end_date)]
+        if backend_ids:
+            backend_filter = " AND backend_id = ANY($3::text[])"
+            args.append(backend_ids)
+        records = await self._require_pool().fetch(
+            f"""
+            SELECT organization_id, usage_date,
+                   ROUND(COALESCE(SUM(spend), 0)::numeric, 6) AS spend
+            FROM usage_daily
+            WHERE usage_date BETWEEN $1::date AND $2::date
+              AND organization_id <> ''
+              AND billing_eligible = TRUE{backend_filter}
+            GROUP BY organization_id, usage_date
+            ORDER BY usage_date, organization_id
+            """,
+            *args,
+        )
+        cutoffs = billing_effective_at_by_organization or {}
+        result: list[dict[str, Any]] = []
+        for record in records:
+            organization_id = str(record["organization_id"])
+            usage_day = record["usage_date"]
+            cutoff = cutoffs.get(organization_id)
+            if cutoff is not None:
+                cutoff_day = cutoff.astimezone(timezone.utc).date()
+                if usage_day < cutoff_day:
+                    continue
+                if usage_day == cutoff_day:
+                    # Daily aggregates cannot prove which requests happened
+                    # before an intraday credit cutoff. Fail closed rather than
+                    # charging pre-credit usage; expose the reason so operations
+                    # can distinguish this from a successful zero-dollar day.
+                    result.append(
+                        {
+                            "upstreamOrganizationId": organization_id,
+                            "usageDate": usage_day.isoformat(),
+                            "spendUsd": str(record["spend"] or 0),
+                            "settlementStatus": "skipped",
+                            "settlementReason": "needs_event_time",
+                        }
+                    )
+                    continue
+            result.append(
+                {
+                    "upstreamOrganizationId": organization_id,
+                    "usageDate": usage_day.isoformat(),
+                    "spendUsd": str(record["spend"] or 0),
+                }
+            )
+        return result
 
     async def has_coverage(self, start_date: str, end_date: str, backend_ids: list[str]) -> bool:
         return bool(await self.covered_backend_ids(start_date, end_date, backend_ids))
@@ -593,6 +973,154 @@ class UsageStore:
             counts[model.casefold()] += _as_int(record["request_count"])
         return dict(counts)
 
+    async def organization_rows(
+        self,
+        organization_id: str,
+        start_date: str,
+        end_date: str,
+        source: str,
+        backend_ids: list[str],
+        *,
+        employee: str = "",
+    ) -> dict[str, Any] | None:
+        """Read a real organization exclusively from persisted attribution."""
+
+        covered = await self.covered_backend_ids(start_date, end_date, backend_ids)
+        if set(covered) != set(backend_ids):
+            return None
+        conditions = [
+            "organization_id=$1",
+            "usage_date BETWEEN $2::date AND $3::date",
+            "backend_id=ANY($4::text[])",
+            "($5='all' OR source=$5)",
+        ]
+        args: list[Any] = [organization_id, _as_date(start_date), _as_date(end_date), covered, source or "all"]
+        normalized_employee = _clean_text(employee).lower()
+        if normalized_employee:
+            args.append(normalized_employee)
+            conditions.append(
+                f"(lower(principal_id)=${len(args)} OR lower(user_id)=${len(args)} "
+                f"OR lower(employee_email)=${len(args)} OR lower(employee_name)=${len(args)})"
+            )
+        where = " AND ".join(conditions)
+        records = await self._require_pool().fetch(
+            f"""
+            SELECT backend_id, usage_date, user_id, principal_id, MAX(employee_email) AS employee_email,
+                   MAX(employee_name) AS employee_name, source, team_id,
+                   model AS model_name,
+                   {self._aggregate_metrics_sql()}
+            FROM usage_daily
+            WHERE {where}
+            GROUP BY backend_id, usage_date, user_id, principal_id, source, team_id, model
+            ORDER BY usage_date, MAX(employee_name), source, model_name
+            """,
+            *args,
+        )
+        rows = [self._aggregated_usage_row(record) for record in records]
+        for row, record in zip(rows, records):
+            principal_id = _clean_text(record["principal_id"])
+            row.update(
+                {
+                    "employeeId": principal_id or record["user_id"],
+                    "employeeEmail": record["employee_email"] or "",
+                    "employeeName": record["employee_name"] or record["user_id"],
+                    "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱",
+                    "principalId": principal_id,
+                    "_userId": record["user_id"],
+                }
+            )
+        department_names: dict[str, str] = {}
+        try:
+            department_records = await self._require_pool().fetch(
+                """
+                SELECT team_id, MAX(team_name) AS team_name
+                FROM usage_team_membership_daily
+                WHERE snapshot_date BETWEEN $1::date AND $2::date
+                  AND backend_id=ANY($3::text[])
+                  AND team_id <> ''
+                GROUP BY team_id
+                """,
+                _as_date(start_date),
+                _as_date(end_date),
+                covered,
+            )
+            department_names = {
+                _clean_text(record["team_id"]): _clean_text(record["team_name"])
+                for record in department_records
+                if _clean_text(record["team_id"])
+            }
+        except Exception:
+            # Team snapshots are supporting display data. The persisted event
+            # team id remains authoritative when a historical label is absent.
+            department_names = {}
+        for row, record in zip(rows, records):
+            team_id = _clean_text(record["team_id"])
+            if team_id:
+                row.update(
+                    {
+                        "departmentId": team_id,
+                        "departmentName": department_names.get(team_id) or team_id,
+                    }
+                )
+        rows = self._canonical_usage_rows(
+            rows,
+            ("_backendId", "date", "_userId", "source", "model", "principalId", "departmentId"),
+        )
+        public_rows = self._public_rows(rows)
+        unattributed_records = await self._require_pool().fetchval(
+            """
+            SELECT COALESCE(SUM(request_count), 0)
+            FROM usage_daily
+            WHERE usage_date BETWEEN $1::date AND $2::date
+              AND backend_id=ANY($3::text[])
+              AND organization_id=''
+            """,
+            _as_date(start_date),
+            _as_date(end_date),
+            covered,
+        )
+        last_synced = await self.latest_sync_at(start_date, end_date, covered)
+        departments: dict[str, dict[str, Any]] = {}
+        for row in public_rows:
+            team_id = _clean_text(row.get("departmentId"))
+            if not team_id:
+                continue
+            item = departments.setdefault(
+                team_id,
+                {
+                    "departmentId": team_id,
+                    "departmentName": row.get("departmentName") or team_id,
+                    "organizationId": organization_id,
+                    "activeEmployees": 0,
+                    **empty_totals(),
+                },
+            )
+            add_totals(item, row)
+        return {
+            "rows": public_rows,
+            "summaryRows": self._group_rows(public_rows, ("date", "source", "model")),
+            "employees": self._employee_summaries(rows),
+            "departments": sorted(
+                departments.values(),
+                key=lambda item: (-item["totalTokens"], str(item["departmentName"]).lower()),
+            ),
+            "pageLimit": 0,
+            "pageSize": 0,
+            "pagesRead": 0,
+            "totalPages": 0,
+            "totalRecords": len(public_rows),
+            "truncated": False,
+            "lastSyncedAt": last_synced,
+            "coverage": {"startDate": start_date, "endDate": end_date, "backends": covered, "complete": True},
+            "dataQuality": {
+                "summarySource": "database",
+                "rankingSource": "database",
+                "organizationScoped": True,
+                "unattributedRequestCount": _as_int(unattributed_records),
+                "attributionPriority": "request_log_then_token_then_upstream_user",
+            },
+        }
+
     async def _fetch_usage(self, start_date: str, end_date: str, backend_ids: list[str] | None = None) -> list[dict[str, Any]]:
         backend_filter = ""
         args: list[Any] = [_as_date(start_date), _as_date(end_date)]
@@ -601,7 +1129,8 @@ class UsageStore:
             args.append(backend_ids)
         records = await self._require_pool().fetch(
             f"""
-            SELECT backend_id, usage_date, user_id, employee_email, employee_name,
+            SELECT backend_id, usage_date, user_id, organization_id, team_id, key_id, principal_id,
+                   employee_email, employee_name,
                    source, model, prompt_tokens, completion_tokens, total_tokens,
                    request_count, success_count, failure_count, spend, collected_at
             FROM usage_daily
@@ -611,7 +1140,10 @@ class UsageStore:
             *args,
         )
         rows = [self._usage_row(record) for record in records]
-        return self._canonical_usage_rows(rows, ("_backendId", "date", "_userId", "source", "model"))
+        return self._canonical_usage_rows(
+            rows,
+            ("_backendId", "date", "_userId", "source", "model", "principalId"),
+        )
 
     @staticmethod
     def _usage_row(record: Any) -> dict[str, Any]:
@@ -628,6 +1160,10 @@ class UsageStore:
             "spend": _as_float(record["spend"]),
             "_backendId": record["backend_id"],
             "_userId": record["user_id"],
+            "organizationId": _record_value(record, "organization_id", "") or "",
+            "teamId": _record_value(record, "team_id", "") or "",
+            "keyId": _record_value(record, "key_id", "") or "",
+            "principalId": _record_value(record, "principal_id", "") or "",
             "employeeEmail": record["employee_email"],
             "employeeName": record["employee_name"],
         }
@@ -720,6 +1256,119 @@ class UsageStore:
         ]
         return {"rows": self._group_rows(rows, ("date", "source", "model")), "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered)}
 
+    async def organization_member_rows(
+        self,
+        organization_id: str,
+        user_id: str,
+        start_date: str,
+        end_date: str,
+        source: str,
+        backend_ids: list[str],
+    ) -> dict[str, Any] | None:
+        """Read one real member using persisted tenant and upstream-user ids."""
+
+        covered = await self.covered_backend_ids(start_date, end_date, backend_ids)
+        if set(covered) != set(backend_ids):
+            return None
+        records = await self._require_pool().fetch(
+            """
+            SELECT usage_date, source, model, prompt_tokens, completion_tokens, total_tokens,
+                   request_count, success_count, failure_count, spend
+            FROM usage_daily
+            WHERE organization_id=$1 AND user_id=$2
+              AND usage_date BETWEEN $3::date AND $4::date
+              AND backend_id=ANY($5::text[])
+              AND ($6='all' OR source=$6)
+            """,
+            organization_id,
+            user_id,
+            _as_date(start_date),
+            _as_date(end_date),
+            covered,
+            source or "all",
+        )
+        rows = [
+            {
+                "date": record["usage_date"].isoformat(),
+                "source": record["source"],
+                "model": normalize_model_display_name(record["model"]) or "未知模型",
+                "promptTokens": _as_int(record["prompt_tokens"]),
+                "completionTokens": _as_int(record["completion_tokens"]),
+                "totalTokens": _as_int(record["total_tokens"]),
+                "requestCount": _as_int(record["request_count"]),
+                "successCount": _as_int(record["success_count"]),
+                "failureCount": _as_int(record["failure_count"]),
+                "spend": _as_float(record["spend"]),
+            }
+            for record in records
+        ]
+        return {
+            "rows": self._group_rows(rows, ("date", "source", "model")),
+            "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered),
+        }
+
+    async def organization_principal_rows(
+        self,
+        organization_id: str,
+        principal_id: str,
+        start_date: str,
+        end_date: str,
+        source: str,
+        backend_ids: list[str],
+    ) -> dict[str, Any] | None:
+        """Aggregate every preserved upstream identity for one local principal."""
+
+        covered = await self.covered_backend_ids(start_date, end_date, backend_ids)
+        if set(covered) != set(backend_ids):
+            return None
+        records = await self._require_pool().fetch(
+            """
+            SELECT usage_date, source, model, prompt_tokens, completion_tokens, total_tokens,
+                   request_count, success_count, failure_count, spend,
+                   ARRAY_AGG(DISTINCT user_id) AS upstream_user_ids
+            FROM usage_daily
+            WHERE organization_id=$1 AND principal_id=$2
+              AND usage_date BETWEEN $3::date AND $4::date
+              AND backend_id=ANY($5::text[])
+              AND ($6='all' OR source=$6)
+            GROUP BY usage_date, source, model
+            ORDER BY usage_date, source, model
+            """,
+            organization_id,
+            principal_id,
+            _as_date(start_date),
+            _as_date(end_date),
+            covered,
+            source or "all",
+        )
+        rows: list[dict[str, Any]] = []
+        upstream_user_ids: set[str] = set()
+        for record in records:
+            upstream_user_ids.update(
+                str(item) for item in (record["upstream_user_ids"] or []) if item
+            )
+            rows.append(
+                {
+                    "date": record["usage_date"].isoformat(),
+                    "source": record["source"],
+                    "model": normalize_model_display_name(record["model"]) or "鏈煡妯″瀷",
+                    "promptTokens": _as_int(record["prompt_tokens"]),
+                    "completionTokens": _as_int(record["completion_tokens"]),
+                    "totalTokens": _as_int(record["total_tokens"]),
+                    "requestCount": _as_int(record["request_count"]),
+                    "successCount": _as_int(record["success_count"]),
+                    "failureCount": _as_int(record["failure_count"]),
+                    "spend": _as_float(record["spend"]),
+                    "principalId": principal_id,
+                }
+            )
+        return {
+            "rows": self._group_rows(rows, ("date", "source", "model", "principalId")),
+            "principalId": principal_id,
+            "upstreamUserIds": sorted(upstream_user_ids),
+            "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered),
+        }
+
     async def rows_by_employee_emails(
         self,
         emails: list[str],
@@ -788,10 +1437,13 @@ class UsageStore:
 
     @staticmethod
     def _aggregated_usage_row(record: Any, include_identity: bool = True) -> dict[str, Any]:
+        raw_model = _record_value(record, "model_name", None)
+        if raw_model is None:
+            raw_model = _record_value(record, "model", "")
         row = {
             "date": record["usage_date"].isoformat(),
             "source": record["source"],
-            "model": normalize_model_display_name(record["model_name"]) or "未知模型",
+            "model": normalize_model_display_name(raw_model) or "未知模型",
             "promptTokens": _as_int(record["prompt_tokens"]),
             "completionTokens": _as_int(record["completion_tokens"]),
             "totalTokens": _as_int(record["total_tokens"]),
@@ -1045,11 +1697,17 @@ class UsageStore:
     def _employee_summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         grouped: dict[str, dict[str, Any]] = {}
         for row in rows:
-            key = _clean_text(row.get("employeeEmail")) or _clean_text(row.get("employeeId"))
+            principal_id = _clean_text(row.get("principalId"))
+            key = (
+                principal_id
+                or _clean_text(row.get("employeeEmail"))
+                or _clean_text(row.get("employeeId"))
+            )
             item = grouped.setdefault(
                 key,
                 {
-                    "employeeId": row.get("employeeId"),
+                    "employeeId": principal_id or row.get("employeeId"),
+                    "principalId": principal_id,
                     "employeeName": row.get("employeeName") or row.get("employeeId"),
                     "employeeEmail": row.get("employeeEmail") or "",
                     "bindStatus": row.get("bindStatus") or "未绑定邮箱",

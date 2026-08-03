@@ -54,6 +54,19 @@ class KeyModelScope:
     unrestricted: bool
 
 
+class UsageLogRows(dict[str, list[dict[str, Any]]]):
+    """Aggregated log rows plus a non-breaking raw-event side channel."""
+
+    def __init__(
+        self,
+        *args: Any,
+        events: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.events = list(events or [])
+
+
 ALL_PROXY_MODELS = "all-proxy-models"
 NO_DEFAULT_MODELS = "no-default-models"
 DEFAULT_PERSONAL_KEY_MAX_BUDGET = 100
@@ -152,10 +165,6 @@ def _clean_text(value: Any) -> str:
     return str(value or "").strip()
 
 
-def normalize_model_display_name(value: Any) -> str:
-    return resolve_canonical_model_name(value)
-
-
 def _normal_email(value: Any) -> str:
     text = _clean_text(value).lower()
     return text if "@" in text else ""
@@ -187,6 +196,25 @@ def _date_text(value: Any) -> str:
     if " " in text:
         return text.split(" ", 1)[0]
     return text[:10]
+
+
+def _datetime_text(value: Any) -> str:
+    """Preserve an upstream expiry timestamp instead of truncating it to a day."""
+
+    if value is None or value == "":
+        return ""
+    if isinstance(value, datetime):
+        normalized = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return normalized.astimezone(timezone.utc).isoformat()
+    text = str(value).strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    normalized = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return normalized.astimezone(timezone.utc).isoformat()
 
 
 def _metrics_dict(value: Any) -> dict[str, Any]:
@@ -366,7 +394,6 @@ _CANONICAL_VENDOR_TOKENS = frozenset(
         "azure",
         "vertex_ai",
         "dashscope",
-        "baai",
     }
 )
 _CANONICAL_ALIAS_TOKENS = frozenset(
@@ -490,6 +517,11 @@ def is_internal_model_alias(model_name: str) -> bool:
     return confirmed_alias
 
 
+# Keep the historical public helpers as thin delegates to the one resolver.
+def normalize_model_display_name(value: Any) -> str:
+    return resolve_canonical_model_name(value)
+
+
 def model_display_name(model_name: str) -> str:
     return resolve_canonical_model_name(model_name)
 
@@ -517,13 +549,27 @@ class LiteLLMClient:
         self._semaphore = asyncio.Semaphore(max(1, _env_int("LITELLM_MAX_CONCURRENCY", 4)))
         self._key_cache = TTLCache()
         self._model_cache = TTLCache()
-        self._model_usage_cache = TTLCache()
         self._deployment_model_maps: dict[str, dict[str, str]] = {}
+        self._model_usage_cache = TTLCache()
         self._account_index_cache = TTLCache()
         self._team_details_cache = TTLCache()
+        # LiteLLM 1.92 accepts an Idempotency-Key header but does not consume
+        # it on /key/generate. Serialize creates by stable alias in this
+        # process; PostgreSQL's unique alias projection covers other workers.
+        self._organization_key_create_locks: dict[str, asyncio.Lock] = {}
+        self._organization_key_create_locks_guard = asyncio.Lock()
 
     async def close(self) -> None:
-        await self.http_client.aclose()
+        # TestClient instances may create and tear down separate event loops
+        # while sharing the module-level client. httpx can then hold an idle
+        # connection owned by an already-closed loop. Closing that connection
+        # raises RuntimeError, but the client still needs to be marked closed
+        # so the next application lifespan can replace it safely.
+        try:
+            await self.http_client.aclose()
+        except RuntimeError as exc:
+            if "event loop is closed" not in str(exc).lower():
+                raise
 
     async def request(self, method: str, path: str, **kwargs: Any) -> Any:
         return await self.request_backend(self.backends[0], method, path, **kwargs)
@@ -531,9 +577,10 @@ class LiteLLMClient:
     async def create_internal_user(
         self,
         user_id: str,
-        email: str,
+        email: str | None,
         name: str | None = None,
         *,
+        metadata: dict[str, Any] | None = None,
         backend: LiteLLMBackend | None = None,
     ) -> dict[str, Any]:
         """Create a local account's primary LiteLLM user without issuing a key.
@@ -546,54 +593,63 @@ class LiteLLMClient:
         """
         backend = backend or self.backends[0]
         local_id = str(user_id).strip()
-        normalized_email = str(email).strip().lower()
-        if not local_id or not normalized_email:
+        normalized_email = str(email or "").strip().lower()
+        if not local_id:
             raise HTTPException(status_code=400, detail="开户参数不完整")
-        if len(normalized_email) > 254 or normalized_email.count("@") != 1:
-            raise HTTPException(status_code=400, detail="开户邮箱格式无效")
-        local_part, domain = normalized_email.split("@", 1)
-        if (
-            not re.fullmatch(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+", local_part)
-            or len(local_part) > 64
-            or local_part.startswith(".")
-            or local_part.endswith(".")
-            or ".." in local_part
-        ):
-            raise HTTPException(status_code=400, detail="开户邮箱格式无效")
-        try:
-            domain = domain.encode("idna").decode("ascii")
-        except UnicodeError as exc:
-            raise HTTPException(status_code=400, detail="开户邮箱格式无效") from exc
-        if len(domain) > 253 or not all(
-            label
-            and len(label) <= 63
-            and not label.startswith("-")
-            and not label.endswith("-")
-            and re.fullmatch(r"[a-z0-9-]+", label)
-            for label in domain.split(".")
-        ):
-            raise HTTPException(status_code=400, detail="开户邮箱格式无效")
-        normalized_email = f"{local_part}@{domain}"
+        if normalized_email:
+            if len(normalized_email) > 254 or normalized_email.count("@") != 1:
+                raise HTTPException(status_code=400, detail="开户邮箱格式无效")
+            local_part, domain = normalized_email.split("@", 1)
+            if (
+                not re.fullmatch(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+", local_part)
+                or len(local_part) > 64
+                or local_part.startswith(".")
+                or local_part.endswith(".")
+                or ".." in local_part
+            ):
+                raise HTTPException(status_code=400, detail="开户邮箱格式无效")
+            try:
+                domain = domain.encode("idna").decode("ascii")
+            except UnicodeError as exc:
+                raise HTTPException(status_code=400, detail="开户邮箱格式无效") from exc
+            if len(domain) > 253 or not all(
+                label
+                and len(label) <= 63
+                and not label.startswith("-")
+                and not label.endswith("-")
+                and re.fullmatch(r"[a-z0-9-]+", label)
+                for label in domain.split(".")
+            ):
+                raise HTTPException(status_code=400, detail="开户邮箱格式无效")
+            normalized_email = f"{local_part}@{domain}"
         configured_role = os.getenv("AUTH_DEFAULT_UPSTREAM_ROLE", "internal_user_viewer").strip()
         user_role = configured_role if configured_role in LOCAL_AUTH_UPSTREAM_ROLES else "internal_user_viewer"
         if configured_role and configured_role != user_role:
             logger.warning("ignoring unsafe AUTH_DEFAULT_UPSTREAM_ROLE value")
         payload: dict[str, Any] = {
             "user_id": local_id,
-            "user_email": normalized_email,
-            "user_alias": str(name or normalized_email).strip() or normalized_email,
+            "user_alias": str(name or normalized_email or local_id).strip() or local_id,
             "user_role": user_role,
             "auto_create_key": False,
             "models": [NO_DEFAULT_MODELS],
             "metadata": {
                 "created_via": "ai-token-dashboard",
                 "local_user_id": local_id,
+                **(metadata or {}),
             },
         }
+        # LiteLLM supports stable user_id-only enterprise users. Username
+        # accounts deliberately omit user_email instead of inventing an
+        # unreachable mailbox that could later be mistaken for identity proof.
+        if normalized_email:
+            payload["user_email"] = normalized_email
         response = await self.request_backend(backend, "POST", "/user/new", json=payload)
         if isinstance(response, dict):
             return response
-        return {"user_id": local_id, "user_email": normalized_email}
+        fallback = {"user_id": local_id}
+        if normalized_email:
+            fallback["user_email"] = normalized_email
+        return fallback
 
     async def user_info(
         self,
@@ -616,6 +672,984 @@ class LiteLLMClient:
                     return data
             return payload
         return {}
+
+    @staticmethod
+    def _management_headers(changed_by: str | None = None, idempotency_key: str | None = None) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        if changed_by:
+            headers["litellm-changed-by"] = str(changed_by).strip()
+        if idempotency_key:
+            headers["Idempotency-Key"] = str(idempotency_key).strip()
+        return {key: value for key, value in headers.items() if value}
+
+    async def organization_capabilities(
+        self,
+        *,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        """Probe the database-backed organization and team management surface."""
+        backend = backend or self.backends[0]
+        checks: dict[str, bool] = {"organizations": False, "teams": False, "keys": False}
+        errors: dict[str, dict[str, Any]] = {}
+        probes = (
+            ("organizations", (("/organization/list", {"org_alias": ""}),)),
+            (
+                "teams",
+                (
+                    ("/v2/team/list", {"page": 1, "page_size": 1}),
+                    ("/team/list", {}),
+                ),
+            ),
+            ("keys", (("/key/list", {"page": 1, "size": 1, "return_full_object": "false"}),)),
+        )
+        for name, candidates in probes:
+            last_error: HTTPException | None = None
+            for path, params in candidates:
+                try:
+                    await self.request_backend(backend, "GET", path, params=params)
+                    checks[name] = True
+                    break
+                except HTTPException as exc:
+                    last_error = exc
+                    if exc.status_code not in {404, 405, 501}:
+                        break
+            if checks[name]:
+                continue
+            if last_error is not None:
+                errors[name] = {
+                    "statusCode": last_error.status_code,
+                    "detail": last_error.detail,
+                }
+        return {
+            "available": all(checks.values()),
+            **checks,
+            "backend": backend.id,
+            "errors": errors,
+        }
+
+    async def create_organization(
+        self,
+        organization_alias: str,
+        *,
+        organization_id: str | None = None,
+        models: list[str] | None = None,
+        max_budget: float | None = None,
+        budget_duration: str | None = None,
+        blocked: bool = False,
+        metadata: dict[str, Any] | None = None,
+        changed_by: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        backend = backend or self.backends[0]
+        body: dict[str, Any] = {
+            "organization_alias": _clean_text(organization_alias),
+            "models": self._clean_model_list(models or []),
+        }
+        # LiteLLM 1.92's organization table has no ``blocked`` column.  The
+        # management endpoint accepts extra JSON at validation time, but then
+        # forwards it to Prisma and fails on the unknown field.  Organization
+        # suspension is enforced locally (and by revoking its keys); keep the
+        # argument for callers that share the team/update interface, but do
+        # not send an unsupported organization field upstream.
+        for key, value in (
+            ("organization_id", _clean_text(organization_id)),
+            ("max_budget", max_budget),
+            ("budget_duration", _clean_text(budget_duration)),
+            ("metadata", metadata),
+        ):
+            if value not in (None, ""):
+                body[key] = value
+        payload = await self.request_backend(
+            backend,
+            "POST",
+            "/organization/new",
+            headers=self._management_headers(changed_by),
+            json=body,
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    async def update_organization(
+        self,
+        organization_id: str,
+        *,
+        organization_alias: str | None = None,
+        models: list[str] | None = None,
+        max_budget: float | None = None,
+        budget_duration: str | None = None,
+        blocked: bool | None = None,
+        metadata: dict[str, Any] | None = None,
+        changed_by: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        backend = backend or self.backends[0]
+        body: dict[str, Any] = {"organization_id": _clean_text(organization_id)}
+        optional: tuple[tuple[str, Any], ...] = (
+            ("organization_alias", _clean_text(organization_alias)),
+            ("models", self._clean_model_list(models) if models is not None else None),
+            ("max_budget", max_budget),
+            ("budget_duration", _clean_text(budget_duration)),
+            ("metadata", metadata),
+        )
+        body.update({key: value for key, value in optional if value not in (None, "")})
+        payload = await self.request_backend(
+            backend,
+            "PATCH",
+            "/organization/update",
+            headers=self._management_headers(changed_by),
+            json=body,
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    async def list_organizations(
+        self,
+        *,
+        organization_id: str | None = None,
+        organization_alias: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> list[dict[str, Any]]:
+        backend = backend or self.backends[0]
+        params: dict[str, Any] = {"page": 1, "page_size": 100}
+        if organization_id:
+            params["org_id"] = organization_id
+        if organization_alias:
+            params["org_alias"] = organization_alias
+        payload = await self.request_backend(backend, "GET", "/organization/list", params=params)
+        return _records(payload)
+
+    async def find_organizations_exact(
+        self,
+        *,
+        organization_id: str | None = None,
+        organization_alias: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return exact Organization matches from LiteLLM's partial alias API."""
+
+        expected_id = _clean_text(organization_id)
+        expected_alias = _clean_text(organization_alias).casefold()
+        if not expected_id and not expected_alias:
+            raise ValueError("organization id or alias is required")
+        records = await self.list_organizations(
+            organization_id=expected_id or None,
+            organization_alias=_clean_text(organization_alias) or None,
+            backend=backend,
+        )
+        # Some 1.90 deployments expose only alias filtering. If a configured
+        # stable id was supplied, also issue the id-shaped query and let the
+        # exact equality guard below decide the result.
+        if expected_id and not records:
+            records = await self.list_organizations(
+                organization_id=expected_id,
+                organization_alias=None,
+                backend=backend,
+            )
+        matches: list[dict[str, Any]] = []
+        for record in records:
+            candidate_id = _clean_text(
+                _first(record, "organization_id", "organizationId", "id", default="")
+            )
+            candidate_alias = _clean_text(
+                _first(record, "organization_alias", "organizationAlias", "alias", "name", default="")
+            ).casefold()
+            if expected_id and candidate_id != expected_id:
+                continue
+            if expected_alias and candidate_alias != expected_alias:
+                continue
+            matches.append(record)
+        return matches
+
+    async def organization_info(
+        self,
+        organization_id: str,
+        *,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        backend = backend or self.backends[0]
+        payload = await self.request_backend(
+            backend,
+            "GET",
+            "/organization/info",
+            params={"organization_id": organization_id},
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _organization_member_role(role: str) -> str:
+        normalized = _clean_text(role).lower()
+        aliases = {
+            "admin": "org_admin",
+            "enterprise_admin": "org_admin",
+            "member": "internal_user",
+            "user": "internal_user",
+            "viewer": "internal_user_viewer",
+        }
+        value = aliases.get(normalized, normalized)
+        if value not in {"org_admin", "internal_user", "internal_user_viewer"}:
+            raise HTTPException(status_code=400, detail="无效的企业成员角色")
+        return value
+
+    @staticmethod
+    def _member_identity(user_id: str | None, user_email: str | None) -> dict[str, str]:
+        if _clean_text(user_id):
+            return {"user_id": _clean_text(user_id)}
+        if _clean_text(user_email):
+            return {"user_email": _clean_text(user_email).lower()}
+        raise HTTPException(status_code=400, detail="成员必须包含用户编号或邮箱")
+
+    async def add_organization_member(
+        self,
+        organization_id: str,
+        role: str,
+        *,
+        user_id: str | None = None,
+        user_email: str | None = None,
+        max_budget: float | None = None,
+        changed_by: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        backend = backend or self.backends[0]
+        member = {**self._member_identity(user_id, user_email), "role": self._organization_member_role(role)}
+        body: dict[str, Any] = {"organization_id": organization_id, "member": member}
+        if max_budget is not None:
+            body["max_budget_in_organization"] = max_budget
+        payload = await self.request_backend(
+            backend,
+            "POST",
+            "/organization/member_add",
+            headers=self._management_headers(changed_by),
+            json=body,
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    async def update_organization_member(
+        self,
+        organization_id: str,
+        *,
+        user_id: str | None = None,
+        user_email: str | None = None,
+        role: str | None = None,
+        max_budget: float | None = None,
+        changed_by: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        backend = backend or self.backends[0]
+        body: dict[str, Any] = {"organization_id": organization_id, **self._member_identity(user_id, user_email)}
+        if role is not None:
+            body["role"] = self._organization_member_role(role)
+        if max_budget is not None:
+            body["max_budget_in_organization"] = max_budget
+        payload = await self.request_backend(
+            backend,
+            "PATCH",
+            "/organization/member_update",
+            headers=self._management_headers(changed_by),
+            json=body,
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    async def delete_organization_member(
+        self,
+        organization_id: str,
+        *,
+        user_id: str | None = None,
+        user_email: str | None = None,
+        changed_by: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        backend = backend or self.backends[0]
+        body = {"organization_id": organization_id, **self._member_identity(user_id, user_email)}
+        payload = await self.request_backend(
+            backend,
+            "DELETE",
+            "/organization/member_delete",
+            headers=self._management_headers(changed_by),
+            json=body,
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    async def create_team(
+        self,
+        team_alias: str,
+        organization_id: str,
+        *,
+        team_id: str | None = None,
+        models: list[str] | None = None,
+        max_budget: float | None = None,
+        budget_duration: str | None = None,
+        blocked: bool = False,
+        metadata: dict[str, Any] | None = None,
+        changed_by: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        backend = backend or self.backends[0]
+        body: dict[str, Any] = {
+            "team_alias": _clean_text(team_alias),
+            "organization_id": organization_id,
+            "models": self._clean_model_list(models or []),
+            "blocked": bool(blocked),
+        }
+        for key, value in (
+            ("team_id", _clean_text(team_id)),
+            ("max_budget", max_budget),
+            ("budget_duration", _clean_text(budget_duration)),
+            ("metadata", metadata),
+        ):
+            if value not in (None, ""):
+                body[key] = value
+        payload = await self.request_backend(
+            backend,
+            "POST",
+            "/team/new",
+            headers=self._management_headers(changed_by),
+            json=body,
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    async def list_teams(
+        self,
+        *,
+        organization_id: str | None = None,
+        team_id: str | None = None,
+        team_alias: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> list[dict[str, Any]]:
+        """List database-backed teams for provisioning reconciliation."""
+
+        backend = backend or self.backends[0]
+        page = 1
+        records: list[dict[str, Any]] = []
+        while True:
+            params: dict[str, Any] = {"page": page, "page_size": 100}
+            if organization_id:
+                params["organization_id"] = _clean_text(organization_id)
+            if team_id:
+                params["team_id"] = _clean_text(team_id)
+            if team_alias:
+                params["team_alias"] = _clean_text(team_alias)
+            try:
+                payload = await self.request_backend(
+                    backend, "GET", "/v2/team/list", params=params
+                )
+            except HTTPException as exc:
+                if page != 1 or exc.status_code not in {404, 405, 501}:
+                    raise
+                legacy_params: dict[str, Any] = {}
+                if organization_id:
+                    legacy_params["organization_id"] = _clean_text(organization_id)
+                payload = await self.request_backend(
+                    backend, "GET", "/team/list", params=legacy_params
+                )
+                legacy_records = _records(payload)
+                if team_id:
+                    legacy_records = [
+                        item
+                        for item in legacy_records
+                        if _clean_text(_first(item, "team_id", "teamId", "id"))
+                        == _clean_text(team_id)
+                    ]
+                if team_alias:
+                    legacy_records = [
+                        item
+                        for item in legacy_records
+                        if _clean_text(_first(item, "team_alias", "teamAlias", "name"))
+                        == _clean_text(team_alias)
+                    ]
+                return legacy_records
+            batch = _records(payload)
+            records.extend(batch)
+            total_pages = _as_int(
+                _first(payload, "total_pages", "totalPages", default=1)
+            ) if isinstance(payload, dict) else 1
+            if page >= max(1, total_pages) or not batch:
+                return records
+            page += 1
+
+    async def find_teams_exact(
+        self,
+        *,
+        organization_id: str | None = None,
+        team_id: str | None = None,
+        team_alias: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return exact Team matches and preserve upstream Organization scope."""
+
+        expected_org = _clean_text(organization_id)
+        expected_id = _clean_text(team_id)
+        expected_alias = _clean_text(team_alias).casefold()
+        if not expected_id and not expected_alias:
+            raise ValueError("team id or alias is required")
+        records = await self.list_teams(
+            organization_id=expected_org or None,
+            team_id=expected_id or None,
+            team_alias=_clean_text(team_alias) or None,
+            backend=backend,
+        )
+        matches: list[dict[str, Any]] = []
+        for record in records:
+            candidate_id = _clean_text(_first(record, "team_id", "teamId", "id", default=""))
+            candidate_alias = _clean_text(
+                _first(record, "team_alias", "teamAlias", "alias", "name", default="")
+            ).casefold()
+            candidate_org = _clean_text(
+                _first(record, "organization_id", "organizationId", "org_id", default="")
+            )
+            if expected_id and candidate_id != expected_id:
+                continue
+            if expected_alias and candidate_alias != expected_alias:
+                continue
+            if expected_org and candidate_org != expected_org:
+                continue
+            matches.append(record)
+        return matches
+
+    async def update_team(
+        self,
+        team_id: str,
+        *,
+        team_alias: str | None = None,
+        organization_id: str | None = None,
+        models: list[str] | None = None,
+        max_budget: float | None = None,
+        budget_duration: str | None = None,
+        blocked: bool | None = None,
+        metadata: dict[str, Any] | None = None,
+        changed_by: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        backend = backend or self.backends[0]
+        body: dict[str, Any] = {"team_id": team_id}
+        optional: tuple[tuple[str, Any], ...] = (
+            ("team_alias", _clean_text(team_alias)),
+            ("organization_id", _clean_text(organization_id)),
+            ("models", self._clean_model_list(models) if models is not None else None),
+            ("max_budget", max_budget),
+            ("budget_duration", _clean_text(budget_duration)),
+            ("blocked", blocked),
+            ("metadata", metadata),
+        )
+        body.update({key: value for key, value in optional if value not in (None, "")})
+        payload = await self.request_backend(
+            backend,
+            "POST",
+            "/team/update",
+            headers=self._management_headers(changed_by),
+            json=body,
+        )
+        if hasattr(self, "_team_details_cache"):
+            self._team_details_cache.delete(f"{backend.id}:{team_id}")
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _management_team_member_role(role: str) -> str:
+        normalized = _clean_text(role).lower()
+        aliases = {"member": "user", "enterprise_admin": "admin"}
+        value = aliases.get(normalized, normalized)
+        if value not in {"admin", "user"}:
+            raise HTTPException(status_code=400, detail="无效的部门成员角色")
+        return value
+
+    async def add_team_member(
+        self,
+        team_id: str,
+        role: str,
+        *,
+        user_id: str | None = None,
+        user_email: str | None = None,
+        max_budget: float | None = None,
+        budget_duration: str | None = None,
+        changed_by: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        backend = backend or self.backends[0]
+        member = {**self._member_identity(user_id, user_email), "role": self._management_team_member_role(role)}
+        body: dict[str, Any] = {"team_id": team_id, "member": member}
+        if max_budget is not None:
+            body["max_budget_in_team"] = max_budget
+        if budget_duration:
+            body["budget_duration"] = budget_duration
+        payload = await self.request_backend(
+            backend,
+            "POST",
+            "/team/member_add",
+            headers=self._management_headers(changed_by),
+            json=body,
+        )
+        self._team_details_cache.delete(f"{backend.id}:{team_id}")
+        return payload if isinstance(payload, dict) else {}
+
+    async def update_team_member(
+        self,
+        team_id: str,
+        *,
+        user_id: str | None = None,
+        user_email: str | None = None,
+        role: str | None = None,
+        max_budget: float | None = None,
+        budget_duration: str | None = None,
+        changed_by: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        backend = backend or self.backends[0]
+        body: dict[str, Any] = {"team_id": team_id, **self._member_identity(user_id, user_email)}
+        if role is not None:
+            body["role"] = self._management_team_member_role(role)
+        if max_budget is not None:
+            body["max_budget_in_team"] = max_budget
+        if budget_duration:
+            body["budget_duration"] = budget_duration
+        payload = await self.request_backend(
+            backend,
+            "POST",
+            "/team/member_update",
+            headers=self._management_headers(changed_by),
+            json=body,
+        )
+        self._team_details_cache.delete(f"{backend.id}:{team_id}")
+        return payload if isinstance(payload, dict) else {}
+
+    async def delete_team_member(
+        self,
+        team_id: str,
+        *,
+        user_id: str | None = None,
+        user_email: str | None = None,
+        changed_by: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        backend = backend or self.backends[0]
+        body = {"team_id": team_id, **self._member_identity(user_id, user_email)}
+        payload = await self.request_backend(
+            backend,
+            "POST",
+            "/team/member_delete",
+            headers=self._management_headers(changed_by),
+            json=body,
+        )
+        self._team_details_cache.delete(f"{backend.id}:{team_id}")
+        return payload if isinstance(payload, dict) else {}
+
+    async def organization_daily_usage(
+        self,
+        organization_id: str,
+        start_date: str,
+        end_date: str,
+        *,
+        model: str | None = None,
+        api_key: str | None = None,
+        page: int = 1,
+        page_size: int = 1000,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        """Return LiteLLM's persisted daily organization spend rows."""
+        backend = backend or self.backends[0]
+        params: dict[str, Any] = {
+            "organization_ids": organization_id,
+            "start_date": start_date,
+            "end_date": end_date,
+            "page": page,
+            "page_size": page_size,
+        }
+        if model:
+            params["model"] = model
+        if api_key:
+            params["api_key"] = api_key
+        payload = await self.request_backend(backend, "GET", "/organization/daily/activity", params=params)
+        return payload if isinstance(payload, dict) else {}
+
+    async def team_daily_usage(
+        self,
+        team_id: str,
+        start_date: str,
+        end_date: str,
+        *,
+        model: str | None = None,
+        api_key: str | None = None,
+        page: int = 1,
+        page_size: int = 1000,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        """Return LiteLLM's persisted daily team spend rows."""
+        backend = backend or self.backends[0]
+        params: dict[str, Any] = {
+            "team_ids": team_id,
+            "start_date": start_date,
+            "end_date": end_date,
+            "page": page,
+            "page_size": page_size,
+        }
+        if model:
+            params["model"] = model
+        if api_key:
+            params["api_key"] = api_key
+        payload = await self.request_backend(backend, "GET", "/team/daily/activity", params=params)
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def daily_usage_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        """Normalize the daily activity response while retaining breakdown details."""
+        return _records(payload.get("results") if isinstance(payload, dict) else payload)
+
+    async def create_organization_key(
+        self,
+        organization_id: str,
+        *,
+        key_alias: str,
+        models: list[str],
+        daily_budget_usd: float | None = None,
+        team_id: str | None = None,
+        user_id: str | None = None,
+        duration: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        changed_by: str | None = None,
+        idempotency_key: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        """Create a real upstream key scoped to an organization/team/member."""
+        backend = backend or self.backends[0]
+        clean_alias = _clean_text(key_alias)
+        if not clean_alias:
+            raise HTTPException(status_code=400, detail="企业 Token 名称不能为空")
+        selected_models = self._clean_model_list(models)
+        if not selected_models:
+            raise HTTPException(status_code=400, detail="企业 Token 至少需要一个模型权限")
+        body: dict[str, Any] = {
+            "key_alias": clean_alias,
+            "key_type": "llm_api",
+            "organization_id": organization_id,
+            "models": selected_models,
+            "metadata": {"created_via": "ai-usage-center", **(metadata or {})},
+        }
+        if team_id:
+            body["team_id"] = team_id
+        if user_id:
+            body["user_id"] = user_id
+        if daily_budget_usd is not None:
+            body["max_budget"] = daily_budget_usd
+            body["budget_duration"] = "1d"
+        if duration and duration != "never":
+            body["duration"] = duration
+        lock_key = f"{backend.id}:{organization_id}:{clean_alias}"
+        async with self._organization_key_create_locks_guard:
+            create_lock = self._organization_key_create_locks.setdefault(
+                lock_key, asyncio.Lock()
+            )
+        try:
+            async with create_lock:
+                # Recover an earlier success before creating again. This is
+                # required because LiteLLM 1.92 does not consume the
+                # Idempotency-Key header on /key/generate.
+                existing = await self.find_organization_key_by_alias(
+                    organization_id,
+                    clean_alias,
+                    team_id=team_id,
+                    user_id=user_id,
+                    backend=backend,
+                )
+                if existing is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="同一企业 Token 请求已处理，请刷新列表确认结果",
+                    )
+                payload = await self.request_backend(
+                    backend,
+                    "POST",
+                    "/key/generate",
+                    headers=self._management_headers(changed_by, idempotency_key),
+                    json=body,
+                )
+        finally:
+            if not create_lock.locked():
+                async with self._organization_key_create_locks_guard:
+                    if self._organization_key_create_locks.get(lock_key) is create_lock:
+                        self._organization_key_create_locks.pop(lock_key, None)
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=502, detail="上游未返回企业 Token")
+        token = _clean_text(_first(payload, "key", "token", default=""))
+        if not token.startswith("sk-"):
+            raise HTTPException(status_code=502, detail="上游未返回有效企业 Token")
+        token_id = _clean_text(_first(payload, "token_id", "token_hash", default=""))
+        if not token_id or token_id.startswith("sk-"):
+            token_id = safe_key_id(token)
+        expires = _first(payload, "expires", default=None)
+        return {
+            "key": token,
+            "id": token_id,
+            "masked": mask_key(token),
+            "organizationId": _clean_text(_first(payload, "organization_id", default=organization_id)) or organization_id,
+            "teamId": _clean_text(_first(payload, "team_id", default=team_id)),
+            "userId": _clean_text(_first(payload, "user_id", default=user_id)),
+            "expiresAt": _datetime_text(expires) if expires else "永久有效",
+            "upstream": payload,
+        }
+
+    async def list_organization_keys(
+        self,
+        organization_id: str,
+        *,
+        key_alias: str | None = None,
+        team_id: str | None = None,
+        user_id: str | None = None,
+        include_full_object: bool = True,
+        backend: LiteLLMBackend | None = None,
+    ) -> list[dict[str, Any]]:
+        backend = backend or self.backends[0]
+        page = 1
+        records: list[dict[str, Any]] = []
+        while True:
+            params: dict[str, Any] = {
+                "organization_id": organization_id,
+                "page": page,
+                "size": 100,
+                "return_full_object": str(bool(include_full_object)).lower(),
+            }
+            if team_id:
+                params["team_id"] = team_id
+            if user_id:
+                params["user_id"] = user_id
+            if key_alias:
+                params["key_alias"] = _clean_text(key_alias)
+            payload = await self.request_backend(
+                backend, "GET", "/key/list", params=params
+            )
+            batch = _records(payload)
+            records.extend(batch)
+            total_pages = _as_int(
+                _first(payload, "total_pages", "totalPages", default=1)
+            ) if isinstance(payload, dict) else 1
+            if page >= max(1, total_pages) or not batch:
+                return records
+            page += 1
+
+    async def list_keys_exact(
+        self,
+        *,
+        key_alias: str | None = None,
+        key_hash: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read exact global key matches without changing an upstream key."""
+
+        alias = _clean_text(key_alias)
+        hashed = safe_key_id(key_hash)
+        if bool(alias) == bool(hashed):
+            raise ValueError("exactly one of key_alias or key_hash is required")
+        backend = backend or self.backends[0]
+        page = 1
+        records: list[dict[str, Any]] = []
+        while True:
+            params: dict[str, Any] = {
+                "page": page,
+                "size": 100,
+                "return_full_object": "true",
+            }
+            if alias:
+                params["key_alias"] = alias
+            else:
+                params["key_hash"] = hashed
+            payload = await self.request_backend(backend, "GET", "/key/list", params=params)
+            batch = _records(payload)
+            for record in batch:
+                identity = self.report_only_key_identity(record)
+                if alias and identity["alias"] != alias:
+                    continue
+                if hashed and hashed not in {identity["id"], identity["hash"]}:
+                    continue
+                records.append(record)
+            total_pages = _as_int(
+                _first(payload, "total_pages", "totalPages", default=1)
+            ) if isinstance(payload, dict) else 1
+            if page >= max(1, total_pages) or not batch:
+                return records
+            page += 1
+
+    @staticmethod
+    def report_only_key_identity(record: dict[str, Any]) -> dict[str, Any]:
+        """Normalize a persisted key row without accepting cleartext credentials.
+
+        LiteLLM 1.90/1.92 returns the SHA-256 token in ``token`` from
+        ``/key/list``.  An unexpected ``sk-*`` value is rejected instead of
+        being hashed locally, logged, or passed into the adoption workflow.
+        """
+
+        candidates = (
+            _first(record, "key_hash", "keyHash", "token_hash", "tokenHash", default=""),
+            _first(record, "token", default=""),
+            _first(record, "token_id", "tokenId", "key_id", "keyId", default=""),
+        )
+        normalized = [_clean_text(value) for value in candidates if _clean_text(value)]
+        if any(value.startswith("sk-") for value in normalized):
+            raise HTTPException(status_code=502, detail="上游密钥列表返回了不安全的凭据格式")
+        key_hash = next((value.lower() for value in normalized if re.fullmatch(r"[0-9a-fA-F]{64}", value)), "")
+        if not key_hash:
+            raise HTTPException(status_code=502, detail="上游密钥缺少稳定哈希标识")
+        key_id = _clean_text(
+            _first(record, "token_id", "tokenId", "key_id", "keyId", default="")
+        ) or key_hash
+        models = _first(record, "models", "allowed_models", "allowedModels", default=[])
+        if not isinstance(models, list):
+            models = []
+        max_budget = _first(record, "max_budget", "maxBudget", default=None)
+        spend = _first(record, "spend", "total_spend", "totalSpend", default=None)
+        expires = _first(
+            record,
+            "expires",
+            "expires_at",
+            "expiresAt",
+            "expiration",
+            default=None,
+        )
+        return {
+            "id": key_id,
+            "hash": key_hash,
+            "alias": _clean_text(_first(record, "key_alias", "keyAlias", "alias", default="")),
+            "organizationId": _clean_text(
+                _first(record, "organization_id", "organizationId", "org_id", default="")
+            ),
+            "teamId": _clean_text(_first(record, "team_id", "teamId", default="")),
+            "userId": _clean_text(_first(record, "user_id", "userId", default="")),
+            "models": [_clean_text(model) for model in models if _clean_text(model)],
+            "maxBudget": max_budget,
+            "budgetDuration": _clean_text(
+                _first(record, "budget_duration", "budgetDuration", default="")
+            ),
+            "spend": spend,
+            "expiresAt": _clean_text(expires),
+            "blocked": bool(_first(record, "blocked", "disabled", default=False)),
+        }
+
+    async def find_organization_key_by_alias(
+        self,
+        organization_id: str,
+        key_alias: str,
+        *,
+        team_id: str | None = None,
+        user_id: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any] | None:
+        """Return an exact alias match for compensating a timed-out key create.
+
+        LiteLLM's list endpoint supports exact ``key_alias`` filtering.  Keep
+        the final equality check here as a guard against older proxy versions
+        that interpret the query as a substring search.
+        """
+
+        alias = _clean_text(key_alias)
+        if not alias:
+            return None
+        records = await self.list_organization_keys(
+            organization_id,
+            key_alias=alias,
+            team_id=team_id,
+            user_id=user_id,
+            include_full_object=True,
+            backend=backend,
+        )
+        expected_organization = _clean_text(organization_id)
+        expected_team = _clean_text(team_id)
+        expected_user = _clean_text(user_id)
+        for record in records:
+            candidate_alias = _clean_text(
+                _first(record, "key_alias", "keyAlias", "alias", default="")
+            )
+            if candidate_alias != alias:
+                continue
+            candidate_org = _clean_text(
+                _first(record, "organization_id", "organizationId", "org_id", default="")
+            )
+            if candidate_org != expected_organization:
+                continue
+            candidate_team = _clean_text(
+                _first(record, "team_id", "teamId", default="")
+            )
+            if candidate_team != expected_team:
+                continue
+            candidate_user = _clean_text(
+                _first(record, "user_id", "userId", default="")
+            )
+            if candidate_user != expected_user:
+                continue
+            return record
+        return None
+
+    @staticmethod
+    def organization_key_identity(record: dict[str, Any]) -> dict[str, str]:
+        """Normalize an upstream key object for local compensation logic."""
+
+        raw_token = _clean_text(_first(record, "key", "token", default=""))
+        token = raw_token if raw_token.startswith("sk-") else ""
+        key_id = _clean_text(
+            _first(record, "token_id", "tokenId", "key_id", "keyId", "token_hash", default="")
+        )
+        key_hash = _clean_text(
+            _first(record, "key_hash", "keyHash", "token_hash", "tokenHash", default="")
+        )
+        if not key_hash and raw_token and not raw_token.startswith("sk-"):
+            key_hash = raw_token
+        # LiteLLM's list endpoint normally exposes the persisted SHA-256 hash
+        # as ``token`` and may omit token_id. The hash is the delete/update
+        # identifier accepted by the proxy; do not derive a different value.
+        if not key_id and key_hash:
+            key_id = key_hash
+        if not key_id and raw_token:
+            key_id = safe_key_id(raw_token)
+        return {
+            "id": key_id,
+            "hash": key_hash,
+            "token": token,
+            "alias": _clean_text(_first(record, "key_alias", "keyAlias", "alias", default="")),
+            "organizationId": _clean_text(
+                _first(record, "organization_id", "organizationId", "org_id", default="")
+            ),
+            "teamId": _clean_text(_first(record, "team_id", "teamId", default="")),
+            "userId": _clean_text(_first(record, "user_id", "userId", default="")),
+        }
+
+    async def revoke_organization_key(
+        self,
+        key_id: str,
+        *,
+        changed_by: str | None = None,
+        idempotency_key: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        backend = backend or self.backends[0]
+        try:
+            payload = await self.request_backend(
+                backend,
+                "POST",
+                "/key/delete",
+                headers=self._management_headers(changed_by, idempotency_key),
+                json={"keys": [key_id]},
+            )
+        except HTTPException as exc:
+            # A retried durable job may find that an earlier attempt already
+            # removed the known upstream key. Manual deletes stay fail-closed.
+            if idempotency_key and str(key_id).strip() and exc.status_code == 404:
+                return {"id": str(key_id), "deleted": True, "alreadyAbsent": True}
+            raise
+        deleted = payload.get("deleted_keys") if isinstance(payload, dict) else None
+        if not self._delete_confirmed(deleted, key_id):
+            raise HTTPException(status_code=502, detail="上游未确认企业 Token 已撤销")
+        return {"id": key_id, "deleted": True}
+
+    async def update_organization_key_budget(
+        self,
+        key_id: str,
+        daily_budget_usd: float,
+        *,
+        changed_by: str | None = None,
+        backend: LiteLLMBackend | None = None,
+    ) -> dict[str, Any]:
+        backend = backend or self.backends[0]
+        payload = await self.request_backend(
+            backend,
+            "POST",
+            "/key/update",
+            headers=self._management_headers(changed_by),
+            json={"key": key_id, "max_budget": daily_budget_usd, "budget_duration": "1d"},
+        )
+        return payload if isinstance(payload, dict) else {"id": key_id, "max_budget": daily_budget_usd, "budget_duration": "1d"}
 
     async def request_backend(self, backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> Any:
         headers = dict(kwargs.pop("headers", {}))
@@ -729,7 +1763,7 @@ class LiteLLMClient:
         try:
             return await self._deployment_model_map(backend)
         except Exception:
-            logger.warning("model directory query failed for backend %s", backend.id)
+            logger.warning("model deployment directory unavailable for backend %s", backend.id)
             return getattr(self, "_deployment_model_maps", {}).get(backend.id, {})
 
     def _is_backend_usage_account(self, backend: LiteLLMBackend, user_id: Any) -> bool:
@@ -840,7 +1874,41 @@ class LiteLLMClient:
         return index
 
     def _log_raw_user(self, log: dict[str, Any]) -> str:
-        return str(_first(log, "user", "user_id", "end_user", default="") or "").strip()
+        metadata = _metadata_dict(_first(log, "metadata", "request_tags", "tags", default={}))
+        return str(
+            _first(log, "user", "user_id", "end_user", default="")
+            or metadata.get("user_api_key_user_id")
+            or metadata.get("user_id")
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _log_usage_attribution(log: dict[str, Any]) -> dict[str, str]:
+        """Extract non-secret tenant identifiers recorded by LiteLLM SpendLogs."""
+
+        metadata = _metadata_dict(_first(log, "metadata", default={}))
+        organization_id = _clean_text(
+            _first(log, "organization_id", "org_id", "organizationId", "orgId", default="")
+            or metadata.get("user_api_key_org_id")
+            or metadata.get("organization_id")
+            or metadata.get("org_id")
+        )
+        team_id = _clean_text(
+            _first(log, "team_id", "teamId", default="")
+            or metadata.get("user_api_key_team_id")
+            or metadata.get("team_id")
+        )
+        # SpendLogs normally returns the hashed token. If an older deployment
+        # returns a raw sk-* value, hash it before it can reach local storage.
+        key_id = safe_key_id(
+            _first(log, "api_key", "token_id", "key_id", default="")
+            or metadata.get("user_api_key")
+        )
+        return {
+            "organizationId": organization_id,
+            "teamId": team_id,
+            "keyId": key_id,
+        }
 
     def _log_identity_candidates(self, log: dict[str, Any]) -> tuple[str, set[str], list[str]]:
         metadata = _metadata_dict(_first(log, "metadata", "request_tags", "tags", default={}))
@@ -1128,20 +2196,24 @@ class LiteLLMClient:
                 continue
             selected_keys.append((key, key_source))
 
-        batches = await asyncio.gather(
-            *(
-                self._usage_from_daily_activity(
-                    user_id=user_id,
-                    start_date=start_date,
-                    end_date=end_date,
-                    source="all",
-                    api_key=key["id"],
-                    backend=backend,
-                    source_override=key_source,
-                )
-                for key, key_source in selected_keys
+        async def load(key: dict[str, Any], key_source: str) -> list[dict[str, Any]]:
+            rows = await self._usage_from_daily_activity(
+                user_id=user_id,
+                start_date=start_date,
+                end_date=end_date,
+                source="all",
+                api_key=key["id"],
+                backend=backend,
+                source_override=key_source,
             )
-        )
+            rotation = key.get("_rotation") if isinstance(key.get("_rotation"), dict) else {}
+            organization_id = _clean_text(rotation.get("org_id") or rotation.get("organization_id"))
+            team_id = _clean_text(rotation.get("team_id"))
+            for row in rows:
+                row.update({"organizationId": organization_id, "teamId": team_id, "keyId": _clean_text(key.get("id"))})
+            return rows
+
+        batches = await asyncio.gather(*(load(key, key_source) for key, key_source in selected_keys))
         return [row for batch in batches for row in batch]
 
     async def usage_from_daily_activity_for_debug(self, user_id: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
@@ -1334,7 +2406,7 @@ class LiteLLMClient:
         )
         keys = []
         for item in _records(payload):
-            token_hash = safe_key_id(_first(item, "token", default=""))
+            token_hash = safe_key_id(_first(item, "token", "token_id", "token_hash", "id", default=""))
             if not token_hash:
                 continue
             metadata = _metadata_dict(_first(item, "metadata", default={}))
@@ -1411,6 +2483,8 @@ class LiteLLMClient:
                         "metadata": metadata,
                         "models": [str(model) for model in models if model],
                         "expires": expires,
+                        "team_id": _clean_text(item.get("team_id")),
+                        "org_id": _clean_text(item.get("org_id") or item.get("organization_id")),
                         **rotation_fields,
                     },
                 }
@@ -2003,6 +3077,7 @@ class LiteLLMClient:
         一次全局扫描覆盖所有账号，避免按账号逐个查询导致的请求放大。
         """
         backend = backend or self.backends[0]
+        await self._ensure_deployment_model_map(backend)
         utc_start, utc_end = _local_date_window_as_utc_text(start_date, end_date)
         # 上游 /spend/logs/v2 限制 page_size <= 100，单日约 800+ 页，需并发拉取。
         page_size = max(1, min(100, _env_int("USAGE_SYNC_LOG_PAGE_SIZE", 100)))
@@ -2030,25 +3105,89 @@ class LiteLLMClient:
         pages_to_fetch = min(total_pages or 1, max_pages)
         truncated = bool(total_pages and total_pages > max_pages)
 
-        grouped: dict[str, dict[tuple[str, str, str], dict[str, Any]]] = defaultdict(dict)
+        grouped: dict[str, dict[tuple[str, str, str, str, str, str], dict[str, Any]]] = defaultdict(dict)
+        event_rows: list[dict[str, Any]] = []
 
         def absorb(logs: list[dict[str, Any]]) -> None:
             for log in logs:
-                user_id = self._log_raw_user(log)
-                if not user_id:
-                    continue
+                user_id = self._log_raw_user(log) or "unattributed"
                 day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
                 # 并发分页取回的记录可能落在窗口外，按本地日界二次校验。
                 if day < start_date or day > end_date:
                     continue
                 source = backend.source or detect_source(log)
-                model = self._usage_model_name(log)
-                key = (day, source, model)
+                model = self._usage_model_name(log, backend=backend)
+                attribution = self._log_usage_attribution(log)
+                event_time = str(
+                    _first(
+                        log,
+                        "startTime",
+                        "start_time",
+                        "created_at",
+                        "date",
+                        default="",
+                    )
+                    or ""
+                )
+                request_id = _clean_text(
+                    _first(
+                        log,
+                        "request_id",
+                        "requestId",
+                        "litellm_call_id",
+                        "id",
+                        default="",
+                    )
+                )
+                if not request_id:
+                    request_id = hashlib.sha256(
+                        json.dumps(
+                            {
+                                "eventTime": event_time,
+                                "userId": user_id,
+                                "source": source,
+                                "model": model,
+                                "keyId": attribution["keyId"],
+                                "spend": _first(log, "spend", "cost", "total_spend"),
+                                "tokens": _first(log, "total_tokens", "totalTokens"),
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            default=str,
+                        ).encode("utf-8")
+                    ).hexdigest()
+                event_row = self._empty_usage_row(day, source, model)
+                event_row.update(attribution)
+                event_row.update(
+                    {
+                        "requestId": request_id,
+                        "eventTime": event_time,
+                        "_userId": user_id,
+                    }
+                )
+                self._add_log_to_row(event_row, log)
+                event_rows.append(event_row)
+                key = (
+                    day,
+                    source,
+                    model,
+                    attribution["organizationId"],
+                    attribution["teamId"],
+                    attribution["keyId"],
+                )
                 bucket = grouped[user_id]
                 row = bucket.get(key)
                 if row is None:
                     row = self._empty_usage_row(day, source, model)
+                    row.update(attribution)
+                    row["eventTime"] = event_time
                     bucket[key] = row
+                else:
+                    current_event_time = str(row.get("eventTime") or "")
+                    if event_time and (
+                        not current_event_time or event_time < current_event_time
+                    ):
+                        row["eventTime"] = event_time
                 self._add_log_to_row(row, log)
 
         absorb(first_logs)
@@ -2087,10 +3226,10 @@ class LiteLLMClient:
                 total_pages,
                 max_pages,
             )
-        result = {
+        result = UsageLogRows({
             user_id: sorted(bucket.values(), key=lambda item: (item["date"], item["source"], item["model"]))
             for user_id, bucket in grouped.items()
-        }
+        }, events=event_rows)
         return result, not truncated
 
     async def admin_daily_activity_rows(self, start_date: str, end_date: str, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
@@ -2125,17 +3264,19 @@ class LiteLLMClient:
         for backend in self.backends:
             if backend.source and _source_filter_applies(source) and source != backend.source:
                 continue
-            # users、team_map 和 her_account_index 相互独立，并行获取
+            # Model directory, users, team map and account index are independent.
             if backend.source == "Her":
-                users, account_index, team_map = await asyncio.gather(
+                users, account_index, team_map, _ = await asyncio.gather(
                     self.users(backend),
                     self.her_account_index(backend),
                     self._team_map_or_empty(backend),
+                    self._ensure_deployment_model_map(backend),
                 )
             else:
-                users, team_map = await asyncio.gather(
+                users, team_map, _ = await asyncio.gather(
                     self.users(backend),
                     self._team_map_or_empty(backend),
+                    self._ensure_deployment_model_map(backend),
                 )
                 account_index = None
             user_map = self._admin_user_map(users)
@@ -2175,7 +3316,7 @@ class LiteLLMClient:
                     employee_key = employee_info["id"]
                     employees.setdefault(employee_key, employee_info)
                     self._collect_department_name(department_names, employee_key, log, team_map)
-                    model = self._usage_model_name(log)
+                    model = self._usage_model_name(log, backend=backend)
                     day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
                     key = (day, employee_key, detected_source, model)
                     row = grouped.setdefault(key, self._admin_empty_row(day, employee_info, detected_source, model))
@@ -2638,17 +3779,19 @@ class LiteLLMClient:
         for backend in self.backends:
             if backend.source and _source_filter_applies(source) and source != backend.source:
                 continue
-            # users、team_map、her_account_index 并行获取
+            # Load the model directory with the other independent backend metadata.
             if backend.source == "Her":
-                users, team_map, account_index = await asyncio.gather(
+                users, team_map, account_index, _ = await asyncio.gather(
                     self.users(backend),
                     self.team_map(backend),
                     self.her_account_index(backend),
+                    self._ensure_deployment_model_map(backend),
                 )
             else:
-                users, team_map = await asyncio.gather(
+                users, team_map, _ = await asyncio.gather(
                     self.users(backend),
                     self.team_map(backend),
+                    self._ensure_deployment_model_map(backend),
                 )
                 account_index = None
             user_map = self._admin_user_map(users)
@@ -2690,7 +3833,7 @@ class LiteLLMClient:
                     logical_key = department_info["key"]
                     departments.setdefault(logical_key, department_info)
                     employees.setdefault(employee_info["id"], employee_info)
-                    model = self._usage_model_name(log)
+                    model = self._usage_model_name(log, backend=backend)
                     day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
                     key = (day, logical_key, employee_info["id"], detected_source, model)
                     row = grouped.setdefault(key, self._department_empty_row(day, department_info, detected_source, model, employee_info))
@@ -2824,14 +3967,18 @@ class LiteLLMClient:
         if team is None:
             raise HTTPException(status_code=404, detail="未找到当前负责的团队")
 
-        # users 和 her_account_index 相互独立，并行获取
+        # Load the model directory with the other independent backend metadata.
         if backend.source == "Her":
-            user_map_users, account_index = await asyncio.gather(
+            user_map_users, account_index, _ = await asyncio.gather(
                 self.users(backend),
                 self.her_account_index(backend),
+                self._ensure_deployment_model_map(backend),
             )
         else:
-            user_map_users = await self.users(backend)
+            user_map_users, _ = await asyncio.gather(
+                self.users(backend),
+                self._ensure_deployment_model_map(backend),
+            )
             account_index = None
         user_map = self._admin_user_map(user_map_users)
         team_info = self._team_summary(team, backend)
@@ -2882,7 +4029,7 @@ class LiteLLMClient:
                 employee_info = self._employee_info_from_log(log, user_map, backend, account_index)
                 employee_key = employee_info["id"]
                 employees.setdefault(employee_key, employee_info)
-                model = self._usage_model_name(log)
+                model = self._usage_model_name(log, backend=backend)
                 day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
                 key = (day, employee_key, detected_source, model)
                 row = grouped.setdefault(key, self._admin_empty_row(day, employee_info, detected_source, model))
@@ -3071,6 +4218,7 @@ class LiteLLMClient:
             user_id = str(user.get("user_id") or "").strip()
             if not user_id:
                 continue
+            metadata = _metadata_dict(user.get("metadata"))
             email = str(user.get("user_email") or user.get("sso_user_id") or "").strip().lower()
             alias = str(user.get("user_alias") or "").strip()
             if email and email in by_email:
@@ -3082,6 +4230,9 @@ class LiteLLMClient:
                     "id": email or user_id,
                     "name": alias or email.split("@", 1)[0] or user_id,
                     "email": email,
+                    "organization_id": _clean_text(user.get("organization_id") or user.get("org_id") or metadata.get("organization_id")),
+                    "team_id": _clean_text(user.get("team_id") or metadata.get("team_id")),
+                    "metadata": metadata,
                     "bindStatus": "已绑定邮箱" if email else "未绑定邮箱",
                 }
                 if email:

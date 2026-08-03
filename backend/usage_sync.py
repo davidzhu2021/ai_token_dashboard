@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import argparse
+import inspect
 import json
 import logging
 import os
 import sys
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from .litellm_client import LiteLLMBackend, LiteLLMClient, usage_today
@@ -18,6 +19,8 @@ logger = logging.getLogger("ai-token-dashboard.usage-sync")
 
 
 def _env_int(name: str, default: int) -> int:
+    import os
+
     try:
         return int(os.getenv(name, str(default)))
     except ValueError:
@@ -25,6 +28,8 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_bool(name: str, default: bool) -> bool:
+    import os
+
     raw = os.getenv(name)
     if raw is None or not raw.strip():
         return default
@@ -57,12 +62,190 @@ class BackendSnapshot:
     backend_id: str
     rows: list[dict[str, Any]]
     memberships: list[dict[str, Any]]
+    # None means raw event coverage was unavailable and existing event rows
+    # must not be replaced by a daily-activity fallback.
+    events: list[dict[str, Any]] | None = None
 
 
 class UsageSynchronizer:
-    def __init__(self, client: LiteLLMClient, store: UsageStore) -> None:
+    def __init__(
+        self,
+        client: LiteLLMClient,
+        store: UsageStore,
+        organization_repository: Any | None = None,
+    ) -> None:
         self.client = client
         self.store = store
+        # The repository is optional so demo-mode/unit-test synchronizers keep
+        # their lightweight construction. Real mode supplies the durable token
+        # mapping used when SpendLogs omit organization/team identifiers.
+        self.organization_repository = organization_repository
+
+    async def _token_attribution_map(
+        self, backend_id: str
+    ) -> dict[tuple[str, str], list[dict[str, Any]]]:
+        repository = self.organization_repository
+        loader = getattr(repository, "usage_token_attribution_map", None)
+        if not callable(loader):
+            return {}
+        try:
+            records = await loader()
+        except Exception:
+            logger.exception("failed to load organization token attribution mappings")
+            return {}
+        index: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for record in records if isinstance(records, list) else []:
+            if not isinstance(record, dict):
+                continue
+            mapping_backend = _text(record.get("backendId") or "primary")
+            if mapping_backend != backend_id:
+                continue
+            mode = _text(record.get("mode") or "managed")
+            fields = (
+                ("key_id", "upstreamKeyId"),
+                ("key_hash", "upstreamKeyHash"),
+            )
+            # Aliases are safe recovery hints for managed dashboard keys, but
+            # report-only imports require the canonical upstream SHA-256 hash.
+            if mode != "report_only":
+                fields += (("key_alias", "upstreamKeyAlias"),)
+            for identifier_kind, field in fields:
+                value = _text(record.get(field))
+                if value:
+                    index.setdefault((identifier_kind, value), []).append(record)
+        return index
+
+    @staticmethod
+    def _row_event_time(row: dict[str, Any]) -> datetime | None:
+        value = _text(
+            row.get("eventTime")
+            or row.get("event_time")
+            or row.get("startTime")
+            or row.get("start_time")
+        )
+        if value:
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        # A report-only decision must use the request timestamp. A daily
+        # aggregate cannot prove which side of an intraday cutoff it belongs
+        # to, so fail closed instead of guessing from the date.
+        return None
+
+    @staticmethod
+    def _within_mapping_window(
+        row: dict[str, Any], mapping: dict[str, Any]
+    ) -> bool:
+        if _text(mapping.get("mode")) != "report_only":
+            return True
+        event_time = UsageSynchronizer._row_event_time(row)
+        if event_time is None:
+            return False
+        try:
+            effective_from = datetime.fromisoformat(
+                _text(mapping.get("effectiveFrom")).replace("Z", "+00:00")
+            )
+        except ValueError:
+            return False
+        if effective_from.tzinfo is None:
+            effective_from = effective_from.replace(tzinfo=timezone.utc)
+        effective_through_text = _text(mapping.get("effectiveThrough"))
+        if not effective_through_text:
+            return effective_from <= event_time
+        try:
+            effective_through = datetime.fromisoformat(
+                effective_through_text.replace("Z", "+00:00")
+            )
+        except ValueError:
+            return False
+        if effective_through.tzinfo is None:
+            effective_through = effective_through.replace(tzinfo=timezone.utc)
+        return effective_from <= event_time <= effective_through
+
+    @staticmethod
+    def _apply_token_attribution(
+        rows: list[dict[str, Any]],
+        mapping_index: dict[tuple[str, str], list[dict[str, Any]]],
+    ) -> None:
+        """Apply an unambiguous token map without overriding tenant evidence.
+
+        Explicit Organization/Team fields remain authoritative. A matching
+        token mapping may still add its reporting/billing policy; a mismatch
+        is quarantined as a data-quality conflict instead of being charged or
+        attributed to either tenant.
+        """
+
+        for row in rows:
+            candidates: list[dict[str, Any]] = []
+            identifiers = (
+                ("key_id", _text(row.get("keyId") or row.get("key_id"))),
+                ("key_hash", _text(row.get("keyHash") or row.get("key_hash"))),
+                ("key_alias", _text(row.get("keyAlias") or row.get("key_alias"))),
+            )
+            for identifier_kind, value in identifiers:
+                if not value:
+                    continue
+                lookup_kinds = [identifier_kind]
+                # SpendLogs expose the stable SHA-256 token in keyId. Match it
+                # against either a managed key id or a report-only key hash,
+                # while still keeping the two mapping namespaces distinct.
+                if identifier_kind == "key_id" and len(value) == 64:
+                    lookup_kinds.append("key_hash")
+                matches = [
+                    item
+                    for kind in lookup_kinds
+                    for item in mapping_index.get((kind, value), [])
+                ]
+                candidates.extend(
+                    item
+                    for item in matches
+                    if UsageSynchronizer._within_mapping_window(row, item)
+                )
+            unique = {id(item): item for item in candidates}
+            if len(unique) != 1:
+                # An ambiguous alias/hash must remain unattributed rather than
+                # risking cross-tenant leakage.
+                continue
+            mapping = next(iter(unique.values()))
+            explicit_organization_id = _text(
+                row.get("organizationId") or row.get("organization_id")
+            )
+            explicit_team_id = _text(row.get("teamId") or row.get("team_id"))
+            mapped_organization_id = _text(mapping.get("organizationId"))
+            mapped_team_id = _text(mapping.get("teamId"))
+            tenant_conflict = bool(
+                explicit_organization_id
+                and mapped_organization_id
+                and explicit_organization_id != mapped_organization_id
+            ) or bool(
+                explicit_team_id
+                and mapped_team_id
+                and explicit_team_id != mapped_team_id
+            )
+            if tenant_conflict:
+                row["organizationId"] = ""
+                row["teamId"] = ""
+                row["principalId"] = ""
+                row.pop("memberId", None)
+                row["attributionSource"] = "tenant_mapping_conflict"
+                row["billingEligible"] = False
+                continue
+            row["organizationId"] = (
+                explicit_organization_id or mapped_organization_id
+            )
+            row["teamId"] = explicit_team_id or mapped_team_id
+            if not _text(row.get("keyId") or row.get("key_id")):
+                row["keyId"] = _text(mapping.get("upstreamKeyId") or mapping.get("upstreamKeyHash"))
+            row["principalId"] = _text(mapping.get("principalId"))
+            member_id = _text(mapping.get("memberId"))
+            if member_id:
+                row["memberId"] = member_id
+            row["attributionSource"] = _text(
+                mapping.get("attributionSource") or "managed_token"
+            )
+            row["billingEligible"] = bool(mapping.get("billingEligible", True))
 
     @staticmethod
     def date_range(days: int, end: date | None = None) -> tuple[str, str]:
@@ -94,12 +277,25 @@ class UsageSynchronizer:
 
             row_count = 0
             for snapshot in snapshots:
-                row_count += await self.store.replace_backend_snapshot(
+                replace_snapshot = self.store.replace_backend_snapshot
+                events = getattr(snapshot, "events", None)
+                supports_events = True
+                try:
+                    signature = inspect.signature(replace_snapshot)
+                    supports_events = "events" in signature.parameters or any(
+                        parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in signature.parameters.values()
+                    )
+                except (TypeError, ValueError):
+                    pass
+                kwargs = {"events": events} if supports_events and events is not None else {}
+                row_count += await replace_snapshot(
                     snapshot.backend_id,
                     start_date,
                     end_date,
                     snapshot.rows,
                     snapshot.memberships,
+                    **kwargs,
                 )
             status = "partial" if errors and snapshots else "failed" if errors else "ok"
             await self.store.finish_sync_run(run_id, status, len(snapshots), row_count, "; ".join(errors))
@@ -149,6 +345,8 @@ class UsageSynchronizer:
         # 扫描单日约需 3 分钟（全局 8 万条日志、每页上限 100 条），因此只对增量同步的
         # 短窗口启用；初始回填这类长窗口仍走 daily activity，避免一次同步跑上数小时。
         log_rows: dict[str, list[dict[str, Any]]] | None = None
+        event_rows: list[dict[str, Any]] = []
+        token_mapping_index = await self._token_attribution_map(backend.id)
         window_days = (date.fromisoformat(end_date) - date.fromisoformat(start_date)).days + 1
         max_window = max(1, _env_int("USAGE_SYNC_LOG_MAX_WINDOW_DAYS", 3))
         if _env_bool("USAGE_SYNC_LOG_TIMEZONE_ENABLED", True) and not backend.source:
@@ -164,6 +362,16 @@ class UsageSynchronizer:
                     scanned, complete = await self.client.sync_rows_from_logs(start_date, end_date, backend)
                     if complete:
                         log_rows = scanned
+                        event_rows = list(
+                            getattr(log_rows, "events", None)
+                            or log_rows.pop("__events__", [])
+                        )
+                        if token_mapping_index:
+                            for batch in log_rows.values():
+                                self._apply_token_attribution(batch, token_mapping_index)
+                            self._apply_token_attribution(
+                                event_rows, token_mapping_index
+                            )
                     else:
                         logger.warning(
                             "usage log scan incomplete for backend %s; falling back to daily activity",
@@ -185,6 +393,7 @@ class UsageSynchronizer:
             result: list[dict[str, Any]] = []
             for row in rows:
                 item = dict(row)
+                metadata = info.get("metadata") if isinstance(info.get("metadata"), dict) else {}
                 item.update(
                     {
                         "_userId": user_id,
@@ -192,6 +401,18 @@ class UsageSynchronizer:
                         "employeeName": _text(info.get("name")) or user_id,
                     }
                 )
+                # Explicit request-log attribution stays authoritative. Only
+                # fill missing fields from persisted upstream user metadata.
+                if not _text(item.get("organizationId") or item.get("organization_id")):
+                    item["userOrganizationId"] = _text(
+                        info.get("organization_id")
+                        or info.get("organizationId")
+                        or metadata.get("organization_id")
+                    )
+                if not _text(item.get("teamId") or item.get("team_id")):
+                    item["userTeamId"] = _text(
+                        info.get("team_id") or info.get("teamId") or metadata.get("team_id")
+                    )
                 result.append(item)
             return result
 
@@ -199,6 +420,27 @@ class UsageSynchronizer:
             *(collect_user(user_id, info) for user_id, info in account_users.items()),
         )
         rows = [row for batch in results for row in batch]
+        # Full scans may contain user ids missing from /user/list. Preserve all
+        # buckets so stable principal mappings can still attribute them and
+        # unknown identities remain visible to data-quality checks.
+        if log_rows is not None:
+            known_user_ids = set(account_users)
+            for raw_user_id, raw_rows in log_rows.items():
+                if raw_user_id in known_user_ids:
+                    continue
+                for row in raw_rows:
+                    rows.append(
+                        {
+                            **row,
+                            "_userId": raw_user_id,
+                            "employeeEmail": "",
+                            "employeeName": (
+                                raw_user_id
+                                if raw_user_id != "unattributed"
+                                else "未归属请求"
+                            ),
+                        }
+                    )
         logger.info(
             "usage snapshot collected backend=%s users=%s rows=%s start=%s end=%s",
             backend.id,
@@ -208,7 +450,12 @@ class UsageSynchronizer:
             end_date,
         )
         memberships = await self.collect_memberships(backend, users, start_date, end_date, account_index)
-        return BackendSnapshot(backend.id, rows, memberships)
+        return BackendSnapshot(
+            backend.id,
+            rows,
+            memberships,
+            event_rows if log_rows is not None else None,
+        )
 
     async def collect_memberships(
         self,
@@ -311,9 +558,67 @@ class UsageSynchronizer:
         return memberships
 
 
-async def run_sync_once(client: LiteLLMClient, store: UsageStore, days: int) -> dict[str, Any]:
+async def run_sync_once(
+    client: LiteLLMClient,
+    store: UsageStore,
+    days: int,
+    organization_repository: Any | None = None,
+    synchronizer_factory: Any | None = None,
+) -> dict[str, Any]:
     start_date, end_date = UsageSynchronizer.date_range(days)
-    return await UsageSynchronizer(client, store).sync(start_date, end_date)
+    factory = synchronizer_factory or UsageSynchronizer
+    return await factory(client, store, organization_repository).sync(
+        start_date, end_date
+    )
+
+
+async def run_sync_with_recent_refresh(
+    client: LiteLLMClient,
+    store: UsageStore,
+    days: int,
+    organization_repository: Any | None = None,
+    synchronizer_factory: Any | None = None,
+) -> dict[str, Any]:
+    """Refresh recent request logs after an efficient long aggregate backfill."""
+
+    if organization_repository is None and synchronizer_factory is None:
+        result = await run_sync_once(client, store, days)
+    else:
+        result = await run_sync_once(
+            client,
+            store,
+            days,
+            organization_repository,
+            synchronizer_factory,
+        )
+    if result.get("status") != "ok" or not _env_bool("USAGE_SYNC_LOG_TIMEZONE_ENABLED", True):
+        return result
+
+    recent_days = min(days, max(1, _env_int("USAGE_SYNC_LOG_MAX_WINDOW_DAYS", 3)))
+    if recent_days >= days:
+        return result
+
+    # Keep organization attribution enabled on both passes; otherwise the
+    # accurate recent replacement can lose imported/managed token ownership.
+    if organization_repository is None and synchronizer_factory is None:
+        recent_result = await run_sync_once(client, store, recent_days)
+    else:
+        recent_result = await run_sync_once(
+            client,
+            store,
+            recent_days,
+            organization_repository,
+            synchronizer_factory,
+        )
+    output = dict(result)
+    output["recentRefresh"] = {"days": recent_days, **recent_result}
+    if recent_result.get("status") != "ok":
+        output["status"] = "partial"
+        output["errors"] = [
+            *list(result.get("errors") or []),
+            *list(recent_result.get("errors") or []),
+        ]
+    return output
 
 
 async def _run_cli(days: int) -> int:
@@ -322,10 +627,17 @@ async def _run_cli(days: int) -> int:
         print(json.dumps({"status": "disabled", "error": "USAGE_DATABASE_URL is not configured"}))
         return 2
     client: LiteLLMClient | None = None
+    repository: Any | None = None
     try:
         client = LiteLLMClient()
         await store.connect()
-        result = await run_sync_once(client, store, days)
+        if os.getenv("ORGANIZATION_MODE", "disabled").strip().lower() == "real":
+            from .organization_repository import PostgreSQLOrganizationRepository
+
+            repository = PostgreSQLOrganizationRepository.from_environment()
+            if repository is not None:
+                await repository.connect()
+        result = await run_sync_with_recent_refresh(client, store, days, repository)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0 if result.get("status") == "ok" else 1
     except Exception as exc:
@@ -335,6 +647,8 @@ async def _run_cli(days: int) -> int:
     finally:
         if client is not None:
             await client.close()
+        if repository is not None:
+            await repository.close()
         await store.close()
 
 

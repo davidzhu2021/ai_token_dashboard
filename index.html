@@ -1752,6 +1752,60 @@
         font-variant-numeric: tabular-nums;
       }
 
+      .operational-status {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        margin-top: 12px;
+        padding: 10px 12px;
+        border: 1px solid rgba(184, 135, 39, 0.24);
+        border-radius: 10px;
+        background: rgba(255, 248, 229, 0.82);
+        color: #765212;
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .operational-status.danger {
+        border-color: rgba(185, 71, 71, 0.24);
+        background: rgba(255, 238, 235, 0.86);
+        color: #803232;
+      }
+
+      .operational-status-icon {
+        display: grid;
+        flex: 0 0 18px;
+        width: 18px;
+        height: 18px;
+        place-items: center;
+      }
+
+      .operational-status-icon svg {
+        width: 16px;
+        height: 16px;
+        stroke: currentColor;
+        fill: none;
+        stroke-width: 1.8;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      .operational-status strong,
+      .operational-status p {
+        margin: 0;
+      }
+
+      .operational-status p {
+        margin-top: 2px;
+        color: inherit;
+        opacity: 0.86;
+      }
+
+      .operational-status-action {
+        flex: 0 0 auto;
+        margin-left: auto;
+      }
+
       @container (max-width: 560px) {
         .daily-main-title-row {
           grid-template-columns: minmax(0, 1fr);
@@ -4979,7 +5033,7 @@
         }
       }
 
-      /* ===== 企业组织（演示数据） ===== */
+      /* ===== 企业组织（disabled / demo / real） ===== */
       .organization-view {
         display: grid;
         gap: 18px;
@@ -5130,6 +5184,161 @@
       .organization-department-panel,
       .organization-member-panel {
         min-width: 0;
+      }
+
+      .organization-claim-panel {
+        grid-column: 1 / -1;
+      }
+
+      .organization-adoption-panel {
+        grid-column: 1 / -1;
+      }
+
+      .organization-adoption-intro {
+        margin-bottom: 16px;
+        padding: 14px 16px;
+        border-left: 4px solid var(--brand);
+        border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+        background: linear-gradient(90deg, rgba(6, 115, 210, 0.1), rgba(235, 246, 255, 0.46));
+      }
+
+      .organization-adoption-intro strong,
+      .organization-adoption-intro p {
+        margin: 0;
+      }
+
+      .organization-adoption-intro p {
+        margin-top: 5px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.65;
+      }
+
+      .organization-adoption-form {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .organization-adoption-form .field {
+        margin: 0;
+      }
+
+      .organization-adoption-form > .field-error,
+      .organization-adoption-actions {
+        grid-column: 1 / -1;
+        margin: 0;
+      }
+
+      .organization-adoption-panel > .operational-status {
+        margin-top: 16px;
+      }
+
+      .organization-adoption-result {
+        display: grid;
+        gap: 14px;
+        margin-top: 16px;
+        padding: 16px;
+        border: 1px solid rgba(6, 115, 210, 0.18);
+        border-radius: var(--radius-sm);
+        background: rgba(247, 251, 255, 0.76);
+      }
+
+      .organization-adoption-result-head {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .organization-adoption-result-head > div {
+        display: grid;
+        gap: 4px;
+        padding: 12px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.76);
+      }
+
+      .organization-adoption-result-head span,
+      .organization-adoption-assets p {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .organization-adoption-assets {
+        display: grid;
+        gap: 7px;
+        padding-top: 14px;
+        border-top: 1px solid var(--line);
+      }
+
+      .organization-adoption-assets p {
+        margin: 0;
+        line-height: 1.65;
+      }
+
+      .organization-adoption-assets .organization-status {
+        justify-self: start;
+      }
+
+      .organization-claim-intro {
+        display: grid;
+        grid-template-columns: minmax(0, 1.35fr) minmax(260px, 0.65fr);
+        gap: 16px;
+        margin-bottom: 16px;
+        padding: 16px;
+        border: 1px solid rgba(6, 115, 210, 0.16);
+        border-radius: var(--radius-sm);
+        background: linear-gradient(120deg, rgba(235, 246, 255, 0.88), rgba(255, 255, 255, 0.76));
+      }
+
+      .organization-claim-intro strong,
+      .organization-claim-intro p {
+        margin: 0;
+      }
+
+      .organization-claim-intro p {
+        margin-top: 5px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.65;
+      }
+
+      .organization-claim-form {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .organization-claim-form .field {
+        margin: 0;
+      }
+
+      .organization-claim-form > .field-error {
+        grid-column: 1 / -1;
+        margin: 0;
+      }
+
+      .organization-claim-form .modal-actions {
+        grid-column: 1 / -1;
+        margin-top: 2px;
+      }
+
+      .organization-claim-link {
+        display: grid;
+        align-content: center;
+        gap: 8px;
+        padding: 12px;
+        border: 1px dashed rgba(6, 115, 210, 0.32);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.74);
+      }
+
+      .organization-claim-link code {
+        overflow-wrap: anywhere;
+        color: var(--brand);
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 12px;
       }
 
       .organization-department-list {
@@ -5532,6 +5741,16 @@
         background: rgba(104, 118, 138, 0.12);
       }
 
+      .customer-organization-status.gold {
+        color: #7a5312;
+        background: var(--gold-soft);
+      }
+
+      .customer-organization-status.rose {
+        color: var(--rose);
+        background: var(--rose-soft);
+      }
+
       .customer-organization-metrics {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -5645,6 +5864,10 @@
           grid-template-columns: 1fr;
         }
 
+        .organization-claim-intro {
+          grid-template-columns: 1fr;
+        }
+
         .organization-member-toolbar {
           grid-template-columns: repeat(2, minmax(0, 1fr));
         }
@@ -5695,6 +5918,24 @@
         .organization-member-toolbar {
           grid-template-columns: 1fr;
           align-items: stretch;
+        }
+
+        .organization-claim-form {
+          grid-template-columns: 1fr;
+        }
+
+        .organization-adoption-form,
+        .organization-adoption-result-head {
+          grid-template-columns: 1fr;
+        }
+
+        .organization-adoption-form > .field-error,
+        .organization-adoption-actions {
+          grid-column: auto;
+        }
+
+        .organization-claim-form .modal-actions {
+          grid-column: auto;
         }
 
         .organization-filter-field:first-child {
@@ -5976,21 +6217,113 @@
             </div>
             <p id="authAvailabilityNotice" class="auth-status" role="status" aria-live="polite"></p>
 
+            <section id="organizationInvitationScreen" class="auth-screen hidden" aria-label="接受企业邀请" aria-hidden="true">
+              <div class="login-card-head">
+                <h2 id="organizationInvitationTitle">接受企业邀请</h2>
+                <p id="organizationInvitationDescription">正在验证邀请链接，请稍候。</p>
+              </div>
+              <div id="organizationInvitationSummary" class="enterprise-login-copy">
+                <strong id="organizationInvitationOrganization">企业邀请</strong>
+                <span id="organizationInvitationEmail"></span>
+              </div>
+              <p id="organizationInvitationExistingAccount" class="auth-screen-note hidden">这个邮箱已有账号。接受邀请只会绑定企业成员关系，不会修改密码；完成后请使用原密码登录。</p>
+              <p id="organizationInvitationNewAccount" class="auth-screen-note hidden">这是首次使用该邮箱接受邀请，请设置一个至少 8 位的密码。</p>
+              <div id="organizationInvitationPasswordFields" class="hidden">
+                <div class="field">
+                  <label for="organizationInvitationPassword">设置密码</label>
+                  <div class="password-field">
+                    <input id="organizationInvitationPassword" class="input" type="password" placeholder="至少 8 个字符" autocomplete="new-password" minlength="8" maxlength="128" />
+                    <button class="password-toggle" type="button" data-password-toggle="organizationInvitationPassword" aria-label="显示密码" aria-pressed="false">
+                      <svg><use href="#icon-eye"></use></svg>
+                    </button>
+                  </div>
+                  <p id="organizationInvitationPasswordError" class="field-error" aria-live="polite"></p>
+                </div>
+                <div class="field">
+                  <label for="organizationInvitationConfirmPassword">确认密码</label>
+                  <div class="password-field">
+                    <input id="organizationInvitationConfirmPassword" class="input" type="password" placeholder="再次输入密码" autocomplete="new-password" minlength="8" maxlength="128" />
+                    <button class="password-toggle" type="button" data-password-toggle="organizationInvitationConfirmPassword" aria-label="显示密码" aria-pressed="false">
+                      <svg><use href="#icon-eye"></use></svg>
+                    </button>
+                  </div>
+                  <p id="organizationInvitationConfirmPasswordError" class="field-error" aria-live="polite"></p>
+                </div>
+              </div>
+              <p id="organizationInvitationError" class="auth-status" role="alert" aria-live="assertive"></p>
+              <p id="organizationInvitationSuccess" class="auth-status success" role="status" aria-live="polite"></p>
+              <div id="organizationInvitationActions" class="login-actions">
+                <button id="organizationInvitationAcceptButton" class="primary-btn auth-submit" type="button">
+                  <span class="app-icon"><svg><use href="#icon-team"></use></svg></span>
+                  <span>接受邀请并开通账号</span>
+                </button>
+                <button id="organizationInvitationRetryButton" class="ghost-btn auth-submit hidden" type="button">重新验证邀请</button>
+                <button id="organizationInvitationLoginButton" class="primary-btn auth-submit hidden" type="button">去登录</button>
+                <button id="organizationInvitationCancelButton" class="ghost-btn auth-submit" type="button">返回登录</button>
+              </div>
+            </section>
+
+            <section id="organizationClaimScreen" class="auth-screen hidden" aria-label="激活企业账号" aria-hidden="true">
+              <div class="login-card-head">
+                <h2 id="organizationClaimTitle">激活企业账号</h2>
+                <p id="organizationClaimDescription">正在核对账号认领链接，请稍候。</p>
+              </div>
+              <div id="organizationClaimSummary" class="enterprise-login-copy">
+                <strong id="organizationClaimOrganization">企业账号认领</strong>
+                <span id="organizationClaimIdentity"></span>
+              </div>
+              <p class="auth-screen-note">设置密码后，认领申请会提交给平台运营审核。审核通过前不会获得企业数据或令牌权限。</p>
+              <div id="organizationClaimPasswordFields">
+                <div class="field">
+                  <label for="organizationClaimPassword">设置密码</label>
+                  <div class="password-field">
+                    <input id="organizationClaimPassword" class="input" type="password" placeholder="至少 8 个字符" autocomplete="new-password" minlength="8" maxlength="128" />
+                    <button class="password-toggle" type="button" data-password-toggle="organizationClaimPassword" aria-label="显示密码" aria-pressed="false">
+                      <svg><use href="#icon-eye"></use></svg>
+                    </button>
+                  </div>
+                  <p id="organizationClaimPasswordError" class="field-error" aria-live="polite"></p>
+                </div>
+                <div class="field">
+                  <label for="organizationClaimConfirmPassword">确认密码</label>
+                  <div class="password-field">
+                    <input id="organizationClaimConfirmPassword" class="input" type="password" placeholder="再次输入密码" autocomplete="new-password" minlength="8" maxlength="128" />
+                    <button class="password-toggle" type="button" data-password-toggle="organizationClaimConfirmPassword" aria-label="显示密码" aria-pressed="false">
+                      <svg><use href="#icon-eye"></use></svg>
+                    </button>
+                  </div>
+                  <p id="organizationClaimConfirmPasswordError" class="field-error" aria-live="polite"></p>
+                </div>
+              </div>
+              <div id="organizationClaimTurnstile" class="turnstile-wrap hidden"></div>
+              <p id="organizationClaimError" class="auth-status" role="alert" aria-live="assertive"></p>
+              <p id="organizationClaimSuccess" class="auth-status success" role="status" aria-live="polite"></p>
+              <div class="login-actions">
+                <button id="organizationClaimAcceptButton" class="primary-btn auth-submit" type="button">
+                  <span class="app-icon"><svg><use href="#icon-team"></use></svg></span>
+                  <span>提交认领申请</span>
+                </button>
+                <button id="organizationClaimRetryButton" class="ghost-btn auth-submit hidden" type="button">重新核对链接</button>
+                <button id="organizationClaimLoginButton" class="primary-btn auth-submit hidden" type="button">返回登录</button>
+                <button id="organizationClaimCancelButton" class="ghost-btn auth-submit" type="button">返回登录</button>
+              </div>
+            </section>
+
             <div id="authAccessSwitch" class="auth-access-switch" role="tablist" aria-label="登录方式">
-              <button id="personalAccessTab" class="auth-access-tab" type="button" role="tab" aria-selected="true" aria-controls="personalAuthPanel" tabindex="0" data-auth-access="personal">邮箱账号</button>
-              <button id="enterpriseAccessTab" class="auth-access-tab" type="button" role="tab" aria-selected="false" aria-controls="enterpriseAuthPanel" tabindex="-1" data-auth-access="enterprise">企业账号</button>
+              <button id="personalAccessTab" class="auth-access-tab" type="button" role="tab" aria-selected="true" aria-controls="personalAuthPanel" tabindex="0" data-auth-access="personal">密码登录</button>
+              <button id="enterpriseAccessTab" class="auth-access-tab" type="button" role="tab" aria-selected="false" aria-controls="enterpriseAuthPanel" tabindex="-1" data-auth-access="enterprise">统一认证</button>
             </div>
 
             <div id="personalAuthPanel" role="tabpanel" aria-labelledby="personalAccessTab" aria-hidden="false">
-              <div id="authFlowSwitch" class="auth-flow-switch" role="tablist" aria-label="邮箱账号操作">
+              <div id="authFlowSwitch" class="auth-flow-switch" role="tablist" aria-label="密码账号操作">
                 <button id="loginFlowTab" class="auth-flow-tab" type="button" role="tab" aria-selected="true" aria-controls="passwordLoginScreen" tabindex="0" data-auth-mode="login">登录</button>
                 <button id="registerFlowTab" class="auth-flow-tab" type="button" role="tab" aria-selected="false" aria-controls="registerScreen" tabindex="-1" data-auth-mode="register">注册</button>
               </div>
 
               <section id="passwordLoginScreen" class="auth-screen" role="tabpanel" aria-labelledby="loginFlowTab" aria-hidden="false">
                 <div class="field">
-                  <label for="loginEmailInput">邮箱</label>
-                  <input id="loginEmailInput" class="input" name="email" type="email" placeholder="name@example.com" autocomplete="email" maxlength="254" />
+                  <label for="loginEmailInput">邮箱或账号</label>
+                  <input id="loginEmailInput" class="input" name="identifier" type="text" placeholder="name@example.com 或企业账号" autocomplete="username" maxlength="320" />
                   <p id="loginEmailError" class="field-error" aria-live="polite"></p>
                 </div>
                 <div class="field">
@@ -6270,6 +6603,7 @@
               <div class="daily-main-meta">
                 <span id="heroContext" class="daily-context">近 1 天 · 全部来源 · 最新数据日 暂无日期</span>
               </div>
+              <div id="personalUsageStatus" class="operational-status hidden" aria-live="polite"></div>
             </div>
             <div class="daily-main-values">
               <div>
@@ -6438,6 +6772,7 @@
                 <div class="daily-main-meta">
                   <span id="adminHeroContext" class="daily-context">近 1 天 · 全部来源 · 最新数据日 暂无日期</span>
                 </div>
+                <div id="adminUsageStatus" class="operational-status hidden" aria-live="polite"></div>
               </div>
               <div class="daily-main-values">
                 <div>
@@ -6717,10 +7052,11 @@
                     <span id="teamWelcomeTitle" class="daily-eyebrow">所选范围 · 团队视图</span>
                     <span id="teamHeroFreshness" class="daily-freshness">数据更新时间：暂未同步</span>
                   </div>
-                  <div class="daily-main-meta">
-                    <span id="teamHeroContext" class="daily-context">近 1 天 · 全部来源 · 最新数据日 暂无日期</span>
-                  </div>
+                <div class="daily-main-meta">
+                  <span id="teamHeroContext" class="daily-context">近 1 天 · 全部来源 · 最新数据日 暂无日期</span>
                 </div>
+                <div id="teamUsageStatus" class="operational-status hidden" aria-live="polite"></div>
+              </div>
                 <div class="daily-main-values">
                   <div>
                     <span id="teamHeroTotalLabel" class="daily-label">所选范围 Token</span>
@@ -6912,6 +7248,7 @@
                 <div class="daily-main-meta">
                   <span id="departmentHeroContext" class="daily-context">近 1 天 · 全部来源 · 最新数据日 暂无日期</span>
                 </div>
+                <div id="departmentUsageStatus" class="operational-status hidden" aria-live="polite"></div>
               </div>
               <div class="daily-main-values">
                 <div>
@@ -7051,12 +7388,12 @@
         <section id="customersView" class="view-section customer-view hidden" aria-labelledby="customersTitle">
           <section class="organization-hero customer-hero">
             <div class="organization-hero-copy">
-              <span class="organization-demo-badge">演示数据</span>
+              <span class="organization-demo-badge hidden" data-organization-demo-badge>演示数据</span>
               <h2 id="customersTitle">客户企业</h2>
-              <p>为每家客户企业维护独立的部门、成员和访问状态。当前数据仅用于演示，不会创建真实账号或发送邮件。</p>
+              <p id="customersDescription">为每家客户企业维护独立的部门、成员和访问状态。</p>
             </div>
             <div class="organization-hero-actions">
-              <button id="resetCustomerOrganizationsDemoButton" class="ghost-btn" type="button">重置演示数据</button>
+              <button id="resetCustomerOrganizationsDemoButton" class="ghost-btn hidden" type="button">重置演示数据</button>
               <button id="createCustomerOrganizationButton" class="primary-btn" type="button">
                 <span class="app-icon"><svg><use href="#icon-team"></use></svg></span>
                 新增客户企业
@@ -7104,9 +7441,10 @@
         <section id="organizationView" class="view-section organization-view hidden" aria-labelledby="organizationTitle">
           <section class="organization-hero">
             <div class="organization-hero-copy">
-              <span class="organization-demo-badge">演示数据</span>
+              <span class="organization-demo-badge hidden" data-organization-demo-badge>演示数据</span>
               <h2 id="organizationTitle">企业组织</h2>
               <p id="organizationSubtitle">在这里维护本企业的部门和成员，并进入企业范围看板与额度。</p>
+              <div id="organizationOperationalStatus" class="operational-status hidden" aria-live="polite"></div>
             </div>
             <div class="organization-hero-actions">
               <button id="backToCustomersButton" class="ghost-btn hidden" type="button">返回客户企业</button>
@@ -7149,6 +7487,117 @@
               <strong id="organizationInvitedMemberCount">0</strong>
               <small>等待加入企业</small>
             </article>
+          </section>
+
+          <section id="organizationClaimPanel" class="panel organization-claim-panel hidden" aria-labelledby="organizationClaimPanelTitle">
+            <div class="panel-header">
+              <div class="panel-heading">
+                <span class="panel-icon"><svg><use href="#icon-team"></use></svg></span>
+                <div>
+                  <h3 id="organizationClaimPanelTitle" class="panel-title">账号认领与审核</h3>
+                  <p class="panel-desc">为已有企业调用账号生成一次性激活链接。账号设置密码后，需平台运营审核才会获得企业访问权限。</p>
+                </div>
+              </div>
+              <span id="organizationClaimCountChip" class="chip blue">0 条</span>
+            </div>
+            <div class="organization-claim-intro">
+              <div>
+                <strong>北汽等已有调用账号</strong>
+                <p id="organizationClaimPanelHint">认领链接只在生成时展示一次，请通过受控渠道交给本人。链接过期或撤销后不能重放。</p>
+              </div>
+              <div id="organizationClaimLastResult" class="organization-claim-link hidden" aria-live="polite">
+                <span class="hint">本次激活链接</span>
+                <code id="organizationClaimLastUrl"></code>
+                <button id="copyOrganizationClaimUrlButton" class="ghost-btn" type="button">复制链接</button>
+              </div>
+            </div>
+            <form id="organizationClaimForm" class="organization-claim-form" autocomplete="off">
+              <div class="field">
+                <label for="organizationClaimMemberNameInput">姓名</label>
+                <input id="organizationClaimMemberNameInput" class="input" type="text" maxlength="120" required placeholder="例如：梁海强" />
+              </div>
+              <div class="field">
+                <label for="organizationClaimLoginNameInput">企业账号</label>
+                <input id="organizationClaimLoginNameInput" class="input" type="text" maxlength="80" required pattern="[A-Za-z0-9._-]+" placeholder="例如：lianghaiqiang" />
+              </div>
+              <div class="field">
+                <label for="organizationClaimDepartmentInput">所属部门</label>
+                <select id="organizationClaimDepartmentInput" class="select" required></select>
+              </div>
+              <div class="field">
+                <label for="organizationClaimRoleInput">企业角色</label>
+                <select id="organizationClaimRoleInput" class="select" required>
+                  <option value="admin">企业管理员</option>
+                  <option value="member">成员</option>
+                </select>
+              </div>
+              <p id="organizationClaimFormError" class="field-error" aria-live="polite"></p>
+              <div class="modal-actions">
+                <button id="submitOrganizationClaimButton" class="primary-btn" type="submit">生成激活链接</button>
+              </div>
+            </form>
+            <div class="table-wrap">
+              <table aria-label="企业账号认领列表">
+                <thead>
+                  <tr><th>账号</th><th>姓名</th><th>角色</th><th>状态</th><th>有效期</th><th>操作</th></tr>
+                </thead>
+                <tbody id="organizationClaimTable"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section id="organizationAdoptionPanel" class="panel organization-adoption-panel hidden" aria-labelledby="organizationAdoptionPanelTitle">
+            <div class="panel-header">
+              <div class="panel-heading">
+                <span class="panel-icon"><svg><use href="#icon-source"></use></svg></span>
+                <div>
+                  <h3 id="organizationAdoptionPanelTitle" class="panel-title">企业接管与历史资产</h3>
+                  <p class="panel-desc">先做只读预检，再一次性应用北汽集团试点接管。预检不会修改现有调用权限。</p>
+                </div>
+              </div>
+              <span class="chip blue">平台运营</span>
+            </div>
+            <div class="organization-adoption-intro">
+              <strong>接管前核对</strong>
+              <p>系统会核对企业、部门、David 管理员邀请和两项历史资产的唯一归属。任何冲突都会停止写入。</p>
+            </div>
+            <form id="organizationAdoptionForm" class="organization-adoption-form" autocomplete="off">
+              <div class="field">
+                <label for="organizationAdoptionNameInput">客户企业</label>
+                <input id="organizationAdoptionNameInput" class="input" type="text" maxlength="120" value="北汽集团" required />
+              </div>
+              <div class="field">
+                <label for="organizationAdoptionDepartmentInput">首个部门</label>
+                <input id="organizationAdoptionDepartmentInput" class="input" type="text" maxlength="120" value="企业管理" required />
+              </div>
+              <div class="field">
+                <label for="organizationAdoptionAdminNameInput">临时管理员</label>
+                <input id="organizationAdoptionAdminNameInput" class="input" type="text" maxlength="120" value="David Zhu" required />
+              </div>
+              <div class="field">
+                <label for="organizationAdoptionAdminEmailInput">管理员邮箱</label>
+                <input id="organizationAdoptionAdminEmailInput" class="input" type="email" maxlength="254" value="davidzhu2021@163.com" required />
+              </div>
+              <div class="field">
+                <label for="organizationAdoptionPrincipalInput">历史资产负责人</label>
+                <input id="organizationAdoptionPrincipalInput" class="input" type="text" maxlength="120" value="梁海强" required />
+              </div>
+              <div class="field">
+                <label for="organizationAdoptionEffectiveFromInput">历史用量起始日期</label>
+                <input id="organizationAdoptionEffectiveFromInput" class="input" type="date" required />
+              </div>
+              <div class="field">
+                <label for="organizationAdoptionEffectiveThroughInput">历史用量截止日期</label>
+                <input id="organizationAdoptionEffectiveThroughInput" class="input" type="date" required />
+              </div>
+              <p id="organizationAdoptionError" class="field-error" aria-live="polite"></p>
+              <div class="organization-adoption-actions modal-actions">
+                <button id="previewOrganizationAdoptionButton" class="ghost-btn" type="submit">执行接管预检</button>
+                <button id="applyOrganizationAdoptionButton" class="primary-btn hidden" type="button">应用接管</button>
+              </div>
+            </form>
+            <div id="organizationAdoptionStatus" class="operational-status hidden" aria-live="polite"></div>
+            <div id="organizationAdoptionResult" class="organization-adoption-result hidden" aria-live="polite"></div>
           </section>
 
           <section id="organizationManagementWorkspace" class="organization-workspace">
@@ -7239,7 +7688,7 @@
 
           <section class="organization-hero">
             <div class="organization-hero-copy">
-              <span class="organization-demo-badge">演示数据</span>
+              <span class="organization-demo-badge hidden" data-organization-demo-badge>演示数据</span>
               <h2 id="organizationTokenTitle">令牌管理</h2>
               <p id="organizationTokenSubtitle">为本企业签发调用令牌，并指定每个令牌可以使用的模型。令牌完整值仅在创建成功时展示一次。</p>
             </div>
@@ -7251,6 +7700,15 @@
               <span id="organizationTokenReadOnlyHint" class="organization-billing-readonly hidden">平台视图仅供查看</span>
             </div>
           </section>
+
+          <div id="organizationTokenCatalogStatus" class="operational-status danger hidden" aria-live="polite">
+            <span class="operational-status-icon" aria-hidden="true"><svg><use href="#icon-warning"></use></svg></span>
+            <div>
+              <strong>模型目录暂不可用</strong>
+              <p>当前无法校验企业可用模型，令牌列表和新建功能暂不可用。请稍后重新检查。</p>
+            </div>
+            <button id="retryOrganizationTokenCatalogButton" class="ghost-btn operational-status-action" type="button">重新检查</button>
+          </div>
 
           <section class="organization-stats" aria-label="企业令牌概览">
             <article class="organization-stat accent">
@@ -7376,18 +7834,24 @@
 
             <section class="organization-billing-hero">
               <div>
-                <span class="organization-demo-badge">演示数据</span>
+                <span class="organization-demo-badge hidden" data-organization-demo-badge>演示数据</span>
                 <span class="eyebrow">企业额度</span>
                 <h2 id="organizationBillingTitle">企业账户余额</h2>
-                <p><strong id="organizationBillingScopeName">客户企业</strong> 的额度仅用于本地演示。演示用量不影响企业余额，也不会发起真实付款。</p>
+                <p><strong id="organizationBillingScopeName">客户企业</strong> <span id="organizationBillingDescription">的企业额度与用量数据。</span></p>
+                <div id="organizationBillingOperationalStatus" class="operational-status hidden" aria-live="polite"></div>
               </div>
               <div class="organization-billing-hero-balance">
                 <span>当前可用余额</span>
                 <strong id="organizationBillingBalance">$0.00</strong>
                 <button id="openOrganizationTopupModalButton" class="primary-btn hidden" type="button">
                   <span class="app-icon"><svg><use href="#icon-cost"></use></svg></span>
-                  模拟充值
+                  联系平台运营授信
                 </button>
+                <button id="openOrganizationCreditAdjustmentButton" class="primary-btn hidden" type="button">
+                  <span class="app-icon"><svg><use href="#icon-cost"></use></svg></span>
+                  授予额度
+                </button>
+                <button id="openOrganizationCreditRevokeButton" class="danger-outline-btn hidden" type="button">扣减额度</button>
                 <span id="organizationBillingReadOnlyHint" class="organization-billing-readonly hidden">平台视图仅供查看</span>
               </div>
             </section>
@@ -7396,15 +7860,15 @@
               <article class="organization-billing-metric accent">
                 <span>累计企业额度</span>
                 <strong id="organizationBillingTotalCredits">$0.00</strong>
-                <small>含初始企业额度与模拟充值</small>
+                <small id="organizationBillingTotalCreditsHint">累计授予与退回的企业额度</small>
               </article>
               <article class="organization-billing-metric">
                 <span>初始企业额度</span>
                 <strong id="organizationBillingInitialCredits">$0.00</strong>
-                <small>每家演示企业独立初始化</small>
+                <small id="organizationBillingInitialCreditsHint">企业开户及后续额度授予</small>
               </article>
               <article class="organization-billing-metric">
-                <span>演示用量估算</span>
+                <span id="organizationBillingUsageLabel">近 30 天用量</span>
                 <strong id="organizationBillingUsageEstimate">$0.00</strong>
                 <small><span id="organizationBillingUsageTokens">0</span> Token · <span id="organizationBillingUsageRequests">0</span> 次请求</small>
               </article>
@@ -7412,7 +7876,7 @@
 
             <section class="organization-billing-note">
               <span class="app-icon" aria-hidden="true"><svg><use href="#icon-shield"></use></svg></span>
-              <p>演示用量仅帮助查看企业使用情况，不会扣减企业账户余额。本页不包含支付方式、收款码、兑换码或真实订单。</p>
+              <p id="organizationBillingNoteText" data-demo-copy="本页不包含支付方式、收款码、兑换码或真实订单。">企业额度由平台运营人员维护；用量数据按实际调用汇总。</p>
             </section>
 
             <section id="organizationBillingUsageCards" class="organization-billing-usage-grid" aria-label="企业用量统计"></section>
@@ -7423,7 +7887,7 @@
                   <span class="panel-icon"><svg><use href="#icon-table"></use></svg></span>
                   <div>
                     <h3 class="panel-title">额度变动记录</h3>
-                    <p class="panel-desc">记录初始企业额度与后续模拟充值。所有内容均为演示数据。</p>
+                    <p id="organizationBillingRecordDescription" class="panel-desc">记录平台对企业额度的授予、扣减与调整。</p>
                   </div>
                 </div>
                 <span id="organizationBillingRecordCount" class="chip blue">0 条</span>
@@ -7760,7 +8224,7 @@
     <div id="organizationMemberModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="organizationMemberModalTitle">
       <form id="organizationMemberForm" class="modal">
         <h3 id="organizationMemberModalTitle">邀请成员</h3>
-        <p id="organizationMemberModalDescription">成员会以待邀请状态加入演示企业，不会发送真实邮件。</p>
+        <p id="organizationMemberModalDescription">成员会以待邀请状态加入企业；系统会按企业配置发送邀请。</p>
         <div class="field">
           <label for="organizationMemberNameInput">姓名</label>
           <input id="organizationMemberNameInput" class="input" type="text" maxlength="120" required autocomplete="off" placeholder="例如：张三" />
@@ -7779,7 +8243,7 @@
             <option value="member">成员</option>
             <option value="admin">企业管理员</option>
           </select>
-          <p class="organization-modal-note">企业管理员可维护本企业部门、成员与企业范围权限；不会发送真实邮件。</p>
+          <p class="organization-modal-note">企业管理员可维护本企业部门、成员与企业范围权限。</p>
         </div>
         <div id="organizationMemberStatusField" class="field hidden">
           <label for="organizationMemberStatusInput">访问状态</label>
@@ -7811,7 +8275,7 @@
         <div id="customerOrganizationAdminEmailField" class="field">
           <label for="customerOrganizationAdminEmailInput">首位企业管理员邮箱</label>
           <input id="customerOrganizationAdminEmailInput" class="input" type="email" maxlength="254" required autocomplete="off" placeholder="admin@company.com" />
-          <p class="organization-modal-note">首位企业管理员会以已启用状态加入演示企业；不会发送真实邮件。</p>
+          <p class="organization-modal-note">首位企业管理员会按企业配置完成邀请和开通。</p>
         </div>
         <div class="modal-actions">
           <button id="cancelCustomerOrganizationButton" class="ghost-btn" type="button">取消</button>
@@ -7822,18 +8286,42 @@
 
     <div id="organizationTopupModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="organizationTopupModalTitle">
       <form id="organizationTopupForm" class="modal organization-topup-modal" autocomplete="off">
-        <h3 id="organizationTopupModalTitle">模拟充值</h3>
-        <p>立即为当前企业增加演示额度，不会调用支付、收款、邮件或任何真实充值服务。</p>
-        <div id="organizationTopupOptions" class="billing-amount-options" role="group" aria-label="模拟充值快速金额"></div>
+        <h3 id="organizationTopupModalTitle">企业额度由平台运营维护</h3>
+        <p>真实模式不提供客户自助充值，请联系平台运营人员授予或调整企业额度。</p>
+        <div id="organizationTopupOptions" class="billing-amount-options" role="group" aria-label="企业额度维护说明"></div>
         <div class="field">
           <label for="organizationTopupAmount">自定义金额（美元）</label>
-          <input id="organizationTopupAmount" class="input" type="number" min="1" max="100000" step="0.01" inputmode="decimal" placeholder="请输入模拟充值金额" />
+          <input id="organizationTopupAmount" class="input" type="number" min="1" max="100000" step="0.01" inputmode="decimal" placeholder="请联系平台运营授信" disabled />
           <p id="organizationTopupError" class="field-error" aria-live="polite"></p>
         </div>
-        <p class="organization-modal-note">金额范围为 $1.00 至 $100,000.00，最多两位小数。提交成功后余额和记录会立即刷新。</p>
+        <p class="organization-modal-note">真实模式下，企业额度由平台运营依据合同、订单或审批结果维护。</p>
         <div class="modal-actions">
           <button id="cancelOrganizationTopupButton" class="ghost-btn" type="button">取消</button>
-          <button id="submitOrganizationTopupButton" class="primary-btn" type="submit">确认模拟充值</button>
+          <button id="submitOrganizationTopupButton" class="primary-btn" type="submit" disabled>联系平台运营授信</button>
+        </div>
+      </form>
+    </div>
+
+    <div id="organizationCreditAdjustmentModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="organizationCreditAdjustmentModalTitle">
+      <form id="organizationCreditAdjustmentForm" class="modal" autocomplete="off">
+        <h3 id="organizationCreditAdjustmentModalTitle">授予企业额度</h3>
+        <p>额度调整会写入企业账本，并立即影响后续用量结算。请填写可审计的原因。</p>
+        <div class="field">
+          <label for="organizationCreditAdjustmentAmount">金额（美元）</label>
+          <input id="organizationCreditAdjustmentAmount" class="input" type="number" min="0.01" max="100000" step="0.01" required inputmode="decimal" />
+        </div>
+        <div class="field">
+          <label for="organizationCreditAdjustmentReason">调整原因</label>
+          <input id="organizationCreditAdjustmentReason" class="input" type="text" maxlength="500" required placeholder="例如：合同续费赠送额度" />
+        </div>
+        <div class="field">
+          <label for="organizationCreditAdjustmentReference">外部参考号（可选）</label>
+          <input id="organizationCreditAdjustmentReference" class="input" type="text" maxlength="128" placeholder="订单号或合同号" />
+          <p id="organizationCreditAdjustmentError" class="field-error" aria-live="polite"></p>
+        </div>
+        <div class="modal-actions">
+          <button id="cancelOrganizationCreditAdjustmentButton" class="ghost-btn" type="button">取消</button>
+          <button id="organizationCreditAdjustmentSubmit" class="primary-btn" type="submit">确认授予</button>
         </div>
       </form>
     </div>

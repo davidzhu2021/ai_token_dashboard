@@ -3,92 +3,59 @@
 The store deliberately has no HTTP, authentication, email, or upstream
 dependencies.  It models the seller's customer directory and independently
 scoped customer organizations, so route handlers can keep platform access
-checks separate from a customer's membership role.  A database-backed
-implementation can keep the same public operations later.
+checks separate from a customer's membership role.
+
+生产部署使用 :mod:`backend.organization_repository` 的真实 PostgreSQL 实现；本模块保留
+下来只服务两个用途：离线单测的 Protocol 双测，以及未配置真实数据库时的受控演示。
+两个实现共享 :mod:`backend.organization_validation` 的校验，避免输入语义漂移。
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
-import re
 import secrets
 import threading
 import uuid
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Protocol
 
-
-ORGANIZATION_ROLES = frozenset({"admin", "member"})
-MEMBER_STATUSES = frozenset({"invited", "active", "suspended"})
-ORGANIZATION_STATUSES = frozenset({"active", "suspended", "archived"})
-TEAM_ROLES = frozenset({"leader", "member"})
-ACTIVE_DEPARTMENT_MEMBER_STATUSES = frozenset({"invited", "active"})
-
-# This is deliberately separate from the production billing ledger.  Mock
-# organizations receive a deterministic opening credit that is never reduced
-# by generated usage data.
-INITIAL_ORGANIZATION_BALANCE_USD = Decimal("5000.00")
-MIN_SIMULATED_TOPUP_USD = Decimal("1.00")
-MAX_SIMULATED_TOPUP_USD = Decimal("100000.00")
-
-# 可选模型目录的正常来源是网关真实模型列表，由路由层注入（见
-# main.organization_token_model_catalog）。这份内置清单只是回落值：store 契约不允许
-# 发起任何上游调用，未配置上游或上游不可用时靠它保证令牌管理仍然可用。
-ORGANIZATION_TOKEN_MODELS = (
-    "claude-opus-5",
-    "claude-sonnet-4-6",
-    "gpt-5.2",
-    "qwen3-coder-plus",
-    "gemini-3-pro",
+from .organization_validation import (
+    ACTIVE_DEPARTMENT_MEMBER_STATUSES,
+    DEFAULT_TOKEN_DAILY_BUDGET_USD,
+    INITIAL_ORGANIZATION_BALANCE_USD,
+    MAX_MODELS_PER_TOKEN,
+    MAX_SIMULATED_TOPUP_USD,
+    MAX_TOKEN_DAILY_BUDGET_USD,
+    MAX_TOKENS_PER_ORGANIZATION,
+    MEMBER_STATUSES,
+    MIN_SIMULATED_TOPUP_USD,
+    MIN_TOKEN_DAILY_BUDGET_USD,
+    ORGANIZATION_ROLES,
+    ORGANIZATION_STATUSES,
+    ORGANIZATION_TOKEN_MODELS,
+    TEAM_ROLES,
+    TOKEN_DURATION_DAYS,
+    TOKEN_DURATIONS,
+    TOKEN_STATUSES,
+    _UNSET,
+    DuplicateMemberEmailError,
+    OrganizationConflictError,
+    OrganizationNotFoundError,
+    OrganizationPermissionError,
+    OrganizationStoreError,
+    OrganizationValidationError,
+    OrganizationValidationMixin,
 )
-TOKEN_STATUSES = frozenset({"active", "revoked", "expired"})
-TOKEN_DURATIONS = ("never", "30d", "90d")
-TOKEN_DURATION_DAYS = {"30d": 30, "90d": 90}
-MAX_TOKENS_PER_ORGANIZATION = 20
-# 不与内置清单长度挂钩：真实网关目录远多于回落清单，绑死会让请求体在 Pydantic 层
-# 就被截断，管理员选不满自己有权使用的模型。
-MAX_MODELS_PER_TOKEN = 50
-MIN_TOKEN_DAILY_BUDGET_USD = Decimal("1.00")
-MAX_TOKEN_DAILY_BUDGET_USD = Decimal("5000.00")
-DEFAULT_TOKEN_DAILY_BUDGET_USD = Decimal("100.00")
 
 _SEED_TIMESTAMP = "2026-01-01T00:00:00+00:00"
-_UNSET = object()
-_EMAIL_LOCAL_PATTERN = re.compile(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+\Z")
-_EMAIL_DOMAIN_LABEL_PATTERN = re.compile(r"[a-z0-9-]+\Z")
-_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9_-]+\Z")
 _USAGE_SOURCES = (
     ("Cursor", "gpt-5.2", 12.0),
     ("Claude Code", "claude-sonnet-4-6", 15.0),
     ("其他", "qwen3-coder-plus", 4.0),
 )
-
-
-class OrganizationStoreError(RuntimeError):
-    """Base exception raised by organization repository operations."""
-
-
-class OrganizationValidationError(OrganizationStoreError):
-    """Raised when a caller supplies an invalid organization field."""
-
-
-class OrganizationNotFoundError(OrganizationStoreError):
-    """Raised when an organization, department, member, or team does not exist."""
-
-
-class OrganizationConflictError(OrganizationStoreError):
-    """Raised when a requested change violates organization state rules."""
-
-
-class OrganizationPermissionError(OrganizationStoreError):
-    """Raised when a customer member tries to leave their assigned scope."""
-
-
-class DuplicateMemberEmailError(OrganizationConflictError):
-    """Raised when a mock identity is already assigned to another customer."""
 
 
 class OrganizationStore(Protocol):
@@ -327,7 +294,7 @@ class _OrganizationState:
     usage_cache_version: int = 1
 
 
-class InMemoryOrganizationStore:
+class InMemoryOrganizationStore(OrganizationValidationMixin):
     """Thread-safe, deterministic platform demo repository.
 
     ``org-demo`` remains the legacy current tenant so existing routes can keep
@@ -345,121 +312,8 @@ class InMemoryOrganizationStore:
         self._load_seed()
 
     # ------------------------------------------------------------------
-    # Validation and deterministic seed data
+    # Deterministic seed data
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def normalize_email(email: str) -> str:
-        """Normalize and validate an email used for customer membership."""
-
-        if not isinstance(email, str):
-            raise OrganizationValidationError("email must be a string")
-        value = email.strip().lower()
-        if value.count("@") != 1 or len(value) > 254:
-            raise OrganizationValidationError("enter a valid email address")
-        local, domain = value.split("@", 1)
-        if (
-            not local
-            or len(local) > 64
-            or local.startswith(".")
-            or local.endswith(".")
-            or ".." in local
-            or not _EMAIL_LOCAL_PATTERN.fullmatch(local)
-        ):
-            raise OrganizationValidationError("enter a valid email address")
-        try:
-            domain = domain.encode("idna").decode("ascii")
-        except UnicodeError as exc:
-            raise OrganizationValidationError("enter a valid email address") from exc
-        labels = domain.split(".")
-        if (
-            len(domain) > 253
-            or len(labels) < 2
-            or any(
-                not label
-                or len(label) > 63
-                or label.startswith("-")
-                or label.endswith("-")
-                or not _EMAIL_DOMAIN_LABEL_PATTERN.fullmatch(label)
-                for label in labels
-            )
-        ):
-            raise OrganizationValidationError("enter a valid email address")
-        return f"{local}@{domain}"
-
-    @staticmethod
-    def _now() -> str:
-        return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-    @staticmethod
-    def _required_text(value: Any, field_name: str, max_length: int) -> str:
-        if not isinstance(value, str):
-            raise OrganizationValidationError(f"{field_name} must be a string")
-        normalized = " ".join(value.split())
-        if not normalized:
-            raise OrganizationValidationError(f"{field_name} is required")
-        if len(normalized) > max_length:
-            raise OrganizationValidationError(f"{field_name} must be at most {max_length} characters")
-        if any(ord(character) < 32 for character in normalized):
-            raise OrganizationValidationError(f"{field_name} contains invalid characters")
-        return normalized
-
-    @staticmethod
-    def _required_identifier(value: Any, field_name: str) -> str:
-        if not isinstance(value, str) or not value.strip():
-            raise OrganizationValidationError(f"{field_name} is required")
-        return value.strip()
-
-    @classmethod
-    def _valid_identifier(cls, value: Any, field_name: str) -> str:
-        identifier = cls._required_identifier(value, field_name)
-        if len(identifier) > 128 or not _IDENTIFIER_PATTERN.fullmatch(identifier):
-            raise OrganizationValidationError(f"{field_name} contains invalid characters")
-        return identifier
-
-    @staticmethod
-    def _normalized_optional_filter(value: Any, field_name: str) -> str:
-        if value is None:
-            return ""
-        if not isinstance(value, str):
-            raise OrganizationValidationError(f"{field_name} must be a string")
-        return value.strip()
-
-    @classmethod
-    def _validate_role(cls, value: Any) -> str:
-        if not isinstance(value, str) or value not in ORGANIZATION_ROLES:
-            raise OrganizationValidationError("role must be admin or member")
-        return value
-
-    @classmethod
-    def _validate_status(cls, value: Any) -> str:
-        if not isinstance(value, str) or value not in MEMBER_STATUSES:
-            raise OrganizationValidationError("status must be invited, active, or suspended")
-        return value
-
-    @classmethod
-    def _validate_organization_status(cls, value: Any) -> str:
-        if not isinstance(value, str) or value not in ORGANIZATION_STATUSES:
-            raise OrganizationValidationError("organization status must be active, suspended, or archived")
-        return value
-
-    @classmethod
-    def _validate_team_role(cls, value: Any) -> str:
-        if not isinstance(value, str) or value not in TEAM_ROLES:
-            raise OrganizationValidationError("team_role must be leader or member")
-        return value
-
-    @staticmethod
-    def _page_value(value: Any, field_name: str, maximum: int) -> int:
-        if isinstance(value, bool):
-            raise OrganizationValidationError(f"{field_name} must be an integer")
-        try:
-            parsed = int(value)
-        except (TypeError, ValueError) as exc:
-            raise OrganizationValidationError(f"{field_name} must be an integer") from exc
-        if parsed < 1 or parsed > maximum:
-            raise OrganizationValidationError(f"{field_name} must be between 1 and {maximum}")
-        return parsed
 
     @staticmethod
     def _seed_state(
@@ -828,12 +682,6 @@ class InMemoryOrganizationStore:
             "departments": departments,
             "stats": self._stats_payload(state),
         }
-
-    @staticmethod
-    def _money(value: Decimal) -> float:
-        """Return a JSON-friendly monetary value rounded to cents."""
-
-        return float(value.quantize(Decimal("0.01")))
 
     @classmethod
     def _billing_record_payload(cls, record: _BillingRecord) -> dict[str, Any]:

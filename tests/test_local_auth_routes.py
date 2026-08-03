@@ -2,6 +2,8 @@ import sqlite3
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from backend import main
@@ -566,6 +568,99 @@ def test_dev_login_requires_csrf_in_local_development(tmp_path, monkeypatch) -> 
 
     assert response.status_code == 403
     assert response.json()["detail"]["code"] == "AUTH_CSRF_INVALID"
+
+
+def test_managed_enterprise_account_cannot_use_personal_upstream_key_scope(
+    monkeypatch,
+) -> None:
+    request = type(
+        "RequestStub",
+        (),
+        {
+            "session": {
+                "user": {
+                    "id": "managed-user-1",
+                    "authType": "password",
+                    "accountType": "enterprise_managed",
+                    "email": None,
+                    "name": "梁海强",
+                }
+            }
+        },
+    )()
+
+    async def false_demo(_user):
+        return False
+
+    async def no_inactive_membership(_user):
+        return None
+
+    async def auth_call(method, *_args, **_kwargs):
+        if method == "get_user":
+            return {
+                "id": "managed-user-1",
+                "email": None,
+                "login_name": "lianghaiqiang",
+                "name": "梁海强",
+                "status": "active",
+                "account_type": "enterprise_managed",
+                "identity_status": "verified",
+            }
+        if method == "get_upstream_account":
+            raise AssertionError("managed account must not use personal upstream mapping")
+        return None
+
+    async def user_payload(user, **_kwargs):
+        return user
+
+    monkeypatch.setattr(main, "is_demo_customer_user", false_demo)
+    monkeypatch.setattr(
+        main, "require_non_inactive_demo_identity", no_inactive_membership
+    )
+    monkeypatch.setattr(main, "auth_store_call", auth_call)
+    monkeypatch.setattr(main, "auth_user_payload", user_payload)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(main.current_upstream_user(request))
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail["code"] == "ORGANIZATION_UPSTREAM_FORBIDDEN"
+
+
+def test_managed_enterprise_account_without_active_membership_has_no_personal_usage(
+    monkeypatch,
+) -> None:
+    app_user = {
+        "id": "managed-user-1",
+        "email": None,
+        "loginName": "lianghaiqiang",
+        "accountType": "enterprise_managed",
+        "accountStatus": "provisioned",
+        "entitlementStatus": "active",
+        "organizationAccessStatus": "provisioning",
+    }
+
+    async def no_memberships(_user):
+        return []
+
+    async def personal_scope_must_not_run(*_args, **_kwargs):
+        raise AssertionError("managed account reached personal usage scope")
+
+    monkeypatch.setattr(main, "organization_real_enabled", lambda: True)
+    monkeypatch.setattr(main, "organization_memberships_for_user", no_memberships)
+    monkeypatch.setattr(
+        main, "local_personal_usage_payload", personal_scope_must_not_run
+    )
+
+    payload = asyncio.run(
+        main.personal_usage_payload(
+            app_user, "2026-08-01", "2026-08-03", "all"
+        )
+    )
+
+    assert payload["rows"] == []
+    assert payload["summary"]["rangeTotal"]["spend"] == 0
+    assert payload["organizationAccessStatus"] == "provisioning"
 
 
 def test_forgot_password_delivery_failure_keeps_previous_reset_token(tmp_path, monkeypatch) -> None:

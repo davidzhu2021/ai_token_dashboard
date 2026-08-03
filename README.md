@@ -27,7 +27,7 @@ https://myai.carher.net
 - 多数据源聚合：主数据源用于通衢 API，可选 Her 数据源用于补充 Her 聊天机器人相关用量。
 - 缓存加速：员工映射、个人用量、团队权限、团队用量、管理员用量、部门用量、密钥列表和模型列表均使用轻量 TTL 缓存。
 - 充值中心：支持兑换码、在线支付和个人微信/支付宝收款码转账；收款码转账必须由管理员核对到账后才发放额度。
-- 客户企业（演示）：卖方平台管理员可在独立客户企业中心维护甲方企业、部门和成员；甲方成员只会看到自身企业范围内的 Mock 用量。默认关闭。
+- 客户企业：支持 `disabled`、`demo`、`real` 三种运行模式；真实模式可维护企业、部门、成员、邀请、额度和企业令牌，并按租户查看实际用量。默认关闭。
 
 LiteLLM 是本系统的内部后端集成。员工前端文案应使用通衢 API、模型、来源、Token、Codex、Claude Code、Her、访问权限等产品术语，不暴露上游网关、管理员密钥或供应商实现细节。
 
@@ -83,14 +83,24 @@ http://127.0.0.1:8000
 Invoke-RestMethod -Uri 'http://127.0.0.1:8000/api/health'
 ```
 
-## 客户企业 Mock V2 演示
+## 客户企业运行模式
 
-客户企业中心是卖方平台管理员使用的受控本地演示，不会访问真实上游、发送邮件或创建真实账号。它默认关闭；不要为了演示修改共享的 `.env`。如果本机 `8000` 正在运行其他服务，可在独立的 `8001` 进程中启动：
+客户企业中心由 `ORGANIZATION_MODE` 控制：
+
+- `disabled`：默认安全状态，隐藏客户企业、企业管理、企业令牌和企业额度入口。
+- `demo`：仅用于本地受控演示，使用进程内确定性样例；不发送邀请邮件，不创建真实账号或可调用的企业令牌，也不访问真实企业数据。
+- `real`：使用 PostgreSQL 持久化企业、部门、成员、邀请、额度账本、企业令牌和异步补偿任务；企业与部门同步到用量系统，邀请会发送邮件，企业令牌可真实调用已授权模型，用量按企业归属汇总并结算额度。
+
+真实模式不会向企业成员提供自助充值。企业管理员只读查看余额和额度记录，平台运营人员从客户企业详情中授予或扣减额度；调整会写入可审计账本，并同步后续访问预算。
+
+### 本地演示
+
+演示模式默认关闭，不要为了演示修改共享的 `.env`。本地验证统一使用 `127.0.0.1:8000`；如果端口已被本项目占用，应复用现有进程，如果被其他程序占用则先确认冲突，不要静默改用其他端口。
 
 ```powershell
 cd D:\ai_token_dashboard
 $env:APP_BASE_URL = 'http://127.0.0.1:8001'
-$env:ORGANIZATION_DEMO_ENABLED = 'true'
+$env:ORGANIZATION_MODE = 'demo'
 $env:DEV_LOGIN_ENABLED = 'true'
 .\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8001
 ```
@@ -98,12 +108,12 @@ $env:DEV_LOGIN_ENABLED = 'true'
 也可使用同一条 PowerShell 命令启动，三个变量只作用于当前进程：
 
 ```powershell
-$env:APP_BASE_URL='http://127.0.0.1:8001'; $env:ORGANIZATION_DEMO_ENABLED='true'; $env:DEV_LOGIN_ENABLED='true'; .\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8001
+$env:APP_BASE_URL='http://127.0.0.1:8000'; $env:ORGANIZATION_MODE='demo'; $env:DEV_LOGIN_ENABLED='true'; .\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
 ```
 
-打开 `http://127.0.0.1:8001`，用 `ADMIN_EMAILS` 中的卖方平台管理员邮箱进行“开发环境邮箱登录”。`APP_BASE_URL` 必须与浏览器实际访问的协议、主机和端口完全一致；例如访问 `8001` 时必须是 `http://127.0.0.1:8001`，否则请求来源校验会拒绝登录。上面的启动方式不会停止、重启或请求 `8000` 上的服务。
+打开 `http://127.0.0.1:8000`，用 `ADMIN_EMAILS` 中的卖方平台管理员邮箱进行“开发环境邮箱登录”。`APP_BASE_URL` 必须与浏览器实际访问的协议、主机和端口完全一致，否则请求来源校验会拒绝登录。
 
-演示种子含三家独立客户：`Demo Company`（3 个部门、12 名成员）、北辰智造有限公司和远海零售集团。开启演示后，下列已知 Mock 邮箱可以在回环地址使用开发登录，即使其域名不在正常企业邮箱白名单中：
+演示种子含三家独立客户：`Demo Company`（3 个部门、12 名成员）、北辰智造有限公司和远海零售集团。开启演示后，下列样例邮箱可以在回环地址使用开发登录，即使其域名不在正常企业邮箱白名单中：
 
 - `owner@demo.example`：Demo Company 企业管理员，也是团队负责人。
 - `admin@demo.example`：Demo Company 企业管理员，也是团队负责人。
@@ -112,13 +122,13 @@ $env:APP_BASE_URL='http://127.0.0.1:8001'; $env:ORGANIZATION_DEMO_ENABLED='true'
 
 甲方企业只有“企业管理员”（`admin`）和“成员”（`member`）两种角色。企业管理员在侧栏看到“企业管理”，可维护本企业的部门与成员——建部门、改名、归档，邀请成员、改所属部门、授予或取消企业管理员、暂停与恢复访问——并查看本企业的全员/部门看板。写操作范围由服务端从登录会话解析，管理员无法越权操作其他客户企业。每家启用企业至少保留一名启用的企业管理员，最后一名不能被停用或降级；先新增并启用接任者即可完成交接。普通成员保持个人/团队范围，看不到企业组织目录、企业看板和企业额度。
 
-卖方平台管理员保留全局全员/部门看板，并额外看到“客户企业”；进入具体客户后可维护该客户的部门、成员和角色，查看该客户的 Mock 看板，以及只读查看“企业额度”，作为运营协助与兜底入口。企业开户、企业名称修改、状态变更、归档和“重置演示数据”仍然只属于乙方——甲方不能改变客户关系或终止企业，其“企业管理”页也不出现这些控件。平台管理员不会因协助而成为任何客户的成员（`organizationRole` 恒为空）。
+卖方平台管理员保留全局全员/部门看板，并额外看到“客户企业”；进入具体客户后可维护该客户的部门、成员和角色，查看企业全员/部门用量、企业额度和令牌列表。企业开户、企业名称修改、归档和演示数据重置只属于平台运营方；企业管理员不能改变客户关系或终止企业。平台管理员不会因协助而成为任何客户的成员（`organizationRole` 恒为空）。`demo` 模式展示确定性样例用量，`real` 模式展示持久化的实际调用汇总。
 
 侧边栏的“令牌管理”供企业管理员为本企业签发调用令牌。新增令牌时需填写名称，勾选该令牌可用的模型（至少一个），并可选择使用人（默认“企业共享（不绑定成员）”，也可绑定一名启用或待邀请成员）、有效期（永不过期 / 30 天 / 90 天）和每日额度上限（`$1.00` 至 `$5,000.00`）。完整令牌值只在创建成功的弹窗中展示一次，服务端只保留 `sk-...` 掩码形式，创建响应带 `Cache-Control: no-store`；列表和撤销接口都不会再返回明文。每家企业最多 20 个令牌，同名的生效令牌不可重复，撤销后立即失效且不可恢复（原名称可再次使用）。令牌与部门、成员一样按企业隔离。
 
-可选模型来自网关的真实模型目录，是这个演示模块里唯一的真实数据；令牌本身仍是演示数据，不会在网关上创建账号或签发真实密钥，生成的令牌值也无法真正调用模型。同一模型在网关上的多条线路部署会按脱敏后的展示名合并成一个选项，勾选即授权其名下全部线路；界面只显示展示名，不出现内部线路代号。网关不可用、未配置上游或目录为空时回落到内置清单（`claude-opus-5`、`claude-sonnet-4-6`、`gpt-5.2`、`qwen3-coder-plus`、`gemini-3-pro`），令牌管理照常可用。已签发令牌引用的模型即使之后从目录中消失，也照原样保留和展示；模型有效性只在创建时校验。乙方平台管理员的侧边栏没有这一项，他们从“客户企业”下钻后在企业详情页的“令牌管理”标签中查看，与“企业额度”一致为只读——可查看列表用于运营协助，但没有创建与撤销入口，服务端也没有对应的写路由。甲方普通成员看不到该入口。
+可选模型来自真实模型目录。同一模型的多条内部线路会按脱敏后的展示名合并，界面不展示内部线路代号。`demo` 模式只创建不可调用的样例令牌；`real` 模式会创建企业范围的真实令牌，可选绑定成员、部门、模型、有效期和每日额度。完整令牌只在创建成功时展示一次，服务端只持久化标识与哈希；撤销会同步使真实令牌失效。平台管理员从客户企业详情只读查看令牌列表，创建和撤销仍由该企业管理员完成，普通成员看不到该入口。
 
-企业管理员还会在侧栏看到“充值中心”：每家演示企业初始企业额度为 `$5,000.00`，可执行“模拟充值”，不会发起真实付款、扣减余额、调用支付服务或影响演示用量。乙方平台管理员、乙方普通员工、甲方普通成员、待邀请和暂停成员都不会看到该侧栏入口。团队负责人只看自己负责团队，普通成员不显示客户企业或企业范围看板。浏览器刷新会保留本次内存操作；服务重启或平台管理员点击“重置演示数据”后会恢复固定种子。生产环境必须保持 `ORGANIZATION_DEMO_ENABLED=false` 和 `DEV_LOGIN_ENABLED=false`。
+企业管理员会在侧栏看到“充值中心”作为企业额度只读入口。`demo` 模式每家企业初始额度为 `$5,000.00`，可执行无真实付款的模拟充值；刷新浏览器会保留本次进程内操作，服务重启或重置后恢复固定种子。`real` 模式由平台运营人员授予或扣减额度，企业实际用量按日结算，余额不足会停止新令牌并触发已有企业令牌撤销。普通成员、待邀请和暂停成员不显示企业额度入口。生产环境应使用 `ORGANIZATION_MODE=real`，并保持 `ORGANIZATION_DEMO_ENABLED=false` 和 `DEV_LOGIN_ENABLED=false`。
 
 ## Docker 启动
 
@@ -220,7 +230,13 @@ FEISHU_REDIRECT_URI=http://10.68.13.198:30882/callback
 DEV_LOGIN_ENABLED=false
 DEBUG_MAPPING_ENABLED=false
 DEBUG_OIDC_CLAIMS=false
-# Enterprise organization Mock V1. Keep false except for controlled demos.
+# Customer organization runtime: disabled, demo, or real.
+ORGANIZATION_MODE=disabled
+# Required in real mode. Keep this stable and secret.
+ORGANIZATION_INVITATION_SECRET=
+ORGANIZATION_OUTBOX_INTERVAL_SECONDS=30
+ORGANIZATION_OUTBOX_MAX_ATTEMPTS=8
+# Legacy compatibility only. Prefer ORGANIZATION_MODE.
 ORGANIZATION_DEMO_ENABLED=false
 USAGE_LOG_MAX_PAGES=20
 USER_MAPPING_CACHE_TTL_SECONDS=1800
@@ -247,7 +263,12 @@ USAGE_TIMEZONE_OFFSET_MINUTES=-480
 - `APP_BASE_URL` 必须与浏览器实际访问的协议、主机和端口完全一致；本地 `8000` 可设为 `http://127.0.0.1:8000`，独立 `8001` 演示则必须设为 `http://127.0.0.1:8001`，生产环境使用正式域名。
 - `SESSION_SECRET` 必须使用随机长字符串，生产环境不要使用示例值。
 - `AUTH_ENABLED`、`PASSWORD_LOGIN_ENABLED`、`PUBLIC_SIGNUP_ENABLED` 在模板中均默认关闭；三个开关应按后文的生产启用顺序逐步打开。
-- `ORGANIZATION_DEMO_ENABLED=false` 默认不展示“客户企业”页。设为 `true` 时，页面只使用进程内确定性 Mock 客户数据：不会创建真实账号、不会发送邀请邮件、不会调用上游服务；浏览器刷新会保留本次演示操作，服务重启或平台管理员点击“重置演示数据”后恢复三家客户的初始样例。生产环境应保持关闭，除非在受控演示中临时开启。
+- `ORGANIZATION_MODE=disabled` 隐藏企业能力；`demo` 使用进程内样例且无真实外部副作用；`real` 使用 `USAGE_DATABASE_URL` 指向的 PostgreSQL，并启用真实企业、邀请、额度、令牌、用量归属和异步补偿链路。
+- 平台接管预检所需的候选企业、部门和历史资产别名必须通过服务端 `ORGANIZATION_ADOPTION_*` 环境变量配置；前端不会保存或展示这些内部标识。预检只做精确只读查询，应用时仍会复核指纹，任何范围变化均拒绝写入。
+- `ORGANIZATION_INVITATION_SECRET` 在 `real` 模式必填，必须使用稳定随机 Secret；它用于签名可重试的邀请链接，数据库只保存哈希。更换后，尚未使用的旧邀请将失效。
+- `ORGANIZATION_OUTBOX_INTERVAL_SECONDS` 控制企业、部门、成员、额度和令牌补偿任务的轮询周期，默认 30 秒；`/api/health` 会暴露积压和异常状态。
+- `ORGANIZATION_OUTBOX_MAX_ATTEMPTS` 控制单个补偿任务的最大尝试次数，默认 8 次；重试采用指数退避，耗尽后进入 `failed` 状态并由健康检查告警，避免永久高频撞击上游。
+- `ORGANIZATION_DEMO_ENABLED` 仅为旧部署兼容开关；新部署统一使用 `ORGANIZATION_MODE`。生产必须保持该旧开关为 `false`。
 - `AUTH_ALLOWED_EMAIL_DOMAINS` 是逗号分隔的精确邮箱域名白名单；ToC 首期固定为 `auto-link.com.cn,gmail.com,qq.com,163.com`，不匹配子域名或后缀相似域名。留空代表不限制域名，生产公开注册不得留空。
 - `AUTH_DATABASE_PATH` 当前指向本地 SQLite 文件。容器部署必须将其放在持久化卷中；当前实现按单应用实例设计，不要让多个副本同时写同一个 SQLite 文件。
 - `AUTH_DEFAULT_UPSTREAM_ROLE=internal_user_viewer` 将新注册账号限制为只读角色；代码同时使用 `no-default-models` 禁止默认模型访问且不会自动创建访问密钥。不要将该变量设置为管理员角色。

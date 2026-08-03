@@ -1,5 +1,6 @@
 from datetime import date, datetime, timezone
 import asyncio
+from decimal import Decimal
 
 import pytest
 
@@ -70,6 +71,316 @@ def test_usage_record_never_contains_request_details_or_api_key() -> None:
 
     assert "sk-secret" not in repr(record)
     assert "private prompt" not in repr(record)
+
+
+def test_usage_record_persists_non_secret_event_attribution() -> None:
+    collected_at = datetime.now(timezone.utc)
+    record = UsageStore._usage_record(
+        "primary",
+        {
+            "date": "2026-07-22",
+            "_userId": "alice",
+            "organizationId": "org-upstream",
+            "teamId": "team-at-request-time",
+            "keyId": "hashed-key-id",
+            "source": "Codex",
+            "model": "gpt-5",
+        },
+        collected_at,
+    )
+
+    assert record[15:18] == ("org-upstream", "team-at-request-time", "hashed-key-id")
+    assert record[18:] == ("", "explicit", True)
+    assert record[6] == "gpt-5"
+
+
+def test_usage_attribution_priority_is_explicit_then_token_then_user_mapping() -> None:
+    collected_at = datetime.now(timezone.utc)
+    explicit = UsageStore._usage_record(
+        "primary",
+        {
+            "date": "2026-07-22",
+            "organizationId": "org-explicit",
+            "teamId": "team-explicit",
+            "tokenOrganizationId": "org-token",
+            "tokenTeamId": "team-token",
+            "userOrganizationId": "org-user",
+            "userTeamId": "team-user",
+        },
+        collected_at,
+    )
+    token = UsageStore._usage_record(
+        "primary",
+        {
+            "date": "2026-07-22",
+            "tokenOrganizationId": "org-token",
+            "tokenTeamId": "team-token",
+            "userOrganizationId": "org-user",
+            "userTeamId": "team-user",
+        },
+        collected_at,
+    )
+    user = UsageStore._usage_record(
+        "primary",
+        {"date": "2026-07-22", "userOrganizationId": "org-user", "userTeamId": "team-user"},
+        collected_at,
+    )
+
+    assert explicit[15:17] == ("org-explicit", "team-explicit")
+    assert token[15:17] == ("org-token", "team-token")
+    assert user[15:17] == ("org-user", "team-user")
+
+
+def test_report_only_usage_is_visible_but_excluded_from_daily_settlement() -> None:
+    import inspect
+
+    record = UsageStore._usage_record(
+        "primary",
+        {
+            "date": "2026-07-22",
+            "organizationId": "org-upstream",
+            "teamId": "team-upstream",
+            "keyId": "a" * 64,
+            "principalId": "principal-1",
+            "attributionSource": "legacy_report_only",
+            "billingEligible": False,
+        },
+        datetime.now(timezone.utc),
+    )
+
+    assert record[15:21] == (
+        "org-upstream",
+        "team-upstream",
+        "a" * 64,
+        "principal-1",
+        "legacy_report_only",
+        False,
+    )
+    source = inspect.getsource(UsageStore.organization_daily_spend)
+    assert "billing_eligible = TRUE" in source
+
+
+def test_event_record_persists_only_non_content_attribution_metadata() -> None:
+    collected_at = datetime.now(timezone.utc)
+    record = UsageStore._event_record(
+        "primary",
+        {
+            "requestId": "request-1",
+            "eventTime": "2026-07-22T08:30:00+00:00",
+            "date": "2026-07-22",
+            "_userId": "claude-code-lianghaiqiang",
+            "organizationId": "org-upstream",
+            "teamId": "team-upstream",
+            "keyId": "a" * 64,
+            "principalId": "principal-liang",
+            "source": "Claude Code",
+            "model": "claude-sonnet-4-5",
+            "totalTokens": 42,
+            "requestCount": 1,
+            "successCount": 1,
+            "spend": 0.012345,
+            "attributionSource": "legacy_report_only",
+            "billingEligible": False,
+            "prompt": "must not be stored",
+            "response": "must not be stored",
+            "api_key": "sk-secret",
+        },
+        collected_at,
+    )
+
+    assert record is not None
+    assert record[0:11] == (
+        "primary",
+        "request-1",
+        datetime(2026, 7, 22, 8, 30, tzinfo=timezone.utc),
+        date(2026, 7, 22),
+        "claude-code-lianghaiqiang",
+        "org-upstream",
+        "team-upstream",
+        "a" * 64,
+        "principal-liang",
+        "Claude Code",
+        "claude-sonnet-4-5",
+    )
+    assert "must not be stored" not in repr(record)
+    assert "sk-secret" not in repr(record)
+
+
+def test_usage_schema_has_request_level_attribution_without_content_columns() -> None:
+    from backend.usage_store import USAGE_SCHEMA
+
+    assert "CREATE TABLE IF NOT EXISTS usage_event_attribution" in USAGE_SCHEMA
+    assert "event_time TIMESTAMPTZ NOT NULL" in USAGE_SCHEMA
+    assert "PRIMARY KEY (backend_id, request_id)" in USAGE_SCHEMA
+    event_schema = USAGE_SCHEMA.split(
+        "CREATE TABLE IF NOT EXISTS usage_event_attribution", 1
+    )[1]
+    assert "prompt TEXT" not in event_schema
+    assert "response TEXT" not in event_schema
+    assert "api_key TEXT" not in event_schema
+
+
+def test_coalesce_keeps_distinct_event_time_team_and_key_attribution() -> None:
+    rows = [
+        {"date": "2026-07-22", "_userId": "alice", "source": "Codex", "model": "gpt-5", "teamId": "team-old", "keyId": "key-1", "totalTokens": 2},
+        {"date": "2026-07-22", "_userId": "alice", "source": "Codex", "model": "gpt-5", "teamId": "team-new", "keyId": "key-2", "totalTokens": 3},
+    ]
+
+    result = UsageStore._coalesce_usage_rows(rows)
+
+    assert len(result) == 2
+    assert {(row["teamId"], row["keyId"], row["totalTokens"]) for row in result} == {
+        ("team-old", "key-1", 2),
+        ("team-new", "key-2", 3),
+    }
+
+
+def test_organization_query_groups_by_event_time_team() -> None:
+    import inspect
+
+    source = inspect.getsource(UsageStore.organization_rows)
+
+    assert "source, team_id," in source
+    assert "GROUP BY backend_id, usage_date, user_id, principal_id, source, team_id" in source
+    assert '"departmentId": team_id' in source
+    assert '"departments": sorted(' in source
+
+
+def test_organization_query_groups_multiple_upstream_users_by_principal() -> None:
+    import inspect
+
+    source = inspect.getsource(UsageStore.organization_rows)
+    summaries = inspect.getsource(UsageStore._employee_summaries)
+
+    assert "SELECT backend_id, usage_date, user_id, principal_id" in source
+    assert '"employeeId": principal_id or record["user_id"]' in source
+    assert "principal_id" in summaries
+
+
+def test_principal_rows_preserve_original_upstream_user_ids() -> None:
+    class Pool:
+        async def fetch(self, query, *args):
+            if "FROM usage_sync_coverage" in query:
+                return [{"backend_id": "primary"}]
+            assert "principal_id=$2" in query
+            assert args[0:2] == ("org-upstream", "principal-1")
+            return [
+                {
+                    "usage_date": date(2026, 7, 30),
+                    "source": "Codex",
+                    "model": "gpt-5.6-sol",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "total_tokens": 3,
+                    "request_count": 2,
+                    "success_count": 2,
+                    "failure_count": 0,
+                    "spend": 1.25,
+                    "upstream_user_ids": ["claude-code-lianghaiqiang", "cursor-lianghaiqiang"],
+                },
+                {
+                    "usage_date": date(2026, 7, 30),
+                    "source": "Codex",
+                    "model": "openai/chatgpt-gpt-5.6-sol",
+                    "prompt_tokens": 4,
+                    "completion_tokens": 5,
+                    "total_tokens": 9,
+                    "request_count": 3,
+                    "success_count": 2,
+                    "failure_count": 1,
+                    "spend": 2.75,
+                    "upstream_user_ids": ["cursor-lianghaiqiang", "codex-lianghaiqiang"],
+                },
+            ]
+
+        async def fetchval(self, query, *args):
+            if "MAX(synced_at)" in query:
+                return datetime(2026, 7, 30, tzinfo=timezone.utc)
+            raise AssertionError(query)
+
+    store = UsageStore("postgresql://unused")
+    store.pool = Pool()
+
+    result = asyncio.run(
+        store.organization_principal_rows(
+            "org-upstream",
+            "principal-1",
+            "2026-07-30",
+            "2026-07-30",
+            "all",
+            ["primary"],
+        )
+    )
+
+    assert result["principalId"] == "principal-1"
+    assert result["upstreamUserIds"] == [
+        "claude-code-lianghaiqiang",
+        "codex-lianghaiqiang",
+        "cursor-lianghaiqiang",
+    ]
+    assert len(result["rows"]) == 1
+    assert result["rows"][0]["model"] == "gpt-5.6-sol"
+    assert result["rows"][0]["totalTokens"] == 12
+    assert result["rows"][0]["requestCount"] == 5
+    assert result["rows"][0]["successCount"] == 4
+    assert result["rows"][0]["failureCount"] == 1
+    assert result["rows"][0]["spend"] == pytest.approx(4.0)
+
+
+def test_organization_rows_preserve_department_before_canonical_merge() -> None:
+    class Pool:
+        async def fetch(self, query, *args):
+            if "FROM usage_sync_coverage" in query:
+                return [{"backend_id": "primary"}]
+            if "FROM usage_team_membership_daily" in query:
+                return [
+                    {"team_id": "dept-a", "team_name": "部门 A"},
+                    {"team_id": "dept-b", "team_name": "部门 B"},
+                ]
+            if "FROM usage_daily" in query:
+                base = {
+                    "backend_id": "primary",
+                    "usage_date": date(2026, 8, 3),
+                    "user_id": "alice",
+                    "principal_id": "principal-alice",
+                    "employee_email": "alice@example.com",
+                    "employee_name": "Alice",
+                    "source": "Codex",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                    "request_count": 1,
+                    "success_count": 1,
+                    "failure_count": 0,
+                    "spend": 0.1,
+                }
+                return [
+                    {**base, "team_id": "dept-a", "model_name": "gpt-5.6-sol"},
+                    {**base, "team_id": "dept-b", "model_name": "openai/chatgpt-gpt-5.6-sol"},
+                ]
+            raise AssertionError(query)
+
+        async def fetchval(self, query, *args):
+            if "organization_id=''" in query:
+                return 0
+            if "MAX(synced_at)" in query:
+                return datetime(2026, 8, 3, tzinfo=timezone.utc)
+            raise AssertionError(query)
+
+    store = UsageStore("postgresql://unused")
+    store.pool = Pool()
+
+    result = asyncio.run(
+        store.organization_rows(
+            "org-1", "2026-08-03", "2026-08-03", "all", ["primary"]
+        )
+    )
+
+    assert len(result["rows"]) == 2
+    assert {row["departmentId"] for row in result["rows"]} == {"dept-a", "dept-b"}
+    assert {row["model"] for row in result["rows"]} == {"gpt-5.6-sol"}
+    assert len(result["summaryRows"]) == 1
+    assert result["summaryRows"][0]["totalTokens"] == 4
 
 
 def test_coalesce_usage_rows_prevents_duplicate_upsert_records() -> None:
@@ -273,6 +584,12 @@ def test_merge_rows_by_sums_duplicate_normalized_models() -> None:
     assert by_model["claude-opus-4-8"]["totalTokens"] == 4
 
 
+def test_usage_sync_date_range_uses_inclusive_days() -> None:
+    start, end = UsageSynchronizer.date_range(3, date(2026, 7, 22))
+    assert start == "2026-07-20"
+    assert end == "2026-07-22"
+
+
 def test_canonical_usage_rows_merge_historical_aliases_and_all_metrics() -> None:
     rows = [
         {
@@ -309,12 +626,6 @@ def test_usage_queries_group_raw_model_names_before_python_canonicalization() ->
     assert "regexp_replace" not in source
 
 
-def test_usage_sync_date_range_uses_inclusive_days() -> None:
-    start, end = UsageSynchronizer.date_range(3, date(2026, 7, 22))
-    assert start == "2026-07-20"
-    assert end == "2026-07-22"
-
-
 def test_usage_store_environment_is_disabled_by_default(monkeypatch) -> None:
     monkeypatch.delenv("USAGE_SYNC_ENABLED", raising=False)
     monkeypatch.setenv("USAGE_DATABASE_URL", "postgresql://unused")
@@ -345,7 +656,7 @@ def test_usage_sync_cli_returns_nonzero_for_partial_result(monkeypatch, capsys) 
     monkeypatch.setattr(usage_sync, "LiteLLMClient", Client)
 
     class Synchronizer:
-        def __init__(self, _client, _store):
+        def __init__(self, _client, _store, _repository=None):
             pass
 
         @staticmethod
@@ -355,12 +666,93 @@ def test_usage_sync_cli_returns_nonzero_for_partial_result(monkeypatch, capsys) 
 
         async def sync(self, start_date, end_date):
             assert (start_date, end_date) == ("2026-05-06", "2026-08-03")
-            return {"status": "partial", "rowCount": 3, "backendCount": 1}
+            return {"status": "partial", "rowCount": 3, "backendCount": 1, "errors": ["her: RuntimeError"]}
 
     monkeypatch.setattr(usage_sync, "UsageSynchronizer", Synchronizer)
 
     assert asyncio.run(usage_sync._run_cli(90)) == 1
     assert '"status": "partial"' in capsys.readouterr().out
+
+
+def test_usage_sync_cli_refreshes_recent_log_window_after_long_backfill(monkeypatch, capsys) -> None:
+    from backend import usage_sync
+
+    class Store:
+        async def connect(self):
+            return None
+
+        async def close(self):
+            return None
+
+    class Client:
+        async def close(self):
+            return None
+
+    calls: list[tuple[str, str]] = []
+
+    class Synchronizer:
+        def __init__(self, _client, _store, _repository=None):
+            pass
+
+        @staticmethod
+        def date_range(days):
+            return {
+                90: ("2026-05-06", "2026-08-03"),
+                3: ("2026-08-01", "2026-08-03"),
+            }[days]
+
+        async def sync(self, start_date, end_date):
+            calls.append((start_date, end_date))
+            return {
+                "status": "ok",
+                "rowCount": 100 if start_date == "2026-05-06" else 12,
+                "backendCount": 2,
+                "errors": [],
+            }
+
+    monkeypatch.setenv("USAGE_SYNC_LOG_TIMEZONE_ENABLED", "true")
+    monkeypatch.setenv("USAGE_SYNC_LOG_MAX_WINDOW_DAYS", "3")
+    monkeypatch.setattr(usage_sync.UsageStore, "from_environment", lambda: Store())
+    monkeypatch.setattr(usage_sync, "LiteLLMClient", Client)
+    monkeypatch.setattr(usage_sync, "UsageSynchronizer", Synchronizer)
+
+    assert asyncio.run(usage_sync._run_cli(90)) == 0
+    assert calls == [
+        ("2026-05-06", "2026-08-03"),
+        ("2026-08-01", "2026-08-03"),
+    ]
+    output = capsys.readouterr().out
+    assert '"status": "ok"' in output
+    assert '"recentRefresh": {"backendCount": 2, "days": 3' in output
+
+
+def test_usage_sync_cli_fails_when_recent_refresh_is_partial(monkeypatch) -> None:
+    from backend import usage_sync
+
+    results = [
+        {"status": "ok", "rowCount": 100, "backendCount": 2, "errors": []},
+        {
+            "status": "partial",
+            "rowCount": 10,
+            "backendCount": 1,
+            "errors": ["primary: RuntimeError"],
+        },
+    ]
+
+    async def fake_run_sync_once(_client, _store, _days):
+        return results.pop(0)
+
+    monkeypatch.setenv("USAGE_SYNC_LOG_TIMEZONE_ENABLED", "true")
+    monkeypatch.setenv("USAGE_SYNC_LOG_MAX_WINDOW_DAYS", "3")
+    monkeypatch.setattr(usage_sync, "run_sync_once", fake_run_sync_once)
+
+    result = asyncio.run(
+        usage_sync.run_sync_with_recent_refresh(object(), object(), 90)
+    )
+
+    assert result["status"] == "partial"
+    assert result["errors"] == ["primary: RuntimeError"]
+    assert result["recentRefresh"]["days"] == 3
 
 
 def test_usage_store_date_values_are_asyncpg_compatible() -> None:
@@ -384,7 +776,7 @@ def test_usage_schema_is_idempotent_and_uses_aggregate_only_columns() -> None:
     from backend.usage_store import USAGE_SCHEMA
 
     assert USAGE_SCHEMA.count("CREATE TABLE IF NOT EXISTS usage_daily") == 1
-    assert "PRIMARY KEY (backend_id, usage_date, user_id, source, model)" in USAGE_SCHEMA
+    assert "organization_id, team_id, key_id" in USAGE_SCHEMA
     assert "api_key" not in USAGE_SCHEMA.lower()
     assert "prompt TEXT" not in USAGE_SCHEMA
     assert "response TEXT" not in USAGE_SCHEMA
@@ -590,6 +982,92 @@ def test_usage_sync_isolates_backend_failures() -> None:
     assert result["status"] == "partial"
     assert result["backendCount"] == 1
     assert result["errors"] == ["her: RuntimeError"]
+
+
+def test_organization_daily_spend_groups_only_explicit_attribution() -> None:
+    class Pool:
+        async def fetch(self, query, *args):
+            assert "organization_id <> ''" in query
+            assert "billing_eligible = TRUE" in query
+            assert "GROUP BY organization_id, usage_date" in query
+            assert "ROUND(COALESCE(SUM(spend), 0)::numeric, 6)" in query
+            assert args[2] == ["primary"]
+            return [
+                {
+                    "organization_id": "org-upstream",
+                    "usage_date": date(2026, 7, 30),
+                    "spend": Decimal("12.340001"),
+                }
+            ]
+
+    store = UsageStore("postgresql://unused")
+    store.pool = Pool()
+
+    rows = asyncio.run(
+        store.organization_daily_spend(
+            "2026-07-30", "2026-07-30", ["primary"]
+        )
+    )
+
+    assert rows == [
+        {
+            "upstreamOrganizationId": "org-upstream",
+            "usageDate": "2026-07-30",
+            "spendUsd": "12.340001",
+        }
+    ]
+
+
+def test_organization_daily_spend_excludes_pre_credit_and_credit_day() -> None:
+    class Pool:
+        async def fetch(self, _query, *_args):
+            return [
+                {
+                    "organization_id": "org-upstream",
+                    "usage_date": date(2026, 7, 28),
+                    "spend": Decimal("9.05"),
+                },
+                {
+                    "organization_id": "org-upstream",
+                    "usage_date": date(2026, 7, 29),
+                    "spend": Decimal("1.00"),
+                },
+                {
+                    "organization_id": "org-upstream",
+                    "usage_date": date(2026, 7, 30),
+                    "spend": Decimal("0.25"),
+                },
+            ]
+
+    store = UsageStore("postgresql://unused")
+    store.pool = Pool()
+    rows = asyncio.run(
+        store.organization_daily_spend(
+            "2026-07-28",
+            "2026-07-30",
+            ["primary"],
+            billing_effective_at_by_organization={
+                "org-upstream": datetime(
+                    2026, 7, 29, 12, tzinfo=timezone.utc
+                )
+            },
+        )
+    )
+
+    assert rows == [
+        {
+            "upstreamOrganizationId": "org-upstream",
+            "usageDate": "2026-07-29",
+            "spendUsd": "1.00",
+            "settlementStatus": "skipped",
+            "settlementReason": "needs_event_time",
+        },
+        {
+            "upstreamOrganizationId": "org-upstream",
+            "usageDate": "2026-07-30",
+            "spendUsd": "0.25",
+        }
+    ]
 
 
 def test_usage_sync_passes_backend_account_index_to_membership_snapshot() -> None:

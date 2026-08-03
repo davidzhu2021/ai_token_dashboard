@@ -72,6 +72,110 @@ def test_frontend_keeps_session_state_on_transient_auth_failures() -> None:
     assert 'el("authLoadingRetryButton").addEventListener("click", () => window.location.reload())' in source
     assert 'showToast(error.message || "退出登录失败，请检查网络后重试")' in source
     assert 'await api("/api/auth/logout"' in source
+
+
+def test_frontend_handles_invitation_tokens_without_persisting_the_secret() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+
+    assert 'id="organizationInvitationScreen"' in markup
+    assert 'id="organizationInvitationPassword"' in markup
+    assert 'id="organizationInvitationConfirmPassword"' in markup
+    assert 'id="organizationInvitationAcceptButton"' in markup
+    assert 'id="organizationInvitationLoginButton"' in markup
+    assert 'params.delete("organization_invitation")' in source
+    assert 'organizationInvitationToken = takeOrganizationInvitationTokenFromUrl(callbackParams)' in source
+    assert 'api(`/api/auth/invitations/${encodeURIComponent(organizationInvitationToken)}`)' in source
+    assert 'api("/api/auth/invitations/accept"' in source
+    assert 'headers["X-CSRF-Token"] = requestCsrfToken' in source
+    assert "localStorage" not in source[source.index("function takeOrganizationInvitationTokenFromUrl") : source.index("function clearResetPasswordToken")]
+    assert 'organizationInvitationExistingAccount' in source
+    assert 'payload?.existingAccount' in source
+    assert 'organizationInvitationPasswordFields' in source
+    assert 'password !== confirmPassword' in source
+    assert '账号开通中' in source
+
+
+def test_password_login_accepts_an_email_or_enterprise_login_name() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+
+    login_input = next(line for line in markup.splitlines() if 'id="loginEmailInput"' in line)
+    assert '邮箱或账号' in markup
+    assert 'name="identifier"' in login_input
+    assert 'type="text"' in login_input
+    assert 'autocomplete="username"' in login_input
+    assert 'loginIdentifier: el("loginEmailInput").value.trim()' in source
+    assert 'identifier: values.loginIdentifier' in source
+    assert 'email: values.loginIdentifier' in source
+    assert 'validEmail(values.loginEmail)' not in source
+    assert '请输入邮箱或企业账号' in source
+
+
+def test_frontend_handles_enterprise_claim_activation_without_persisting_the_secret() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+
+    for element_id in (
+        "organizationClaimScreen",
+        "organizationClaimPassword",
+        "organizationClaimConfirmPassword",
+        "organizationClaimTurnstile",
+        "organizationClaimAcceptButton",
+        "organizationClaimLoginButton",
+    ):
+        assert f'id="{element_id}"' in markup
+    claim_source = source[
+        source.index("function takeOrganizationClaimTokenFromUrl")
+        : source.index("function clearResetPasswordToken")
+    ]
+    assert 'params.delete("organization_claim")' in claim_source
+    assert "localStorage" not in claim_source
+    assert 'organizationClaimToken = takeOrganizationClaimTokenFromUrl(callbackParams)' in source
+    assert 'api(`/api/auth/organization-claims/${encodeURIComponent(organizationClaimToken)}`)' in source
+    assert 'api("/api/auth/organization-claims/accept"' in source
+    assert 'token: organizationClaimToken' in source
+    assert 'password !== confirmPassword' in source
+    assert 'renderTurnstile("organizationClaim")' in source
+    assert '!requireTurnstile("organizationClaim")' in source
+    assert 'turnstileToken: turnstileTokens.organizationClaim || undefined' in source
+    assert 'resetTurnstile("organizationClaim")' in source
+    assert 'status: payload?.status || "accepted_pending_approval"' in source
+    assert "审核通过前不会获得企业数据或令牌权限" in markup
+
+
+def test_frontend_uses_generic_identifiers_for_username_accounts() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert "function authDisplayIdentifier(" in source
+    assert "user.displayIdentifier" in source
+    assert "user.loginName" in source
+    assert "user.contactEmail" in source
+    assert 'const displayIdentifier = authDisplayIdentifier();' in source
+    assert '`${displayIdentifier} · ${organizationName}`' in source
+    assert 'validEmail(identifier) ? identifier : ""' in source
+
+
+def test_pending_username_claim_has_a_limited_access_state() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    access = source[source.index("function accountAccessCopy(") : source.index("function renderAccountAccessState()")]
+
+    assert "identityStatus" in access
+    assert '"pending_approval", "accepted_pending_approval"' in access
+    assert 'title: "企业账号认领待审核"' in access
+    assert "审核通过后才能访问企业数据和令牌" in access
+
+
+def test_invitation_flow_initializes_before_session_probe_and_supports_retry() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    init_source = source[source.index("async function init()") :]
+
+    assert init_source.index('organizationInvitationToken = takeOrganizationInvitationTokenFromUrl(callbackParams)') < init_source.index('const user = await api("/api/auth/me")')
+    assert 'await verifyOrganizationInvitation();' in init_source
+    assert 'organizationInvitationRetryButton' in source
+    assert 'error.code !== "ORGANIZATION_INVITATION_INVALID"' in source
+    assert 'organizationInvitationExistingAccount = false' in source
+    assert '...(password ? { password } : {})' in source
     assert 'showLogin();\n  } catch (error)' in source
     assert 'turnstileRenderPromises[mode]' in source
 
@@ -88,11 +192,11 @@ def test_frontend_disables_unavailable_auth_methods_and_handles_turnstile_config
     assert 'passwordRecoveryAvailable: false' in source
     assert 'turnstileConfigured: false' in source
     assert '!authConfig.turnstileConfigured || !authConfig.turnstileSiteKey' in source
-    assert '安全验证尚未正确配置，邮箱登录与注册暂时不可用' in source
+    assert '安全验证尚未正确配置，密码登录与注册暂时不可用' in source
     assert 'id="authAvailabilityNotice"' in markup
     assert 'if (!publicSignupAvailable()) {' in source
     assert 'forgotPasswordButton").classList.toggle("hidden", !recoveryEnabled)' in source
-    assert '邮箱登录仍可用。' in source
+    assert '密码登录仍可用。' in source
 
 
 def test_frontend_explains_signup_domains_and_inactive_access_policy() -> None:

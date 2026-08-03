@@ -14,6 +14,22 @@ from backend.litellm_client import LiteLLMBackend, LiteLLMClient
 from backend.usage_sync import UsageSynchronizer
 
 
+def _report_only_mapping(*, through: str = "2026-07-28T02:00:00+00:00") -> dict:
+    return {
+        "backendId": "primary",
+        "upstreamKeyHash": "a" * 64,
+        "organizationId": "org-baic-upstream",
+        "teamId": "team-baic-upstream",
+        "principalId": "principal-lianghaiqiang",
+        "memberId": "",
+        "mode": "report_only",
+        "attributionSource": "legacy_report_only",
+        "billingEligible": False,
+        "effectiveFrom": "2026-01-01T00:00:00+00:00",
+        "effectiveThrough": through,
+    }
+
+
 PRIMARY = LiteLLMBackend(id="primary", label="通衢 API", base_url="http://x", admin_key="sk-admin")
 
 
@@ -36,7 +52,11 @@ class _LogClient(LiteLLMClient):
     def __init__(self, pages: list[list[dict]]) -> None:
         self._pages = pages
         self.backends = [PRIMARY]
+        self._deployment_model_maps = {}
         self.requests: list[dict] = []
+
+    async def _ensure_deployment_model_map(self, _backend):
+        return {}
 
     async def request_backend(self, backend, method, path, **kwargs):  # type: ignore[override]
         params = kwargs.get("params") or {}
@@ -116,6 +136,163 @@ def test_scan_groups_all_users_in_one_pass(monkeypatch) -> None:
     assert rows["cursor-bob"][0]["totalTokens"] == 500, "跨页同账号要累加"
     # 每页各请求一次，不按账号放大请求数
     assert [int(r["page"]) for r in client.requests] == [1, 2]
+
+
+def test_log_sync_retains_explicit_org_team_and_hashed_key_attribution(monkeypatch) -> None:
+    monkeypatch.setenv("USAGE_TIMEZONE_OFFSET_MINUTES", "-480")
+    first = _log("alice", "2026-07-28T01:00:00+00:00", 100, "1.0")
+    first.update(
+        {
+            "organization_id": "org-explicit",
+            "team_id": "team-explicit",
+            "api_key": "hashed-key-1",
+            "metadata": {
+                "user_api_key_org_id": "org-metadata",
+                "user_api_key_team_id": "team-metadata",
+            },
+        }
+    )
+    second = _log("alice", "2026-07-28T02:00:00+00:00", 50, "0.5")
+    second["metadata"] = {
+        "user_api_key_org_id": "org-metadata",
+        "user_api_key_team_id": "team-metadata",
+        "user_api_key": "sk-never-persist-this",
+    }
+    client = _LogClient([[first, second]])
+
+    rows, complete = asyncio.run(client.sync_rows_from_logs("2026-07-28", "2026-07-28", PRIMARY))
+
+    assert complete is True
+    assert len(rows["alice"]) == 2
+    by_org = {row["organizationId"]: row for row in rows["alice"]}
+    assert by_org["org-explicit"]["teamId"] == "team-explicit"
+    assert by_org["org-explicit"]["keyId"] == "hashed-key-1"
+    assert by_org["org-metadata"]["teamId"] == "team-metadata"
+    assert by_org["org-metadata"]["keyId"] != "sk-never-persist-this"
+    assert len(by_org["org-metadata"]["keyId"]) == 64
+
+
+def test_legacy_mapping_applies_only_within_immutable_reporting_window() -> None:
+    mapping = _report_only_mapping()
+    index = {("key_hash", "a" * 64): [mapping]}
+    rows = [
+        {
+            "date": "2026-07-28",
+            "eventTime": "2026-07-28T01:59:59+00:00",
+            "keyId": "a" * 64,
+        },
+        {
+            "date": "2026-07-28",
+            "eventTime": "2026-07-28T02:00:01+00:00",
+            "keyId": "a" * 64,
+        },
+    ]
+
+    UsageSynchronizer._apply_token_attribution(rows, index)
+
+    assert rows[0]["organizationId"] == "org-baic-upstream"
+    assert rows[0]["principalId"] == "principal-lianghaiqiang"
+    assert "memberId" not in rows[0]
+    assert rows[0]["attributionSource"] == "legacy_report_only"
+    assert rows[0]["billingEligible"] is False
+    assert "organizationId" not in rows[1]
+
+
+def test_report_only_mapping_adds_policy_when_log_scope_already_matches() -> None:
+    key_hash = "a" * 64
+    row = {
+        "date": "2026-07-28",
+        "eventTime": "2026-07-28T01:00:00+00:00",
+        "keyId": key_hash,
+        "organizationId": "org-baic-upstream",
+        "teamId": "team-baic-upstream",
+    }
+
+    UsageSynchronizer._apply_token_attribution(
+        [row], {("key_hash", key_hash): [_report_only_mapping()]}
+    )
+
+    assert row["organizationId"] == "org-baic-upstream"
+    assert row["principalId"] == "principal-lianghaiqiang"
+    assert row["attributionSource"] == "legacy_report_only"
+    assert row["billingEligible"] is False
+
+
+def test_explicit_scope_conflicting_with_stable_key_mapping_is_quarantined() -> None:
+    key_hash = "a" * 64
+    row = {
+        "date": "2026-07-28",
+        "eventTime": "2026-07-28T01:00:00+00:00",
+        "keyId": key_hash,
+        "organizationId": "org-other",
+        "teamId": "team-other",
+    }
+
+    UsageSynchronizer._apply_token_attribution(
+        [row], {("key_hash", key_hash): [_report_only_mapping()]}
+    )
+
+    assert row["organizationId"] == ""
+    assert row["teamId"] == ""
+    assert row["attributionSource"] == "tenant_mapping_conflict"
+    assert row["billingEligible"] is False
+
+
+def test_post_cutoff_usage_remains_unattributed_until_key_is_managed() -> None:
+    key_hash = "a" * 64
+    rows = [
+        {
+            "date": "2026-07-29",
+            "eventTime": "2026-07-29T00:00:00+00:00",
+            "keyId": key_hash,
+        }
+    ]
+    index = {("key_hash", key_hash): [_report_only_mapping()]}
+
+    UsageSynchronizer._apply_token_attribution(rows, index)
+
+    assert rows[0].get("organizationId", "") == ""
+    assert rows[0].get("billingEligible") is None
+
+
+def test_principal_and_optional_member_are_separate_attribution_fields() -> None:
+    key_hash = "a" * 64
+    rows = [
+        {
+            "date": "2026-07-28",
+            "eventTime": "2026-07-28T01:00:00+00:00",
+            "keyId": key_hash,
+        }
+    ]
+    index = {
+        ("key_hash", key_hash): [
+            {
+                **_report_only_mapping(),
+                "memberId": "member-lianghaiqiang",
+            }
+        ]
+    }
+
+    UsageSynchronizer._apply_token_attribution(rows, index)
+
+    assert rows[0]["principalId"] == "principal-lianghaiqiang"
+    assert rows[0]["memberId"] == "member-lianghaiqiang"
+
+
+def test_report_only_mapping_is_backend_and_hash_scoped() -> None:
+    class Repository:
+        async def usage_token_attribution_map(self):
+            return [
+                _report_only_mapping(),
+                {**_report_only_mapping(), "backendId": "her", "organizationId": "other"},
+            ]
+
+    synchronizer = UsageSynchronizer(object(), object(), Repository())
+    primary = asyncio.run(synchronizer._token_attribution_map("primary"))
+    her = asyncio.run(synchronizer._token_attribution_map("her"))
+
+    assert primary[("key_hash", "a" * 64)][0]["organizationId"] == "org-baic-upstream"
+    assert her[("key_hash", "a" * 64)][0]["organizationId"] == "other"
 
 
 def test_log_sync_prioritizes_claude_cli_tags_over_legacy_cursor_identity(monkeypatch) -> None:

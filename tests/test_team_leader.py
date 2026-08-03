@@ -375,6 +375,9 @@ def test_auth_scope_reports_billing_visibility_without_upstream_calls(monkeypatc
 
     # 本地密码账号在充值开放且账本可用时才看到入口。
     assert main.self_service_billing_available({"id": "local-1"}) is True
+    assert main.self_service_billing_available(
+        {"id": "managed-1", "accountType": "enterprise_managed"}
+    ) is False
     assert main.self_service_billing_available({}) is False
 
 

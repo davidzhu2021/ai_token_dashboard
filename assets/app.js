@@ -20,9 +20,19 @@ let lastAdminUsageCacheHit = false;
 let lastDepartmentUsageCacheHit = false;
 let lastTeamUsageCacheHit = false;
 let personalDataFreshness = null;
+let personalDataQuality = null;
+let personalCoverage = null;
 let adminDataFreshness = null;
+let adminDataQuality = null;
+let adminCoverage = null;
 let departmentDataFreshness = null;
+let departmentDataQuality = null;
+let departmentCoverage = null;
 let teamDataFreshness = null;
+let teamDataQuality = null;
+let teamCoverage = null;
+let teamMemberDataQuality = null;
+let teamMemberCoverage = null;
 let adminUsageData = [];
 let adminSummaryData = [];
 let adminEmployees = [];
@@ -92,6 +102,8 @@ const organizationMemberPageSize = 20;
 let organizationMemberFilters = { search: "", departmentId: "", role: "", status: "" };
 let isOrganizationLoading = false;
 let isOrganizationMemberLoading = false;
+let organizationLoadError = "";
+let organizationMemberLoadError = "";
 let organizationDataLoadingScopeKey = "";
 let organizationMemberLoadingScopeKey = "";
 let organizationDataRequestId = 0;
@@ -107,11 +119,25 @@ let customerOrganizationsPage = 1;
 const customerOrganizationsPageSize = 12;
 let customerOrganizationsFilters = { search: "", status: "" };
 let isCustomerOrganizationsLoading = false;
+let customerOrganizationsLoadError = "";
 let customerOrganizationsSearchTimer = null;
 let selectedCustomerOrganization = null;
 let customerOrganizationDetailTab = "info";
 let isCustomerOrganizationSaving = false;
 let editingCustomerOrganizationId = "";
+let organizationClaims = [];
+let organizationClaimLoadError = "";
+let isOrganizationClaimLoading = false;
+let isOrganizationClaimSaving = false;
+let organizationClaimLastUrl = "";
+// Adoption preview data is deliberately ephemeral. In particular, the
+// preview fingerprint is never written to localStorage or the URL.
+let organizationAdoptionPreview = null;
+let organizationAdoptionFingerprint = "";
+let organizationAdoptionIdempotencyKey = "";
+let organizationAdoptionLoadError = "";
+let isOrganizationAdoptionLoading = false;
+let isOrganizationAdoptionApplying = false;
 let isSsoRedirecting = false;
 let billingConfig = null;
 let billingAccount = null;
@@ -143,6 +169,8 @@ let organizationBillingScopeKey = "";
 let organizationBillingRequestId = 0;
 let isOrganizationTopupSaving = false;
 let selectedOrganizationTopupAmount = 0;
+let isOrganizationCreditAdjusting = false;
+let organizationCreditAdjustmentOperation = "grant";
 // Customer-scoped access tokens. These live entirely inside the enterprise
 // workspace and never reuse the personal access-key state above.
 let organizationTokens = [];
@@ -157,6 +185,7 @@ let isOrganizationTokenLoading = false;
 let isOrganizationTokenSaving = false;
 let isOrganizationTokenRevoking = false;
 let organizationTokenLoadError = "";
+let organizationTokenLoadErrorCode = "";
 let organizationTokenScopeKey = "";
 let organizationTokenRequestId = 0;
 let organizationTokenSearchTimer = null;
@@ -193,12 +222,21 @@ let authCsrfToken = "";
 let csrfRefreshPromise = null;
 let authSessionGeneration = 0;
 let resetPasswordToken = "";
+let organizationInvitationToken = "";
+let organizationInvitation = null;
+let organizationInvitationExistingAccount = false;
+let organizationInvitationLoading = false;
+let organizationInvitationAccepting = false;
+let organizationClaimToken = "";
+let organizationClaim = null;
+let organizationClaimLoading = false;
+let organizationClaimAccepting = false;
 let verificationCountdown = 0;
 let verificationTimer = null;
 let turnstileLoadPromise = null;
-const turnstileTokens = { login: "", register: "", forgot: "" };
-const turnstileWidgets = { login: null, register: null, forgot: null };
-const turnstileRenderPromises = { login: null, register: null, forgot: null };
+const turnstileTokens = { login: "", register: "", forgot: "", organizationClaim: "" };
+const turnstileWidgets = { login: null, register: null, forgot: null, organizationClaim: null };
+const turnstileRenderPromises = { login: null, register: null, forgot: null, organizationClaim: null };
 
 const el = (id) => document.getElementById(id);
 const fmt = new Intl.NumberFormat("zh-CN");
@@ -335,6 +373,107 @@ function normalizeAuthUser(payload) {
   return payload?.user || payload;
 }
 
+function authDisplayIdentifier(user = currentUser) {
+  if (!user) return "";
+  return String(
+    user.displayIdentifier
+      || user.display_identifier
+      || user.loginName
+      || user.login_name
+      || user.contactEmail
+      || user.email
+      || "",
+  ).trim();
+}
+
+function authContactEmail(user = currentUser) {
+  if (!user) return "";
+  return String(user.contactEmail || user.contact_email || user.email || "").trim();
+}
+
+// The organization mode is server-owned. Keep the legacy demo flag as a
+// fallback so a rolling deploy can upgrade the browser before the API bundle.
+function organizationMode(user = currentUser) {
+  const configured = String(user?.organizationMode || "").trim().toLowerCase();
+  if (["disabled", "demo", "real"].includes(configured)) return configured;
+  if (user?.organizationDemoEnabled) return "demo";
+  return user?.organizationEnabled ? "real" : "disabled";
+}
+
+function organizationEnabled(user = currentUser) {
+  return organizationMode(user) !== "disabled";
+}
+
+function isDemoOrganizationMode(user = currentUser) {
+  return organizationMode(user) === "demo";
+}
+
+function isRealOrganizationMode(user = currentUser) {
+  return organizationMode(user) === "real";
+}
+
+function isKnownOrganizationIdentity(user = currentUser) {
+  // The generic capability is authoritative. The demo-named fallback only
+  // keeps older API bundles usable during a rolling deploy.
+  return Boolean(user?.isKnownOrganizationIdentity ?? user?.isKnownDemoCustomerIdentity);
+}
+
+function isOrganizationCustomerIdentity(user = currentUser) {
+  return Boolean(
+    organizationEnabled(user)
+    && (user?.organizationRole || isKnownOrganizationIdentity(user)),
+  );
+}
+
+function syncOrganizationDemoChrome() {
+  const demo = isDemoOrganizationMode();
+  const realDescription = "企业账号、邀请与权限变更会写入正式业务数据。";
+  document.querySelectorAll("[data-organization-demo-badge]").forEach((badge) => {
+    badge.classList.toggle("hidden", !demo);
+  });
+  const resetButton = el("resetCustomerOrganizationsDemoButton");
+  if (resetButton) resetButton.classList.toggle("hidden", !demo);
+  const topupModal = el("organizationTopupModal");
+  if (topupModal && !demo) {
+    topupModal.classList.add("hidden");
+    closeOrganizationTopupModal({ force: true });
+  }
+  const description = el("customersDescription");
+  if (description) {
+    description.textContent = demo
+      ? "为每家客户企业维护独立的部门、成员和访问状态。当前数据仅用于演示，不会创建真实账号或发送邮件。"
+      : `为每家客户企业维护独立的部门、成员和访问状态。${realDescription}`;
+  }
+  // Real customers receive credit from platform operations; only demo mode
+  // enables the local simulation form.
+  const topupButton = el("openOrganizationTopupModalButton");
+  if (topupButton && !demo) topupButton.classList.add("hidden");
+  setButtonLabel("openOrganizationTopupModalButton", demo ? "模拟充值" : "联系平台运营授信");
+  setText("organizationTopupModalTitle", demo ? "模拟充值" : "企业额度由平台运营维护");
+  const topupDescription = document.querySelector("#organizationTopupModal form > p");
+  if (topupDescription) {
+    topupDescription.textContent = demo
+      ? "立即为当前企业增加演示额度，不会调用支付、收款、邮件或任何真实充值服务。"
+      : "真实模式不提供客户自助充值，请联系平台运营人员授予或调整企业额度。";
+  }
+  const topupOptions = el("organizationTopupOptions");
+  if (topupOptions) topupOptions.setAttribute("aria-label", demo ? "模拟充值快速金额" : "企业额度维护说明");
+  const topupAmount = el("organizationTopupAmount");
+  if (topupAmount) {
+    topupAmount.placeholder = demo ? "请输入模拟充值金额" : "请联系平台运营授信";
+    topupAmount.disabled = !demo;
+  }
+  const topupNote = document.querySelector("#organizationTopupModal .organization-modal-note");
+  if (topupNote) {
+    topupNote.textContent = demo
+      ? "金额范围为 $1.00 至 $100,000.00，最多两位小数。提交成功后余额和记录会立即刷新。"
+      : "真实模式下，企业额度由平台运营依据合同、订单或审批结果维护。";
+  }
+  const topupSubmit = el("submitOrganizationTopupButton");
+  setButtonLabel("submitOrganizationTopupButton", demo ? "确认模拟充值" : "联系平台运营授信");
+  if (topupSubmit) topupSubmit.disabled = !demo;
+}
+
 function replaceCurrentQuery(params) {
   const query = params.toString();
   window.history.replaceState({}, "", `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`);
@@ -347,6 +486,36 @@ function takeResetPasswordTokenFromUrl(params = new URLSearchParams(window.locat
   params.delete("token");
   if (hadSensitiveParam) replaceCurrentQuery(params);
   return token;
+}
+
+function takeOrganizationInvitationTokenFromUrl(params = new URLSearchParams(window.location.search)) {
+  const token = String(params.get("organization_invitation") || "").trim();
+  const hadSensitiveParam = params.has("organization_invitation");
+  params.delete("organization_invitation");
+  if (hadSensitiveParam) replaceCurrentQuery(params);
+  return token;
+}
+
+function takeOrganizationClaimTokenFromUrl(params = new URLSearchParams(window.location.search)) {
+  const token = String(params.get("organization_claim") || "").trim();
+  const hadSensitiveParam = params.has("organization_claim");
+  params.delete("organization_claim");
+  if (hadSensitiveParam) replaceCurrentQuery(params);
+  return token;
+}
+
+function clearOrganizationInvitationSecret() {
+  organizationInvitationToken = "";
+  el("organizationInvitationPassword").value = "";
+  el("organizationInvitationConfirmPassword").value = "";
+}
+
+function clearOrganizationClaimSecret() {
+  organizationClaimToken = "";
+  const password = el("organizationClaimPassword");
+  const confirm = el("organizationClaimConfirmPassword");
+  if (password) password.value = "";
+  if (confirm) confirm.value = "";
 }
 
 function clearResetPasswordToken() {
@@ -503,6 +672,49 @@ function freshnessText(freshness) {
   if (Number.isNaN(parsed.getTime())) return "数据更新时间：未知";
   const timeText = parsed.toLocaleString("zh-CN", { hour12: false });
   return `${freshness.stale ? "数据更新时间（待刷新）" : "数据更新时间"}：${timeText}`;
+}
+
+function usageStatusState(freshness = null, dataQuality = null, coverage = null) {
+  const quality = dataQuality && typeof dataQuality === "object" ? dataQuality : {};
+  const range = coverage && typeof coverage === "object" ? coverage : {};
+  if (quality.snapshotUnavailable) {
+    return {
+      tone: "danger",
+      title: "同步快照暂不可用",
+      description: "当前展示的是可用汇总，成员排行和明细可能缺失。请稍后刷新后再核对。",
+    };
+  }
+  if (range.complete === false) {
+    return {
+      tone: "warning",
+      title: "数据覆盖不完整",
+      description: "所选日期范围尚未全部同步，当前合计和排行可能低于实际用量。",
+    };
+  }
+  if (freshness?.stale) {
+    return {
+      tone: "warning",
+      title: "数据等待刷新",
+      description: "最近一次同步已超过当前数据时效，请刷新后再用于结算或经营判断。",
+    };
+  }
+  return null;
+}
+
+function renderUsageStatus(containerId, freshness = null, dataQuality = null, coverage = null) {
+  const container = el(containerId);
+  if (!container) return;
+  const state = usageStatusState(freshness, dataQuality, coverage);
+  container.classList.toggle("hidden", !state);
+  if (!state) {
+    container.innerHTML = "";
+    return;
+  }
+  container.className = `operational-status ${state.tone}`;
+  container.innerHTML = `
+    <span class="operational-status-icon" aria-hidden="true">${icon("warning")}</span>
+    <div><strong>${escapeHtml(state.title)}</strong><p>${escapeHtml(state.description)}</p></div>
+  `;
 }
 
 function selectedDateRangeText() {
@@ -788,8 +1000,8 @@ function updateAuthAvailability() {
   setAuthAccess(resetPasswordToken && passwordEnabled ? "personal" : (passwordEnabled ? "personal" : "enterprise"));
   setAuthMode(resetPasswordToken && passwordEnabled ? "reset" : (authMode === "reset" ? "login" : authMode), { focus: false });
 
-  if (passwordEnabled && ssoEnabled) el("guestAuthDescription").textContent = "使用邮箱账号或企业账号进入控制台。";
-  else if (passwordEnabled) el("guestAuthDescription").textContent = "使用邮箱账号进入控制台。";
+  if (passwordEnabled && ssoEnabled) el("guestAuthDescription").textContent = "使用邮箱、企业账号或统一认证进入控制台。";
+  else if (passwordEnabled) el("guestAuthDescription").textContent = "使用邮箱或企业账号进入控制台。";
   else if (ssoEnabled) el("guestAuthDescription").textContent = "使用企业统一认证进入控制台。";
   else if (authConfig.devLoginEnabled) el("guestAuthDescription").textContent = "使用下方开发环境邮箱入口登录。";
   else el("guestAuthDescription").textContent = "当前没有可用的登录方式，请联系管理员。";
@@ -801,13 +1013,13 @@ function updateAuthAvailability() {
   if (passwordReason && !passwordEnabled) {
     setAuthAvailabilityNotice(passwordReason, "error");
   } else if (securityUnavailable && authConfig.passwordLoginEnabled) {
-    setAuthAvailabilityNotice("安全验证尚未正确配置，邮箱登录与注册暂时不可用，请联系管理员。", "error");
+    setAuthAvailabilityNotice("安全验证尚未正确配置，密码登录与注册暂时不可用，请联系管理员。", "error");
   } else if (passwordEnabled && !signupEnabled && !recoveryEnabled) {
-    setAuthAvailabilityNotice(`邮箱登录仍可用。${signupReason || "邮箱注册暂未开放。"}${recoveryReason || "密码找回暂不可用。"}`, "info");
+    setAuthAvailabilityNotice(`密码登录仍可用。${signupReason || "邮箱注册暂未开放。"}${recoveryReason || "密码找回暂不可用。"}`, "info");
   } else if (passwordEnabled && !signupEnabled) {
-    setAuthAvailabilityNotice(`邮箱登录和密码找回仍可用。${signupReason || "邮箱注册暂未开放。"}`, "info");
+    setAuthAvailabilityNotice(`密码登录和密码找回仍可用。${signupReason || "邮箱注册暂未开放。"}`, "info");
   } else if (passwordEnabled && !recoveryEnabled) {
-    setAuthAvailabilityNotice(`邮箱登录仍可用。${recoveryReason || "密码找回暂不可用。"}`, "info");
+    setAuthAvailabilityNotice(`密码登录仍可用。${recoveryReason || "密码找回暂不可用。"}`, "info");
   } else if (!passwordEnabled && !ssoEnabled && !authConfig.devLoginEnabled) {
     setAuthAvailabilityNotice("当前没有可用的登录方式，请联系管理员。", "error");
   } else {
@@ -837,7 +1049,7 @@ function setVerificationCountdown(seconds) {
 
 function authFieldValues() {
   return {
-    loginEmail: el("loginEmailInput").value.trim().toLowerCase(),
+    loginIdentifier: el("loginEmailInput").value.trim(),
     loginPassword: el("loginPasswordInput").value,
     registerName: el("registerNameInput").value.trim(),
     registerEmail: el("registerEmailInput").value.trim().toLowerCase(),
@@ -856,7 +1068,7 @@ function validateAuthMode(mode) {
   let valid = true;
   const reject = (id, message) => { fieldError(id, message); valid = false; };
   if (mode === "login") {
-    if (!validEmail(values.loginEmail)) reject("loginEmailInput", "请输入有效的邮箱地址");
+    if (values.loginIdentifier.length < 2) reject("loginEmailInput", "请输入邮箱或企业账号");
     if (values.loginPassword.length < 8) reject("loginPasswordInput", "密码至少需要 8 个字符");
   }
   if (mode === "register") {
@@ -880,26 +1092,48 @@ function validateAuthMode(mode) {
 }
 
 function accountAccessCopy(user) {
+  const identityStatus = String(user?.identityStatus || user?.identity_status || "").trim().toLowerCase();
+  if (["pending_approval", "accepted_pending_approval"].includes(identityStatus)) {
+    return {
+      title: "企业账号认领待审核",
+      description: "账号密码已设置，平台运营审核通过后才能访问企业数据和令牌。",
+      retry: true,
+    };
+  }
+  if (["revoked", "rejected"].includes(identityStatus)) {
+    return {
+      title: "企业账号认领未通过",
+      description: "当前认领申请已撤销或未通过，请联系平台运营人员重新核对账号归属。",
+      retry: false,
+    };
+  }
   const organizationAccessStatus = String(user?.organizationAccessStatus || "");
-  if (user?.organizationDemoEnabled && user?.isKnownDemoCustomerIdentity) {
+  if (isOrganizationCustomerIdentity(user)) {
+    const demoCopy = isDemoOrganizationMode(user);
     if (organizationAccessStatus === "invited") {
       return {
         title: "企业邀请等待启用",
-        description: "你的企业演示邀请尚未启用，暂时不能查看用量或使用企业资源。",
+        description: demoCopy
+          ? "你的企业演示邀请尚未启用，暂时不能查看用量或使用企业资源。"
+          : "你的企业邀请尚未启用，暂时不能查看用量或使用企业资源。",
         retry: false,
       };
     }
     if (organizationAccessStatus === "suspended") {
       return {
         title: "企业访问已暂停",
-        description: "你的企业演示访问已暂停，请联系企业管理员或平台运营人员确认后续安排。",
+        description: demoCopy
+          ? "你的企业演示访问已暂停，请联系企业管理员或平台运营人员确认后续安排。"
+          : "你的企业访问已暂停，请联系企业管理员或平台运营人员确认后续安排。",
         retry: false,
       };
     }
     if (["archived", "organization_suspended"].includes(organizationAccessStatus)) {
       return {
         title: "所属客户企业暂不可用",
-        description: "所属客户企业已归档或暂停，当前不能访问企业演示数据。",
+        description: demoCopy
+          ? "所属客户企业已归档或暂停，当前不能访问企业演示数据。"
+          : "所属客户企业已归档或暂停，当前不能访问企业资源。",
         retry: false,
       };
     }
@@ -940,7 +1174,10 @@ function renderAccountAccessState() {
   el("accountAccessDescription").textContent = state.description;
   el("accountAccessRetryButton").classList.toggle("hidden", !state.retry);
   // 只有充值真的开放时才给出这个入口，否则等于把用户引到死路。
-  el("accountAccessTopupButton").classList.toggle("hidden", !(state.topup && billingAvailable));
+  el("accountAccessTopupButton").classList.toggle(
+    "hidden",
+    !(state.topup && billingAvailable && !isOrganizationCustomerIdentity()),
+  );
 }
 
 function updateHomeCard() {
@@ -948,11 +1185,12 @@ function updateHomeCard() {
   el("authenticatedHome").classList.toggle("hidden", !isLoggedIn);
   el("authGuestContent").classList.toggle("hidden", isLoggedIn);
   if (isLoggedIn) {
-    el("loginTitle").textContent = `欢迎回来，${currentUser.name || currentUser.email}`;
+    const identifier = authDisplayIdentifier();
+    el("loginTitle").textContent = `欢迎回来，${currentUser.name || identifier}`;
     el("loginDescription").textContent = accountAccessCopy(currentUser)
       ? "账号已完成认证。进入控制台可查看当前开通状态。"
       : "你已完成账号认证，可以继续进入控制台查看个人 AI 用量。";
-    el("loginHint").textContent = `当前登录账号：${currentUser.email}`;
+    el("loginHint").textContent = `当前登录账号：${identifier}`;
     return;
   }
   isSsoRedirecting = false;
@@ -968,12 +1206,20 @@ function updateLandingAuthState() {
   const isLoggedIn = Boolean(currentUser);
   el("landingGuestActions").classList.toggle("hidden", isLoggedIn);
   el("landingUserActions").classList.toggle("hidden", !isLoggedIn);
-  el("landingUserEmail").textContent = isLoggedIn ? currentUser.email || "" : "";
+  el("landingUserEmail").textContent = isLoggedIn ? authDisplayIdentifier() : "";
   el("landingPrimaryCta").textContent = isLoggedIn ? "进入控制台" : "立即开始使用";
   el("landingGuestRegisterButton").classList.toggle("hidden", !publicSignupAvailable());
 }
 
 function showLanding() {
+  if (organizationClaimToken) {
+    showOrganizationClaimScreen();
+    return;
+  }
+  if (organizationInvitationToken) {
+    showOrganizationInvitationScreen();
+    return;
+  }
   if (currentView === "keys") clearRevealedKeys();
   el("authLoadingView").classList.add("hidden");
   el("appView").classList.add("hidden");
@@ -996,6 +1242,36 @@ function showAuthPage(mode = "login") {
   el("loginView").classList.remove("hidden");
   updateHomeCard();
   setGlobalPage("");
+  if (organizationClaimToken) {
+    el("organizationClaimScreen")?.classList.remove("hidden");
+    el("organizationClaimScreen")?.setAttribute("aria-hidden", "false");
+    el("organizationInvitationScreen")?.classList.add("hidden");
+    el("organizationInvitationScreen")?.setAttribute("aria-hidden", "true");
+    el("authAccessSwitch")?.classList.add("hidden");
+    el("personalAuthPanel")?.classList.add("hidden");
+    el("personalAuthPanel")?.setAttribute("aria-hidden", "true");
+    el("enterpriseAuthPanel")?.classList.add("hidden");
+    el("enterpriseAuthPanel")?.setAttribute("aria-hidden", "true");
+    el("devLoginArea")?.classList.add("hidden");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    return;
+  }
+  if (organizationInvitationToken) {
+    el("organizationInvitationScreen")?.classList.remove("hidden");
+    el("organizationInvitationScreen")?.setAttribute("aria-hidden", "false");
+    el("authAccessSwitch")?.classList.add("hidden");
+    el("personalAuthPanel")?.classList.add("hidden");
+    el("personalAuthPanel")?.setAttribute("aria-hidden", "true");
+    el("enterpriseAuthPanel")?.classList.add("hidden");
+    el("enterpriseAuthPanel")?.setAttribute("aria-hidden", "true");
+    el("devLoginArea")?.classList.add("hidden");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    return;
+  }
+  el("organizationInvitationScreen")?.classList.add("hidden");
+  el("organizationInvitationScreen")?.setAttribute("aria-hidden", "true");
+  el("organizationClaimScreen")?.classList.add("hidden");
+  el("organizationClaimScreen")?.setAttribute("aria-hidden", "true");
   if (!currentUser) {
     setAuthAccess(passwordLoginAvailable() ? "personal" : "enterprise");
     setAuthMode(mode, { focus: false });
@@ -1009,6 +1285,354 @@ function showAuthPage(mode = "login") {
         ? el("emailInput")
         : null;
   firstLoginControl?.focus({ preventScroll: true });
+}
+
+function setOrganizationInvitationError(message = "") {
+  const node = el("organizationInvitationError");
+  if (!node) return;
+  node.textContent = message;
+  node.className = `auth-status${message ? " show error" : ""}`;
+}
+
+function setOrganizationInvitationSuccess(message = "") {
+  const node = el("organizationInvitationSuccess");
+  if (!node) return;
+  node.textContent = message;
+  node.className = `auth-status${message ? " show success" : " success"}`;
+}
+
+function renderOrganizationInvitation() {
+  const invitation = organizationInvitation || {};
+  const existing = organizationInvitationExistingAccount;
+  const organizationName = String(invitation.organizationName || "你的企业").trim();
+  const email = String(invitation.email || invitation.contactEmail || "").trim().toLowerCase();
+  setText("organizationInvitationOrganization", organizationName || "企业邀请");
+  setText("organizationInvitationEmail", email ? `邀请邮箱：${email}` : "");
+  setText(
+    "organizationInvitationDescription",
+    existing
+      ? "确认后，这个邮箱会绑定到企业成员关系；原有密码和个人账号设置不会改变。"
+      : "确认邀请并设置密码后，企业账号会进入开通流程。",
+  );
+  el("organizationInvitationExistingAccount")?.classList.toggle("hidden", !existing);
+  el("organizationInvitationNewAccount")?.classList.toggle("hidden", existing);
+  el("organizationInvitationPasswordFields")?.classList.toggle("hidden", existing);
+  el("organizationInvitationAcceptButton")?.classList.toggle(
+    "hidden",
+    organizationInvitationLoading || organizationInvitationAccepting || !organizationInvitation,
+  );
+}
+
+function showOrganizationInvitationScreen() {
+  showAuthPage("login");
+  el("organizationInvitationScreen")?.classList.remove("hidden");
+  el("organizationInvitationScreen")?.setAttribute("aria-hidden", "false");
+  el("authAccessSwitch")?.classList.add("hidden");
+  el("personalAuthPanel")?.classList.add("hidden");
+  el("personalAuthPanel")?.setAttribute("aria-hidden", "true");
+  el("enterpriseAuthPanel")?.classList.add("hidden");
+  el("enterpriseAuthPanel")?.setAttribute("aria-hidden", "true");
+  el("devLoginArea")?.classList.add("hidden");
+  setAuthStatus();
+  renderOrganizationInvitation();
+}
+
+function resetOrganizationInvitationScreen() {
+  organizationInvitation = null;
+  organizationInvitationExistingAccount = false;
+  organizationInvitationLoading = false;
+  organizationInvitationAccepting = false;
+  setOrganizationInvitationError("");
+  setOrganizationInvitationSuccess("");
+  fieldError("organizationInvitationPassword", "");
+  fieldError("organizationInvitationConfirmPassword", "");
+  el("organizationInvitationPasswordFields")?.classList.add("hidden");
+  el("organizationInvitationExistingAccount")?.classList.add("hidden");
+  el("organizationInvitationNewAccount")?.classList.add("hidden");
+  el("organizationInvitationAcceptButton")?.classList.remove("hidden");
+  el("organizationInvitationRetryButton")?.classList.add("hidden");
+  el("organizationInvitationLoginButton")?.classList.add("hidden");
+  el("organizationInvitationScreen")?.classList.add("hidden");
+  el("organizationInvitationScreen")?.setAttribute("aria-hidden", "true");
+  clearOrganizationInvitationSecret();
+}
+
+function closeOrganizationInvitationScreen() {
+  if (organizationInvitationAccepting) return;
+  clearOrganizationInvitationSecret();
+  organizationInvitationToken = "";
+  resetOrganizationInvitationScreen();
+  showAuthPage("login");
+}
+
+async function verifyOrganizationInvitation() {
+  if (!organizationInvitationToken || organizationInvitationLoading) return;
+  organizationInvitationLoading = true;
+  setOrganizationInvitationError("");
+  setOrganizationInvitationSuccess("");
+  el("organizationInvitationRetryButton")?.classList.add("hidden");
+  el("organizationInvitationAcceptButton")?.classList.add("hidden");
+  setText("organizationInvitationDescription", "正在验证邀请链接，请稍候。");
+  try {
+    const payload = await api(`/api/auth/invitations/${encodeURIComponent(organizationInvitationToken)}`);
+    organizationInvitation = payload?.invitation || null;
+    organizationInvitationExistingAccount = payload?.existingAccount !== undefined
+      ? Boolean(payload.existingAccount)
+      : payload?.passwordRequired !== undefined
+        ? !Boolean(payload.passwordRequired)
+        : false;
+    if (!organizationInvitation) throw new Error("邀请链接无效、已过期或已被撤销");
+    renderOrganizationInvitation();
+    el("organizationInvitationAcceptButton")?.classList.remove("hidden");
+  } catch (error) {
+    organizationInvitation = null;
+    organizationInvitationExistingAccount = false;
+    setOrganizationInvitationError(error.message || "邀请链接验证失败，请稍后重试。");
+    setText("organizationInvitationDescription", "无法确认这条邀请链接的状态。");
+    if (error.code !== "ORGANIZATION_INVITATION_INVALID") {
+      el("organizationInvitationRetryButton")?.classList.remove("hidden");
+    }
+  } finally {
+    organizationInvitationLoading = false;
+  }
+}
+
+function validateOrganizationInvitationPassword() {
+  const password = String(el("organizationInvitationPassword")?.value || "");
+  const confirmPassword = String(el("organizationInvitationConfirmPassword")?.value || "");
+  fieldError("organizationInvitationPassword", "");
+  fieldError("organizationInvitationConfirmPassword", "");
+  if (password.length < 8) {
+    fieldError("organizationInvitationPassword", "密码至少需要 8 个字符。");
+    return null;
+  }
+  if (password.length > 128) {
+    fieldError("organizationInvitationPassword", "密码不能超过 128 个字符。");
+    return null;
+  }
+  if (password !== confirmPassword) {
+    fieldError("organizationInvitationConfirmPassword", "两次输入的密码不一致。");
+    return null;
+  }
+  return password;
+}
+
+async function acceptOrganizationInvitation() {
+  if (!organizationInvitationToken || !organizationInvitation || organizationInvitationAccepting) return;
+  let password;
+  if (!organizationInvitationExistingAccount) {
+    password = validateOrganizationInvitationPassword();
+    if (!password) return;
+  }
+  organizationInvitationAccepting = true;
+  setOrganizationInvitationError("");
+  setOrganizationInvitationSuccess("");
+  setButtonLoading("organizationInvitationAcceptButton", true, "正在开通");
+  try {
+    await ensureCsrfToken();
+    const payload = await api("/api/auth/invitations/accept", {
+      method: "POST",
+      body: JSON.stringify({
+        token: organizationInvitationToken,
+        ...(password ? { password } : {}),
+      }),
+    });
+    const email = String(organizationInvitation?.email || organizationInvitation?.contactEmail || "").trim().toLowerCase();
+    clearOrganizationInvitationSecret();
+    setText("organizationInvitationDescription", "邀请已确认，企业账号正在开通中。");
+    setOrganizationInvitationSuccess(
+      payload?.message || "账号开通中。完成企业资源配置后，请使用该邮箱登录。",
+    );
+    el("organizationInvitationAcceptButton")?.classList.add("hidden");
+    el("organizationInvitationRetryButton")?.classList.add("hidden");
+    el("organizationInvitationLoginButton")?.classList.remove("hidden");
+    if (email) el("loginEmailInput").value = email;
+    organizationInvitationToken = "";
+  } catch (error) {
+    if (error.code === "ORGANIZATION_INVITATION_PASSWORD_REQUIRED") {
+      organizationInvitationExistingAccount = false;
+      renderOrganizationInvitation();
+      setOrganizationInvitationError("账号状态刚发生变化，请设置密码后继续。");
+    } else {
+      setOrganizationInvitationError(error.message || "邀请接受失败，请稍后重试。");
+    }
+  } finally {
+    organizationInvitationAccepting = false;
+    setButtonLoading("organizationInvitationAcceptButton", false);
+  }
+}
+
+function finishOrganizationInvitationAndLogin() {
+  const email = String(organizationInvitation?.email || organizationInvitation?.contactEmail || el("loginEmailInput")?.value || "").trim().toLowerCase();
+  resetOrganizationInvitationScreen();
+  if (email) el("loginEmailInput").value = email;
+  showAuthPage("login");
+  setAuthStatus("账号正在开通中，请稍后使用原密码登录。", "success");
+}
+
+function setOrganizationClaimError(message = "") {
+  const node = el("organizationClaimError");
+  if (!node) return;
+  node.textContent = message;
+  node.className = `auth-status${message ? " show error" : ""}`;
+}
+
+function setOrganizationClaimSuccess(message = "") {
+  const node = el("organizationClaimSuccess");
+  if (!node) return;
+  node.textContent = message;
+  node.className = `auth-status${message ? " show success" : " success"}`;
+}
+
+function renderOrganizationClaim() {
+  const claim = organizationClaim || {};
+  const organizationName = String(claim.organizationName || claim.organization?.name || "你的企业").trim();
+  const loginName = String(claim.loginName || claim.login_name || "").trim();
+  const memberName = String(claim.memberName || claim.member_name || claim.name || "").trim();
+  setText("organizationClaimOrganization", organizationName || "企业账号认领");
+  setText(
+    "organizationClaimIdentity",
+    [memberName, loginName ? `账号：${loginName}` : ""].filter(Boolean).join(" · "),
+  );
+  setText(
+    "organizationClaimDescription",
+    claim.status === "accepted_pending_approval"
+      ? "认领申请已提交，正在等待平台运营审核。"
+      : "核对账号信息并设置密码后，提交企业账号认领申请。",
+  );
+  el("organizationClaimAcceptButton")?.classList.toggle(
+    "hidden",
+    organizationClaimLoading || organizationClaimAccepting || !organizationClaim || claim.status === "accepted_pending_approval",
+  );
+}
+
+function showOrganizationClaimScreen() {
+  showAuthPage("login");
+  el("organizationClaimScreen")?.classList.remove("hidden");
+  el("organizationClaimScreen")?.setAttribute("aria-hidden", "false");
+  el("authAccessSwitch")?.classList.add("hidden");
+  el("personalAuthPanel")?.classList.add("hidden");
+  el("personalAuthPanel")?.setAttribute("aria-hidden", "true");
+  el("enterpriseAuthPanel")?.classList.add("hidden");
+  el("enterpriseAuthPanel")?.setAttribute("aria-hidden", "true");
+  el("devLoginArea")?.classList.add("hidden");
+  setAuthStatus();
+  renderOrganizationClaim();
+  renderTurnstile("organizationClaim");
+}
+
+function resetOrganizationClaimScreen() {
+  organizationClaim = null;
+  organizationClaimLoading = false;
+  organizationClaimAccepting = false;
+  setOrganizationClaimError("");
+  setOrganizationClaimSuccess("");
+  fieldError("organizationClaimPassword", "");
+  fieldError("organizationClaimConfirmPassword", "");
+  el("organizationClaimAcceptButton")?.classList.remove("hidden");
+  el("organizationClaimRetryButton")?.classList.add("hidden");
+  el("organizationClaimLoginButton")?.classList.add("hidden");
+  el("organizationClaimScreen")?.classList.add("hidden");
+  el("organizationClaimScreen")?.setAttribute("aria-hidden", "true");
+  resetTurnstile("organizationClaim");
+  clearOrganizationClaimSecret();
+}
+
+function closeOrganizationClaimScreen() {
+  if (organizationClaimAccepting) return;
+  clearOrganizationClaimSecret();
+  organizationClaimToken = "";
+  resetOrganizationClaimScreen();
+  showAuthPage("login");
+}
+
+async function verifyOrganizationClaim() {
+  if (!organizationClaimToken || organizationClaimLoading) return;
+  organizationClaimLoading = true;
+  setOrganizationClaimError("");
+  setOrganizationClaimSuccess("");
+  el("organizationClaimRetryButton")?.classList.add("hidden");
+  el("organizationClaimAcceptButton")?.classList.add("hidden");
+  setText("organizationClaimDescription", "正在核对账号认领链接，请稍候。");
+  try {
+    const payload = await api(`/api/auth/organization-claims/${encodeURIComponent(organizationClaimToken)}`);
+    organizationClaim = payload?.claim || payload || null;
+    if (!organizationClaim) throw new Error("账号认领链接无效、已过期或已被撤销");
+    renderOrganizationClaim();
+  } catch (error) {
+    organizationClaim = null;
+    setOrganizationClaimError(error.message || "账号认领链接核对失败，请稍后重试。");
+    setText("organizationClaimDescription", "无法确认这条账号认领链接的状态。");
+    if (error.code !== "ORGANIZATION_CLAIM_INVALID") {
+      el("organizationClaimRetryButton")?.classList.remove("hidden");
+    }
+  } finally {
+    organizationClaimLoading = false;
+  }
+}
+
+function validateOrganizationClaimPassword() {
+  const password = String(el("organizationClaimPassword")?.value || "");
+  const confirmPassword = String(el("organizationClaimConfirmPassword")?.value || "");
+  fieldError("organizationClaimPassword", "");
+  fieldError("organizationClaimConfirmPassword", "");
+  if (password.length < 8) {
+    fieldError("organizationClaimPassword", "密码至少需要 8 个字符。");
+    return null;
+  }
+  if (password.length > 128) {
+    fieldError("organizationClaimPassword", "密码不能超过 128 个字符。");
+    return null;
+  }
+  if (password !== confirmPassword) {
+    fieldError("organizationClaimConfirmPassword", "两次输入的密码不一致。");
+    return null;
+  }
+  return password;
+}
+
+async function acceptOrganizationClaim() {
+  if (!organizationClaimToken || !organizationClaim || organizationClaimAccepting) return;
+  const password = validateOrganizationClaimPassword();
+  if (!password || !requireTurnstile("organizationClaim")) return;
+  organizationClaimAccepting = true;
+  setOrganizationClaimError("");
+  setOrganizationClaimSuccess("");
+  setButtonLoading("organizationClaimAcceptButton", true, "正在提交");
+  try {
+    const payload = await api("/api/auth/organization-claims/accept", {
+      method: "POST",
+      body: JSON.stringify({
+        token: organizationClaimToken,
+        password,
+        turnstileToken: turnstileTokens.organizationClaim || undefined,
+      }),
+    });
+    const loginName = String(payload?.loginName || organizationClaim?.loginName || "").trim();
+    clearOrganizationClaimSecret();
+    organizationClaim = { ...organizationClaim, ...payload, status: payload?.status || "accepted_pending_approval" };
+    setText("organizationClaimDescription", "账号密码已设置，认领申请等待平台运营审核。");
+    setOrganizationClaimSuccess(payload?.message || "申请已提交。审核通过后，请使用企业账号和新密码登录。");
+    el("organizationClaimAcceptButton")?.classList.add("hidden");
+    el("organizationClaimRetryButton")?.classList.add("hidden");
+    el("organizationClaimLoginButton")?.classList.remove("hidden");
+    if (loginName) el("loginEmailInput").value = loginName;
+    organizationClaimToken = "";
+  } catch (error) {
+    setOrganizationClaimError(error.message || "账号认领申请提交失败，请稍后重试。");
+    resetTurnstile("organizationClaim");
+  } finally {
+    organizationClaimAccepting = false;
+    setButtonLoading("organizationClaimAcceptButton", false);
+  }
+}
+
+function finishOrganizationClaimAndLogin() {
+  const loginName = String(organizationClaim?.loginName || el("loginEmailInput")?.value || "").trim();
+  resetOrganizationClaimScreen();
+  if (loginName) el("loginEmailInput").value = loginName;
+  showAuthPage("login");
+  setAuthStatus("认领申请正在等待审核。审核通过后即可使用该账号登录。", "success");
 }
 
 function promptForLogin() {
@@ -1269,6 +1893,7 @@ function renderPersonalMetrics(data) {
   el("spendBadge").textContent = `${label} · ${source}`;
   renderMetricGroups("metrics", data, "personal", usageSummary);
   setText("heroFreshness", freshnessText(personalDataFreshness));
+  renderUsageStatus("personalUsageStatus", personalDataFreshness, personalDataQuality, personalCoverage);
 }
 
 function selectedAdminEmployeeInfo() {
@@ -1324,6 +1949,7 @@ function renderAdminMetrics(data) {
   updateAdminChartTitles();
   renderMetricGroups("adminMetrics", totalData, "admin", null, data);
   setText("adminHeroFreshness", freshnessText(adminDataFreshness));
+  renderUsageStatus("adminUsageStatus", adminDataFreshness, adminDataQuality, adminCoverage);
 }
 
 function renderAdminMemberMetrics(data) {
@@ -1356,6 +1982,7 @@ function renderAdminMemberMetrics(data) {
   updateAdminChartTitles();
   renderMetricGroups("adminMetrics", data, "admin", null, data);
   setText("adminHeroFreshness", freshnessText(adminDataFreshness));
+  renderUsageStatus("adminUsageStatus", adminDataFreshness, adminDataQuality, adminCoverage);
 }
 
 function renderDepartmentMetrics(data) {
@@ -1384,6 +2011,7 @@ function renderDepartmentMetrics(data) {
   el("departmentSourceDesc").textContent = `按${scopeLabel} Codex、Claude Code 与其他来源拆分用量。`;
   renderMetricGroups("departmentMetrics", data, "department");
   setText("departmentHeroFreshness", freshnessText(departmentDataFreshness));
+  renderUsageStatus("departmentUsageStatus", departmentDataFreshness, departmentDataQuality, departmentCoverage);
   setText("departmentModelTitle", `${scopeLabel}模型使用排行`);
   setText("departmentModelDesc", `按${scopeLabel}总 Token 消耗排序。`);
 }
@@ -1458,6 +2086,7 @@ function renderTeamMetrics(data) {
   el("teamSourceDesc").textContent = `按${scopeLabel} Codex、Claude Code 与其他来源拆分用量。`;
   renderMetricGroups("teamMetrics", data, "team");
   setText("teamHeroFreshness", freshnessText(teamDataFreshness));
+  renderUsageStatus("teamUsageStatus", teamDataFreshness, teamDataQuality, teamCoverage);
   setText("teamModelTitle", `${scopeLabel}模型使用排行`);
   setText("teamModelDesc", `按${scopeLabel}总 Token 消耗排序。`);
 }
@@ -1524,6 +2153,7 @@ function renderTeamMemberMetrics(data) {
   el("teamSourceDesc").textContent = `按${employeeName} Codex、Claude Code 与其他来源拆分用量。`;
   renderMetricGroups("teamMetrics", data, "team", teamMemberUsageSummary);
   setText("teamHeroFreshness", freshnessText(teamDataFreshness));
+  renderUsageStatus("teamUsageStatus", teamDataFreshness, teamMemberDataQuality || teamDataQuality, teamMemberCoverage || teamCoverage);
   setText("teamModelTitle", `${employeeName}模型使用排行`);
   setText("teamModelDesc", `按${employeeName}总 Token 消耗排序。`);
 }
@@ -2041,7 +2671,10 @@ function employeeSummariesFromRows(rows) {
   const grouped = {};
   const sourceTotals = {};
   rows.forEach((row) => {
-    const employeeId = row.employeeId || row.employeeEmail || "mock-employee";
+    // Rows without an identity cannot safely be attributed to an employee.
+    // Do not invent a synthetic "mock" employee in a real organization view.
+    const employeeId = row.employeeId || row.employeeEmail;
+    if (!employeeId) return;
     if (!grouped[employeeId]) {
       grouped[employeeId] = {
         employeeId,
@@ -2207,6 +2840,8 @@ function applyTeamUsagePayload(payload, cacheKey = "") {
   teamEmployees = Array.isArray(payload.employees) ? payload.employees : [];
   teamInfo = payload.team || currentUser?.team || teamInfo;
   teamDataFreshness = payload.dataFreshness || null;
+  teamDataQuality = payload.dataQuality || null;
+  teamCoverage = payload.coverage || null;
   lastTeamUsageCacheHit = Boolean(payload.cache?.hit);
   teamRankingError = "";
   teamRankingHint = "";
@@ -2626,6 +3261,7 @@ function renderTeam() {
 }
 
 function render() {
+  syncOrganizationDemoChrome();
   renderAccountAccessState();
   if (accountAccessCopy(currentUser)) return;
   renderPersonal();
@@ -3298,6 +3934,8 @@ function organizationBillingAccount() {
     totalTopupsUsd: number("totalTopupsUsd", "total_topups_usd"),
     totalCreditsUsd: number("totalCreditsUsd", "total_credits_usd"),
     availableBalanceUsd: number("availableBalanceUsd", "available_balance_usd"),
+    billingStatus: String(organizationBillingField(account, "billingStatus", "billing_status") || ""),
+    pastDue: Boolean(organizationBillingField(account, "pastDue", "past_due")),
   };
 }
 
@@ -3342,7 +3980,16 @@ function organizationBillingRecordPageSize() {
 }
 
 function organizationBillingRecordTypeLabel(type) {
-  return String(type || "") === "initial_credit" ? "初始企业额度" : "模拟充值";
+  const labels = {
+    initial_credit: "初始企业额度",
+    simulated_topup: "模拟充值",
+    grant: "额度授予",
+    credit: "额度授予",
+    revoke: "额度扣减",
+    charge: "用量扣减",
+    refund: "额度退回",
+  };
+  return labels[String(type || "")] || String(type || "额度调整");
 }
 
 function organizationBillingRecordStatusLabel(status) {
@@ -3371,30 +4018,65 @@ function renderOrganizationBilling() {
   const last7Days = organizationBillingUsage("last7Days");
   const last30Days = organizationBillingUsage("last30Days");
   const canTopup = !context.readOnly && canSimulateOrganizationTopup();
+  const demoMode = isDemoOrganizationMode();
   const organization = organizationBillingData?.organization || {};
   const name = String(organization?.name || context.name || "客户企业");
   const isLoading = organizationBillingLoading && !organizationBillingData;
+  const hasLoadError = Boolean(organizationBillingLoadError && !organizationBillingData);
+  const unavailableValue = hasLoadError ? "暂不可用" : null;
 
   setText("organizationBillingScopeName", name);
-  setText("organizationBillingBalance", isLoading ? "加载中" : money.format(account.availableBalanceUsd));
-  setText("organizationBillingBalanceChip", isLoading ? "企业额度加载中" : `余额 ${money.format(account.availableBalanceUsd)}`);
-  setText("organizationBillingTotalCredits", money.format(account.totalCreditsUsd));
-  setText("organizationBillingInitialCredits", money.format(account.initialBalanceUsd));
-  setText("organizationBillingUsageEstimate", money.format(last30Days.spend));
-  setText("organizationBillingUsageTokens", formatTokens(last30Days.tokens));
-  setText("organizationBillingUsageRequests", fmt.format(last30Days.requests));
+  renderOrganizationOperationalStatus(
+    "organizationBillingOperationalStatus",
+    { ...organization, ...account },
+  );
+  setText("organizationBillingBalance", unavailableValue || (isLoading ? "加载中" : money.format(account.availableBalanceUsd)));
+  setText("organizationBillingBalanceChip", unavailableValue || (isLoading ? "企业额度加载中" : `余额 ${money.format(account.availableBalanceUsd)}`));
+  setText("organizationBillingTotalCredits", unavailableValue || money.format(account.totalCreditsUsd));
+  setText("organizationBillingInitialCredits", unavailableValue || money.format(account.initialBalanceUsd));
+  setText("organizationBillingUsageEstimate", unavailableValue || money.format(last30Days.spend));
+  setText("organizationBillingUsageTokens", unavailableValue || formatTokens(last30Days.tokens));
+  setText("organizationBillingUsageRequests", unavailableValue || fmt.format(last30Days.requests));
+  setText(
+    "organizationBillingDescription",
+    demoMode
+      ? `${name} 的额度仅用于本地演示。演示用量不影响企业余额，也不会发起真实付款。`
+      : `${name} 的企业额度与实际用量均来自已接通的数据服务。`,
+  );
+  setText("organizationBillingTotalCreditsHint", demoMode ? "含初始企业额度与模拟充值" : "累计授予与退回的企业额度");
+  setText("organizationBillingInitialCreditsHint", demoMode ? "每家演示企业独立初始化" : "企业开户及后续额度授予");
+  setText("organizationBillingUsageLabel", demoMode ? "演示用量估算" : "近 30 天用量");
+  setText(
+    "organizationBillingNoteText",
+    demoMode
+      ? "演示用量仅帮助查看企业使用情况，不会扣减企业账户余额。本页不包含支付方式、收款码、兑换码或真实订单。"
+      : "企业额度由平台运营人员维护；用量数据按实际调用汇总。本页不展示支付方式、收款码或个人充值订单。",
+  );
+  setText(
+    "organizationBillingRecordDescription",
+    demoMode ? "记录初始企业额度与后续模拟充值。所有内容均为演示数据。" : "记录平台对企业额度的授予、扣减与调整。",
+  );
+  document.querySelectorAll("[data-organization-demo-badge]").forEach((badge) => {
+    badge.classList.toggle("hidden", !demoMode);
+  });
   setHtml(
     "organizationBillingUsageCards",
-    [
-      organizationBillingUsageCard("今日", today),
-      organizationBillingUsageCard("近 7 天", last7Days),
-      organizationBillingUsageCard("近 30 天", last30Days),
-    ].join(""),
+    hasLoadError
+      ? `<div class="organization-empty">${escapeHtml(organizationBillingLoadError)}</div>`
+      : [
+          organizationBillingUsageCard("今日", today),
+          organizationBillingUsageCard("近 7 天", last7Days),
+          organizationBillingUsageCard("近 30 天", last30Days),
+        ].join(""),
   );
   const topupButton = el("openOrganizationTopupModalButton");
-  if (topupButton) topupButton.classList.toggle("hidden", !canTopup);
+  if (topupButton) topupButton.classList.toggle("hidden", !canTopup || hasLoadError);
+  const adjustButton = el("openOrganizationCreditAdjustmentButton");
+  if (adjustButton) adjustButton.classList.toggle("hidden", !context.canAdjust || hasLoadError);
+  const revokeButton = el("openOrganizationCreditRevokeButton");
+  if (revokeButton) revokeButton.classList.toggle("hidden", !context.canAdjust || hasLoadError);
   const readOnlyHint = el("organizationBillingReadOnlyHint");
-  if (readOnlyHint) readOnlyHint.classList.toggle("hidden", canTopup);
+  if (readOnlyHint) readOnlyHint.classList.toggle("hidden", !hasLoadError && (canTopup || context.canAdjust));
 
   const recordsBody = el("organizationBillingRecordBody");
   const recordTotal = organizationBillingRecordTotal();
@@ -3459,7 +4141,10 @@ function resetOrganizationBillingData() {
   organizationBillingScopeKey = "";
   selectedOrganizationTopupAmount = 0;
   isOrganizationTopupSaving = false;
+  isOrganizationCreditAdjusting = false;
+  organizationCreditAdjustmentOperation = "grant";
   el("organizationTopupModal")?.classList.add("hidden");
+  el("organizationCreditAdjustmentModal")?.classList.add("hidden");
 }
 
 async function loadOrganizationBillingData() {
@@ -3495,6 +4180,69 @@ async function changeOrganizationBillingPage(direction) {
   await loadOrganizationBillingData();
 }
 
+function closeOrganizationCreditAdjustmentModal(options = {}) {
+  if (isOrganizationCreditAdjusting && !options.force) return;
+  isOrganizationCreditAdjusting = false;
+  organizationCreditAdjustmentOperation = "grant";
+  el("organizationCreditAdjustmentForm")?.reset();
+  el("organizationCreditAdjustmentModal")?.classList.add("hidden");
+  setFieldError("organizationCreditAdjustmentError", "");
+}
+
+function openOrganizationCreditAdjustmentModal(operation = "grant") {
+  const context = organizationBillingContext();
+  if (!context?.canAdjust) return;
+  organizationCreditAdjustmentOperation = operation === "revoke" ? "revoke" : "grant";
+  el("organizationCreditAdjustmentForm")?.reset();
+  setFieldError("organizationCreditAdjustmentError", "");
+  setText("organizationCreditAdjustmentModalTitle", organizationCreditAdjustmentOperation === "revoke" ? "扣减企业额度" : "授予企业额度");
+  setText("organizationCreditAdjustmentSubmit", organizationCreditAdjustmentOperation === "revoke" ? "确认扣减" : "确认授予");
+  el("organizationCreditAdjustmentModal")?.classList.remove("hidden");
+  window.setTimeout(() => el("organizationCreditAdjustmentAmount")?.focus(), 0);
+}
+
+async function submitOrganizationCreditAdjustment(event) {
+  event.preventDefault();
+  const context = organizationBillingContext();
+  if (!context?.canAdjust || isOrganizationCreditAdjusting) return;
+  const amount = Number(el("organizationCreditAdjustmentAmount")?.value || 0);
+  const reason = String(el("organizationCreditAdjustmentReason")?.value || "").trim();
+  const externalReference = String(el("organizationCreditAdjustmentReference")?.value || "").trim();
+  setFieldError("organizationCreditAdjustmentError", "");
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 100000 || Math.round(amount * 100) !== amount * 100) {
+    setFieldError("organizationCreditAdjustmentError", "请输入 $0.01 至 $100,000.00 的金额，最多两位小数。");
+    return;
+  }
+  if (!reason) {
+    setFieldError("organizationCreditAdjustmentError", "请填写调整原因。");
+    return;
+  }
+  isOrganizationCreditAdjusting = true;
+  setButtonLoading("organizationCreditAdjustmentSubmit", true, "提交中");
+  try {
+    await ensureCsrfToken();
+    const idempotencyKey = `org-credit-${context.organizationId}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    await api(context.adjustmentPath, {
+      method: "POST",
+      body: JSON.stringify({
+        operation: organizationCreditAdjustmentOperation,
+        amountUsd: amount,
+        reason,
+        externalReference,
+        idempotencyKey,
+      }),
+    });
+    closeOrganizationCreditAdjustmentModal({ force: true });
+    await loadOrganizationBillingData();
+    showToast("企业额度已更新");
+  } catch (error) {
+    setFieldError("organizationCreditAdjustmentError", error.message || "企业额度调整失败，请稍后重试。");
+  } finally {
+    isOrganizationCreditAdjusting = false;
+    setButtonLoading("organizationCreditAdjustmentSubmit", false);
+  }
+}
+
 function renderOrganizationTopupOptions() {
   const options = [500, 1000, 2000, 5000];
   const container = el("organizationTopupOptions");
@@ -3527,6 +4275,7 @@ async function submitOrganizationTopup(event) {
   event.preventDefault();
   const context = organizationBillingContext();
   if (!context || context.readOnly || !canSimulateOrganizationTopup() || isOrganizationTopupSaving) return;
+  if (!isDemoOrganizationMode()) return;
   const amount = Number(el("organizationTopupAmount")?.value || 0);
   setFieldError("organizationTopupError", "");
   if (!Number.isFinite(amount) || amount < 1 || amount > 100000 || Math.round(amount * 100) !== amount * 100) {
@@ -3618,9 +4367,9 @@ async function loadBillingData() {
 
 async function refreshBillingAvailability() {
   // 后端未开放充值时接口返回 404，据此决定导航项是否出现。
-  // Customer demo identities have a separate organization credit contract.
-  // Never use this legacy probe for them because it targets a personal account.
-  if (isMockCustomerIdentity()) {
+  // Customer identities have a separate organization credit contract. Never
+  // use this legacy probe for them because it targets a personal account.
+  if (isOrganizationCustomerIdentity()) {
     billingAvailable = false;
     updateBillingNav();
     return;
@@ -4121,6 +4870,17 @@ async function copyText(text, successMessage) {
   }
 }
 
+function organizationProvisioningStatus(record) {
+  if (!record || typeof record !== "object") return "";
+  return String(
+    record.provisioningStatus
+      ?? record.provisioning_status
+      ?? record.upstreamStatus
+      ?? record.upstream_status
+      ?? "",
+  ).trim().toLowerCase();
+}
+
 const ORGANIZATION_ROLE_LABELS = {
   admin: "企业管理员",
   member: "成员",
@@ -4148,10 +4908,10 @@ function canViewCurrentOrganizationUsage() {
   if (currentUser?.canViewOrganizationUsage !== undefined) {
     return Boolean(currentUser.canViewOrganizationUsage);
   }
-  // Keep older demo payloads usable without giving ordinary members the
-  // organization-wide boards while a server bundle is being upgraded.
+  // Keep older payloads usable without giving ordinary members the
+    // organization-wide boards while a server bundle is being upgraded.
   return Boolean(
-    currentUser?.organizationDemoEnabled
+    organizationEnabled()
     && String(currentUser?.organizationRole || "") === "admin",
   );
 }
@@ -4161,22 +4921,29 @@ function canViewOrganizationBilling() {
 }
 
 function canSimulateOrganizationTopup() {
-  return Boolean(currentUser?.canSimulateOrganizationTopup);
+  return Boolean(isDemoOrganizationMode() && currentUser?.canSimulateOrganizationTopup);
 }
 
 function organizationBillingContext() {
   if (isViewingCustomerOrganization()) {
     const organizationId = selectedCustomerOrganizationId();
     if (!organizationId) return null;
+    const canAdjust = Boolean(
+      isRealOrganizationMode()
+      && currentUser?.canAdjustOrganizationCredit
+      && customerOrganizationStatus(selectedCustomerOrganization) !== "archived",
+    );
     return {
       kind: "platformCustomer",
       organizationId,
       name: selectedCustomerOrganizationName(),
       readOnly: true,
+      canAdjust,
       path: `${customerOrganizationPath(organizationId)}/billing`,
+      adjustmentPath: `${customerOrganizationPath(organizationId)}/billing/adjustments`,
     };
   }
-  if (!isMockCustomerIdentity() || !canViewOrganizationBilling()) return null;
+  if (!isOrganizationCustomerIdentity() || !canViewOrganizationBilling()) return null;
   return {
     kind: "currentOrganization",
     organizationId: String(currentUser?.organizationId || ""),
@@ -4196,9 +4963,10 @@ function isOrganizationBillingView() {
 }
 
 function canAccessBillingView() {
-  // Demo seller accounts keep only the global operations panel in the full
-  // employee board. They cannot open the customer-facing billing destination.
-  return Boolean(isOrganizationBillingView() || (billingAvailable && !currentUser?.organizationDemoEnabled));
+  // Seller accounts keep their global billing operations; customer accounts
+  // use the enterprise credit workspace when the server grants that capability.
+  const personalBillingAvailable = Boolean(billingAvailable && !isOrganizationCustomerIdentity());
+  return Boolean(isOrganizationBillingView() || personalBillingAvailable);
 }
 
 function selectedCustomerOrganizationId() {
@@ -4253,6 +5021,16 @@ function customerOrganizationStats(item) {
 function customerOrganizationStatus(item) {
   const record = customerOrganizationRecord(item);
   return String(organizationField(record, "status", "status") || "active");
+}
+
+function organizationStatusChip(item) {
+  const record = customerOrganizationRecord(item);
+  const provisioningStatus = organizationProvisioningStatus(record);
+  const billingStatus = String(organizationField(record, "billingStatus", "billing_status") || "").trim().toLowerCase();
+  if (["failed", "error", "degraded"].includes(provisioningStatus)) return { label: "同步失败", tone: "rose" };
+  if (["pending", "provisioning", "creating"].includes(provisioningStatus)) return { label: "开通中", tone: "gold" };
+  if (["past_due", "insufficient", "blocked", "suspended"].includes(billingStatus)) return { label: "余额不足", tone: "rose" };
+  return { label: customerOrganizationStatus(item) === "archived" ? "已归档" : "正常", tone: "" };
 }
 
 function customerOrganizationUpdatedAt(item) {
@@ -4346,13 +5124,6 @@ function organizationUsageScopeLabel() {
   return organizationUsageScope()?.name || "全员";
 }
 
-function isMockCustomerIdentity() {
-  return Boolean(
-    currentUser?.organizationDemoEnabled
-    && (currentUser?.organizationRole || currentUser?.isKnownDemoCustomerIdentity),
-  );
-}
-
 // 侧边栏的每一项都由权限决定，逐项揭示会让「我的用量」「令牌管理」先蹦出来、
 // 其余项随各自的探测请求陆续追加。这里改成整栏一次性揭示：权限没落地前导航保持
 // 骨架占位，落地后同一帧内决定全部 7 项。
@@ -4364,24 +5135,28 @@ function syncNavigationVisibility() {
   const canManageCurrentOrganization = Boolean(currentUser?.canManageOrganization);
   const canViewAdmin = canViewAdminUsage();
   const canViewDepartments = canViewDepartmentUsage();
-  const isCustomer = isMockCustomerIdentity();
+  const isCustomer = isOrganizationCustomerIdentity();
   // A customer administrator gets an enterprise-credit entry. Seller accounts
   // keep their global billing operations in the admin board, never in this
   // customer-facing sidebar destination.
   const canUseBillingSidebar = isCustomer
     ? canViewOrganizationBilling()
-    : Boolean(billingAvailable && !currentUser?.organizationDemoEnabled);
+    : Boolean(billingAvailable);
   el("customersTab").classList.toggle("hidden", !canBrowseCustomers);
+  el("resetCustomerOrganizationsDemoButton")?.classList.toggle("hidden", !isDemoOrganizationMode());
   el("organizationTab")?.classList.toggle("hidden", !canManageCurrentOrganization);
   // 企业令牌是甲方管理员的一级目的地。乙方运营不在侧边栏出现，他们从客户企业
   // 下钻后在企业详情标签里只读查看。
   el("organizationTokensTab")?.classList.toggle("hidden", !canManageCurrentOrganization);
+  if (!canManageCurrentOrganization && currentUser?.canManageOrganizationTokens) {
+    el("organizationTokensTab")?.classList.remove("hidden");
+  }
   el("adminTab").classList.toggle("hidden", !canViewAdmin);
   el("departmentTab").classList.toggle("hidden", !canViewDepartments);
   el("teamTab").classList.toggle("hidden", !currentUser?.isTeamLeader);
   // 个人用量对每个登录身份都成立，但仍在这里统一揭示，避免它比其他项先出现。
   el("dashboardTab")?.classList.remove("hidden");
-  // Customer identities use their demo-scoped views only; never expose
+  // Customer identities use their tenant-scoped views only; never expose
   // seller account functions that lack a customer-local contract.
   document.querySelectorAll('[data-view="keys"]').forEach((button) => {
     button.classList.toggle("hidden", isCustomer);
@@ -4493,6 +5268,405 @@ function organizationStatusLabel(status) {
   return ORGANIZATION_STATUS_LABELS[String(status || "")] || "未知";
 }
 
+const ORGANIZATION_CLAIM_STATUS_LABELS = {
+  pending: "等待激活",
+  created: "等待激活",
+  pending_activation: "等待激活",
+  pending_approval: "待平台审核",
+  accepted_pending_approval: "待平台审核",
+  approved: "已审核通过",
+  provisioning: "账号开通中",
+  active: "已生效",
+  revoked: "已撤销",
+  expired: "已过期",
+};
+
+function organizationClaimStatus(claim) {
+  return String(organizationField(claim, "status", "status") || "pending").trim().toLowerCase();
+}
+
+function organizationClaimStatusLabel(status) {
+  return ORGANIZATION_CLAIM_STATUS_LABELS[String(status || "")] || "未知";
+}
+
+function organizationClaimStatusTone(status) {
+  if (["approved", "active"].includes(status)) return "active";
+  if (["revoked", "expired"].includes(status)) return "suspended";
+  return "invited";
+}
+
+function platformCanManageOrganizationClaims() {
+  if (!isViewingCustomerOrganization() || !isRealOrganizationMode()) return false;
+  if (customerOrganizationStatus(selectedCustomerOrganization) === "archived") return false;
+  if (currentUser?.canManageOrganizationClaims !== undefined) {
+    return Boolean(currentUser.canManageOrganizationClaims);
+  }
+  return isPlatformAdmin();
+}
+
+function organizationClaimsPath(suffix = "") {
+  const organizationId = selectedCustomerOrganizationId();
+  return `${customerOrganizationPath(organizationId)}/membership-claims${suffix}`;
+}
+
+function clearOrganizationClaimLastUrl() {
+  organizationClaimLastUrl = "";
+  setText("organizationClaimLastUrl", "");
+  el("organizationClaimLastResult")?.classList.add("hidden");
+}
+
+function resetOrganizationClaims() {
+  organizationClaims = [];
+  organizationClaimLoadError = "";
+  isOrganizationClaimLoading = false;
+  isOrganizationClaimSaving = false;
+  clearOrganizationClaimLastUrl();
+}
+
+function platformCanAdoptOrganization() {
+  if (!isViewingCustomerOrganization() || !isRealOrganizationMode()) return false;
+  if (customerOrganizationStatus(selectedCustomerOrganization) === "archived") return false;
+  if (currentUser?.canAdoptCustomerOrganization !== undefined) {
+    return Boolean(currentUser.canAdoptCustomerOrganization);
+  }
+  return isPlatformAdmin();
+}
+
+function resetOrganizationAdoption() {
+  organizationAdoptionPreview = null;
+  organizationAdoptionFingerprint = "";
+  organizationAdoptionIdempotencyKey = "";
+  organizationAdoptionLoadError = "";
+  isOrganizationAdoptionLoading = false;
+  isOrganizationAdoptionApplying = false;
+}
+
+function organizationAdoptionRequestBody() {
+  return {
+    organizationName: String(el("organizationAdoptionNameInput")?.value || "").trim(),
+    departmentName: String(el("organizationAdoptionDepartmentInput")?.value || "").trim(),
+    adminName: String(el("organizationAdoptionAdminNameInput")?.value || "").trim(),
+    adminEmail: String(el("organizationAdoptionAdminEmailInput")?.value || "").trim().toLowerCase(),
+    principalName: String(el("organizationAdoptionPrincipalInput")?.value || "").trim(),
+    // Stable source candidates and the two historical asset aliases are
+    // resolved by the server-side pilot configuration. Do not place them in
+    // HTML, browser storage, URLs, or user-facing copy.
+    organizationCandidates: [],
+    teamCandidates: [],
+    keyAliases: [],
+    effectiveFrom: String(el("organizationAdoptionEffectiveFromInput")?.value || "").trim(),
+    effectiveThrough: String(el("organizationAdoptionEffectiveThroughInput")?.value || "").trim(),
+  };
+}
+
+function organizationAdoptionActionLabel(record, subject) {
+  const action = String(organizationField(record, "action", "action") || "").trim().toLowerCase();
+  if (["adopt", "reuse", "existing"].includes(action)) return `${subject}将接管现有对象`;
+  if (["create", "new"].includes(action)) return `${subject}将创建新对象`;
+  return `${subject}已确认`;
+}
+
+function renderOrganizationAdoption() {
+  const panel = el("organizationAdoptionPanel");
+  if (!panel) return;
+  const visible = platformCanAdoptOrganization();
+  panel.classList.toggle("hidden", !visible);
+  if (!visible) return;
+
+  const status = el("organizationAdoptionStatus");
+  const result = el("organizationAdoptionResult");
+  const previewButton = el("previewOrganizationAdoptionButton");
+  const applyButton = el("applyOrganizationAdoptionButton");
+  if (previewButton) previewButton.disabled = isOrganizationAdoptionLoading || isOrganizationAdoptionApplying;
+  if (applyButton) {
+    applyButton.disabled = !organizationAdoptionFingerprint || isOrganizationAdoptionLoading || isOrganizationAdoptionApplying;
+    applyButton.classList.toggle("hidden", !organizationAdoptionFingerprint);
+  }
+
+  if (isOrganizationAdoptionLoading) {
+    status.className = "operational-status warning";
+    status.innerHTML = `<span class="operational-status-icon" aria-hidden="true">${icon("warning")}</span><div><strong>正在执行接管预检</strong><p>正在核对企业、部门和历史资产的唯一归属。预检完成前不会写入任何业务数据。</p></div>`;
+    status.classList.remove("hidden");
+  } else if (isOrganizationAdoptionApplying) {
+    status.className = "operational-status warning";
+    status.innerHTML = `<span class="operational-status-icon" aria-hidden="true">${icon("warning")}</span><div><strong>正在应用接管</strong><p>正在创建本地映射、David 邀请和历史资产只读归属，请勿重复提交。</p></div>`;
+    status.classList.remove("hidden");
+  } else if (organizationAdoptionLoadError) {
+    status.className = "operational-status danger";
+    status.innerHTML = `<span class="operational-status-icon" aria-hidden="true">${icon("warning")}</span><div><strong>接管预检冲突</strong><p>${escapeHtml(organizationAdoptionLoadError)}</p></div>`;
+    status.classList.remove("hidden");
+  } else if (organizationAdoptionPreview) {
+    const applied = ["applied", "idempotent"].includes(String(organizationAdoptionPreview.status || ""));
+    status.className = `operational-status ${applied ? "" : "warning"}`;
+    status.innerHTML = `<span class="operational-status-icon" aria-hidden="true">${icon(applied ? "check" : "warning")}</span><div><strong>${applied ? "真实接管已完成" : "接管预检已通过"}</strong><p>${applied ? "企业、部门、管理员邀请与历史资产归属已持久化。" : "范围与归属一致，可以应用接管；应用前不会改变现有调用权限。"}</p></div>`;
+    status.classList.remove("hidden");
+  } else {
+    status.classList.add("hidden");
+    status.innerHTML = "";
+  }
+
+  if (!result) return;
+  const preview = organizationAdoptionPreview;
+  if (!preview) {
+    result.classList.add("hidden");
+    result.innerHTML = "";
+    return;
+  }
+  const organization = preview.organization || {};
+  const department = preview.department || {};
+  const assets = preview.legacyAssets || preview.legacy_assets || {};
+  const assetCount = Number(assets.count || 0);
+  const identityCount = Number(assets.originalIdentityCount ?? assets.original_identity_count ?? 0);
+  const scopeConsistent = Boolean(
+    (organizationField(department, "scopeConsistent", "scope_consistent") ?? true)
+    && (organizationField(assets, "scopeConsistent", "scope_consistent") ?? true),
+  );
+  const principalName = String(organizationField(assets, "principalName", "principal_name") || "梁海强");
+  result.innerHTML = `
+    <div class="organization-adoption-result-head">
+      <div><span>企业范围</span><strong>${escapeHtml(organizationAdoptionActionLabel(organization, "企业"))}</strong></div>
+      <div><span>部门范围</span><strong>${escapeHtml(organizationAdoptionActionLabel(department, "部门"))}</strong></div>
+      <div><span>归属核对</span><strong>${scopeConsistent ? "范围一致" : "需要人工复核"}</strong></div>
+    </div>
+    <div class="organization-adoption-assets">
+      <strong>${fmt.format(assetCount)} 项历史资产已确认</strong>
+      <p>${fmt.format(identityCount)} 个原始调用身份将聚合为“${escapeHtml(principalName)}”的企业用量报表；原始审计身份仍分别保留。</p>
+      <span class="organization-status invited">历史资产、只读、不计企业额度</span>
+    </div>
+  `;
+  result.classList.remove("hidden");
+}
+
+async function previewOrganizationAdoption(event) {
+  event?.preventDefault();
+  if (!platformCanAdoptOrganization() || isOrganizationAdoptionLoading || isOrganizationAdoptionApplying) return;
+  const body = organizationAdoptionRequestBody();
+  if (!body.organizationName || !body.departmentName || !body.adminName || !validEmail(body.adminEmail) || !body.principalName || !body.effectiveFrom || !body.effectiveThrough) {
+    setFieldError("organizationAdoptionError", "请完整填写企业、部门、管理员、历史资产负责人和有效时间窗。");
+    return;
+  }
+  organizationAdoptionPreview = null;
+  organizationAdoptionFingerprint = "";
+  organizationAdoptionIdempotencyKey = "";
+  organizationAdoptionLoadError = "";
+  setFieldError("organizationAdoptionError", "");
+  isOrganizationAdoptionLoading = true;
+  setButtonLoading("previewOrganizationAdoptionButton", true, "正在预检");
+  renderOrganizationAdoption();
+  try {
+    await ensureCsrfToken();
+    const payload = await api("/api/platform/organization-adoptions/preview", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    organizationAdoptionPreview = payload || null;
+    organizationAdoptionFingerprint = String(payload?.previewFingerprint || payload?.preview_fingerprint || "");
+    organizationAdoptionIdempotencyKey = String(payload?.idempotencyKey || payload?.idempotency_key || `baic-pilot-adoption-${Date.now()}`);
+    if (!organizationAdoptionFingerprint) throw new Error("预检响应缺少可验证凭据，请重新预检。");
+    showToast("接管预检已通过");
+  } catch (error) {
+    organizationAdoptionPreview = null;
+    organizationAdoptionFingerprint = "";
+    organizationAdoptionIdempotencyKey = "";
+    organizationAdoptionLoadError = error.code === "ORGANIZATION_ADOPTION_CONFLICT"
+      ? (error.message || "候选对象存在冲突，未执行任何写入。")
+      : (error.message || "接管预检失败，请稍后重试。");
+  } finally {
+    isOrganizationAdoptionLoading = false;
+    setButtonLoading("previewOrganizationAdoptionButton", false);
+    renderOrganizationAdoption();
+  }
+}
+
+async function applyOrganizationAdoption() {
+  if (!platformCanAdoptOrganization() || !organizationAdoptionFingerprint || isOrganizationAdoptionApplying) return;
+  isOrganizationAdoptionApplying = true;
+  organizationAdoptionLoadError = "";
+  setButtonLoading("applyOrganizationAdoptionButton", true, "正在应用");
+  renderOrganizationAdoption();
+  try {
+    await ensureCsrfToken();
+    const payload = await api("/api/platform/organization-adoptions/apply", {
+      method: "POST",
+      body: JSON.stringify({
+        ...organizationAdoptionRequestBody(),
+        previewFingerprint: organizationAdoptionFingerprint,
+        idempotencyKey: organizationAdoptionIdempotencyKey,
+      }),
+    });
+    organizationAdoptionPreview = payload || { status: "applied" };
+    organizationAdoptionFingerprint = "";
+    organizationAdoptionIdempotencyKey = "";
+    showToast(payload?.status === "idempotent" ? "该接管已完成，无需重复执行" : "真实接管已完成");
+    await Promise.all([loadOrganizationData(), loadOrganizationTokens(), loadOrganizationClaims()]);
+  } catch (error) {
+    organizationAdoptionLoadError = error.code === "ORGANIZATION_ADOPTION_CONFLICT"
+      ? (error.message || "企业或历史资产状态已变化，请重新执行预检。")
+      : (error.message || "接管应用失败，请重新预检后再试。");
+    organizationAdoptionFingerprint = "";
+    organizationAdoptionIdempotencyKey = "";
+  } finally {
+    isOrganizationAdoptionApplying = false;
+    setButtonLoading("applyOrganizationAdoptionButton", false);
+    renderOrganizationAdoption();
+  }
+}
+
+function renderOrganizationClaimDepartmentOptions() {
+  const select = el("organizationClaimDepartmentInput");
+  if (!select) return;
+  const selected = select.value;
+  const departments = organizationDepartments().filter((department) => String(department.status || "active") !== "archived");
+  select.innerHTML = departments.length
+    ? departments.map((department) => {
+        const id = organizationDepartmentId(department);
+        return `<option value="${escapeHtml(id)}">${escapeHtml(department.name || "未命名部门")}</option>`;
+      }).join("")
+    : '<option value="">请先创建部门</option>';
+  if (departments.some((department) => organizationDepartmentId(department) === selected)) select.value = selected;
+  select.disabled = !departments.length || isOrganizationClaimSaving;
+}
+
+function renderOrganizationClaims() {
+  const panel = el("organizationClaimPanel");
+  if (!panel) return;
+  const visible = platformCanManageOrganizationClaims();
+  panel.classList.toggle("hidden", !visible);
+  if (!visible) return;
+  setText("organizationClaimCountChip", `${fmt.format(organizationClaims.length)} 条`);
+  renderOrganizationClaimDepartmentOptions();
+  const submit = el("submitOrganizationClaimButton");
+  if (submit) submit.disabled = isOrganizationClaimSaving || !organizationDepartments().length;
+  const table = el("organizationClaimTable");
+  if (!table) return;
+  if (organizationClaimLoadError) {
+    table.innerHTML = `<tr><td colspan="6"><div class="organization-empty">${escapeHtml(organizationClaimLoadError)}</div></td></tr>`;
+    return;
+  }
+  if (isOrganizationClaimLoading) {
+    table.innerHTML = '<tr><td colspan="6"><div class="organization-empty">正在加载账号认领记录…</div></td></tr>';
+    return;
+  }
+  if (!organizationClaims.length) {
+    table.innerHTML = '<tr><td colspan="6"><div class="organization-empty">还没有账号认领记录。可为已有调用账号生成一次性激活链接。</div></td></tr>';
+    return;
+  }
+  table.innerHTML = organizationClaims.map((claim) => {
+    const id = String(organizationField(claim, "id", "claim_id") || organizationField(claim, "claimId", "claim_id") || "");
+    const loginName = String(organizationField(claim, "loginName", "login_name") || "");
+    const name = String(organizationField(claim, "memberName", "member_name") || organizationField(claim, "name", "name") || "-");
+    const role = String(organizationField(claim, "role", "role") || "member");
+    const status = organizationClaimStatus(claim);
+    const expiresAt = organizationField(claim, "expiresAt", "expires_at");
+    const canApprove = status === "accepted_pending_approval";
+    const canRevoke = ["pending", "created", "accepted_pending_approval"].includes(status);
+    return `
+      <tr>
+        <td><div class="organization-member-identity"><strong>${escapeHtml(loginName || "-")}</strong><span>企业账号</span></div></td>
+        <td>${escapeHtml(name)}</td>
+        <td>${escapeHtml(organizationRoleLabel(role))}</td>
+        <td><span class="organization-status ${escapeHtml(organizationClaimStatusTone(status))}">${escapeHtml(organizationClaimStatusLabel(status))}</span></td>
+        <td>${escapeHtml(organizationDate(expiresAt))}</td>
+        <td><div class="organization-member-actions">
+          <button class="primary-btn" type="button" data-organization-claim-approve="${escapeHtml(id)}" ${canApprove ? "" : "disabled"}>审核通过</button>
+          <button class="danger-outline-btn" type="button" data-organization-claim-revoke="${escapeHtml(id)}" ${canRevoke ? "" : "disabled"}>撤销</button>
+        </div></td>
+      </tr>
+    `;
+  }).join("");
+}
+
+async function loadOrganizationClaims() {
+  if (!platformCanManageOrganizationClaims() || isOrganizationClaimLoading) return;
+  const scopeKey = organizationUsageScopeKey();
+  isOrganizationClaimLoading = true;
+  organizationClaimLoadError = "";
+  renderOrganizationClaims();
+  try {
+    const payload = await api(organizationClaimsPath());
+    if (scopeKey !== organizationUsageScopeKey()) return;
+    organizationClaims = Array.isArray(payload?.items)
+      ? payload.items
+      : Array.isArray(payload?.claims)
+        ? payload.claims
+        : Array.isArray(payload)
+          ? payload
+          : [];
+  } catch (error) {
+    if (scopeKey !== organizationUsageScopeKey()) return;
+    organizationClaims = [];
+    organizationClaimLoadError = error.message || "账号认领记录加载失败，请稍后重试。";
+  } finally {
+    isOrganizationClaimLoading = false;
+    renderOrganizationClaims();
+  }
+}
+
+function organizationClaimUrlFromPayload(payload) {
+  const claim = payload?.claim && typeof payload.claim === "object" ? payload.claim : {};
+  const rawUrl = String(payload?.activationUrl || payload?.activation_url || payload?.claimUrl || payload?.claim_url || payload?.url || claim.activationUrl || claim.activation_url || claim.claimUrl || claim.claim_url || claim.url || "").trim();
+  if (rawUrl) return new URL(rawUrl, window.location.origin).toString();
+  const token = String(payload?.token || payload?.claimToken || payload?.claim_token || claim.token || claim.claimToken || claim.claim_token || "").trim();
+  if (!token) return "";
+  const url = new URL(window.location.origin + window.location.pathname);
+  url.searchParams.set("organization_claim", token);
+  return url.toString();
+}
+
+async function submitOrganizationClaim(event) {
+  event.preventDefault();
+  if (!platformCanManageOrganizationClaims() || isOrganizationClaimSaving) return;
+  const name = el("organizationClaimMemberNameInput").value.trim();
+  const loginName = el("organizationClaimLoginNameInput").value.trim().toLowerCase();
+  const departmentId = el("organizationClaimDepartmentInput").value;
+  const role = el("organizationClaimRoleInput").value;
+  setFieldError("organizationClaimFormError", "");
+  if (!name || !/^[a-z0-9._-]{2,80}$/i.test(loginName) || !departmentId) {
+    setFieldError("organizationClaimFormError", "请填写姓名、2 至 80 位企业账号，并选择所属部门。");
+    return;
+  }
+  isOrganizationClaimSaving = true;
+  setButtonLoading("submitOrganizationClaimButton", true, "正在生成");
+  renderOrganizationClaims();
+  try {
+    await ensureCsrfToken();
+    const payload = await api(organizationClaimsPath(), {
+      method: "POST",
+      body: JSON.stringify({ memberName: name, loginName, departmentId, role }),
+    });
+    organizationClaimLastUrl = organizationClaimUrlFromPayload(payload);
+    if (organizationClaimLastUrl) {
+      setText("organizationClaimLastUrl", organizationClaimLastUrl);
+      el("organizationClaimLastResult")?.classList.remove("hidden");
+    }
+    showToast("企业账号激活链接已生成");
+    await loadOrganizationClaims();
+    el("organizationClaimForm").reset();
+    el("organizationClaimRoleInput").value = "admin";
+  } catch (error) {
+    setFieldError("organizationClaimFormError", error.message || "企业账号激活链接生成失败，请稍后重试。");
+  } finally {
+    isOrganizationClaimSaving = false;
+    setButtonLoading("submitOrganizationClaimButton", false);
+    renderOrganizationClaims();
+  }
+}
+
+async function mutateOrganizationClaim(claimId, action) {
+  if (!platformCanManageOrganizationClaims() || !claimId) return;
+  try {
+    await ensureCsrfToken();
+    await api(organizationClaimsPath(`/${encodeURIComponent(claimId)}/${action}`), {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    showToast(action === "approve" ? "账号认领已审核通过" : "账号认领已撤销");
+    await Promise.all([loadOrganizationClaims(), loadOrganizationData()]);
+  } catch (error) {
+    showToast(error.message || (action === "approve" ? "账号认领审核失败" : "账号认领撤销失败"));
+  }
+}
+
 function organizationStats() {
   const stats = organizationSnapshot?.stats || {};
   const members = organizationMembers;
@@ -4518,6 +5692,49 @@ function organizationCanManage() {
   const serverCapability = capabilities.canManageOrganization ?? capabilities.canManage;
   if (organizationSnapshot && serverCapability === false) return false;
   return Boolean(currentUser?.canManageOrganization);
+}
+
+function organizationOperationalState(organization = {}) {
+  const provisioningStatus = organizationProvisioningStatus(organization);
+  const billingStatus = String(organizationField(organization, "billingStatus", "billing_status") || "").trim().toLowerCase();
+  if (["failed", "error", "degraded"].includes(provisioningStatus)) {
+    return { tone: "danger", title: "企业账号同步失败", description: "企业资源尚未完成同步，请联系平台运营人员重试。" };
+  }
+  if (["pending", "provisioning", "creating"].includes(provisioningStatus)) {
+    return { tone: "warning", title: "企业账号开通中", description: "企业资源正在准备，完成后即可使用企业看板与额度。" };
+  }
+  if (["past_due", "insufficient", "blocked", "suspended"].includes(billingStatus)) {
+    return { tone: "danger", title: "企业余额不足", description: "企业额度已不足或待处理，新的调用可能会被暂停，请联系平台运营人员。" };
+  }
+  return null;
+}
+
+function renderOrganizationOperationalStatus(containerId, organization = {}) {
+  const container = el(containerId);
+  if (!container) return;
+  const state = organizationOperationalState(organization);
+  container.classList.toggle("hidden", !state);
+  if (!state) {
+    container.innerHTML = "";
+    return;
+  }
+  container.className = `operational-status ${state.tone}`;
+  container.innerHTML = `
+    <span class="operational-status-icon" aria-hidden="true">${icon("warning")}</span>
+    <div><strong>${escapeHtml(state.title)}</strong><p>${escapeHtml(state.description)}</p></div>
+  `;
+}
+
+function organizationBillingOperationalState(account = {}, organization = {}) {
+  const merged = {
+    ...organization,
+    billingStatus: organizationField(account, "billingStatus", "billing_status") || organizationField(organization, "billingStatus", "billing_status"),
+  };
+  const state = organizationOperationalState(merged);
+  if (state) return state;
+  const pastDue = Boolean(account?.pastDue);
+  if (pastDue) return { tone: "danger", title: "企业余额不足", description: "当前额度处于待处理状态，请联系平台运营人员补充或调整额度。" };
+  return null;
 }
 
 function organizationCanView() {
@@ -4552,6 +5769,10 @@ function renderOrganizationDepartments() {
   const departments = organizationDepartments();
   if (isOrganizationLoading && !departments.length) {
     container.innerHTML = '<div class="organization-empty">正在加载部门…</div>';
+    return;
+  }
+  if (organizationLoadError) {
+    container.innerHTML = `<div class="organization-empty">${escapeHtml(organizationLoadError)}</div>`;
     return;
   }
   if (!departments.length) {
@@ -4595,10 +5816,16 @@ function renderOrganizationMembers() {
   const stats = organizationStats();
   setText("organizationMemberCountChip", `${fmt.format(organizationMemberTotal)} / ${fmt.format(stats.memberCount)} 人`);
   setText("organizationPageInfo", `第 ${page} / ${totalPages} 页`);
-  el("organizationPreviousPageButton").disabled = page <= 1 || isOrganizationMemberLoading;
-  el("organizationNextPageButton").disabled = page >= totalPages || isOrganizationMemberLoading;
-  if (isOrganizationMemberLoading && !organizationMembers.length) {
+  const isLoading = isOrganizationLoading || isOrganizationMemberLoading;
+  el("organizationPreviousPageButton").disabled = page <= 1 || isLoading;
+  el("organizationNextPageButton").disabled = page >= totalPages || isLoading;
+  if (isLoading && !organizationMembers.length) {
     table.innerHTML = '<tr><td colspan="6"><div class="organization-empty">正在加载成员…</div></td></tr>';
+    return;
+  }
+  const memberLoadError = organizationMemberLoadError || organizationLoadError;
+  if (memberLoadError) {
+    table.innerHTML = `<tr><td colspan="6"><div class="organization-empty">${escapeHtml(memberLoadError)}</div></td></tr>`;
     return;
   }
   if (!organizationMembers.length) {
@@ -4614,8 +5841,15 @@ function renderOrganizationMembers() {
     const status = String(member.status || "invited");
     const departmentName = organizationField(member, "departmentName", "department_name") || "未分配部门";
     const joinedAt = organizationField(member, "createdAt", "created_at");
-    const toggleStatus = status === "suspended" ? "active" : "suspended";
-    const toggleLabel = status === "suspended" ? "恢复" : "暂停";
+    const realMode = isRealOrganizationMode();
+    const statusActions = status === "invited" && realMode
+      ? `
+            <button class="ghost-btn" type="button" data-organization-member-invitation-resend="${escapeHtml(id)}" ${canManage ? "" : "disabled"}>重发邀请</button>
+            <button class="danger-outline-btn" type="button" data-organization-member-invitation-revoke="${escapeHtml(id)}" ${canManage ? "" : "disabled"}>撤销邀请</button>
+          `
+      : status === "suspended" && realMode
+        ? `<button class="ghost-btn" type="button" data-organization-member-reinvite="${escapeHtml(id)}" ${canManage ? "" : "disabled"}>重新邀请</button>`
+        : `<button class="${status === "suspended" ? "ghost-btn" : "danger-outline-btn"}" type="button" data-organization-member-status="${escapeHtml(id)}" data-organization-member-next-status="${status === "suspended" ? "active" : "suspended"}" ${canManage ? "" : "disabled"}>${status === "suspended" ? "恢复" : "暂停"}</button>`;
     return `
       <tr>
         <td>
@@ -4631,7 +5865,7 @@ function renderOrganizationMembers() {
         <td>
           <div class="organization-member-actions">
             <button class="ghost-btn" type="button" data-organization-member-edit="${escapeHtml(id)}" ${canManage ? "" : "disabled"}>编辑</button>
-            <button class="${toggleStatus === "suspended" ? "danger-outline-btn" : "ghost-btn"}" type="button" data-organization-member-status="${escapeHtml(id)}" data-organization-member-next-status="${escapeHtml(toggleStatus)}" ${canManage ? "" : "disabled"}>${toggleLabel}</button>
+            ${statusActions}
           </div>
         </td>
       </tr>
@@ -4653,6 +5887,10 @@ function renderCustomerOrganizations() {
     grid.innerHTML = '<div class="customer-directory-empty">正在加载客户企业…</div>';
     return;
   }
+  if (customerOrganizationsLoadError) {
+    grid.innerHTML = `<div class="customer-directory-empty">${escapeHtml(customerOrganizationsLoadError)}</div>`;
+    return;
+  }
   if (!customerOrganizations.length) {
     grid.innerHTML = '<div class="customer-directory-empty">没有符合当前筛选条件的客户企业。新增企业后，可继续维护其部门和成员。</div>';
     return;
@@ -4663,6 +5901,7 @@ function renderCustomerOrganizations() {
     const name = organization.name || "未命名企业";
     const status = customerOrganizationStatus(item);
     const isArchived = status === "archived";
+    const statusChip = organizationStatusChip(item);
     const stats = customerOrganizationStats(item);
     return `
       <article class="customer-organization-card ${isArchived ? "archived" : ""}">
@@ -4671,7 +5910,7 @@ function renderCustomerOrganizations() {
             <h3>${escapeHtml(name)}</h3>
             <p>${escapeHtml(id || "企业")}</p>
           </div>
-          <span class="customer-organization-status ${isArchived ? "archived" : ""}">${isArchived ? "已归档" : "正常"}</span>
+          <span class="customer-organization-status ${isArchived ? "archived" : ""} ${statusChip.tone}">${escapeHtml(statusChip.label)}</span>
         </div>
         <div class="customer-organization-metrics">
           <div><strong>${fmt.format(stats.departmentCount)}</strong><span>部门</span></div>
@@ -4700,6 +5939,7 @@ function renderCustomerOrganizationFilters() {
 async function loadCustomerOrganizations() {
   if (!customerOrganizationsAvailable() || isCustomerOrganizationsLoading) return;
   isCustomerOrganizationsLoading = true;
+  customerOrganizationsLoadError = "";
   renderCustomerOrganizations();
   try {
     const payload = await api(customerOrganizationsUrl());
@@ -4709,7 +5949,8 @@ async function loadCustomerOrganizations() {
   } catch (error) {
     customerOrganizations = [];
     customerOrganizationsTotal = 0;
-    showToast(error.message || "客户企业列表加载失败");
+    customerOrganizationsLoadError = error.message || "客户企业列表加载失败，请稍后重试。";
+    showToast(customerOrganizationsLoadError);
   } finally {
     isCustomerOrganizationsLoading = false;
     renderCustomerOrganizationFilters();
@@ -4728,6 +5969,8 @@ async function openCustomerOrganization(organizationId) {
   isOrganizationMemberLoading = false;
   organizationDataLoadingScopeKey = "";
   organizationMemberLoadingScopeKey = "";
+  organizationLoadError = "";
+  organizationMemberLoadError = "";
   organizationSnapshot = null;
   organizationMembers = [];
   organizationMemberTotal = 0;
@@ -4735,10 +5978,18 @@ async function openCustomerOrganization(organizationId) {
   organizationMemberFilters = { search: "", departmentId: "", role: "", status: "" };
   resetOrganizationBillingData();
   resetOrganizationTokenData();
+  resetOrganizationClaims();
+  resetOrganizationAdoption();
   customerOrganizationDetailTab = "info";
   syncNavigationVisibility();
   switchView("organization");
   await loadOrganizationData();
+  const today = localDate(new Date());
+  const adoptionFrom = el("organizationAdoptionEffectiveFromInput");
+  const adoptionThrough = el("organizationAdoptionEffectiveThroughInput");
+  if (adoptionFrom && !adoptionFrom.value) adoptionFrom.value = "2020-01-01";
+  if (adoptionThrough && !adoptionThrough.value) adoptionThrough.value = today;
+  if (platformCanManageOrganizationClaims()) await loadOrganizationClaims();
 }
 
 function closeCustomerOrganization() {
@@ -4746,12 +5997,16 @@ function closeCustomerOrganization() {
   resetOrganizationUsageViews();
   resetOrganizationBillingData();
   resetOrganizationTokenData();
+  resetOrganizationClaims();
+  resetOrganizationAdoption();
   organizationDataRequestId += 1;
   organizationMemberRequestId += 1;
   isOrganizationLoading = false;
   isOrganizationMemberLoading = false;
   organizationDataLoadingScopeKey = "";
   organizationMemberLoadingScopeKey = "";
+  organizationLoadError = "";
+  organizationMemberLoadError = "";
   organizationSnapshot = null;
   organizationMembers = [];
   organizationMemberTotal = 0;
@@ -4770,12 +6025,16 @@ function renderOrganization() {
   const stats = organizationStats();
   const canManage = organizationCanManage();
   const isPlatformCustomer = customerOrganizationsAvailable() && Boolean(selectedCustomerOrganizationId());
+  const demoMode = isDemoOrganizationMode();
   setText("organizationTitle", name);
+  renderOrganizationOperationalStatus("organizationOperationalStatus", organization);
   setText(
     "organizationSubtitle",
     isPlatformCustomer
       ? `${name} · 平台运营视图。可维护客户资料、部门和成员，并切换查看企业全员或部门用量。`
-      : `${name} · 当前身份：${organizationRoleLabel(currentRole)}。这里的内容为演示数据，不会创建真实账号或发送邮件。`,
+      : demoMode
+        ? `${name} · 当前身份：${organizationRoleLabel(currentRole)}。这里的内容为演示数据，不会创建真实账号或发送邮件。`
+        : `${name} · 当前身份：${organizationRoleLabel(currentRole)}。在这里维护部门、成员与企业范围访问权限。`,
   );
   setText("organizationDepartmentCount", fmt.format(stats.departmentCount));
   setText("organizationMemberCount", fmt.format(stats.memberCount));
@@ -4791,6 +6050,8 @@ function renderOrganization() {
   }
   el("organizationUsageTabs")?.classList.toggle("hidden", !isPlatformCustomer && !canViewCurrentOrganizationUsage());
   el("organizationManagementWorkspace")?.classList.toggle("hidden", !canManage);
+  renderOrganizationClaims();
+  renderOrganizationAdoption();
   renderOrganizationUsageTabs();
   renderOrganizationFilters();
   renderOrganizationDepartments();
@@ -4855,6 +6116,7 @@ async function loadOrganizationMembers() {
   if (!organizationCanView() || isOrganizationMemberLoading) return;
   const requestId = ++organizationMemberRequestId;
   isOrganizationMemberLoading = true;
+  organizationMemberLoadError = "";
   organizationMemberLoadingScopeKey = scopeKey;
   renderOrganizationMembers();
   try {
@@ -4867,7 +6129,8 @@ async function loadOrganizationMembers() {
     if (requestId !== organizationMemberRequestId || scopeKey !== organizationUsageScopeKey()) return;
     organizationMembers = [];
     organizationMemberTotal = 0;
-    showToast(error.message || "成员列表加载失败");
+    organizationMemberLoadError = error.message || "成员列表加载失败，请稍后重试。";
+    showToast(organizationMemberLoadError);
   } finally {
     if (requestId !== organizationMemberRequestId) return;
     isOrganizationMemberLoading = false;
@@ -4881,6 +6144,8 @@ async function loadOrganizationData() {
   if (!organizationCanView() || isOrganizationLoading) return;
   const requestId = ++organizationDataRequestId;
   isOrganizationLoading = true;
+  organizationLoadError = "";
+  organizationMemberLoadError = "";
   organizationDataLoadingScopeKey = scopeKey;
   renderOrganization();
   try {
@@ -4893,12 +6158,15 @@ async function loadOrganizationData() {
     organizationMembers = Array.isArray(membersPayload?.items) ? membersPayload.items : [];
     organizationMemberTotal = Number(membersPayload?.total || 0);
     organizationMemberPage = Number(membersPayload?.page || organizationMemberPage || 1);
+    renderOrganizationClaimDepartmentOptions();
   } catch (error) {
     if (requestId !== organizationDataRequestId || scopeKey !== organizationUsageScopeKey()) return;
     organizationSnapshot = null;
     organizationMembers = [];
     organizationMemberTotal = 0;
-    showToast(error.message || "企业组织加载失败");
+    organizationLoadError = error.message || "企业组织加载失败，请稍后重试。";
+    organizationMemberLoadError = organizationLoadError;
+    showToast(organizationLoadError);
   } finally {
     if (requestId !== organizationDataRequestId) return;
     isOrganizationLoading = false;
@@ -4930,7 +6198,26 @@ function organizationTokenStatusTone(status) {
 function canViewOrganizationTokens() {
   // A seller operator drilled into a customer may read the list; a customer's
   // own administrator is the only identity that may also create or revoke.
-  return Boolean(isViewingCustomerOrganization() || currentUser?.canManageOrganization);
+  return Boolean(
+    isViewingCustomerOrganization()
+    || currentUser?.canManageOrganizationTokens
+    || currentUser?.canManageOrganization,
+  );
+}
+
+function organizationTokenIsReportOnly(token) {
+  const source = String(organizationField(token, "source", "source") || "").trim().toLowerCase();
+  const managementMode = String(
+    organizationField(token, "managementMode", "management_mode")
+      || organizationField(token, "accessMode", "access_mode")
+      || "",
+  ).trim().toLowerCase();
+  const billingMode = String(organizationField(token, "billingMode", "billing_mode") || "").trim().toLowerCase();
+  return Boolean(
+    organizationField(token, "reportOnly", "report_only")
+    || billingMode === "report_only"
+    || (source === "imported" && managementMode === "read_only"),
+  );
 }
 
 function organizationTokenReadOnly() {
@@ -4938,7 +6225,36 @@ function organizationTokenReadOnly() {
 }
 
 function organizationTokenCanManage() {
+  if (currentUser?.canManageOrganizationTokens !== undefined) {
+    return Boolean(!organizationTokenReadOnly() && currentUser.canManageOrganizationTokens);
+  }
   return Boolean(!organizationTokenReadOnly() && organizationCanManage());
+}
+
+function organizationTokenOrganizationRecord() {
+  const snapshotOrganization = organizationSnapshot?.organization;
+  if (snapshotOrganization && typeof snapshotOrganization === "object") return snapshotOrganization;
+  if (isViewingCustomerOrganization()) return customerOrganizationRecord(selectedCustomerOrganization);
+  const currentOrganization = currentUser?.organization;
+  return currentOrganization && typeof currentOrganization === "object" ? currentOrganization : {};
+}
+
+function organizationTokenCreationBlockedByOrganization() {
+  const organization = organizationTokenOrganizationRecord();
+  const provisioningStatus = organizationProvisioningStatus(organization);
+  const billingStatus = String(
+    organizationField(organization, "billingStatus", "billing_status") || "",
+  ).trim().toLowerCase();
+  if (["failed", "error", "degraded"].includes(provisioningStatus)) {
+    return "企业账号同步失败，暂时不能创建企业 Token";
+  }
+  if (["pending", "provisioning", "creating"].includes(provisioningStatus)) {
+    return "企业账号仍在开通中，暂时不能创建企业 Token";
+  }
+  if (["past_due", "insufficient", "blocked", "suspended"].includes(billingStatus)) {
+    return "企业余额不足或额度尚未生效，暂时不能创建企业 Token";
+  }
+  return "";
 }
 
 function organizationTokensUrl() {
@@ -4964,6 +6280,7 @@ function resetOrganizationTokenData() {
   isOrganizationTokenSaving = false;
   isOrganizationTokenRevoking = false;
   organizationTokenLoadError = "";
+  organizationTokenLoadErrorCode = "";
   organizationTokenScopeKey = "";
   revokingOrganizationTokenId = "";
   window.clearTimeout(organizationTokenSearchTimer);
@@ -4996,14 +6313,28 @@ function renderOrganizationTokens() {
   setText(
     "organizationTokenSubtitle",
     readOnly
-      ? `${scopeName} 的令牌列表仅供运营协助查看。签发和撤销由该企业的管理员自行操作。`
+      ? `${scopeName} 的令牌列表仅供运营协助查看。历史资产会明确标注为只读且不计企业额度。`
       : "为本企业签发调用令牌，并指定每个令牌可以使用的模型。令牌完整值仅在创建成功时展示一次。",
   );
   const createButton = el("createOrganizationTokenButton");
+  const catalogUnavailable = organizationTokenLoadErrorCode === "ORGANIZATION_MODEL_CATALOG_UNAVAILABLE";
+  const organizationBlockedReason = organizationTokenCreationBlockedByOrganization();
   if (createButton) {
     createButton.classList.toggle("hidden", readOnly);
-    createButton.disabled = !canManage;
+    createButton.disabled = Boolean(
+      !canManage
+      || isOrganizationTokenLoading
+      || catalogUnavailable
+      || organizationBlockedReason
+      || !organizationTokenModels.length,
+    );
+    createButton.title = catalogUnavailable
+      ? "模型目录暂不可用，当前不能创建企业 Token"
+      : organizationBlockedReason;
   }
+  el("organizationTokenCatalogStatus")?.classList.toggle("hidden", !catalogUnavailable);
+  const retryCatalogButton = el("retryOrganizationTokenCatalogButton");
+  if (retryCatalogButton) retryCatalogButton.disabled = isOrganizationTokenLoading;
   el("organizationTokenReadOnlyHint")?.classList.toggle("hidden", !readOnly);
   setText("organizationTokenTotalCount", fmt.format(Number(stats.total || organizationTokenTotal || 0)));
   setText("organizationTokenMaxCount", fmt.format(Number(stats.maxTokenCount || 20)));
@@ -5014,6 +6345,8 @@ function renderOrganizationTokens() {
   renderOrganizationTokenFilters();
 
   const table = el("organizationTokenTable");
+  const reportOnlyHint = el("organizationTokenReportOnlyHint");
+  if (reportOnlyHint) reportOnlyHint.remove();
   const totalPages = Math.max(1, Math.ceil(organizationTokenTotal / organizationTokenPageSize));
   const page = Math.min(organizationTokenPage, totalPages);
   if (organizationTokenPage !== page) organizationTokenPage = page;
@@ -5037,6 +6370,14 @@ function renderOrganizationTokens() {
     }</div></td></tr>`;
     return;
   }
+  const reportOnlyCount = organizationTokens.filter(organizationTokenIsReportOnly).length;
+  if (reportOnlyCount) {
+    const hint = document.createElement("div");
+    hint.id = "organizationTokenReportOnlyHint";
+    hint.className = "organization-billing-readonly";
+    hint.textContent = `${fmt.format(reportOnlyCount)} 项历史资产：只读、不计企业额度、不可撤销。`;
+    table.closest(".panel")?.insertBefore(hint, table.closest(".table-wrap") || table);
+  }
   table.innerHTML = organizationTokens.map((token) => {
     const id = String(organizationField(token, "id", "token_id") || "");
     const name = organizationField(token, "name", "name") || "未命名令牌";
@@ -5044,11 +6385,13 @@ function renderOrganizationTokens() {
     const models = Array.isArray(token.models) ? token.models : [];
     const memberName = organizationField(token, "memberName", "member_name") || "";
     const memberEmail = organizationField(token, "memberEmail", "member_email") || "";
+    const memberLoginName = organizationField(token, "memberLoginName", "member_login_name") || "";
     const departmentName = organizationField(token, "departmentName", "department_name") || "";
     const status = String(organizationField(token, "status", "status") || "active");
     const budget = Number(organizationField(token, "dailyBudgetUsd", "daily_budget_usd") || 0);
     const createdAt = organizationField(token, "createdAt", "created_at");
     const expiresAt = organizationField(token, "expiresAt", "expires_at");
+    const reportOnly = organizationTokenIsReportOnly(token);
     // 展示名由后端按每条令牌单独算并合并同一模型的多条线路：已签发令牌可能引用了
     // 当前目录里已经没有的模型，它仍然是历史事实。旧 bundle 回落到原始名。
     const modelLabels = Array.isArray(token.modelLabels) && token.modelLabels.length
@@ -5059,10 +6402,12 @@ function renderOrganizationTokens() {
       : '<span class="chip">未指定</span>';
     const owner = memberName
       ? `<div class="organization-member-identity"><strong>${escapeHtml(memberName)}</strong><span>${escapeHtml(
-          departmentName ? `${departmentName} · ${memberEmail}` : memberEmail,
+          departmentName ? `${departmentName} · ${memberEmail || memberLoginName}` : (memberEmail || memberLoginName),
         )}</span></div>`
       : '<span class="chip blue">企业共享</span>';
-    const canRevoke = canManage && status === "active";
+    const canRevoke = canManage && status === "active" && !reportOnly;
+    const statusLabel = reportOnly ? "历史资产、只读" : organizationTokenStatusLabel(status);
+    const statusTone = reportOnly ? "invited" : organizationTokenStatusTone(status);
     return `
       <tr>
         <td>
@@ -5070,13 +6415,13 @@ function renderOrganizationTokens() {
         </td>
         <td><div class="organization-token-models">${modelChips}</div></td>
         <td>${owner}</td>
-        <td class="num">${escapeHtml(money.format(budget))}</td>
-        <td><span class="organization-status ${escapeHtml(organizationTokenStatusTone(status))}">${escapeHtml(organizationTokenStatusLabel(status))}</span></td>
+        <td class="num">${reportOnly ? "不计企业额度" : escapeHtml(money.format(budget))}</td>
+        <td><span class="organization-status ${escapeHtml(statusTone)}">${escapeHtml(statusLabel)}</span></td>
         <td>${escapeHtml(organizationDate(createdAt))}</td>
         <td>${escapeHtml(expiresAt ? organizationDate(expiresAt) : "永不过期")}</td>
         <td>
           <div class="organization-member-actions">
-            <button class="danger-outline-btn" type="button" data-organization-token-revoke="${escapeHtml(id)}" ${canRevoke ? "" : "disabled"}>撤销</button>
+            <button class="danger-outline-btn" type="button" data-organization-token-revoke="${escapeHtml(id)}" ${canRevoke ? "" : "disabled"}>${reportOnly ? "不可撤销" : "撤销"}</button>
           </div>
         </td>
       </tr>
@@ -5090,6 +6435,7 @@ async function loadOrganizationTokens() {
   const requestId = ++organizationTokenRequestId;
   isOrganizationTokenLoading = true;
   organizationTokenLoadError = "";
+  organizationTokenLoadErrorCode = "";
   organizationTokenScopeKey = scopeKey;
   renderOrganizationTokens();
   try {
@@ -5102,12 +6448,14 @@ async function loadOrganizationTokens() {
     organizationTokenStats = payload?.stats && typeof payload.stats === "object" ? payload.stats : null;
     organizationTokenModels = normalizeOrganizationTokenModels(payload);
     organizationTokenBindableMembers = Array.isArray(payload?.bindableMembers) ? payload.bindableMembers : [];
+    organizationTokenLoadErrorCode = "";
   } catch (error) {
     if (requestId !== organizationTokenRequestId || scopeKey !== organizationUsageScopeKey()) return;
     organizationTokens = [];
     organizationTokenTotal = 0;
     organizationTokenStats = null;
     organizationTokenLoadError = error.message || "令牌列表加载失败，请稍后重试。";
+    organizationTokenLoadErrorCode = String(error.code || "");
     showToast(organizationTokenLoadError);
   } finally {
     if (requestId !== organizationTokenRequestId) return;
@@ -5205,6 +6553,7 @@ function closeOrganizationTokenSecretModal() {
 
 function showOrganizationTokenSecret(secret, token) {
   const value = String(secret || "");
+  if (!value) return false;
   setText("organizationTokenSecretValue", value);
   const name = organizationField(token, "name", "name") || "新令牌";
   const models = Array.isArray(token?.models) ? token.models : [];
@@ -5216,6 +6565,12 @@ function showOrganizationTokenSecret(secret, token) {
     }`,
   );
   el("organizationTokenSecretModal")?.classList.remove("hidden");
+  return true;
+}
+
+function organizationTokenSecretFromPayload(payload) {
+  const token = payload?.token && typeof payload.token === "object" ? payload.token : null;
+  return String(payload?.secret || token?.token || token?.secret || "");
 }
 
 async function submitOrganizationToken(event) {
@@ -5248,10 +6603,16 @@ async function submitOrganizationToken(event) {
       body: JSON.stringify({ name, models, memberId, duration, dailyBudgetUsd: budget }),
     });
     closeOrganizationTokenModal({ force: true });
-    showOrganizationTokenSecret(payload?.secret, payload?.token);
+    const secret = organizationTokenSecretFromPayload(payload);
+    if (showOrganizationTokenSecret(secret, payload?.token)) {
+      showToast("令牌已创建，请立即保存完整令牌。");
+    } else {
+      // Idempotent retries return the durable projection without replaying the
+      // one-time secret; never open an empty secret dialog in that case.
+      showToast("令牌已创建，但完整令牌仅在首次成功响应中显示。请确认请求结果后再重试。", "warning");
+    }
     organizationTokenPage = 1;
     await loadOrganizationTokens();
-    showToast("令牌已创建，请立即保存完整令牌。");
   } catch (error) {
     setFieldError("organizationTokenError", error.message || "令牌创建失败，请稍后重试。");
   } finally {
@@ -5318,6 +6679,8 @@ function openCustomerOrganizationModal(organizationId = "") {
   const isEditing = Boolean(editingCustomerOrganizationId);
   el("customerOrganizationAdminNameField").classList.toggle("hidden", isEditing);
   el("customerOrganizationAdminEmailField").classList.toggle("hidden", isEditing);
+  // Editing an existing tenant only changes its name. Admin provisioning is
+  // required for creation and is intentionally absent from the PATCH body.
   el("customerOrganizationAdminNameInput").required = !isEditing;
   el("customerOrganizationAdminEmailInput").required = !isEditing;
   setText("customerOrganizationModalTitle", isEditing ? "修改客户企业名称" : "新增客户企业");
@@ -5338,13 +6701,14 @@ async function archiveCustomerOrganization(organizationId) {
   const item = customerOrganizations.find((candidate) => customerOrganizationId(candidate) === String(organizationId));
   const organization = customerOrganizationRecord(item);
   const name = organization.name || "这家客户企业";
-  if (!window.confirm(`归档“${name}”？已归档企业将无法继续管理或访问演示数据。`)) return;
+  if (!window.confirm(`归档“${name}”？已归档企业将无法继续管理或访问企业资源。`)) return;
   try {
     await ensureCsrfToken();
     await api(`${customerOrganizationPath(organizationId)}/archive`, { method: "POST", body: JSON.stringify({}) });
     if (selectedCustomerOrganizationId() === String(organizationId)) {
       selectedCustomerOrganization = null;
       resetOrganizationUsageViews();
+      resetOrganizationClaims();
       organizationDataRequestId += 1;
       organizationMemberRequestId += 1;
       isOrganizationLoading = false;
@@ -5362,6 +6726,7 @@ async function archiveCustomerOrganization(organizationId) {
 
 async function resetCustomerOrganizationsDemo() {
   if (!customerOrganizationsAvailable()) return;
+  if (!isDemoOrganizationMode()) return;
   if (!window.confirm("重置后会清除本次演示中的所有客户企业、部门与成员变更，并恢复初始样例。确定继续吗？")) return;
   setButtonLoading("resetCustomerOrganizationsDemoButton", true, "重置中");
   try {
@@ -5369,6 +6734,7 @@ async function resetCustomerOrganizationsDemo() {
     await api("/api/platform/organizations/demo/reset", { method: "POST", body: JSON.stringify({}) });
     selectedCustomerOrganization = null;
     resetOrganizationUsageViews();
+    resetOrganizationClaims();
     organizationDataRequestId += 1;
     organizationMemberRequestId += 1;
     isOrganizationLoading = false;
@@ -5428,9 +6794,17 @@ function openOrganizationMemberModal(memberId = "") {
   );
   const isEditing = Boolean(member);
   setText("organizationMemberModalTitle", isEditing ? "编辑成员" : "邀请成员");
-  setText("organizationMemberModalDescription", isEditing ? "更新角色、部门或访问状态后会立即生效。" : "成员会以待邀请状态加入演示企业，不会发送真实邮件。");
+  setText(
+    "organizationMemberModalDescription",
+    isEditing
+      ? "更新角色、部门或访问状态后会立即生效。"
+      : isDemoOrganizationMode()
+        ? "成员会以待邀请状态加入演示企业，不会发送真实邮件。"
+        : "成员会以待邀请状态加入企业；系统会按企业配置发送邀请。",
+  );
   setText("submitOrganizationMemberButton", isEditing ? "保存修改" : "发送邀请");
-  el("organizationMemberStatusField").classList.toggle("hidden", !isEditing);
+  const statusEditable = isEditing && !isRealOrganizationMode();
+  el("organizationMemberStatusField").classList.toggle("hidden", !statusEditable);
   el("organizationMemberNameInput").value = member?.name || "";
   el("organizationMemberEmailInput").value = member?.email || "";
   el("organizationMemberEmailInput").disabled = isEditing;
@@ -5476,6 +6850,54 @@ async function updateOrganizationMemberStatus(memberId, status) {
   }
 }
 
+async function resendOrganizationMemberInvitation(memberId) {
+  if (!organizationCanManage() || !isRealOrganizationMode()) return;
+  try {
+    await ensureCsrfToken();
+    await api(organizationApiPath(`/members/${encodeURIComponent(memberId)}/invitation/resend`), {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    await loadOrganizationData();
+    showToast("邀请已重新发送");
+  } catch (error) {
+    showToast(error.message || "邀请重发失败");
+  }
+}
+
+async function revokeOrganizationMemberInvitation(memberId) {
+  if (!organizationCanManage() || !isRealOrganizationMode()) return;
+  const member = organizationMembers.find((item) => organizationMemberId(item) === String(memberId));
+  if (!window.confirm(`撤销发给“${member?.email || "该成员"}”的邀请？撤销后当前链接将立即失效。`)) return;
+  try {
+    await ensureCsrfToken();
+    await api(organizationApiPath(`/members/${encodeURIComponent(memberId)}/invitation/revoke`), {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    await loadOrganizationData();
+    showToast("邀请已撤销");
+  } catch (error) {
+    showToast(error.message || "邀请撤销失败");
+  }
+}
+
+async function reinviteOrganizationMember(memberId) {
+  if (!organizationCanManage() || !isRealOrganizationMode()) return;
+  try {
+    await ensureCsrfToken();
+    await api(organizationApiPath(`/members/${encodeURIComponent(memberId)}`), {
+      method: "PATCH",
+      body: JSON.stringify({ status: "invited" }),
+    });
+    await loadOrganizationData();
+    showToast("成员已重新进入邀请流程");
+  } catch (error) {
+    await loadOrganizationData();
+    showToast(error.message || "重新邀请失败");
+  }
+}
+
 function switchView(view) {
   if (view === "customers" && !customerOrganizationsAvailable()) view = "dashboard";
   if (view === "admin" && !canViewAdminUsage()) view = "dashboard";
@@ -5483,13 +6905,14 @@ function switchView(view) {
   if (view === "team" && !currentUser?.isTeamLeader) view = "dashboard";
   if (view === "organization" && !organizationCanView()) view = "dashboard";
   if (view === "organization-tokens" && !canViewOrganizationTokens()) view = "dashboard";
-  if (isMockCustomerIdentity() && (view === "keys" || view === "models")) view = "dashboard";
+  if (isOrganizationCustomerIdentity() && (view === "keys" || view === "models")) view = "dashboard";
   if (view === "billing" && !canAccessBillingView()) view = "dashboard";
   if (currentView === "keys" && view !== "keys") clearRevealedKeys();
   // 离开充值页就停掉支付轮询与二维码，避免后台空转和收款码久留在页面上。
   if (currentView === "billing" && view !== "billing") {
     hideManualPayPanel();
     closeOrganizationTopupModal({ force: true });
+    closeOrganizationCreditAdjustmentModal({ force: true });
   }
   currentView = view;
   setGlobalPage(view === "models" ? "models" : "console");
@@ -5592,11 +7015,15 @@ async function loadDashboardData(forceRefresh = false) {
     usageData = payload.rows || [];
     usageSummary = payload.summary || null;
     personalDataFreshness = payload.dataFreshness || null;
+    personalDataQuality = payload.dataQuality || null;
+    personalCoverage = payload.coverage || null;
     lastPersonalUsageCacheHit = Boolean(payload.cache?.hit);
   } catch (error) {
     showToast(error.message || "用量数据加载失败");
     usageData = [];
     usageSummary = null;
+    personalDataQuality = null;
+    personalCoverage = null;
   } finally {
     isDashboardLoading = false;
     renderPersonal();
@@ -5626,6 +7053,8 @@ async function loadAdminData(forceRefresh = false) {
     adminSummaryData = payload.summaryRows || adminUsageData;
     adminEmployees = payload.employees || [];
     adminDataFreshness = payload.dataFreshness || null;
+    adminDataQuality = payload.dataQuality || null;
+    adminCoverage = payload.coverage || null;
     adminUsageScopeKey = scopeKey;
     lastAdminUsageCacheHit = Boolean(payload.cache?.hit);
     if (payload.truncated) {
@@ -5639,6 +7068,8 @@ async function loadAdminData(forceRefresh = false) {
     adminUsageData = [];
     adminSummaryData = [];
     adminEmployees = [];
+    adminDataQuality = null;
+    adminCoverage = null;
   } finally {
     if (requestId !== adminUsageRequestId) return;
     isAdminLoading = false;
@@ -5671,6 +7102,8 @@ async function loadDepartmentData(forceRefresh = false) {
     departmentRankings = payload.departments || [];
     departmentEmployees = payload.employees || [];
     departmentDataFreshness = payload.dataFreshness || null;
+    departmentDataQuality = payload.dataQuality || null;
+    departmentCoverage = payload.coverage || null;
     departmentUsageScopeKey = scopeKey;
     if (!department) departmentPickerOptions = departmentRankings;
     lastDepartmentUsageCacheHit = Boolean(payload.cache?.hit);
@@ -5687,6 +7120,8 @@ async function loadDepartmentData(forceRefresh = false) {
     departmentSummaryData = [];
     departmentRankings = [];
     departmentEmployees = [];
+    departmentDataQuality = null;
+    departmentCoverage = null;
     if (!department) departmentPickerOptions = [];
   } finally {
     if (requestId !== departmentUsageRequestId) return;
@@ -5753,6 +7188,8 @@ async function loadTeamData(forceRefresh = false) {
   teamUsageData = [];
   teamSummaryData = [];
   teamEmployees = [];
+  teamDataQuality = null;
+  teamCoverage = null;
   teamRankingError = "";
   teamRankingHint = "";
   isTeamLoading = true;
@@ -5811,6 +7248,10 @@ async function loadTeamMemberData(employee, forceRefresh = false, scrollToCard =
   const requestId = ++teamMemberUsageRequestId;
   teamMemberUsageData = [];
   teamMemberUsageSummary = null;
+  teamMemberDataQuality = null;
+  teamMemberCoverage = null;
+  teamMemberDataQuality = null;
+  teamMemberCoverage = null;
   if (!keepFilters) teamMemberUsageFilters = { date: "all", model: "all", status: "all", keyword: "" };
   isTeamMemberLoading = true;
   updateTeamMemberLoadingLabels();
@@ -5827,6 +7268,8 @@ async function loadTeamMemberData(employee, forceRefresh = false, scrollToCard =
     teamMemberUsageData = payload.rows || [];
     teamMemberUsageSummary = payload.summary || null;
     teamDataFreshness = payload.dataFreshness || null;
+    teamMemberDataQuality = payload.dataQuality || null;
+    teamMemberCoverage = payload.coverage || null;
     const employeePayload = payload.employee || {};
     const employeeId = employeePayload.employeeEmail || employeePayload.employeeId || employee;
     if (employeeId && employeeId !== selectedTeamEmployee) selectedTeamEmployee = employeeId;
@@ -5835,6 +7278,8 @@ async function loadTeamMemberData(employee, forceRefresh = false, scrollToCard =
     showToast(error.message || "成员用量明细加载失败");
     teamMemberUsageData = [];
     teamMemberUsageSummary = null;
+    teamMemberDataQuality = null;
+    teamMemberCoverage = null;
   } finally {
     if (requestId === teamMemberUsageRequestId) {
       isTeamMemberLoading = false;
@@ -5849,10 +7294,10 @@ function clearTeamMemberSelection() {
 }
 
 async function loadModels({ silent = false } = {}) {
-  // Customer demo identities intentionally have no model-catalog contract.
+  // Customer identities intentionally use their tenant-scoped model grants.
   // Do not make a forbidden request merely because an older navigation event
   // tries to prefetch the global page.
-  if (isMockCustomerIdentity()) {
+  if (isOrganizationCustomerIdentity()) {
     modelCatalog = [];
     setupModelFilters();
     renderModels();
@@ -5885,6 +7330,7 @@ async function loadModels({ silent = false } = {}) {
 async function showApp(user) {
   clearResetPasswordToken();
   currentUser = normalizeAuthUser(user);
+  syncOrganizationDemoChrome();
   if (user?.csrfToken) authCsrfToken = user.csrfToken;
   if (currentUser?.csrfToken) authCsrfToken = currentUser.csrfToken;
   leaderTeams = normalizeLeaderTeams(currentUser);
@@ -5899,22 +7345,23 @@ async function showApp(user) {
   resetNavigationToPending();
   scheduleNavigationRevealFallback();
   const organizationName = String(currentUser.organizationName || currentUser.organization?.name || "").trim();
+  const displayIdentifier = authDisplayIdentifier();
   el("userEmail").textContent = organizationName && currentUser.organizationRole
-    ? `${currentUser.email} · ${organizationName}`
-    : currentUser.email;
-  el("userName").textContent = currentUser.name || currentUser.email;
-  el("avatar").textContent = currentUser.avatar || initials(currentUser.email, currentUser.name);
+    ? `${displayIdentifier} · ${organizationName}`
+    : displayIdentifier;
+  el("userName").textContent = currentUser.name || displayIdentifier;
+  el("avatar").textContent = currentUser.avatar || initials(authContactEmail(), currentUser.name || displayIdentifier);
   el("teamWelcomeTitle").textContent = `所选范围 · ${teamScopeLabel()}`;
   el("departmentWelcomeTitle").textContent = "所选范围 · 全部部门";
   switchView("dashboard");
   render();
-  const isDemoCustomer = isMockCustomerIdentity();
-  if (isDemoCustomer) {
-    // Customer Mock identities use only their tenant-safe usage and enterprise
+  const isCustomer = isOrganizationCustomerIdentity();
+  if (isCustomer) {
+    // Customer identities use only their tenant-safe usage and enterprise
     // credit APIs. In particular, never probe the personal billing endpoint.
     billingAvailable = false;
     modelCatalog = [];
-    // 演示客户的导航项全部由 /api/auth/scope 的组织字段决定，等它落地即可揭示。
+    // Customer navigation is derived from /api/auth/scope capabilities.
     const scopePromise = loadAuthScope();
     await Promise.all([loadCurrentViewData(), scopePromise]);
     return;
@@ -5938,6 +7385,7 @@ async function loadAuthScope() {
   try {
     const scope = await api("/api/auth/scope");
     Object.assign(currentUser, scope);
+    syncOrganizationDemoChrome();
     leaderTeams = normalizeLeaderTeams(currentUser);
     selectedTeamRef = currentUser.team?.teamRef || leaderTeams[0]?.teamRef || "";
     // 充值入口的可见性由这里的零成本判断给出；老后端没有该字段时退回按需探测，
@@ -5952,7 +7400,7 @@ async function loadAuthScope() {
     renderAdminBilling();
     renderAccountAccessState();
     render();
-    if (scope?.billingAvailable === undefined && !isMockCustomerIdentity()) {
+    if (scope?.billingAvailable === undefined && !isOrganizationCustomerIdentity()) {
       await refreshBillingAvailability();
     }
   } catch (error) {
@@ -5973,9 +7421,13 @@ function showLogin() {
   departmentPickerOpen = false;
   usageData = [];
   usageSummary = null;
+  personalDataQuality = null;
+  personalCoverage = null;
   adminUsageData = [];
   adminSummaryData = [];
   adminEmployees = [];
+  adminDataQuality = null;
+  adminCoverage = null;
   adminUsageScopeKey = "";
   adminUsageLoadingScopeKey = "";
   adminUsageRequestId += 1;
@@ -5983,14 +7435,20 @@ function showLogin() {
   departmentSummaryData = [];
   departmentRankings = [];
   departmentEmployees = [];
+  departmentDataQuality = null;
+  departmentCoverage = null;
   departmentUsageScopeKey = "";
   departmentUsageLoadingScopeKey = "";
   departmentUsageRequestId += 1;
   teamUsageData = [];
   teamSummaryData = [];
   teamEmployees = [];
+  teamDataQuality = null;
+  teamCoverage = null;
   teamMemberUsageData = [];
   teamMemberUsageSummary = null;
+  teamMemberDataQuality = null;
+  teamMemberCoverage = null;
   // 换账号时清空充值状态，避免上一个账号的余额与订单残留在页面上。
   stopTopupPolling();
   billingConfig = null;
@@ -6036,6 +7494,8 @@ function showLogin() {
   isOrganizationMemberLoading = false;
   organizationDataLoadingScopeKey = "";
   organizationMemberLoadingScopeKey = "";
+  organizationLoadError = "";
+  organizationMemberLoadError = "";
   organizationDataRequestId += 1;
   organizationMemberRequestId += 1;
   isOrganizationDepartmentSaving = false;
@@ -6044,11 +7504,14 @@ function showLogin() {
   editingOrganizationMemberId = "";
   customerOrganizations = [];
   customerOrganizationsTotal = 0;
+  customerOrganizationsLoadError = "";
   customerOrganizationsPage = 1;
   customerOrganizationsFilters = { search: "", status: "" };
   selectedCustomerOrganization = null;
   customerOrganizationDetailTab = "info";
   editingCustomerOrganizationId = "";
+  resetOrganizationClaims();
+  resetOrganizationAdoption();
   window.clearTimeout(customerOrganizationsSearchTimer);
   // 导航退回骨架态，下一个登录身份不会先看到上一个身份的可见项。
   resetNavigationToPending();
@@ -6102,14 +7565,17 @@ async function submitPasswordLogin() {
     const payload = await api("/api/auth/login", {
       method: "POST",
       body: JSON.stringify({
-        email: values.loginEmail,
+        identifier: values.loginIdentifier,
+        // Keep email in the request during the rolling deploy; older servers
+        // ignore identifier and continue to authenticate by email.
+        email: values.loginIdentifier,
         password: values.loginPassword,
         turnstileToken: turnstileTokens.login || undefined,
       }),
     });
     await showApp(payload);
   } catch (error) {
-    setAuthStatus(error.message || "登录失败，请检查邮箱和密码。", "error");
+    setAuthStatus(error.message || "登录失败，请检查邮箱或企业账号和密码。", "error");
     resetTurnstile("login");
   } finally {
     authSubmitting = false;
@@ -6271,6 +7737,8 @@ async function devLogin() {
 document.addEventListener("submit", async (event) => {
   if (event.target.id !== "loginForm") return;
   event.preventDefault();
+  if (organizationClaimToken) return;
+  if (organizationInvitationToken) return;
   if (currentUser) {
     showAuthenticatedPage("console");
     return;
@@ -6323,9 +7791,19 @@ document.querySelectorAll("[data-password-toggle]").forEach((button) => {
 });
 
 el("forgotPasswordButton").addEventListener("click", () => {
-  el("forgotEmailInput").value = el("loginEmailInput").value;
+  const identifier = el("loginEmailInput").value.trim();
+  el("forgotEmailInput").value = validEmail(identifier) ? identifier : "";
   setAuthMode("forgot");
 });
+
+el("organizationInvitationAcceptButton")?.addEventListener("click", acceptOrganizationInvitation);
+el("organizationInvitationRetryButton")?.addEventListener("click", verifyOrganizationInvitation);
+el("organizationInvitationLoginButton")?.addEventListener("click", finishOrganizationInvitationAndLogin);
+el("organizationInvitationCancelButton")?.addEventListener("click", closeOrganizationInvitationScreen);
+el("organizationClaimAcceptButton")?.addEventListener("click", acceptOrganizationClaim);
+el("organizationClaimRetryButton")?.addEventListener("click", verifyOrganizationClaim);
+el("organizationClaimLoginButton")?.addEventListener("click", finishOrganizationClaimAndLogin);
+el("organizationClaimCancelButton")?.addEventListener("click", closeOrganizationClaimScreen);
 el("sendRegisterCodeButton").addEventListener("click", sendRegistrationCode);
 el("devLoginButton").addEventListener("click", devLogin);
 el("enterConsoleButton").addEventListener("click", () => showAuthenticatedPage("console"));
@@ -6366,7 +7844,7 @@ el("accountAccessRetryButton").addEventListener("click", async () => {
 
 el("accountAccessTopupButton").addEventListener("click", () => switchView("billing"));
 el("createCustomerOrganizationButton").addEventListener("click", () => openCustomerOrganizationModal());
-el("resetCustomerOrganizationsDemoButton").addEventListener("click", resetCustomerOrganizationsDemo);
+el("resetCustomerOrganizationsDemoButton")?.addEventListener("click", resetCustomerOrganizationsDemo);
 el("cancelCustomerOrganizationButton").addEventListener("click", closeCustomerOrganizationModal);
 el("backToCustomersButton").addEventListener("click", closeCustomerOrganization);
 el("backToCustomerOrganizationButton").addEventListener("click", () => showOrganizationUsage("info"));
@@ -6376,15 +7854,19 @@ el("createOrganizationDepartmentButton").addEventListener("click", () => openOrg
 el("inviteOrganizationMemberButton").addEventListener("click", () => openOrganizationMemberModal());
 el("cancelOrganizationDepartmentButton").addEventListener("click", closeOrganizationDepartmentModal);
 el("cancelOrganizationMemberButton").addEventListener("click", closeOrganizationMemberModal);
-el("openOrganizationTopupModalButton").addEventListener("click", openOrganizationTopupModal);
-el("cancelOrganizationTopupButton").addEventListener("click", closeOrganizationTopupModal);
-el("organizationTopupForm").addEventListener("submit", submitOrganizationTopup);
-el("organizationTopupAmount").addEventListener("input", () => {
+el("openOrganizationTopupModalButton")?.addEventListener("click", openOrganizationTopupModal);
+el("openOrganizationCreditAdjustmentButton")?.addEventListener("click", () => openOrganizationCreditAdjustmentModal("grant"));
+el("openOrganizationCreditRevokeButton")?.addEventListener("click", () => openOrganizationCreditAdjustmentModal("revoke"));
+el("cancelOrganizationTopupButton")?.addEventListener("click", closeOrganizationTopupModal);
+el("cancelOrganizationCreditAdjustmentButton")?.addEventListener("click", closeOrganizationCreditAdjustmentModal);
+el("organizationTopupForm")?.addEventListener("submit", submitOrganizationTopup);
+el("organizationCreditAdjustmentForm")?.addEventListener("submit", submitOrganizationCreditAdjustment);
+el("organizationTopupAmount")?.addEventListener("input", () => {
   selectedOrganizationTopupAmount = 0;
   renderOrganizationTopupOptions();
   setFieldError("organizationTopupError", "");
 });
-el("organizationTopupOptions").addEventListener("click", (event) => {
+el("organizationTopupOptions")?.addEventListener("click", (event) => {
   const option = event.target.closest("[data-organization-topup-amount]");
   if (!option) return;
   selectedOrganizationTopupAmount = Number(option.dataset.organizationTopupAmount || 0);
@@ -6436,6 +7918,22 @@ el("customerOrganizationForm").addEventListener("submit", async (event) => {
     setButtonLoading("submitCustomerOrganizationButton", false);
   }
 });
+
+el("organizationClaimForm")?.addEventListener("submit", submitOrganizationClaim);
+el("copyOrganizationClaimUrlButton")?.addEventListener("click", () => {
+  if (organizationClaimLastUrl) copyText(organizationClaimLastUrl, "企业账号激活链接已复制");
+});
+el("organizationClaimTable")?.addEventListener("click", (event) => {
+  const approveButton = event.target.closest("[data-organization-claim-approve]");
+  if (approveButton) {
+    mutateOrganizationClaim(approveButton.dataset.organizationClaimApprove, "approve");
+    return;
+  }
+  const revokeButton = event.target.closest("[data-organization-claim-revoke]");
+  if (revokeButton) mutateOrganizationClaim(revokeButton.dataset.organizationClaimRevoke, "revoke");
+});
+el("organizationAdoptionForm")?.addEventListener("submit", previewOrganizationAdoption);
+el("applyOrganizationAdoptionButton")?.addEventListener("click", applyOrganizationAdoption);
 
 el("customerOrganizationGrid").addEventListener("click", (event) => {
   const openButton = event.target.closest("[data-customer-organization-open]");
@@ -6549,7 +8047,12 @@ el("organizationMemberForm").addEventListener("submit", async (event) => {
   try {
     await ensureCsrfToken();
     const body = isEditing
-      ? { name, departmentId, role, status }
+      ? {
+          name,
+          departmentId,
+          role,
+          ...(!isRealOrganizationMode() ? { status } : {}),
+        }
       : { name, email, departmentId, role };
     await api(
       isEditing
@@ -6591,7 +8094,20 @@ el("organizationMemberTable").addEventListener("click", (event) => {
       statusButton.dataset.organizationMemberStatus,
       statusButton.dataset.organizationMemberNextStatus,
     );
+    return;
   }
+  const resendButton = event.target.closest("[data-organization-member-invitation-resend]");
+  if (resendButton) {
+    resendOrganizationMemberInvitation(resendButton.dataset.organizationMemberInvitationResend);
+    return;
+  }
+  const revokeButton = event.target.closest("[data-organization-member-invitation-revoke]");
+  if (revokeButton) {
+    revokeOrganizationMemberInvitation(revokeButton.dataset.organizationMemberInvitationRevoke);
+    return;
+  }
+  const reinviteButton = event.target.closest("[data-organization-member-reinvite]");
+  if (reinviteButton) reinviteOrganizationMember(reinviteButton.dataset.organizationMemberReinvite);
 });
 
 el("organizationMemberSearch").addEventListener("input", () => {
@@ -6641,6 +8157,7 @@ document.querySelectorAll("[data-organization-usage-view]").forEach((button) => 
 
 el("backToCustomerOrganizationTokensButton").addEventListener("click", () => showOrganizationUsage("info"));
 el("createOrganizationTokenButton").addEventListener("click", openOrganizationTokenModal);
+el("retryOrganizationTokenCatalogButton")?.addEventListener("click", loadOrganizationTokens);
 el("cancelOrganizationTokenButton").addEventListener("click", () => closeOrganizationTokenModal());
 el("organizationTokenForm").addEventListener("submit", submitOrganizationToken);
 el("closeOrganizationTokenSecret").addEventListener("click", closeOrganizationTokenSecretModal);
@@ -7184,6 +8701,7 @@ document.querySelectorAll(".modal-backdrop").forEach((backdrop) => {
     if (backdrop.id === "organizationDepartmentModal") closeOrganizationDepartmentModal();
     if (backdrop.id === "organizationMemberModal") closeOrganizationMemberModal();
     if (backdrop.id === "organizationTopupModal") closeOrganizationTopupModal();
+    if (backdrop.id === "organizationCreditAdjustmentModal") closeOrganizationCreditAdjustmentModal();
   });
 });
 
@@ -7197,16 +8715,22 @@ document.addEventListener("keydown", (event) => {
   else if (!el("organizationMemberModal").classList.contains("hidden")) closeOrganizationMemberModal();
   else if (!el("organizationDepartmentModal").classList.contains("hidden")) closeOrganizationDepartmentModal();
   else if (!el("organizationTopupModal").classList.contains("hidden")) closeOrganizationTopupModal();
+  else if (!el("organizationCreditAdjustmentModal")?.classList.contains("hidden")) closeOrganizationCreditAdjustmentModal();
 });
 
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) clearRevealedKeys();
+  if (document.hidden) {
+    clearRevealedKeys();
+    clearOrganizationClaimLastUrl();
+  }
 });
 
 window.addEventListener("beforeunload", clearRevealedKeys);
 
 async function init() {
   const callbackParams = new URLSearchParams(window.location.search);
+  organizationClaimToken = takeOrganizationClaimTokenFromUrl(callbackParams);
+  organizationInvitationToken = takeOrganizationInvitationTokenFromUrl(callbackParams);
   resetPasswordToken = takeResetPasswordTokenFromUrl(callbackParams);
   const hasAuthCallback = callbackParams.get("auth_callback") === "success";
   if (hasAuthCallback) {
@@ -7248,6 +8772,18 @@ async function init() {
     };
   }
   setupModelFilters();
+  if (organizationClaimToken) {
+    el("authLoadingView").classList.add("hidden");
+    showOrganizationClaimScreen();
+    await verifyOrganizationClaim();
+    return;
+  }
+  if (organizationInvitationToken) {
+    el("authLoadingView").classList.add("hidden");
+    showOrganizationInvitationScreen();
+    await verifyOrganizationInvitation();
+    return;
+  }
   try {
     const user = await api("/api/auth/me");
     await showApp(user);

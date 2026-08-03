@@ -1,6 +1,7 @@
 import base64
 import asyncio
 import hashlib
+import inspect
 import ipaddress
 import json
 import logging
@@ -10,8 +11,9 @@ import secrets
 import smtplib
 import socket
 import ssl
+import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from base64 import urlsafe_b64encode
 from email.message import EmailMessage
@@ -57,7 +59,14 @@ from .auth import (
     verify_password,
 )
 from . import billing
-from .auth_store import AuthStore, AuthStoreConfigError, DuplicateEmailError
+from .auth_store import (
+    AuthStore,
+    AuthStoreConfigError,
+    DuplicateEmailError,
+    DuplicateLoginNameError,
+    ManagedAccountPasswordResetError,
+    MembershipClaimStateError,
+)
 from .billing_store import (
     BillingStore,
     BillingStoreError,
@@ -91,8 +100,10 @@ from .organization_store import (
     OrganizationStoreError,
     OrganizationValidationError,
 )
+from .organization_repository import PostgreSQLOrganizationRepository
+from .organization_provisioning import OrganizationProvisioningService
 from .usage_store import UsageStore
-from .usage_sync import UsageSynchronizer
+from .usage_sync import UsageSynchronizer, run_sync_with_recent_refresh
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -119,6 +130,7 @@ def session_cookie_max_age() -> int:
 async def app_lifespan(_app: FastAPI):
     validate_runtime_auth_config()
     await start_billing_store()
+    await start_organization_service()
     await start_usage_sync()
     try:
         yield
@@ -152,6 +164,35 @@ async def hydrate_server_session(request: Request, call_next):
             request.session.pop(SESSION_USER_KEY, None)
 
 
+@app.middleware("http")
+async def protect_secret_bearing_urls(request: Request, call_next):
+    """Keep one-time activation/reset tokens out of browser caches and referrers."""
+
+    response = await call_next(request)
+    query = request.query_params
+    secret_query = any(
+        name in query
+        for name in ("organization_claim", "organization_invitation", "reset_token")
+    )
+    secret_route = (
+        request.method == "GET"
+        and request.url.path.startswith("/api/auth/organization-claims/")
+    ) or (
+        request.method == "POST"
+        and (
+            request.url.path
+            == "/api/platform/organization-adoptions/apply"
+            or request.url.path.endswith("/membership-claims")
+            or request.url.path.endswith("/password-reset")
+        )
+    )
+    if secret_query or secret_route:
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
 app.add_middleware(
     SessionMiddleware,
     secret_key=os.getenv("SESSION_SECRET", "dev-session-secret-change-me"),
@@ -176,11 +217,20 @@ _key_vault: KeyVault | None = None
 _usage_store: UsageStore | None = UsageStore.from_environment()
 _billing_store: BillingStore | None = BillingStore.from_environment()
 _auth_store: AuthStore | None = None
-_organization_store: OrganizationStore | None = None
+_organization_store: OrganizationStore | PostgreSQLOrganizationRepository | None = None
+_organization_capability_status: dict[str, Any] = {
+    "mode": "disabled",
+    "status": "disabled",
+    "available": False,
+    "lastCheckedAt": None,
+}
+_organization_capability_probe_lock = asyncio.Lock()
 local_entitlement_cache = TTLCache()
 _usage_sync_task: asyncio.Task[Any] | None = None
 _usage_refresh_task: asyncio.Task[Any] | None = None
 _usage_sync_stop: asyncio.Event | None = None
+_organization_outbox_task: asyncio.Task[Any] | None = None
+_organization_outbox_stop: asyncio.Event | None = None
 _usage_sync_status: dict[str, Any] = {"status": "disabled", "lastRun": None}
 
 
@@ -194,6 +244,10 @@ def validate_runtime_auth_config() -> None:
         for name in ("AUTH_ENABLED", "PASSWORD_LOGIN_ENABLED", "PUBLIC_SIGNUP_ENABLED")
     )
     loopback_development = parsed_base_url.scheme.lower() == "http" and app_host in LOOPBACK_HOSTS
+    if organization_mode() == "demo" and not loopback_development:
+        raise RuntimeError(
+            "ORGANIZATION_MODE=demo 仅允许 APP_BASE_URL 使用本机回环 HTTP 地址"
+        )
     if auth_requested and not loopback_development and parsed_base_url.scheme.lower() != "https":
         raise RuntimeError("启用邮箱认证时 APP_BASE_URL 必须使用 HTTPS；仅允许本机回环地址使用 HTTP")
     if parsed_base_url.scheme.lower() != "https":
@@ -375,23 +429,58 @@ def billing_store() -> BillingStore | None:
     return _billing_store
 
 
+def organization_mode() -> str:
+    """Resolve the organization runtime mode with legacy demo compatibility."""
+
+    configured = os.getenv("ORGANIZATION_MODE", "").strip().lower()
+    if configured:
+        if configured not in {"disabled", "demo", "real"}:
+            raise RuntimeError("ORGANIZATION_MODE 必须是 disabled、demo 或 real")
+        return configured
+    return "demo" if env_bool("ORGANIZATION_DEMO_ENABLED", False) else "disabled"
+
+
+def organization_enabled() -> bool:
+    return organization_mode() in {"demo", "real"}
+
+
 def organization_demo_enabled() -> bool:
-    """Whether the side-effect-free enterprise organization demo is available."""
-    return env_bool("ORGANIZATION_DEMO_ENABLED", False)
+    return organization_mode() == "demo"
 
 
-def organization_store() -> OrganizationStore:
-    """Return the process-local demo store only after the feature is enabled."""
+def organization_real_enabled() -> bool:
+    return organization_mode() == "real"
+
+
+def organization_store() -> OrganizationStore | PostgreSQLOrganizationRepository:
+    """Return the configured store without ever falling back from real to demo."""
+
     global _organization_store
-    if not organization_demo_enabled():
-        raise HTTPException(status_code=404, detail="企业组织演示功能尚未启用")
+    mode = organization_mode()
+    if mode == "disabled":
+        raise HTTPException(status_code=404, detail="企业组织功能尚未启用")
     if _organization_store is None:
-        _organization_store = InMemoryOrganizationStore()
+        if mode == "demo":
+            _organization_store = InMemoryOrganizationStore()
+        else:
+            repository = PostgreSQLOrganizationRepository.from_environment()
+            if repository is None:
+                raise HTTPException(status_code=503, detail="企业组织数据库尚未配置")
+            _organization_store = repository
     return _organization_store
 
 
 async def organization_store_call(method: str, *args: Any, **kwargs: Any) -> Any:
+    # A few local-only workflows (notably invitation verification/acceptance)
+    # must remain usable while the model gateway is temporarily unavailable.
+    # They opt out explicitly; all customer data and upstream-management calls
+    # remain fail-closed by default.
+    require_capability = kwargs.pop("_require_capability", True)
+    if require_capability:
+        require_real_organization_capability()
     function = getattr(organization_store(), method)
+    if inspect.iscoroutinefunction(function):
+        return await function(*args, **kwargs)
     return await asyncio.to_thread(function, *args, **kwargs)
 
 
@@ -442,9 +531,27 @@ async def run_usage_sync(days: int) -> dict[str, Any]:
         return {"status": "disabled", "rowCount": 0, "backendCount": 0}
     try:
         await store.connect()
-        result = await UsageSynchronizer(client(), store).sync(
-            *UsageSynchronizer.date_range(days),
+        start_date, end_date = UsageSynchronizer.date_range(days)
+        repository = await organization_repository_for_usage_sync()
+        result = await run_sync_with_recent_refresh(
+            client(), store, days, repository, UsageSynchronizer
         )
+        settlement: dict[str, Any] | None = None
+        if result.get("status") == "ok" and organization_real_enabled():
+            if isinstance(repository, PostgreSQLOrganizationRepository):
+                completed_end = min(date.fromisoformat(end_date), usage_today() - timedelta(days=1))
+                if completed_end >= date.fromisoformat(start_date):
+                    billing_cutoffs = (
+                        await repository.billing_effective_at_by_upstream_organization()
+                    )
+                    spend_rows = await store.organization_daily_spend(
+                        start_date,
+                        completed_end.isoformat(),
+                        usage_backend_ids(),
+                        billing_effective_at_by_organization=billing_cutoffs,
+                    )
+                    settlement = await repository.settle_usage_rows(spend_rows)
+                    result["settlement"] = settlement
         _usage_sync_status.update(
             {
                 "status": result.get("status", "ok"),
@@ -452,6 +559,7 @@ async def run_usage_sync(days: int) -> dict[str, Any]:
                 "rowCount": result.get("rowCount", 0),
                 "backendCount": result.get("backendCount", 0),
                 "errors": result.get("errors", []),
+                "settlement": settlement,
             }
         )
         return result
@@ -565,8 +673,369 @@ async def start_billing_store() -> None:
         logger.exception("billing store connect failed; topup routes stay disabled")
 
 
+async def organization_repository_for_usage_sync() -> Any | None:
+    """Wait for real organization persistence and its first capability probe.
+
+    Usage synchronization runs in a background task, so waiting here does not
+    delay application startup.  The probe records upstream failures instead of
+    raising them; a connected local repository can still provide safe token
+    attribution while the usage APIs independently report their own failures.
+    """
+
+    if not organization_real_enabled():
+        return None
+    repository = organization_store()
+    connect = getattr(repository, "connect", None)
+    if callable(connect):
+        result = connect()
+        if inspect.isawaitable(result):
+            await result
+    await refresh_organization_capabilities()
+    return repository
+
+
+async def start_organization_service() -> None:
+    """Connect durable organization state and probe the upstream contract."""
+
+    mode = organization_mode()
+    _organization_capability_status.update(
+        {"mode": mode, "status": "disabled", "available": False, "lastCheckedAt": None}
+    )
+    if mode == "disabled":
+        return
+    if mode == "demo":
+        organization_store()
+        _organization_capability_status.update(
+            {"status": "ready", "available": True, "lastCheckedAt": datetime.now(timezone.utc).isoformat()}
+        )
+        return
+    # Do not make application startup wait on PostgreSQL or the upstream API.
+    # The worker performs the first probe immediately and keeps retrying after
+    # a transient outage, while health checks can also trigger a due probe.
+    _organization_capability_status.update(
+        {"mode": mode, "status": "starting", "available": False, "lastCheckedAt": None}
+    )
+    await start_organization_outbox_worker()
+
+
+def organization_capability_recheck_seconds() -> int:
+    """Return the minimum interval between automatic capability probes."""
+
+    # Keep a conservative default so health checks cannot create an upstream
+    # request storm. Tests and operators may set zero to request immediate
+    # retries; malformed negative values fall back to the safe default.
+    configured = env_int("ORGANIZATION_CAPABILITY_RECHECK_SECONDS", 60)
+    return configured if configured >= 0 else 60
+
+
+def _capability_last_checked_at() -> datetime | None:
+    value = str(_organization_capability_status.get("lastCheckedAt") or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def organization_capability_probe_due(*, force: bool = False) -> bool:
+    """Whether a real-mode capability probe should run now."""
+
+    if force:
+        return True
+    last_checked = _capability_last_checked_at()
+    if last_checked is None:
+        return True
+    elapsed = (datetime.now(timezone.utc) - last_checked).total_seconds()
+    return elapsed >= organization_capability_recheck_seconds()
+
+
+async def refresh_organization_capabilities(*, force: bool = False) -> dict[str, Any]:
+    """Re-probe real organization dependencies without blocking startup.
+
+    The lock and interval guard make this safe to call from both ``/api/health``
+    and the outbox worker.  A successful probe starts (or leaves running) the
+    compensation worker; failures are recorded and retried on a later call.
+    """
+
+    if not organization_real_enabled():
+        return dict(_organization_capability_status)
+    async with _organization_capability_probe_lock:
+        # Another concurrent health request may have completed the probe while
+        # this caller was waiting for the lock.
+        if not organization_capability_probe_due(force=force):
+            return dict(_organization_capability_status)
+        checked_at = datetime.now(timezone.utc).isoformat()
+        try:
+            if not os.getenv("ORGANIZATION_INVITATION_SECRET", "").strip():
+                raise RuntimeError("ORGANIZATION_INVITATION_SECRET is required in real mode")
+            store = organization_store()
+            connect = getattr(store, "connect", None)
+            if callable(connect):
+                result = connect()
+                if inspect.isawaitable(result):
+                    await result
+            capabilities = await client().organization_capabilities()
+            _organization_capability_status.update(
+                {
+                    **capabilities,
+                    "mode": "real",
+                    "status": "ready" if capabilities.get("available") else "unavailable",
+                    "available": bool(capabilities.get("available")),
+                    "lastCheckedAt": checked_at,
+                }
+            )
+            _organization_capability_status.pop("error", None)
+        except Exception as exc:
+            logger.exception("real organization capability probe failed")
+            _organization_capability_status.update(
+                {
+                    "mode": "real",
+                    "status": "error",
+                    "available": False,
+                    "organizations": False,
+                    "teams": False,
+                    "keys": False,
+                    "error": exc.__class__.__name__,
+                    "lastCheckedAt": checked_at,
+                }
+            )
+        state = dict(_organization_capability_status)
+    if state.get("available"):
+        await start_organization_outbox_worker()
+    return state
+
+
+async def organization_outbox_once(limit: int = 20) -> int:
+    store = organization_store()
+    if not isinstance(store, PostgreSQLOrganizationRepository):
+        return 0
+
+    async def mailer(email: str, token: str, _payload: dict[str, Any]) -> None:
+        base_url = os.getenv("APP_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+        await send_auth_email(email, "通衢 API 企业邀请", f"请打开以下链接接受企业邀请（72 小时内有效）：\n\n{base_url}/?organization_invitation={token}")
+
+    result = await OrganizationProvisioningService(store, client(), mailer=mailer).process_outbox(limit=limit)
+    await reconcile_active_membership_claims()
+    await reconcile_baic_pilot_credit()
+    return int(result.get("completed", 0))
+
+
+async def organization_outbox_if_available(limit: int = 20) -> int:
+    """Process durable work immediately only when the upstream is ready."""
+
+    if not _organization_capability_status.get("available"):
+        return 0
+    try:
+        return await organization_outbox_once(limit=limit)
+    except Exception:
+        # The approval and its outbox record are already durable. A transient
+        # upstream failure must not make the platform repeat identity approval.
+        logger.exception("organization outbox immediate run failed")
+        return 0
+
+
+async def reconcile_active_membership_claims() -> int:
+    """Open managed login only after the durable member is fully active."""
+
+    if not organization_real_enabled():
+        return 0
+    store = organization_store()
+    if not isinstance(store, PostgreSQLOrganizationRepository):
+        return 0
+    claims = await auth_store_call("list_membership_claims", None, 500)
+    activated = 0
+    for claim in claims:
+        status = str(claim.get("status") or "")
+        if status not in {"approved", "provisioning"}:
+            continue
+        auth_user_id = str(claim.get("authUserId") or "")
+        organization_id = str(claim.get("organizationId") or "")
+        if not auth_user_id or not organization_id:
+            continue
+        memberships = await store.resolve_members_by_auth_user_id(auth_user_id)
+        member = next(
+            (
+                item.get("member")
+                for item in memberships
+                if str(item.get("organizationId") or "") == organization_id
+                and isinstance(item.get("member"), dict)
+            ),
+            None,
+        )
+        if not member and status == "approved":
+            try:
+                member = await store.create_managed_member(
+                    str(claim.get("memberName") or ""),
+                    str(claim.get("loginName") or ""),
+                    str(claim.get("departmentId") or ""),
+                    str(claim.get("role") or "admin"),
+                    auth_user_id=auth_user_id,
+                    team_role=(
+                        "leader"
+                        if str(claim.get("role") or "admin") == "admin"
+                        else "member"
+                    ),
+                    organization_id=organization_id,
+                )
+            except OrganizationStoreError:
+                logger.exception(
+                    "failed to resume approved organization claim claim_id=%s",
+                    claim.get("id"),
+                )
+                continue
+        if status == "approved":
+            await auth_store_call(
+                "mark_membership_claim_provisioning", str(claim["id"]), ""
+            )
+        if not member or str(member.get("status") or "") != "active":
+            continue
+        principal_id = str(claim.get("principalId") or "")
+        principal = (
+            await store.get_principal(organization_id, principal_id)
+            if principal_id
+            else await store.ensure_principal(
+                organization_id, str(claim.get("memberName") or "")
+            )
+        )
+        if principal is None:
+            logger.error(
+                "organization claim principal is missing claim_id=%s principal_id=%s",
+                claim.get("id"),
+                principal_id,
+            )
+            continue
+        await store.link_principal_member(
+            organization_id, str(principal["id"]), str(member["id"])
+        )
+        await auth_store_call("activate_membership_claim", str(claim["id"]))
+        activated += 1
+    return activated
+
+
+async def reconcile_baic_pilot_credit() -> bool:
+    """Grant the pilot credit only after David has full customer access."""
+
+    if not organization_real_enabled():
+        return False
+    store = organization_store()
+    if not isinstance(store, PostgreSQLOrganizationRepository):
+        return False
+    organizations = await store.list_organizations(
+        keyword="北汽集团", include_archived=False, page=1, page_size=10
+    )
+    candidates = [
+        item for item in (organizations.get("items") or [])
+        if str(item.get("name") or "").strip() == "北汽集团"
+    ]
+    if len(candidates) != 1:
+        return False
+    organization_id = str(candidates[0]["id"])
+    members = await store.list_members(
+        organization_id=organization_id,
+        keyword="davidzhu2021@163.com",
+        page=1,
+        page_size=10,
+    )
+    david = next(
+        (
+            item for item in members.get("items", [])
+            if str(item.get("email") or "").casefold() == "davidzhu2021@163.com"
+            and str(item.get("role") or "") == "admin"
+            and str(item.get("status") or "") == "active"
+            and str(item.get("upstreamUserId") or "")
+        ),
+        None,
+    )
+    if david is None:
+        return False
+    # Re-read every adopted asset before the grant. A changed upstream scope
+    # means the original adoption proof is stale and credit must not be issued.
+    backend_id = os.getenv("ORGANIZATION_ADOPTION_BACKEND_ID", "primary").strip() or "primary"
+    backend = next((item for item in client().backends if item.id == backend_id), None)
+    aliases = configured_organization_adoption_values(
+        "ORGANIZATION_ADOPTION_KEY_ALIASES"
+    )
+    organization = await store.get_organization(organization_id)
+    departments = await store.list_departments(organization_id=organization_id)
+    upstream_organization_id = str(
+        (organization or {}).get("upstreamOrganizationId") or ""
+    )
+    upstream_team_ids = {
+        str(item.get("upstreamTeamId") or "")
+        for item in departments
+        if str(item.get("upstreamTeamId") or "")
+    }
+    if backend is None or not aliases or not upstream_organization_id or len(upstream_team_ids) != 1:
+        return False
+    upstream_team_id = next(iter(upstream_team_ids))
+    for alias in aliases:
+        records = await client().list_keys_exact(key_alias=alias, backend=backend)
+        if len(records) != 1:
+            return False
+        identity = client().report_only_key_identity(records[0])
+        if (
+            str(identity.get("organizationId") or "") != upstream_organization_id
+            or str(identity.get("teamId") or "") != upstream_team_id
+        ):
+            return False
+    await store.adjust_billing(
+        organization_id,
+        operation="grant",
+        amount_usd="5000.00",
+        reason="北汽集团试点初始授信",
+        operator="baic-pilot-reconciler",
+        operator_email="",
+        external_reference="BAIC-PILOT-INITIAL-5000",
+        idempotency_key="baic-pilot-initial-credit-v1",
+    )
+    return True
+
+
+async def organization_outbox_loop() -> None:
+    while _organization_outbox_stop is not None and not _organization_outbox_stop.is_set():
+        try:
+            capability = await refresh_organization_capabilities()
+            if capability.get("available"):
+                await organization_outbox_once()
+        except Exception:
+            logger.exception("organization outbox worker failed")
+        try:
+            await asyncio.wait_for(_organization_outbox_stop.wait(), timeout=max(10, env_int("ORGANIZATION_OUTBOX_INTERVAL_SECONDS", 30)))
+        except asyncio.TimeoutError:
+            continue
+
+
+async def start_organization_outbox_worker() -> None:
+    global _organization_outbox_task, _organization_outbox_stop
+    if _organization_outbox_task is not None and not _organization_outbox_task.done():
+        return
+    _organization_outbox_stop = asyncio.Event()
+    _organization_outbox_task = asyncio.create_task(organization_outbox_loop(), name="organization-outbox-loop")
+
+
+def require_real_organization_capability() -> None:
+    if organization_real_enabled() and not _organization_capability_status.get("available"):
+        raise auth_http_error(
+            503,
+            "企业组织能力暂不可用，请联系平台管理员检查上游数据库或许可配置",
+            "ORGANIZATION_UPSTREAM_UNAVAILABLE",
+        )
+
+
 async def close_litellm_client() -> None:
-    global _usage_sync_task, _usage_refresh_task, _usage_sync_stop
+    global _usage_sync_task, _usage_refresh_task, _usage_sync_stop, _organization_outbox_task, _organization_outbox_stop
+    if _organization_outbox_stop is not None:
+        _organization_outbox_stop.set()
+    if _organization_outbox_task is not None:
+        _organization_outbox_task.cancel()
+        try:
+            await _organization_outbox_task
+        except asyncio.CancelledError:
+            pass
+        _organization_outbox_task = None
+        _organization_outbox_stop = None
     if _usage_sync_stop is not None:
         _usage_sync_stop.set()
     if _usage_sync_task is not None:
@@ -588,6 +1057,14 @@ async def close_litellm_client() -> None:
         await usage_store().close()
     if billing_store() is not None:
         await billing_store().close()
+    global _organization_store
+    if _organization_store is not None:
+        close = getattr(_organization_store, "close", None)
+        if callable(close):
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        _organization_store = None
     global _litellm_client
     if _litellm_client is not None:
         await _litellm_client.close()
@@ -663,7 +1140,7 @@ def organization_access_fields(
     customer organization.
     """
 
-    enabled = organization_demo_enabled()
+    enabled = organization_enabled()
     active_membership = membership if isinstance(membership, dict) and membership.get("status") == "active" else None
     role = str(active_membership.get("role") or "") if active_membership else None
     if role not in {"admin", "member"}:
@@ -683,7 +1160,21 @@ def organization_access_fields(
     can_view_usage = role == "admin"
     can_view_billing = role == "admin"
     return {
-        "organizationDemoEnabled": enabled,
+        "organizationEnabled": enabled,
+        "organizationMode": organization_mode(),
+        "organizationAvailable": bool(
+            enabled
+            and (
+                organization_demo_enabled()
+                or _organization_capability_status.get("available")
+            )
+        ),
+        "organizationCapabilityStatus": str(
+            _organization_capability_status.get("status") or "disabled"
+        ),
+        # Legacy browser bundles still read this field; real mode must not
+        # advertise demo controls.
+        "organizationDemoEnabled": organization_demo_enabled(),
         "isPlatformAdmin": bool(user.get("isPlatformAdmin")),
         "organizationId": organization_id,
         # The customer name is safe display context for scoped boards. It lets
@@ -694,12 +1185,15 @@ def organization_access_fields(
         "organizationRole": role,
         "canViewOrganizationUsage": can_view_usage,
         "canViewOrganizationBilling": can_view_billing,
-        "canSimulateOrganizationTopup": can_view_billing,
+        "canSimulateOrganizationTopup": bool(organization_demo_enabled() and can_view_billing),
+        "canManageOrganizationTokens": bool(enabled and role == "admin"),
+        "canAdjustOrganizationCredit": bool(enabled and user.get("isPlatformAdmin")),
         "canManageOrganization": bool(enabled and role == "admin"),
         # Keep the explicit V2 capability separate from the legacy alias while
         # older browser bundles are still in circulation.
         "canManageCustomerOrganizations": bool(enabled and user.get("isPlatformAdmin")),
         "canManageCustomers": bool(enabled and user.get("isPlatformAdmin")),
+        "isKnownOrganizationIdentity": bool(membership),
     }
 
 
@@ -718,6 +1212,7 @@ def organization_identity_status_fields(
     if membership is None:
         return {
             "isKnownDemoCustomerIdentity": False,
+            "isKnownOrganizationIdentity": False,
             "organizationAccessStatus": None,
         }
     organization = membership.get("organization")
@@ -735,6 +1230,7 @@ def organization_identity_status_fields(
         access_status = "active"
     return {
         "isKnownDemoCustomerIdentity": True,
+        "isKnownOrganizationIdentity": True,
         "organizationAccessStatus": access_status,
     }
 
@@ -769,35 +1265,69 @@ def _organization_membership_items(value: Any) -> list[dict[str, Any]]:
 
 
 async def organization_memberships_for_user(user: dict[str, Any]) -> list[dict[str, Any]]:
-    """Resolve active Mock memberships; password identities never inherit them."""
+    """Resolve persisted memberships without granting seller-side access.
+
+    Demo password accounts remain separate test principals. In real mode the
+    invitation acceptance flow explicitly binds a password account, so that
+    account is allowed to resolve its durable customer membership.
+    """
 
     if (
-        not organization_demo_enabled()
-        or user.get("authType") == "password"
+        not organization_enabled()
+        or (organization_demo_enabled() and user.get("authType") == "password")
         or is_platform_admin_email(str(user.get("email") or ""))
     ):
         return []
-    email = str(user.get("email") or "")
     try:
-        # V2 store: a user may have at most one effective Mock customer.  The
-        # fallback preserves V1 tests until the store migration lands.
-        try:
-            result = await organization_store_call("resolve_members_by_email", email)
-        except AttributeError:
-            result = await organization_store_call("get_member_by_email", email)
+        if organization_real_enabled():
+            # Real customer access is bound by invitation to a local account
+            # id; matching only an email would silently create tenant access.
+            local_user_id = str(user.get("id") or "").strip()
+            if not local_user_id:
+                return []
+            result = await organization_store_call("resolve_members_by_auth_user_id", local_user_id)
+        else:
+            email = str(user.get("email") or "")
+            # V2 store: a user may have at most one effective Mock customer.
+            # The fallback preserves V1 tests until the store migration lands.
+            try:
+                result = await organization_store_call("resolve_members_by_email", email)
+            except AttributeError:
+                result = await organization_store_call("get_member_by_email", email)
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
     return _organization_membership_items(result)
 
 
+async def active_real_organization_membership(
+    user: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return the one active real-organization membership for this account."""
+
+    if not organization_real_enabled():
+        return None
+    memberships = await organization_memberships_for_user(user)
+    return next(
+        (
+            item
+            for item in memberships
+            if item.get("status") == "active"
+            and item.get("organizationStatus", "active") == "active"
+        ),
+        None,
+    )
+
+
 async def organization_access_fields_for_user(user: dict[str, Any]) -> dict[str, Any]:
     """Resolve bootstrap capabilities without granting platform admins membership."""
 
-    if not organization_demo_enabled():
+    if not organization_enabled():
         return organization_access_fields(user)
     try:
         memberships = await organization_memberships_for_user(user)
     except HTTPException:
+        if organization_real_enabled():
+            raise
         logger.exception("failed to resolve organization demo membership")
         return organization_access_fields(user)
     active = next(
@@ -820,7 +1350,7 @@ async def organization_scope_fields_for_user(user: dict[str, Any]) -> dict[str, 
     # A local password identity is deliberately a different principal from an
     # SSO-backed customer member.  Do not add demo capabilities to its legacy
     # scope response, even when the email happens to match a seeded member.
-    if not organization_demo_enabled() or user.get("authType") == "password":
+    if not organization_enabled():
         return {}
     return await organization_access_fields_for_user(user)
 
@@ -828,11 +1358,15 @@ async def organization_scope_fields_for_user(user: dict[str, Any]) -> dict[str, 
 async def organization_user(request: Request) -> dict[str, Any]:
     """Require an active customer membership derived from the server session."""
 
-    if not organization_demo_enabled():
-        raise HTTPException(status_code=404, detail="企业组织演示功能尚未启用")
+    if not organization_enabled():
+        raise HTTPException(status_code=404, detail="企业组织功能尚未启用")
     user = require_user(request)
-    if user.get("authType") == "password":
-        raise auth_http_error(403, "本地密码账号不能继承企业组织权限", "ORGANIZATION_SSO_REQUIRED")
+    if organization_demo_enabled() and user.get("authType") == "password":
+        raise auth_http_error(
+            403,
+            "演示企业账号只能通过企业统一认证登录",
+            "ORGANIZATION_SSO_REQUIRED",
+        )
     memberships = await organization_memberships_for_user(user)
     if any(item.get("status") != "active" or item.get("organizationStatus", "active") != "active" for item in memberships):
         raise auth_http_error(403, "当前企业成员尚未启用或已被暂停", "ORGANIZATION_MEMBER_INACTIVE")
@@ -900,6 +1434,23 @@ async def require_organization_demo_manager(request: Request) -> dict[str, Any]:
     return user
 
 
+def reject_direct_real_member_activation(status: Any) -> None:
+    """Keep invitation activation exclusively in the upstream provisioning flow.
+
+    In real mode an API caller may suspend or re-invite a member, but must not
+    turn an invited row into an active membership by editing the local record.
+    The provisioning worker is the only path that has completed the upstream
+    user and organization/team membership checks before activation.
+    """
+
+    if organization_real_enabled() and str(status or "").strip().lower() == "active":
+        raise auth_http_error(
+            409,
+            "真实企业成员必须接受邀请并完成上游开通后才能启用",
+            "ORGANIZATION_MEMBER_ACTIVATION_REQUIRES_PROVISIONING",
+        )
+
+
 def organization_current_member(user: dict[str, Any]) -> dict[str, Any]:
     membership = user.get("organizationMember")
     return dict(membership) if isinstance(membership, dict) else {}
@@ -925,12 +1476,40 @@ async def organization_scoped_store_call(
     store = organization_store()
     facade_factory = getattr(store, "for_organization", None)
     if callable(facade_factory):
-        facade = await asyncio.to_thread(facade_factory, organization_id)
+        facade = facade_factory(organization_id)
+        if inspect.isawaitable(facade):
+            facade = await facade
         function = getattr(facade, method)
+        if inspect.iscoroutinefunction(function):
+            return await function(*args, **kwargs)
         return await asyncio.to_thread(function, *args, **kwargs)
     function = getattr(store, method)
+    # Repository methods that take the tenant as their first positional
+    # argument cannot also receive it as a keyword. Directory CRUD methods use
+    # a keyword-only tenant to mirror the legacy protocol.
+    positional_scope_methods = {
+        "get_organization",
+        "get_organization_snapshot",
+        "organization_snapshot",
+        "usage_cache_fingerprint",
+        "billing_payload",
+        "list_tokens",
+        "revoke_token",
+    }
+    if isinstance(store, PostgreSQLOrganizationRepository) and method in positional_scope_methods:
+        if inspect.iscoroutinefunction(function):
+            return await function(organization_id, *args, **kwargs)
+        return await asyncio.to_thread(function, organization_id, *args, **kwargs)
+    call_kwargs = {**kwargs, "organization_id": organization_id}
+    if inspect.iscoroutinefunction(function):
+        try:
+            return await function(*args, **call_kwargs)
+        except TypeError:
+            if organization_id == "org-demo":
+                return await function(*args, **kwargs)
+            raise
     try:
-        return await asyncio.to_thread(function, *args, organization_id=organization_id, **kwargs)
+        return await asyncio.to_thread(function, *args, **call_kwargs)
     except TypeError:
         # Legacy V1 compatibility exists only for existing tests.  A V2 store
         # must expose either for_organization() or organization_id keywords.
@@ -1029,14 +1608,207 @@ async def cached_mock_organization_usage_payload(
     return result
 
 
-async def require_platform_organization(request: Request, organization_id: str) -> dict[str, Any]:
+def _filter_organization_usage_source(rows: list[dict[str, Any]], source: str) -> list[dict[str, Any]]:
+    if not source or source == "all":
+        return rows
+    return [row for row in rows if str(row.get("source") or "") == source]
+
+
+def _usage_metric_row(day: str, source: str, model: str, metrics: dict[str, Any]) -> dict[str, Any]:
+    prompt = int(metrics.get("prompt_tokens") or metrics.get("promptTokens") or 0)
+    completion = int(metrics.get("completion_tokens") or metrics.get("completionTokens") or 0)
+    total = int(metrics.get("total_tokens") or metrics.get("totalTokens") or prompt + completion)
+    requests = int(metrics.get("api_requests") or metrics.get("request_count") or metrics.get("requestCount") or 0)
+    failures = int(metrics.get("failed_requests") or metrics.get("failure_count") or metrics.get("failureCount") or 0)
+    successes = int(metrics.get("successful_requests") or metrics.get("success_count") or metrics.get("successCount") or max(0, requests - failures))
+    return {
+        "date": day,
+        "source": source or "其他",
+        "model": normalize_model_display_name(model) or model or "未知模型",
+        "promptTokens": prompt,
+        "completionTokens": completion,
+        "totalTokens": total,
+        "requestCount": requests,
+        "successCount": successes,
+        "failureCount": failures,
+        "spend": float(metrics.get("spend") or metrics.get("total_spend") or 0),
+    }
+
+
+def normalize_litellm_daily_usage(payload: dict[str, Any], source: str = "all") -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in client().daily_usage_rows(payload):
+        day = str(item.get("date") or item.get("day") or "")[:10]
+        breakdown = item.get("breakdown") if isinstance(item.get("breakdown"), dict) else {}
+        models = breakdown.get("models") if isinstance(breakdown.get("models"), dict) else {}
+        if models:
+            for model, value in models.items():
+                metrics = value.get("metrics") if isinstance(value, dict) and isinstance(value.get("metrics"), dict) else value
+                rows.append(_usage_metric_row(day, "其他", str(model), metrics if isinstance(metrics, dict) else {}))
+            continue
+        metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else item
+        model = str(item.get("model") or item.get("model_group") or "全部模型")
+        rows.append(_usage_metric_row(day, "其他", model, metrics))
+    return _filter_organization_usage_source(rows, source)
+
+
+async def real_organization_usage_payload(
+    organization_id: str,
+    *,
+    start_date: str,
+    end_date: str,
+    source: str,
+    employee: str = "",
+    refresh: bool = False,
+) -> dict[str, Any]:
+    require_real_organization_capability()
+    organization = await organization_scoped_store_call(organization_id, "get_organization")
+    upstream_id = str((organization or {}).get("upstreamOrganizationId") or "")
+    if not upstream_id or str((organization or {}).get("upstreamStatus") or "") != "active":
+        raise auth_http_error(409, "企业账号仍在开通中，请稍后重试", "ORGANIZATION_PROVISIONING_PENDING")
+    store = usage_store()
+    if store is None or store.pool is None:
+        raise auth_http_error(
+            503,
+            "企业用量快照暂不可用，请等待同步完成后重试",
+            "ORGANIZATION_USAGE_SNAPSHOT_UNAVAILABLE",
+        )
+    try:
+        stored = await store.organization_rows(
+            upstream_id,
+            start_date,
+            end_date,
+            source,
+            usage_backend_ids(),
+            employee=employee,
+        )
+    except Exception as exc:
+        logger.exception(
+            "organization usage snapshot query failed organization_id=%s upstream_id=%s",
+            organization_id,
+            upstream_id,
+        )
+        raise auth_http_error(
+            503,
+            "企业用量快照暂不可用，请稍后重试",
+            "ORGANIZATION_USAGE_SNAPSHOT_UNAVAILABLE",
+        ) from exc
+    if stored is None:
+        raise auth_http_error(
+            503,
+            "企业用量仍在同步中，请稍后重试",
+            "ORGANIZATION_USAGE_SNAPSHOT_UNAVAILABLE",
+        )
+    last_synced = stored.get("lastSyncedAt")
+    stored["organization"] = organization
+    stored["dataFreshness"] = usage_data_freshness(
+        last_synced if isinstance(last_synced, datetime) else None,
+        start_date,
+        end_date,
+    )
+    stored["cache"] = {"hit": False, "ttlSeconds": 0}
+    return stored
+
+
+async def real_organization_department_usage_payload(
+    organization_id: str,
+    *,
+    start_date: str,
+    end_date: str,
+    source: str,
+    department: str = "",
+    refresh: bool = False,
+) -> dict[str, Any]:
+    require_real_organization_capability()
+    organization = await organization_scoped_store_call(organization_id, "get_organization")
+    upstream_organization_id = str((organization or {}).get("upstreamOrganizationId") or "")
+    if not organization or str(organization.get("upstreamStatus") or "") != "active":
+        raise auth_http_error(409, "企业账号仍在开通中，请稍后重试", "ORGANIZATION_PROVISIONING_PENDING")
+    store = usage_store()
+    if store is None or store.pool is None:
+        raise auth_http_error(
+            503,
+            "部门用量快照暂不可用，请等待同步完成后重试",
+            "ORGANIZATION_USAGE_SNAPSHOT_UNAVAILABLE",
+        )
+    try:
+        stored = await store.organization_rows(
+            upstream_organization_id,
+            start_date,
+            end_date,
+            source,
+            usage_backend_ids(),
+        )
+    except Exception as exc:
+        logger.exception(
+            "organization department snapshot query failed organization_id=%s upstream_id=%s",
+            organization_id,
+            upstream_organization_id,
+        )
+        raise auth_http_error(
+            503,
+            "部门用量快照暂不可用，请稍后重试",
+            "ORGANIZATION_USAGE_SNAPSHOT_UNAVAILABLE",
+        ) from exc
+    if stored is None:
+        raise auth_http_error(
+            503,
+            "部门用量仍在同步中，请稍后重试",
+            "ORGANIZATION_USAGE_SNAPSHOT_UNAVAILABLE",
+        )
+    departments = list(stored.get("departments") or [])
+    rows = list(stored.get("rows") or [])
+    if department:
+        matched_ids = {
+            str(item.get("departmentId") or "")
+            for item in departments
+            if department in {
+                str(item.get("departmentId") or ""),
+                str(item.get("departmentName") or ""),
+            }
+        }
+        departments = [
+            item for item in departments
+            if str(item.get("departmentId") or "") in matched_ids
+        ]
+        rows = [
+            item for item in rows
+            if str(item.get("departmentId") or "") in matched_ids
+        ]
+    last_synced = stored.get("lastSyncedAt")
+    return {
+        **stored,
+        "rows": rows,
+        "summaryRows": UsageStore._group_rows(rows, ("date", "source", "model")),
+        "departments": departments,
+        "department": department,
+        "totalRecords": len(rows),
+        "dataFreshness": usage_data_freshness(
+            last_synced if isinstance(last_synced, datetime) else None,
+            start_date,
+            end_date,
+        ),
+        "cache": {"hit": False, "ttlSeconds": 0},
+    }
+
+
+async def require_platform_organization(
+    request: Request,
+    organization_id: str,
+    *,
+    require_capability: bool = True,
+) -> dict[str, Any]:
     """Authorize a seller operator and resolve exactly the requested customer."""
 
-    if not organization_demo_enabled():
-        raise HTTPException(status_code=404, detail="企业组织演示功能尚未启用")
+    if not organization_enabled():
+        raise HTTPException(status_code=404, detail="企业组织功能尚未启用")
     user = require_platform_admin(request)
     try:
-        organization = await platform_organization_store_call("get_organization", organization_id)
+        organization = await platform_organization_store_call(
+            "get_organization",
+            organization_id,
+            _require_capability=require_capability,
+        )
     except AttributeError:
         # The V1 store exposes no customer list and only keeps org-demo.
         if organization_id == "org-demo":
@@ -1048,6 +1820,26 @@ async def require_platform_organization(request: Request, organization_id: str) 
     if not isinstance(organization, dict):
         raise auth_http_error(404, "未找到对应客户企业", "ORGANIZATION_NOT_FOUND")
     return {**user, "selectedOrganization": organization, "selectedOrganizationId": organization_id}
+
+
+async def require_platform_claim_organization(
+    request: Request, organization_id: str
+) -> dict[str, Any]:
+    """Resolve a platform customer for local claim operations.
+
+    Claim approval/revocation is a durable local decision and must remain
+    available while the upstream provisioning capability is recovering. The
+    compatibility fallback keeps older test doubles and integrations working.
+    """
+
+    try:
+        return await require_platform_organization(
+            request, organization_id, require_capability=False
+        )
+    except TypeError as exc:
+        if "require_capability" not in str(exc):
+            raise
+        return await require_platform_organization(request, organization_id)
 
 
 async def mock_usage_payload(
@@ -1101,9 +1893,9 @@ async def mock_usage_payload(
 
 
 async def is_demo_customer_user(app_user: dict[str, Any]) -> bool:
-    """True only for an active customer membership, never seller operators."""
+    """True only for an active customer in the explicit demo runtime."""
 
-    if not organization_demo_enabled() or app_user.get("authType") == "password":
+    if not organization_demo_enabled():
         return False
     try:
         memberships = await organization_memberships_for_user(app_user)
@@ -1122,7 +1914,7 @@ async def is_known_demo_customer_identity(app_user: dict[str, Any]) -> bool:
     a same-email seller account or a real upstream query.
     """
 
-    if not organization_demo_enabled() or app_user.get("authType") == "password":
+    if not organization_demo_enabled():
         return False
     try:
         return bool(await organization_memberships_for_user(app_user))
@@ -1131,16 +1923,30 @@ async def is_known_demo_customer_identity(app_user: dict[str, Any]) -> bool:
 
 
 async def require_non_inactive_demo_identity(app_user: dict[str, Any]) -> None:
-    """Fail closed before any non-Mock path can resolve a disabled customer.
+    """Fail closed before any non-organization path can resolve a disabled customer.
 
-    Active customer identities are handled by their Mock adapters. Invited,
-    suspended, and archived customer identities must not fall through to a
-    same-email platform account or an upstream usage lookup.
+    Active customer identities are handled by their organization-scoped paths.
+    Invited, suspended, and archived identities must not fall through to a
+    same-email platform account or an unrelated upstream usage lookup.
     """
 
-    if await is_demo_customer_user(app_user):
+    if not organization_enabled():
         return
-    if await is_known_demo_customer_identity(app_user):
+    try:
+        memberships = await organization_memberships_for_user(app_user)
+    except HTTPException:
+        # Preserve an upstream capability error instead of treating the user
+        # as an unrelated non-organization account.
+        if organization_real_enabled():
+            raise
+        memberships = []
+    if any(
+        item.get("status") == "active"
+        and item.get("organizationStatus", "active") == "active"
+        for item in memberships
+    ):
+        return
+    if memberships or await is_known_demo_customer_identity(app_user):
         raise inactive_demo_customer_error()
 
 
@@ -1234,13 +2040,262 @@ async def organization_token_model_catalog() -> tuple[str, ...]:
     try:
         names = await client().organization_token_models()
     except HTTPException:
-        # 未配置上游：演示环境的常态，不值得记 error。
+        if organization_real_enabled():
+            raise auth_http_error(503, "模型目录暂不可用，当前不能创建企业 Token", "ORGANIZATION_MODEL_CATALOG_UNAVAILABLE")
         return ORGANIZATION_TOKEN_MODELS
     except Exception:
+        if organization_real_enabled():
+            logger.exception("organization token model catalog unavailable")
+            raise auth_http_error(503, "模型目录暂不可用，当前不能创建企业 Token", "ORGANIZATION_MODEL_CATALOG_UNAVAILABLE")
         logger.warning("organization token model catalog unavailable; using the built-in list")
         return ORGANIZATION_TOKEN_MODELS
     catalog = tuple(name for name in names if name)
+    if not catalog and organization_real_enabled():
+        raise auth_http_error(503, "模型目录暂不可用，当前不能创建企业 Token", "ORGANIZATION_MODEL_CATALOG_UNAVAILABLE")
     return catalog or ORGANIZATION_TOKEN_MODELS
+
+
+async def create_real_organization_token(
+    organization_id: str,
+    data: "OrganizationTokenCreateRequest",
+    catalog: tuple[str, ...],
+    *,
+    changed_by: str = "",
+) -> dict[str, Any]:
+    """Provision a durable local token and its LiteLLM key atomically enough to retry.
+
+    The local row is intentionally created first in ``provisioning`` state.  A
+    failed upstream request therefore never looks like an active credential;
+    retries can find the row by its stable alias and either finalize it or
+    clean up the orphan upstream key.
+    """
+
+    require_real_organization_capability()
+    selected_models = list(dict.fromkeys(model.strip() for model in data.models))
+    unknown = [model for model in selected_models if model not in catalog]
+    if unknown:
+        raise auth_http_error(400, "所选模型当前不可用", "ORGANIZATION_TOKEN_MODEL_UNAVAILABLE")
+    store = organization_store()
+    if not isinstance(store, PostgreSQLOrganizationRepository):
+        raise auth_http_error(503, "企业 Token 持久化能力暂不可用", "ORGANIZATION_TOKEN_STORE_UNAVAILABLE")
+    member_id = str(data.memberId or "").strip()
+    member: dict[str, Any] | None = None
+    if member_id:
+        member = await store.get_member(member_id, organization_id=organization_id)
+        if not member or member.get("status") != "active":
+            raise auth_http_error(409, "只能为已启用成员创建 Token", "ORGANIZATION_TOKEN_MEMBER_INACTIVE")
+        if not str(member.get("upstreamUserId") or "").strip():
+            raise auth_http_error(503, "成员上游账号仍在开通中", "ORGANIZATION_MEMBER_PROVISIONING")
+    organization = await store.get_organization(organization_id)
+    upstream_org_id = str((organization or {}).get("upstreamOrganizationId") or "").strip()
+    if not upstream_org_id:
+        raise auth_http_error(503, "企业上游账号仍在开通中", "ORGANIZATION_UPSTREAM_PROVISIONING")
+    if str((organization or {}).get("billingStatus") or "past_due") != "active":
+        raise auth_http_error(
+            409,
+            "企业额度不足或尚未生效，当前不能创建新的企业 Token",
+            "ORGANIZATION_BILLING_INACTIVE",
+        )
+    upstream_team_id = ""
+    if member:
+        department = await store.get_department(
+            str(member.get("departmentId") or ""), organization_id=organization_id
+        )
+        upstream_team_id = str((department or {}).get("upstreamTeamId") or "")
+    expires_at = None
+    if data.duration != "never":
+        expires_at = datetime.now(timezone.utc) + timedelta(days=int(data.duration[:-1]))
+    # Alias is deterministic for the requested scope and payload, allowing a
+    # retried request to recover a key created before a local timeout.
+    alias_seed = json.dumps(
+        [organization_id, member_id, data.name.strip(), selected_models, str(data.dailyBudgetUsd), data.duration],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    alias = "ai-org-" + hashlib.sha256(alias_seed.encode("utf-8")).hexdigest()[:24]
+    existing = await store.get_token_by_alias(alias)
+    if existing and existing.get("status") == "active":
+        # The secret was intentionally never persisted; an idempotent retry
+        # can only return the masked durable projection.
+        return {"token": existing}
+    if existing:
+        token_record = existing
+    else:
+        try:
+            token_record = await store.create_token_record(
+                organization_id,
+                data.name,
+                selected_models,
+                member_id=member_id,
+                daily_budget_usd=data.dailyBudgetUsd,
+                duration=data.duration,
+                expires_at=expires_at,
+                upstream_key_alias=alias,
+            )
+        except OrganizationConflictError:
+            # A concurrent process may have inserted the same stable alias
+            # after the optimistic lookup. Reuse that durable row; the alias
+            # remains the only cross-process idempotency primitive because
+            # LiteLLM 1.92 ignores the HTTP Idempotency-Key header.
+            token_record = await store.get_token_by_alias(alias)
+            if not token_record:
+                raise
+            if token_record.get("status") == "active":
+                return {"token": token_record}
+            # Another request owns the upstream provisioning attempt for this
+            # alias. Do not issue a second key while that durable row is still
+            # pending reconciliation.
+            raise auth_http_error(
+                409,
+                "相同请求的企业 Token 正在开通中，请稍后刷新列表",
+                "ORGANIZATION_TOKEN_PROVISIONING",
+            )
+    try:
+        upstream = await client().create_organization_key(
+            upstream_org_id,
+            key_alias=alias,
+            models=selected_models,
+            daily_budget_usd=float(data.dailyBudgetUsd),
+            team_id=upstream_team_id or None,
+            user_id=str((member or {}).get("upstreamUserId") or "") or None,
+            duration=data.duration,
+            changed_by=changed_by,
+            idempotency_key=alias,
+        )
+    except Exception as exc:
+        # A timeout/transport error can occur after the proxy committed the
+        # key. Reconcile every uncertain create by stable alias; the worker
+        # will either recover the secret-free projection or delete an orphan.
+        if isinstance(exc, HTTPException) and exc.status_code < 500:
+            # A stable alias may already exist upstream after a previous
+            # request timed out. Treat the proxy's duplicate response as an
+            # uncertain outcome and let durable reconciliation recover it.
+            if exc.status_code != 409:
+                raise
+        try:
+            await store.enqueue_token_reconciliation(
+                organization_id,
+                str(token_record["id"]),
+                upstream_organization_id=upstream_org_id,
+                upstream_team_id=upstream_team_id,
+                upstream_user_id=str((member or {}).get("upstreamUserId") or ""),
+                upstream_key_alias=alias,
+            )
+        except Exception:
+            logger.exception(
+                "failed to enqueue timed-out organization token reconciliation token_id=%s",
+                token_record.get("id"),
+            )
+        raise auth_http_error(
+            503,
+            "企业 Token 开通结果暂未确认，正在自动对账，请稍后刷新列表",
+            "ORGANIZATION_TOKEN_RECONCILIATION_PENDING",
+        ) from exc
+    secret = str(upstream.get("key") or "")
+    token_id = str(token_record["id"])
+    try:
+        finalized = await store.finalize_token_record(
+            token_id,
+            upstream_key_id=str(upstream.get("id") or ""),
+            upstream_key_hash=hashlib.sha256(secret.encode("utf-8")).hexdigest(),
+            status="active",
+            plaintext_token=secret,
+        )
+    except Exception as exc:
+        # The key may already exist upstream even though the local commit
+        # failed. Persist only stable identifiers so the outbox can recover or
+        # revoke it without ever storing the plaintext credential.
+        try:
+            await store.enqueue_token_reconciliation(
+                organization_id,
+                token_id,
+                upstream_organization_id=upstream_org_id,
+                upstream_team_id=upstream_team_id,
+                upstream_user_id=str((member or {}).get("upstreamUserId") or ""),
+                upstream_key_alias=alias,
+            )
+        except Exception:
+            logger.exception(
+                "failed to enqueue organization token reconciliation token_id=%s",
+                token_id,
+            )
+        # A rejected CAS means eligibility changed while the upstream key was
+        # being issued; remove it immediately. Transient database failures are
+        # left for reconciliation so a valid key is not deleted accidentally.
+        if isinstance(exc, OrganizationConflictError):
+            try:
+                upstream_id = str(upstream.get("id") or "").strip()
+                if upstream_id:
+                    await client().revoke_organization_key(
+                        upstream_id,
+                        changed_by=changed_by,
+                        idempotency_key=f"finalize-failed:{token_id}",
+                    )
+            except Exception:
+                logger.exception(
+                    "failed immediate cleanup after organization token finalize token_id=%s",
+                    token_id,
+                )
+        raise auth_http_error(
+            503,
+            "企业 Token 已提交开通，正在自动对账，请稍后刷新列表",
+            "ORGANIZATION_TOKEN_RECONCILIATION_PENDING",
+        ) from exc
+    return {"token": finalized}
+
+
+async def revoke_real_organization_token(
+    organization_id: str,
+    token_id: str,
+    *,
+    changed_by: str = "",
+) -> dict[str, Any]:
+    """Revoke upstream first, then mark the tenant-scoped local record."""
+
+    require_real_organization_capability()
+    store = organization_store()
+    if not isinstance(store, PostgreSQLOrganizationRepository):
+        raise auth_http_error(503, "企业 Token 持久化能力暂不可用", "ORGANIZATION_TOKEN_STORE_UNAVAILABLE")
+    token = await store.get_token(organization_id, token_id)
+    if not token:
+        raise auth_http_error(404, "未找到对应的 Token", "ORGANIZATION_TOKEN_NOT_FOUND")
+    upstream_id = str(token.get("upstreamKeyId") or "").strip()
+    if not upstream_id:
+        organization = await store.get_organization(organization_id)
+        upstream_org_id = str((organization or {}).get("upstreamOrganizationId") or "").strip()
+        alias = str(token.get("upstreamKeyAlias") or "").strip()
+        if upstream_org_id and alias:
+            upstream_record = await client().find_organization_key_by_alias(
+                upstream_org_id,
+                alias,
+                team_id=str(token.get("upstreamTeamId") or "").strip() or None,
+            )
+            if upstream_record is not None:
+                upstream_id = str(
+                    client().organization_key_identity(upstream_record).get("id") or ""
+                ).strip()
+        if not upstream_id:
+            await store.enqueue_token_reconciliation(
+                organization_id,
+                token_id,
+                upstream_organization_id=upstream_org_id,
+                upstream_team_id=str(token.get("upstreamTeamId") or ""),
+                upstream_key_alias=alias,
+            )
+            raise auth_http_error(
+                409,
+                "Token 开通结果正在确认，系统会在确认后自动撤销",
+                "ORGANIZATION_TOKEN_PROVISIONING",
+            )
+    # Keep retries idempotent: if the upstream delete succeeded but the local
+    # transaction failed, a later attempt treats the upstream 404 as already
+    # revoked and can safely converge the local record.
+    await client().revoke_organization_key(
+        upstream_id,
+        changed_by=changed_by,
+        idempotency_key=f"organization-token-revoke:{organization_id}:{token_id}",
+    )
+    return await store.mark_token_revoked(organization_id, token_id)
 
 
 def organization_token_model_options(catalog: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -1664,7 +2719,16 @@ def upstream_user_owned_by_local_account(info: dict[str, Any], user: dict[str, A
 
 async def auth_user_payload(user: dict[str, Any], *, refresh_entitlement: bool = False) -> dict[str, Any]:
     account = await auth_store_call("get_upstream_account", str(user["id"]), "primary")
+    account_type = str(user.get("account_type") or user.get("accountType") or "personal")
     account_status = str((account or {}).get("status") or "provisioning")
+    if account_type == "enterprise_managed":
+        # Managed identities are provisioned through customer_member. They do
+        # not create or depend on the personal auth_upstream_accounts mapping.
+        account_status = (
+            "provisioned"
+            if str(user.get("status") or "") == "active"
+            else str(user.get("status") or "provisioning")
+        )
     entitlement_status = "inactive"
     upstream_user_id = str((account or {}).get("upstream_user_id") or "")
     if account_status == "provisioned" and upstream_user_id:
@@ -1692,7 +2756,17 @@ async def auth_user_payload(user: dict[str, Any], *, refresh_entitlement: bool =
                 # Entitlements are advisory UI state. A transient upstream lookup
                 # must not invalidate an otherwise valid dashboard login.
                 entitlement_status = "inactive"
-    normalized = normalize_user(str(user["email"]), str(user.get("name") or ""))
+    elif account_type == "enterprise_managed":
+        entitlement_status = await managed_account_entitlement_status(
+            user, refresh=refresh_entitlement
+        )
+    contact_email = str(user.get("email") or user.get("contactEmail") or "").strip().lower()
+    login_name = str(user.get("login_name") or user.get("loginName") or "").strip()
+    display_identifier = contact_email or login_name
+    normalized = normalize_user(display_identifier, str(user.get("name") or ""))
+    # Username-only managed accounts must not leak a fabricated email into
+    # auth/me or downstream authorization checks.
+    normalized["email"] = contact_email or None
     # Password accounts are intentionally separate from SSO identities, even
     # when they use the same email address. Do not inherit admin privileges.
     normalized["isAdmin"] = False
@@ -1701,6 +2775,12 @@ async def auth_user_payload(user: dict[str, Any], *, refresh_entitlement: bool =
         **normalized,
         "id": str(user["id"]),
         "authType": "password",
+        "loginName": login_name or None,
+        "contactEmail": contact_email or None,
+        "displayIdentifier": display_identifier,
+        "accountType": account_type,
+        "identityStatus": str(user.get("identity_status") or user.get("identityStatus") or "verified"),
+        "identityVerifiedAt": user.get("identity_verified_at") or user.get("identityVerifiedAt"),
         "emailVerified": bool(user.get("email_verified") or user.get("emailVerified")),
         "authMethods": ["password"],
         "accountStatus": account_status,
@@ -1738,6 +2818,33 @@ async def create_local_session(request: Request, user: dict[str, Any]) -> tuple[
     )
     csrf_value = set_server_session(request, str(session["token"]))
     return await auth_user_payload(user), csrf_value
+
+
+async def managed_account_entitlement_status(
+    user: dict[str, Any], *, refresh: bool = False
+) -> str:
+    """Resolve a username account's upstream member without personal mapping."""
+
+    user_id = str(user.get("id") or "")
+    if not organization_real_enabled() or not user_id:
+        return "inactive"
+    try:
+        memberships = await organization_store_call(
+            "resolve_members_by_auth_user_id", user_id, _require_capability=False
+        )
+    except Exception:
+        return "inactive"
+    active = next(
+        (
+            item
+            for item in _organization_membership_items(memberships)
+            if item.get("status") == "active"
+            and item.get("organizationStatus", "active") == "active"
+            and str(item.get("upstreamUserId") or "")
+        ),
+        None,
+    )
+    return "active" if active else "inactive"
 
 
 async def provision_local_user(user: dict[str, Any]) -> dict[str, Any]:
@@ -1981,6 +3088,50 @@ def feishu_direct_url(casdoor_authorize_url: str) -> str:
 
 
 async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_date: str, source: str, refresh: bool = False) -> dict[str, Any]:
+    account_type = str(
+        app_user.get("accountType") or app_user.get("account_type") or "personal"
+    )
+    if organization_real_enabled():
+        memberships = await organization_memberships_for_user(app_user)
+        membership = next(
+            (
+                item
+                for item in memberships
+                if item.get("status") == "active"
+                and item.get("organizationStatus", "active") == "active"
+            ),
+            None,
+        )
+        if membership is not None:
+            return await real_organization_member_usage_payload(
+                app_user,
+                membership,
+                start_date=start_date,
+                end_date=end_date,
+                source=source,
+                refresh=refresh,
+            )
+    if account_type == "enterprise_managed":
+        # Username-only managed identities never fall through to the personal
+        # upstream account path. Until their customer membership is active,
+        # return an explicit empty/provisioning view instead of querying by a
+        # fabricated or missing email address.
+        rows: list[dict[str, Any]] = []
+        return {
+            "user": app_user,
+            "startDate": start_date,
+            "endDate": end_date,
+            "source": source,
+            "rows": rows,
+            "summary": usage_summary(rows),
+            "accountStatus": app_user.get("accountStatus", "provisioning"),
+            "entitlementStatus": app_user.get("entitlementStatus", "inactive"),
+            "organizationAccessStatus": app_user.get(
+                "organizationAccessStatus", "provisioning"
+            ),
+            "mappingCache": {"hit": True, "ttlSeconds": 0},
+            "cache": {"hit": False, "ttlSeconds": 0},
+        }
     if app_user.get("id") and (
         app_user.get("accountStatus") != "provisioned"
         or app_user.get("entitlementStatus") != "active"
@@ -2057,6 +3208,90 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
     payload = dict(payload)
     payload["cache"] = {"hit": False, "ttlSeconds": 0}
     return payload
+
+
+async def real_organization_member_usage_payload(
+    app_user: dict[str, Any],
+    membership: dict[str, Any],
+    *,
+    start_date: str,
+    end_date: str,
+    source: str,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Read a real member without using email as a tenant or identity key."""
+
+    require_real_organization_capability()
+    organization_id = organization_identifier(membership)
+    organization = membership.get("organization")
+    upstream_organization_id = str(
+        (organization or {}).get("upstreamOrganizationId")
+        if isinstance(organization, dict)
+        else ""
+    ).strip()
+    upstream_user_id = str(membership.get("upstreamUserId") or "").strip()
+    if not upstream_organization_id or not upstream_user_id:
+        raise auth_http_error(
+            409,
+            "企业账号仍在开通中，请稍后重试",
+            "ORGANIZATION_MEMBER_PROVISIONING",
+        )
+    store = usage_store()
+    if store is None:
+        raise auth_http_error(
+            503,
+            "企业成员用量暂不可用，请稍后重试",
+            "ORGANIZATION_USAGE_UNAVAILABLE",
+        )
+    try:
+        await store.connect()
+        await prepare_usage_refresh(start_date, end_date, refresh)
+        stored = await store.organization_member_rows(
+            upstream_organization_id,
+            upstream_user_id,
+            start_date,
+            end_date,
+            source,
+            usage_backend_ids(),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "organization member usage query failed organization_id=%s member_id=%s",
+            organization_id,
+            membership.get("id"),
+        )
+        raise auth_http_error(
+            503,
+            "企业成员用量暂不可用，请稍后重试",
+            "ORGANIZATION_USAGE_UNAVAILABLE",
+        ) from exc
+    if stored is None:
+        raise auth_http_error(
+            503,
+            "企业成员用量快照尚未就绪，请稍后重试",
+            "ORGANIZATION_USAGE_UNAVAILABLE",
+        )
+    rows = list(stored.get("rows") or [])
+    return {
+        "user": app_user,
+        "startDate": start_date,
+        "endDate": end_date,
+        "source": source,
+        "rows": rows,
+        "summary": usage_summary(rows),
+        "mappingCache": {"hit": True, "ttlSeconds": 0},
+        "dataFreshness": usage_data_freshness(
+            stored.get("lastSyncedAt"), start_date, end_date
+        ),
+        "dataQuality": {
+            "summarySource": "database",
+            "organizationScoped": True,
+            "memberIdentityMatch": "upstream_user_id",
+        },
+        "cache": {"hit": False, "ttlSeconds": 0},
+    }
 
 
 async def local_personal_usage_payload(
@@ -2518,6 +3753,12 @@ async def current_upstream_user(request: Request, refresh: bool = False) -> tupl
         if not local_user or str(local_user.get("status") or "active") != "active":
             raise auth_http_error(401, "本地登录已失效，请重新登录", "AUTH_LOGIN_REQUIRED")
         app_user = await auth_user_payload(local_user, refresh_entitlement=True)
+        if str(local_user.get("account_type") or local_user.get("accountType") or "") == "enterprise_managed":
+            raise auth_http_error(
+                403,
+                "企业托管账号请使用企业令牌管理，不提供个人令牌操作",
+                "ORGANIZATION_UPSTREAM_FORBIDDEN",
+            )
         account = await auth_store_call("get_upstream_account", local_user_id, "primary")
         if not account or account.get("status") != "provisioned" or not account.get("upstream_user_id"):
             raise auth_http_error(409, "账号仍在开通中，请稍后重试", "AUTH_PROVISIONING_PENDING")
@@ -2606,9 +3847,61 @@ class RegisterRequest(BaseModel):
 
 
 class PasswordLoginRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=320)
+    identifier: str | None = Field(default=None, min_length=3, max_length=320)
+    email: str | None = Field(default=None, min_length=3, max_length=320)
     password: str = Field(min_length=1, max_length=128)
     turnstileToken: str = Field(default="", max_length=4096)
+
+    @field_validator("identifier", "email")
+    @classmethod
+    def strip_login_identifier(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
+
+    def resolved_identifier(self) -> str:
+        value = str(self.identifier or self.email or "").strip()
+        if not value:
+            raise ValueError("请输入邮箱或账号")
+        return value
+
+
+class OrganizationInvitationAcceptRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=16, max_length=512)
+    password: str | None = Field(default=None, min_length=8, max_length=128)
+
+    @field_validator("token")
+    @classmethod
+    def strip_invitation_token(cls, value: str) -> str:
+        return value.strip()
+
+
+class OrganizationClaimAcceptRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=24, max_length=512)
+    password: str = Field(min_length=8, max_length=128)
+    turnstileToken: str = Field(default="", max_length=4096)
+
+    @field_validator("token")
+    @classmethod
+    def strip_claim_token(cls, value: str) -> str:
+        return value.strip()
+
+
+class OrganizationMembershipClaimCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    memberName: str | None = Field(default=None, min_length=1, max_length=120)
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    loginName: str = Field(default="lianghaiqiang", min_length=3, max_length=64)
+    departmentId: str = Field(min_length=1, max_length=128)
+    role: Literal["admin", "member"] = "admin"
+
+    @field_validator("memberName", "name", "loginName", "departmentId")
+    @classmethod
+    def strip_claim_text(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
 
 
 class ForgotPasswordRequest(BaseModel):
@@ -2718,6 +4011,10 @@ class OrganizationEmptyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class OrganizationInvitationMutationRequest(OrganizationEmptyRequest):
+    """Strict body for invitation resend/revoke actions."""
+
+
 class PlatformOrganizationRequest(BaseModel):
     """Seller-side customer organization create/update request."""
 
@@ -2740,6 +4037,49 @@ class PlatformOrganizationCreateRequest(PlatformOrganizationRequest):
     @field_validator("adminName", "adminEmail")
     @classmethod
     def strip_admin_text(cls, value: str) -> str:
+        return value.strip()
+
+
+class OrganizationAdoptionPreviewRequest(BaseModel):
+    """Read-only platform preflight for an explicitly configured pilot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    organizationName: str = Field(min_length=1, max_length=120)
+    departmentName: str = Field(min_length=1, max_length=120)
+    adminName: str = Field(min_length=1, max_length=120)
+    adminEmail: str = Field(min_length=3, max_length=254)
+    principalName: str = Field(min_length=1, max_length=120)
+    organizationCandidates: list[str] = Field(default_factory=list, max_length=20)
+    teamCandidates: list[str] = Field(default_factory=list, max_length=20)
+    keyAliases: list[str] = Field(default_factory=list, max_length=20)
+    effectiveFrom: date
+    effectiveThrough: date
+
+    @field_validator(
+        "organizationName",
+        "departmentName",
+        "adminName",
+        "adminEmail",
+        "principalName",
+    )
+    @classmethod
+    def strip_adoption_text(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("organizationCandidates", "teamCandidates", "keyAliases")
+    @classmethod
+    def strip_adoption_candidates(cls, values: list[str]) -> list[str]:
+        return list(dict.fromkeys(str(value or "").strip() for value in values if str(value or "").strip()))
+
+
+class OrganizationAdoptionApplyRequest(OrganizationAdoptionPreviewRequest):
+    previewFingerprint: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    idempotencyKey: str = Field(min_length=8, max_length=128)
+
+    @field_validator("previewFingerprint", "idempotencyKey")
+    @classmethod
+    def strip_adoption_proof(cls, value: str) -> str:
         return value.strip()
 
 
@@ -2769,6 +4109,39 @@ class OrganizationBillingTopupRequest(BaseModel):
         if value < Decimal("1.00") or value > Decimal("100000.00"):
             raise ValueError("amountUsd must be between 1.00 and 100000.00")
         return value.quantize(Decimal("0.01"))
+
+
+class OrganizationCreditAdjustmentRequest(BaseModel):
+    """Seller-issued enterprise credit adjustment with an idempotency key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: Literal["grant", "revoke"]
+    amountUsd: Decimal
+    reason: str = Field(min_length=1, max_length=500)
+    externalReference: str = Field(default="", max_length=128)
+    idempotencyKey: str = Field(min_length=8, max_length=128)
+
+    @field_validator("amountUsd", mode="before")
+    @classmethod
+    def require_numeric_adjustment_amount(cls, value: Any) -> Any:
+        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+            raise ValueError("amountUsd must be a number")
+        return value
+
+    @field_validator("amountUsd")
+    @classmethod
+    def validate_adjustment_amount(cls, value: Decimal) -> Decimal:
+        if not value.is_finite() or value.as_tuple().exponent < -2:
+            raise ValueError("amountUsd must be a finite amount with at most two decimal places")
+        if value < Decimal("0.01") or value > Decimal("100000.00"):
+            raise ValueError("amountUsd must be between 0.01 and 100000.00")
+        return value.quantize(Decimal("0.01"))
+
+    @field_validator("reason", "externalReference", "idempotencyKey")
+    @classmethod
+    def strip_adjustment_text(cls, value: str) -> str:
+        return value.strip()
 
 
 class OrganizationTokenCreateRequest(BaseModel):
@@ -2988,6 +4361,41 @@ async def debug_admin_usage_compare(
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     result: dict[str, Any] = {"status": "ok", "usageSync": dict(_usage_sync_status)}
+    if organization_real_enabled() and (
+        not _organization_capability_status.get("available")
+        or organization_capability_probe_due()
+    ):
+        await refresh_organization_capabilities()
+    result["organization"] = {
+        **dict(_organization_capability_status),
+        "mode": organization_mode(),
+        "configured": bool(
+            organization_demo_enabled()
+            or (
+                organization_real_enabled()
+                and bool(os.getenv("USAGE_DATABASE_URL", "").strip())
+            )
+        ),
+    }
+    if organization_real_enabled() and not _organization_capability_status.get("available"):
+        result["status"] = "degraded"
+    if organization_real_enabled() and isinstance(_organization_store, PostgreSQLOrganizationRepository):
+        try:
+            outbox = await _organization_store.outbox_health()
+            result["organization"]["outbox"] = outbox
+            if outbox["pendingCount"] or outbox.get("failedCount"):
+                result["organization"]["status"] = "degraded"
+                result["status"] = "degraded"
+        except Exception:
+            logger.exception("organization outbox health check failed")
+            result["organization"]["outbox"] = {"status": "error"}
+            result["status"] = "degraded"
+        try:
+            result["organization"]["settlement"] = await _organization_store.settlement_health()
+        except Exception:
+            logger.exception("organization settlement health check failed")
+            result["organization"]["settlement"] = {"status": "error"}
+            result["status"] = "degraded"
     password_unavailable = password_login_unavailable_code()
     signup_unavailable = signup_unavailable_code()
     recovery_unavailable = password_recovery_unavailable_code()
@@ -3026,6 +4434,18 @@ async def health() -> dict[str, Any]:
         result["usageDatabase"] = {"enabled": False, "connected": False, "status": "disabled"}
     if result["usageSync"].get("status") in {"error", "failed", "partial"}:
         result["status"] = "degraded"
+    last_run = str(result["usageSync"].get("lastRun") or "")
+    if last_run:
+        try:
+            parsed_last_run = datetime.fromisoformat(last_run.replace("Z", "+00:00"))
+            if parsed_last_run.tzinfo is None:
+                parsed_last_run = parsed_last_run.replace(tzinfo=timezone.utc)
+            lag_seconds = max(0, int((datetime.now(timezone.utc) - parsed_last_run).total_seconds()))
+            result["usageSync"]["lagSeconds"] = lag_seconds
+            if lag_seconds > max(60, env_int("USAGE_SYNC_HEALTH_MAX_LAG_SECONDS", 7200)):
+                result["status"] = "degraded"
+        except ValueError:
+            result["usageSync"]["lagSeconds"] = None
     billing_ledger = billing_store()
     if billing_ledger is None:
         result["billing"] = {"enabled": False, "status": "disabled"}
@@ -3109,7 +4529,28 @@ async def auth_csrf(request: Request) -> dict[str, str]:
 async def auth_me(request: Request) -> dict[str, Any]:
     local_user = await current_local_auth_user(request)
     if local_user:
-        await retry_local_provisioning(local_user)
+        # Invitation-bound organization accounts are provisioned through the
+        # organization outbox. Never create a second generic local upstream
+        # user for the same password account.
+        if not organization_real_enabled():
+            await retry_local_provisioning(local_user)
+        else:
+            try:
+                # Any durable membership means this account belongs to the
+                # invitation/provisioning state machine, even before it becomes
+                # active. Creating the generic personal upstream user here
+                # would race and conflict with organization member provisioning.
+                managed_account = str(
+                    local_user.get("account_type")
+                    or local_user.get("accountType")
+                    or "personal"
+                ) == "enterprise_managed"
+                if not managed_account and not await organization_memberships_for_user(local_user):
+                    await retry_local_provisioning(local_user)
+            except HTTPException:
+                # Keep real-mode capability failures visible in the scope
+                # response instead of silently creating an unrelated account.
+                pass
     user = await auth_user_payload(local_user, refresh_entitlement=True) if local_user else dict(require_user(request))
     if await is_demo_customer_user(user):
         user.update(await demo_team_scope_for_user(user))
@@ -3206,19 +4647,38 @@ async def password_login(data: PasswordLoginRequest, request: Request) -> dict[s
     await enforce_csrf(request)
     await verify_turnstile(request, data.turnstileToken)
     try:
-        email = auth_store().normalize_email(data.email)
+        identifier = data.resolved_identifier()
+        normalized_identifier = (
+            auth_store().normalize_email(identifier)
+            if "@" in identifier
+            else auth_store().normalize_login_name(identifier)
+        )
     except ValueError as exc:
-        raise auth_http_error(401, "邮箱或密码不正确", "AUTH_INVALID_CREDENTIALS") from exc
-    await enforce_rate_limit("login_email", email, 10, 60)
+        raise auth_http_error(401, "邮箱、账号或密码不正确", "AUTH_INVALID_CREDENTIALS") from exc
+    await enforce_rate_limit("login_identifier", normalized_identifier, 10, 60)
     await enforce_rate_limit("login_ip", request_ip(request), 30, 60)
-    user = await auth_store_call("get_user_by_email", email)
+    user = await auth_store_call("get_user_by_identifier", normalized_identifier)
     valid = bool(user and await asyncio.to_thread(verify_password, data.password, str(user.get("password_hash") or user.get("passwordHash") or "")))
     if not valid:
-        await auth_store_call("record_audit_event", "login_failed", str(user["id"]) if user else None, email, request_ip(request), False, {})
-        raise auth_http_error(401, "邮箱或密码不正确", "AUTH_INVALID_CREDENTIALS")
+        audit_email = str(user.get("email") or "") if user else ""
+        await auth_store_call(
+            "record_audit_event", "login_failed", str(user["id"]) if user else None,
+            audit_email or None, request_ip(request), False,
+            {"identifierType": "email" if "@" in normalized_identifier else "login_name"},
+        )
+        raise auth_http_error(401, "邮箱、账号或密码不正确", "AUTH_INVALID_CREDENTIALS")
     if str(user.get("status") or "active") != "active":
-        raise auth_http_error(403, "账号当前不可登录，请联系管理员", "AUTH_ACCOUNT_SUSPENDED")
-    if env_bool("EMAIL_VERIFICATION_REQUIRED", True) and not bool(user.get("email_verified") or user.get("emailVerified")):
+        status = str(user.get("status") or "")
+        code = "AUTH_PROVISIONING_PENDING" if status in {"pending_approval", "provisioning"} else "AUTH_ACCOUNT_SUSPENDED"
+        message = "企业账号仍在审核或开通中" if code == "AUTH_PROVISIONING_PENDING" else "账号当前不可登录，请联系管理员"
+        raise auth_http_error(403, message, code)
+    if str(user.get("identity_status") or user.get("identityStatus") or "verified") != "verified":
+        raise auth_http_error(403, "企业账号仍待平台审核", "AUTH_IDENTITY_PENDING_APPROVAL")
+    if (
+        str(user.get("account_type") or user.get("accountType") or "personal") == "personal"
+        and env_bool("EMAIL_VERIFICATION_REQUIRED", True)
+        and not bool(user.get("email_verified") or user.get("emailVerified"))
+    ):
         raise auth_http_error(403, "请先完成邮箱验证", "AUTH_EMAIL_UNVERIFIED")
     stored_hash = str(user.get("password_hash") or user.get("passwordHash") or "")
     if password_needs_rehash(stored_hash):
@@ -3226,7 +4686,11 @@ async def password_login(data: PasswordLoginRequest, request: Request) -> dict[s
         user = await auth_store_call("get_user", str(user["id"])) or user
     await auth_store_call("touch_last_login", str(user["id"]))
     payload, csrf_value = await create_local_session(request, user)
-    await auth_store_call("record_audit_event", "login_success", str(user["id"]), email, request_ip(request), True, {})
+    await auth_store_call(
+        "record_audit_event", "login_success", str(user["id"]),
+        str(user.get("email") or "") or None, request_ip(request), True,
+        {"identifierType": "email" if "@" in normalized_identifier else "login_name"},
+    )
     return {"user": payload, "csrfToken": csrf_value}
 
 
@@ -3304,7 +4768,15 @@ async def change_password(data: ChangePasswordRequest, request: Request) -> dict
     await auth_store_call("revoke_user_sessions", user_id)
     updated = await auth_store_call("get_user", user_id) or user
     payload, csrf_value = await create_local_session(request, updated)
-    await auth_store_call("record_audit_event", "password_changed", user_id, str(user["email"]), request_ip(request), True, {})
+    await auth_store_call(
+        "record_audit_event",
+        "password_changed",
+        user_id,
+        str(user.get("email") or "") or None,
+        request_ip(request),
+        True,
+        {},
+    )
     return {"ok": True, "user": payload, "csrfToken": csrf_value}
 
 
@@ -3325,6 +4797,10 @@ def self_service_billing_available(user: dict[str, Any]) -> bool:
         return False
     store = billing_store()
     if store is None or store.pool is None:
+        return False
+    if str(
+        user.get("accountType") or user.get("account_type") or "personal"
+    ) == "enterprise_managed":
         return False
     return bool(user.get("id"))
 
@@ -3517,8 +4993,189 @@ async def logout(request: Request) -> dict[str, bool]:
     return {"ok": True}
 
 
+@app.get("/api/auth/invitations/{token}")
+async def verify_organization_invitation(token: str) -> dict[str, Any]:
+    """Validate an invitation without consuming it or revealing a secret hash."""
+
+    if not organization_real_enabled():
+        raise HTTPException(status_code=404, detail="企业邀请功能尚未开放")
+    try:
+        invitation = await organization_store_call(
+            "verify_invitation", token, _require_capability=False
+        )
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    if not invitation:
+        raise auth_http_error(404, "邀请链接无效、已过期或已被撤销", "ORGANIZATION_INVITATION_INVALID")
+    email = str(invitation.get("email") or "").strip().lower()
+    existing_account = bool(email and await auth_store_call("get_user_by_email", email))
+    return {
+        "ok": True,
+        "invitation": invitation,
+        "existingAccount": existing_account,
+        "passwordRequired": not existing_account,
+    }
+
+
+@app.post("/api/auth/invitations/accept")
+async def accept_organization_invitation(
+    data: OrganizationInvitationAcceptRequest, request: Request
+) -> dict[str, Any]:
+    """Consume an invitation and bind it to a password account.
+
+    Existing accounts keep their password. New accounts must submit one in the
+    invitation request; upstream provisioning is queued before access becomes
+    active, so a transient upstream outage never grants temporary membership.
+    """
+
+    if not organization_real_enabled():
+        raise HTTPException(status_code=404, detail="企业邀请功能尚未开放")
+    await enforce_csrf(request)
+    invitation = await organization_store_call(
+        "verify_invitation", data.token, _require_capability=False
+    )
+    if not invitation:
+        raise auth_http_error(404, "邀请链接无效、已过期或已被撤销", "ORGANIZATION_INVITATION_INVALID")
+    email = str(invitation.get("email") or "").strip().lower()
+    local_user = await auth_store_call("get_user_by_email", email)
+    created_local_user = False
+    if local_user is None:
+        if not data.password:
+            raise auth_http_error(400, "首次接受邀请必须设置密码", "ORGANIZATION_INVITATION_PASSWORD_REQUIRED")
+        try:
+            local_user = await auth_store_call(
+                "create_user",
+                email,
+                str(invitation.get("name") or email.split("@", 1)[0]),
+                await asyncio.to_thread(hash_password, data.password),
+                True,
+                "active",
+            )
+            created_local_user = True
+        except DuplicateEmailError as exc:
+            local_user = await auth_store_call("get_user_by_email", email)
+            if local_user is None:
+                raise auth_http_error(409, "该邮箱已注册，请直接登录", "AUTH_EMAIL_EXISTS") from exc
+    try:
+        consumed = await organization_store_call(
+            "accept_invitation",
+            data.token,
+            str(local_user["id"]),
+            _require_capability=False,
+        )
+    except Exception:
+        if created_local_user:
+            try:
+                await auth_store_call("delete_unprovisioned_user", str(local_user["id"]))
+            except Exception:
+                logger.exception("failed to compensate invitation account creation")
+        raise
+    if not consumed:
+        if created_local_user:
+            try:
+                await auth_store_call("delete_unprovisioned_user", str(local_user["id"]))
+            except Exception:
+                logger.exception("failed to compensate rejected invitation account")
+        raise auth_http_error(409, "邀请链接已被其他请求使用", "ORGANIZATION_INVITATION_CONSUMED")
+    member_id = str(consumed["memberId"])
+    organization_id = str(consumed["organizationId"])
+    payload = await auth_user_payload(local_user)
+    return {
+        "ok": True,
+        "status": "provisioning",
+        "organizationId": organization_id,
+        "memberId": member_id,
+        "user": payload,
+        "message": "邀请已接受，企业账号正在开通中",
+    }
+
+
+@app.get("/api/auth/organization-claims/{token}")
+async def verify_organization_claim(token: str, request: Request) -> dict[str, Any]:
+    """Expose only the offline claim details needed by the anonymous page."""
+
+    if not organization_real_enabled():
+        raise HTTPException(status_code=404, detail="企业账号认领功能尚未开放")
+    await enforce_rate_limit("organization_claim_verify_ip", request_ip(request), 60, 60)
+    claim = await auth_store_call("get_membership_claim_by_token", token)
+    if not claim or str(claim.get("status") or "") != "pending":
+        raise auth_http_error(
+            404, "激活链接无效、已过期或已被撤销", "ORGANIZATION_CLAIM_INVALID"
+        )
+    return {
+        "ok": True,
+        "claim": {
+            "organizationName": claim.get("organizationName"),
+            "loginName": claim.get("loginName"),
+            "memberName": claim.get("memberName"),
+            "role": claim.get("role"),
+            "expiresAt": claim.get("expiresAt"),
+            "status": claim.get("status"),
+        },
+    }
+
+
+@app.post("/api/auth/organization-claims/accept")
+async def accept_organization_claim(
+    data: OrganizationClaimAcceptRequest, request: Request
+) -> dict[str, Any]:
+    """Set a username password, then wait for the platform's offline approval."""
+
+    if not organization_real_enabled():
+        raise HTTPException(status_code=404, detail="企业账号认领功能尚未开放")
+    if not password_login_configured():
+        raise auth_http_error(
+            503,
+            "企业账号登录能力尚未配置完成",
+            "ORGANIZATION_CLAIM_AUTH_UNAVAILABLE",
+        )
+    if not turnstile_enabled() or not turnstile_configured():
+        raise auth_http_error(
+            503,
+            "企业账号激活的人机验证尚未配置完成",
+            "ORGANIZATION_CLAIM_TURNSTILE_REQUIRED",
+        )
+    await enforce_csrf(request)
+    await enforce_rate_limit("organization_claim_attempt_ip", request_ip(request), 30, 3600)
+    await enforce_rate_limit("organization_claim_token", hash_auth_token(data.token), 8, 3600)
+    await verify_turnstile(request, data.turnstileToken)
+    try:
+        accepted = await auth_store_call(
+            "accept_membership_claim",
+            data.token,
+            await asyncio.to_thread(hash_password, data.password),
+        )
+    except DuplicateLoginNameError as exc:
+        raise auth_http_error(
+            409, "该企业账号已存在", "ORGANIZATION_CLAIM_LOGIN_EXISTS"
+        ) from exc
+    if not accepted:
+        raise auth_http_error(
+            409, "激活链接已使用、已过期或已被撤销", "ORGANIZATION_CLAIM_CONSUMED"
+        )
+    claim = accepted.get("claim") or {}
+    user = accepted.get("user") or {}
+    await auth_store_call(
+        "record_audit_event",
+        "organization_claim_accepted",
+        str(user.get("id") or "") or None,
+        None,
+        request_ip(request),
+        True,
+        {"claimId": claim.get("id"), "organizationId": claim.get("organizationId")},
+    )
+    return {
+        "ok": True,
+        "status": "accepted_pending_approval",
+        "claimId": claim.get("id"),
+        "loginName": claim.get("loginName"),
+        "message": "密码已设置，平台完成本人核验后才会开通登录",
+    }
+
+
 @app.get("/api/organization/current")
 async def organization_current(request: Request) -> dict[str, Any]:
+    require_real_organization_capability()
     user = await require_organization_directory_viewer(request)
     return await organization_current_payload(user)
 
@@ -3534,6 +5191,7 @@ async def organization_members(
     page: int = Query(1, ge=1, le=100000),
     pageSize: int = Query(50, ge=1, le=100),
 ) -> dict[str, Any]:
+    require_real_organization_capability()
     user = await require_organization_directory_viewer(request)
     # ``pending`` is the UI wording for a member whose invitation is waiting.
     normalized_status = "invited" if status == "pending" else status
@@ -3561,21 +5219,26 @@ async def organization_current_usage(
     employee: str | None = Query(None, max_length=320),
     refresh: bool = Query(False),
 ) -> dict[str, Any]:
-    """Return Mock full-member usage for the authenticated customer only."""
+    """Return persisted real usage or deterministic demo usage by mode."""
 
     user = await require_organization_usage_viewer(request)
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
     organization_id = organization_identifier(organization_current_member(user))
-    payload = await cached_mock_organization_usage_payload(
-        "mock_organization_usage",
-        organization_id,
-        start_date=start_date,
-        end_date=end_date,
-        source=source,
-        employee=(employee or "").strip(),
-        refresh=refresh,
-    )
+    if organization_real_enabled():
+        payload = await real_organization_usage_payload(
+            organization_id,
+            start_date=start_date,
+            end_date=end_date,
+            source=source,
+            employee=(employee or "").strip(),
+            refresh=refresh,
+        )
+    else:
+        payload = await cached_mock_organization_usage_payload(
+            "mock_organization_usage", organization_id, start_date=start_date,
+            end_date=end_date, source=source, employee=(employee or "").strip(), refresh=refresh,
+        )
     return {
         "organization": {"id": organization_id},
         "startDate": start_date,
@@ -3601,15 +5264,20 @@ async def organization_current_department_usage(
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
     organization_id = organization_identifier(organization_current_member(user))
-    payload = await cached_mock_organization_usage_payload(
-        "mock_department_usage",
-        organization_id,
-        start_date=start_date,
-        end_date=end_date,
-        source=source,
-        department=(department or "").strip(),
-        refresh=refresh,
-    )
+    if organization_real_enabled():
+        payload = await real_organization_department_usage_payload(
+            organization_id,
+            start_date=start_date,
+            end_date=end_date,
+            source=source,
+            department=(department or "").strip(),
+            refresh=refresh,
+        )
+    else:
+        payload = await cached_mock_organization_usage_payload(
+            "mock_department_usage", organization_id, start_date=start_date,
+            end_date=end_date, source=source, department=(department or "").strip(), refresh=refresh,
+        )
     return {
         "organization": {"id": organization_id},
         "startDate": start_date,
@@ -3628,6 +5296,7 @@ async def organization_current_billing(
 ) -> dict[str, Any]:
     """Return a customer administrator's isolated Mock enterprise credit balance."""
 
+    require_real_organization_capability()
     user = await require_organization_billing_viewer(request)
     organization_id = organization_identifier(organization_current_member(user))
     try:
@@ -3650,6 +5319,8 @@ async def organization_current_billing_topup(
 ) -> dict[str, Any]:
     """Credit only the session-derived customer balance; never take payment."""
 
+    if organization_real_enabled():
+        raise auth_http_error(410, "企业模拟充值已下线，请联系平台运营授信", "ORGANIZATION_TOPUP_DISABLED")
     await enforce_csrf(request)
     user = await require_organization_billing_topup_operator(request)
     organization_id = organization_identifier(organization_current_member(user))
@@ -3721,9 +5392,11 @@ async def organization_create_member(data: OrganizationMemberCreateRequest, requ
     await enforce_csrf(request)
     user = await require_organization_demo_manager(request)
     try:
+        organization_id = organization_identifier(organization_current_member(user))
+        operation = "create_member_with_invitation" if organization_real_enabled() else "create_member"
         member = await organization_scoped_store_call(
-            organization_identifier(organization_current_member(user)),
-            "create_member",
+            organization_id,
+            operation,
             data.name,
             data.email,
             data.departmentId,
@@ -3752,15 +5425,122 @@ async def organization_update_member(
     if "role" in fields:
         updates["role"] = data.role
     if "status" in fields:
+        reject_direct_real_member_activation(data.status)
         updates["status"] = "invited" if data.status == "pending" else data.status
     try:
+        organization_id = organization_identifier(organization_current_member(user))
         member = await organization_scoped_store_call(
-            organization_identifier(organization_current_member(user)), "update_member", member_id, **updates
+            organization_id, "update_member", member_id, **updates
         )
+        if organization_real_enabled() and updates.get("status") == "invited":
+            store = organization_store()
+            if isinstance(store, PostgreSQLOrganizationRepository):
+                await store.create_invitation(organization_id, member_id)
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
     invalidate_organization_usage_cache()
     return {"member": member}
+
+
+async def resend_real_member_invitation(
+    organization_id: str,
+    member_id: str,
+) -> dict[str, Any]:
+    """Rotate and enqueue one invitation without sending mail in the request."""
+
+    require_real_organization_capability()
+    store = organization_store()
+    if not isinstance(store, PostgreSQLOrganizationRepository):
+        raise auth_http_error(
+            503,
+            "企业邀请持久化能力暂不可用",
+            "ORGANIZATION_INVITATION_STORE_UNAVAILABLE",
+        )
+    member = await store.get_member(member_id, organization_id=organization_id)
+    if not member:
+        raise auth_http_error(404, "未找到对应成员", "ORGANIZATION_MEMBER_NOT_FOUND")
+    if str(member.get("status") or "") != "invited":
+        raise auth_http_error(
+            409,
+            "只能向待邀请成员重发邀请",
+            "ORGANIZATION_INVITATION_MEMBER_NOT_PENDING",
+        )
+    invitation = await store.create_invitation(organization_id, member_id)
+    # The signed token is an internal delivery credential. Never expose it
+    # from an authenticated management route.
+    return {key: value for key, value in invitation.items() if key != "token"}
+
+
+async def revoke_real_member_invitation(
+    organization_id: str,
+    member_id: str,
+) -> None:
+    """Revoke a tenant-scoped pending invitation by member id."""
+
+    require_real_organization_capability()
+    store = organization_store()
+    if not isinstance(store, PostgreSQLOrganizationRepository):
+        raise auth_http_error(
+            503,
+            "企业邀请持久化能力暂不可用",
+            "ORGANIZATION_INVITATION_STORE_UNAVAILABLE",
+        )
+    member = await store.get_member(member_id, organization_id=organization_id)
+    if not member:
+        raise auth_http_error(404, "未找到对应成员", "ORGANIZATION_MEMBER_NOT_FOUND")
+    if str(member.get("status") or "") != "invited":
+        raise auth_http_error(
+            409,
+            "只能撤销待邀请成员的邀请",
+            "ORGANIZATION_INVITATION_MEMBER_NOT_PENDING",
+        )
+    if not await store.revoke_member_invitation(organization_id, member_id):
+        raise auth_http_error(
+            409,
+            "当前没有可撤销的有效邀请",
+            "ORGANIZATION_INVITATION_NOT_PENDING",
+        )
+
+
+@app.post("/api/organization/current/members/{member_id}/invitation/resend")
+async def organization_resend_member_invitation(
+    member_id: str,
+    request: Request,
+    _data: OrganizationInvitationMutationRequest | None = None,
+) -> dict[str, Any]:
+    """Let a customer administrator rotate and resend a pending invitation."""
+
+    if not organization_real_enabled():
+        raise HTTPException(status_code=404, detail="企业邀请功能尚未开放")
+    await enforce_csrf(request)
+    user = await require_organization_demo_manager(request)
+    organization_id = organization_identifier(organization_current_member(user))
+    try:
+        invitation = await resend_real_member_invitation(organization_id, member_id)
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    return {"ok": True, "invitation": invitation}
+    return {"ok": True, "invitation": invitation}
+
+
+@app.post("/api/organization/current/members/{member_id}/invitation/revoke")
+async def organization_revoke_member_invitation(
+    member_id: str,
+    request: Request,
+    _data: OrganizationInvitationMutationRequest | None = None,
+) -> dict[str, Any]:
+    """Let a customer administrator revoke a pending invitation."""
+
+    if not organization_real_enabled():
+        raise HTTPException(status_code=404, detail="企业邀请功能尚未开放")
+    await enforce_csrf(request)
+    user = await require_organization_demo_manager(request)
+    organization_id = organization_identifier(organization_current_member(user))
+    try:
+        await revoke_real_member_invitation(organization_id, member_id)
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    return {"ok": True, "memberId": member_id}
 
 
 @app.get("/api/organization/current/tokens")
@@ -3774,6 +5554,7 @@ async def organization_current_tokens(
 ) -> dict[str, Any]:
     """List the authenticated customer's own tokens, masked values only."""
 
+    require_real_organization_capability()
     user = await require_organization_demo_manager(request)
     catalog = await organization_token_model_catalog()
     try:
@@ -3801,19 +5582,28 @@ async def organization_create_token(
     await enforce_csrf(request)
     user = await require_organization_demo_manager(request)
     catalog = await organization_token_model_catalog()
-    try:
-        result = await organization_scoped_store_call(
-            organization_identifier(organization_current_member(user)),
-            "create_token",
-            data.name,
-            data.models,
-            member_id=data.memberId,
-            duration=data.duration,
-            daily_budget_usd=data.dailyBudgetUsd,
-            available_models=catalog,
+    organization_id = organization_identifier(organization_current_member(user))
+    if organization_real_enabled():
+        result = await create_real_organization_token(
+            organization_id,
+            data,
+            catalog,
+            changed_by=str(user.get("email") or ""),
         )
-    except OrganizationStoreError as exc:
-        raise organization_token_store_error(exc) from exc
+    else:
+        try:
+            result = await organization_scoped_store_call(
+                organization_id,
+                "create_token",
+                data.name,
+                data.models,
+                member_id=data.memberId,
+                duration=data.duration,
+                daily_budget_usd=data.dailyBudgetUsd,
+                available_models=catalog,
+            )
+        except OrganizationStoreError as exc:
+            raise organization_token_store_error(exc) from exc
     # The plaintext value exists only in this response body, so it must never
     # be stored by a shared cache or an intermediate proxy.
     return JSONResponse(
@@ -3832,14 +5622,22 @@ async def organization_revoke_token(
 
     await enforce_csrf(request)
     user = await require_organization_demo_manager(request)
-    try:
-        token = await organization_scoped_store_call(
-            organization_identifier(organization_current_member(user)),
-            "revoke_token",
+    organization_id = organization_identifier(organization_current_member(user))
+    if organization_real_enabled():
+        token = await revoke_real_organization_token(
+            organization_id,
             token_id,
+            changed_by=str(user.get("email") or ""),
         )
-    except OrganizationStoreError as exc:
-        raise organization_token_store_error(exc) from exc
+    else:
+        try:
+            token = await organization_scoped_store_call(
+                organization_id,
+                "revoke_token",
+                token_id,
+            )
+        except OrganizationStoreError as exc:
+            raise organization_token_store_error(exc) from exc
     return {"ok": True, "token": token}
 
 
@@ -3853,7 +5651,7 @@ async def platform_organizations(
 ) -> dict[str, Any]:
     """List seller-managed customer organizations, never customer memberships."""
 
-    if not organization_demo_enabled():
+    if not organization_enabled():
         raise HTTPException(status_code=404, detail="客户企业演示功能尚未启用")
     require_platform_admin(request)
     try:
@@ -3876,10 +5674,28 @@ async def platform_create_organization(
 ) -> dict[str, Any]:
     """Create a Mock customer with its default department and first administrator."""
 
-    if not organization_demo_enabled():
+    if not organization_enabled():
         raise HTTPException(status_code=404, detail="客户企业演示功能尚未启用")
     await enforce_csrf(request)
     require_platform_admin(request)
+    if organization_real_enabled():
+        existing_account = await auth_store_call("get_user_by_email", data.adminEmail)
+        if existing_account is None:
+            raise auth_http_error(
+                409,
+                "首位企业管理员必须先完成通衢账号注册",
+                "ORGANIZATION_ADMIN_ACCOUNT_NOT_FOUND",
+            )
+        if str(existing_account.get("status") or "") != "active" or str(
+            existing_account.get("identity_status")
+            or existing_account.get("identityStatus")
+            or "verified"
+        ) != "verified":
+            raise auth_http_error(
+                409,
+                "首位企业管理员账号尚未完成身份验证",
+                "ORGANIZATION_ADMIN_ACCOUNT_NOT_VERIFIED",
+            )
     try:
         created = await platform_organization_store_call(
             "create_organization_with_admin",
@@ -3950,6 +5766,8 @@ async def platform_organization_members(
     page: int = Query(1, ge=1, le=100000),
     pageSize: int = Query(50, ge=1, le=100),
 ) -> dict[str, Any]:
+    if organization_real_enabled():
+        require_real_organization_capability()
     await require_platform_organization(request, organization_id)
     try:
         return await organization_scoped_store_call(
@@ -3970,6 +5788,8 @@ async def platform_organization_members(
 async def platform_create_department(
     organization_id: str, data: OrganizationDepartmentRequest, request: Request
 ) -> dict[str, Any]:
+    if organization_real_enabled():
+        require_real_organization_capability()
     await enforce_csrf(request)
     await require_platform_organization(request, organization_id)
     try:
@@ -3987,6 +5807,8 @@ async def platform_update_department(
     data: OrganizationDepartmentRequest,
     request: Request,
 ) -> dict[str, Any]:
+    if organization_real_enabled():
+        require_real_organization_capability()
     await enforce_csrf(request)
     await require_platform_organization(request, organization_id)
     try:
@@ -4006,6 +5828,8 @@ async def platform_archive_department(
     request: Request,
     _data: OrganizationEmptyRequest | None = None,
 ) -> dict[str, Any]:
+    if organization_real_enabled():
+        require_real_organization_capability()
     await enforce_csrf(request)
     await require_platform_organization(request, organization_id)
     try:
@@ -4022,11 +5846,32 @@ async def platform_archive_department(
 async def platform_create_member(
     organization_id: str, data: OrganizationMemberCreateRequest, request: Request
 ) -> dict[str, Any]:
+    if organization_real_enabled():
+        require_real_organization_capability()
     await enforce_csrf(request)
     await require_platform_organization(request, organization_id)
+    if organization_real_enabled():
+        existing_account = await auth_store_call("get_user_by_email", data.email)
+        if existing_account is None:
+            raise auth_http_error(
+                409,
+                "该邮箱尚未注册通衢账号，请先完成账号注册后再邀请",
+                "ORGANIZATION_MEMBER_ACCOUNT_NOT_FOUND",
+            )
+        if str(existing_account.get("status") or "") != "active" or str(
+            existing_account.get("identity_status")
+            or existing_account.get("identityStatus")
+            or "verified"
+        ) != "verified":
+            raise auth_http_error(
+                409,
+                "该账号尚未完成身份验证，暂时不能加入企业",
+                "ORGANIZATION_MEMBER_ACCOUNT_NOT_VERIFIED",
+            )
     try:
+        operation = "create_member_with_invitation" if organization_real_enabled() else "create_member"
         member = await organization_scoped_store_call(
-            organization_id, "create_member", data.name, data.email, data.departmentId, data.role
+            organization_id, operation, data.name, data.email, data.departmentId, data.role
         )
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
@@ -4041,6 +5886,8 @@ async def platform_update_member(
     data: OrganizationMemberUpdateRequest,
     request: Request,
 ) -> dict[str, Any]:
+    if organization_real_enabled():
+        require_real_organization_capability()
     await enforce_csrf(request)
     await require_platform_organization(request, organization_id)
     fields = data.model_fields_set
@@ -4054,15 +5901,1169 @@ async def platform_update_member(
     if "role" in fields:
         updates["role"] = data.role
     if "status" in fields:
+        reject_direct_real_member_activation(data.status)
         updates["status"] = "invited" if data.status == "pending" else data.status
     try:
         member = await organization_scoped_store_call(
             organization_id, "update_member", member_id, **updates
         )
+        if organization_real_enabled() and updates.get("status") == "invited":
+            store = organization_store()
+            if isinstance(store, PostgreSQLOrganizationRepository):
+                await store.create_invitation(organization_id, member_id)
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
     invalidate_organization_usage_cache()
     return {"member": member}
+
+
+@app.post("/api/platform/organizations/{organization_id}/members/{member_id}/invitation/resend")
+async def platform_resend_member_invitation(
+    organization_id: str,
+    member_id: str,
+    request: Request,
+    _data: OrganizationInvitationMutationRequest | None = None,
+) -> dict[str, Any]:
+    """Let a seller operator resend one customer's pending invitation."""
+
+    if not organization_real_enabled():
+        raise HTTPException(status_code=404, detail="企业邀请功能尚未开放")
+    await enforce_csrf(request)
+    await require_platform_organization(request, organization_id)
+    try:
+        invitation = await resend_real_member_invitation(organization_id, member_id)
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    return {"ok": True, "invitation": invitation}
+
+
+def configured_organization_adoption_values(name: str) -> list[str]:
+    """Resolve server-owned pilot candidates without trusting browser values."""
+
+    return list(
+        dict.fromkeys(
+            item.strip()
+            for item in os.getenv(name, "").split(",")
+            if item.strip()
+        )
+    )
+
+
+def organization_adoption_stable_id(kind: str, *values: str) -> str:
+    """Derive retry-stable, non-secret upstream identifiers for one pilot."""
+
+    material = "\x1f".join(str(value or "").strip().casefold() for value in values)
+    value = uuid.uuid5(uuid.NAMESPACE_URL, f"ai-token-dashboard:{kind}:{material}")
+    return f"customer-{kind}-{value}"
+
+
+def parse_optional_upstream_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise OrganizationConflictError(
+            "upstream key expiry snapshot is invalid"
+        ) from exc
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def adoption_upstream_metadata(record: dict[str, Any]) -> dict[str, Any]:
+    value = record.get("metadata")
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+async def ensure_adoption_upstream_scope(
+    upstream: Any,
+    backend: Any,
+    *,
+    source: dict[str, Any],
+    organization_name: str,
+    department_name: str,
+    changed_by: str,
+) -> tuple[str, str]:
+    """Create-or-recover the exact upstream scope planned by the preview."""
+
+    action = str(source.get("action") or "adopt")
+    organization_id = str(source.get("upstreamOrganizationId") or "").strip()
+    team_id = str(source.get("upstreamTeamId") or "").strip()
+    if action != "create":
+        return organization_id, team_id
+    if not organization_id or not team_id:
+        raise OrganizationConflictError("planned upstream scope is incomplete")
+
+    expected_org_metadata = {
+        "adoption_operation": "baic-pilot",
+        "created_via": "ai-token-dashboard",
+    }
+    organizations = await upstream.find_organizations_exact(
+        organization_id=organization_id, backend=backend
+    )
+    if not organizations:
+        try:
+            await upstream.create_organization(
+                organization_name,
+                organization_id=organization_id,
+                metadata=expected_org_metadata,
+                changed_by=changed_by,
+                backend=backend,
+            )
+        except Exception:
+            organizations = await upstream.find_organizations_exact(
+                organization_id=organization_id, backend=backend
+            )
+            if not organizations:
+                raise
+        else:
+            organizations = await upstream.find_organizations_exact(
+                organization_id=organization_id, backend=backend
+            )
+    if len(organizations) != 1:
+        raise OrganizationConflictError("planned upstream organization is ambiguous")
+    organization_record = organizations[0]
+    organization_alias = str(
+        organization_record.get("organization_alias")
+        or organization_record.get("organizationAlias")
+        or organization_record.get("name")
+        or ""
+    ).strip()
+    organization_metadata = adoption_upstream_metadata(organization_record)
+    if (
+        organization_alias.casefold() != organization_name.casefold()
+        or any(
+            str(organization_metadata.get(key) or "") != value
+            for key, value in expected_org_metadata.items()
+        )
+    ):
+        raise OrganizationConflictError("planned upstream organization fingerprint changed")
+
+    expected_team_metadata = {
+        "adoption_operation": "baic-pilot",
+        "created_via": "ai-token-dashboard",
+        "organization_id": organization_id,
+    }
+    teams = await upstream.find_teams_exact(
+        organization_id=organization_id, team_id=team_id, backend=backend
+    )
+    if not teams:
+        try:
+            await upstream.create_team(
+                department_name,
+                organization_id,
+                team_id=team_id,
+                metadata=expected_team_metadata,
+                changed_by=changed_by,
+                backend=backend,
+            )
+        except Exception:
+            teams = await upstream.find_teams_exact(
+                organization_id=organization_id, team_id=team_id, backend=backend
+            )
+            if not teams:
+                raise
+        else:
+            teams = await upstream.find_teams_exact(
+                organization_id=organization_id, team_id=team_id, backend=backend
+            )
+    if len(teams) != 1:
+        raise OrganizationConflictError("planned upstream team is ambiguous")
+    team_record = teams[0]
+    team_alias = str(
+        team_record.get("team_alias")
+        or team_record.get("teamAlias")
+        or team_record.get("name")
+        or ""
+    ).strip()
+    team_organization_id = str(
+        team_record.get("organization_id")
+        or team_record.get("organizationId")
+        or team_record.get("org_id")
+        or ""
+    ).strip()
+    team_metadata = adoption_upstream_metadata(team_record)
+    if (
+        team_alias.casefold() != department_name.casefold()
+        or team_organization_id != organization_id
+        or any(
+            str(team_metadata.get(key) or "") != value
+            for key, value in expected_team_metadata.items()
+        )
+    ):
+        raise OrganizationConflictError("planned upstream team fingerprint changed")
+    return organization_id, team_id
+
+
+async def organization_adoption_preview_payload(
+    data: OrganizationAdoptionPreviewRequest,
+) -> dict[str, Any]:
+    """Build a secret-free fingerprint from exact read-only upstream matches."""
+
+    if data.effectiveFrom > data.effectiveThrough:
+        raise auth_http_error(
+            400,
+            "历史用量时间范围无效",
+            "ORGANIZATION_ADOPTION_INVALID_WINDOW",
+        )
+    if (
+        data.organizationName != "北汽集团"
+        or data.departmentName != "企业管理"
+        or data.adminName != "David Zhu"
+        or data.adminEmail.casefold() != "davidzhu2021@163.com"
+        or data.principalName != "梁海强"
+    ):
+        raise auth_http_error(
+            409,
+            "接管请求与北汽试点预留信息不一致",
+            "ORGANIZATION_ADOPTION_PILOT_MISMATCH",
+        )
+    if data.effectiveThrough > usage_today() + timedelta(days=3660):
+        raise auth_http_error(
+            400,
+            "历史资产归属截止时间超出允许范围",
+            "ORGANIZATION_ADOPTION_INVALID_WINDOW",
+        )
+    account = await auth_store_call("get_user_by_email", data.adminEmail)
+    if not account or str(account.get("status") or "") != "active" or str(
+        account.get("identity_status") or account.get("identityStatus") or "verified"
+    ) != "verified":
+        raise auth_http_error(
+            409,
+            "临时管理员账号不存在或尚未完成验证",
+            "ORGANIZATION_ADOPTION_ADMIN_INVALID",
+        )
+
+    configured_organizations = configured_organization_adoption_values(
+        "ORGANIZATION_ADOPTION_ORGANIZATION_CANDIDATES"
+    )
+    configured_teams = configured_organization_adoption_values(
+        "ORGANIZATION_ADOPTION_TEAM_CANDIDATES"
+    )
+    configured_aliases = configured_organization_adoption_values(
+        "ORGANIZATION_ADOPTION_KEY_ALIASES"
+    )
+    # Candidate identifiers are intentionally server-owned. The request fields
+    # remain in the schema for forward-compatible clients, but are ignored in
+    # real mode so a browser cannot steer an adoption lookup at another tenant.
+    organization_candidates = configured_organizations
+    team_candidates = configured_teams
+    key_aliases = configured_aliases
+    if not organization_candidates or not team_candidates or not key_aliases:
+        raise auth_http_error(
+            503,
+            "接管候选对象尚未在服务端配置",
+            "ORGANIZATION_ADOPTION_NOT_CONFIGURED",
+        )
+    backend_id = os.getenv("ORGANIZATION_ADOPTION_BACKEND_ID", "primary").strip() or "primary"
+    upstream = client()
+    backend = next((item for item in upstream.backends if item.id == backend_id), None)
+    if backend is None:
+        raise auth_http_error(
+            503,
+            "接管数据来源不可用",
+            "ORGANIZATION_ADOPTION_BACKEND_UNAVAILABLE",
+        )
+
+    async def exact_organization_candidates(candidate: str) -> list[dict[str, Any]]:
+        value = candidate.strip()
+        if value.startswith("id:"):
+            return await upstream.find_organizations_exact(
+                organization_id=value[3:].strip(), backend=backend
+            )
+        if value.startswith("alias:"):
+            return await upstream.find_organizations_exact(
+                organization_alias=value[6:].strip(), backend=backend
+            )
+        by_id = await upstream.find_organizations_exact(
+            organization_id=value, backend=backend
+        )
+        by_alias = await upstream.find_organizations_exact(
+            organization_alias=value, backend=backend
+        )
+        return [*by_id, *by_alias]
+
+    async def exact_team_candidates(candidate: str) -> list[dict[str, Any]]:
+        value = candidate.strip()
+        if value.startswith("id:"):
+            return await upstream.find_teams_exact(
+                organization_id=upstream_organization_id,
+                team_id=value[3:].strip(),
+                backend=backend,
+            )
+        if value.startswith("alias:"):
+            return await upstream.find_teams_exact(
+                organization_id=upstream_organization_id,
+                team_alias=value[6:].strip(),
+                backend=backend,
+            )
+        by_id = await upstream.find_teams_exact(
+            organization_id=upstream_organization_id,
+            team_id=value,
+            backend=backend,
+        )
+        by_alias = await upstream.find_teams_exact(
+            organization_id=upstream_organization_id,
+            team_alias=value,
+            backend=backend,
+        )
+        return [*by_id, *by_alias]
+
+    organization_matches: dict[str, dict[str, Any]] = {}
+    for candidate in organization_candidates:
+        matches = await exact_organization_candidates(candidate)
+        for record in matches:
+            identity = str(
+                record.get("organization_id")
+                or record.get("organizationId")
+                or record.get("id")
+                or ""
+            ).strip()
+            if identity:
+                organization_matches[identity] = record
+    if len(organization_matches) > 1:
+        raise auth_http_error(
+            409,
+            "企业候选对象不是唯一匹配，未执行任何写入",
+            "ORGANIZATION_ADOPTION_CONFLICT",
+        )
+    upstream_organization_id = next(iter(organization_matches), "")
+
+    team_matches: dict[str, dict[str, Any]] = {}
+    if upstream_organization_id:
+        for candidate in team_candidates:
+            matches = await exact_team_candidates(candidate)
+            for record in matches:
+                identity = str(record.get("team_id") or record.get("teamId") or record.get("id") or "").strip()
+                if identity:
+                    team_matches[identity] = record
+    else:
+        # A zero-match create is safe only when none of the configured stable
+        # team candidates already exists anywhere. An orphan Team is a
+        # partial upstream state and must be resolved by an operator.
+        for candidate in team_candidates:
+            value = candidate.strip()
+            if value.startswith("id:"):
+                matches = await upstream.find_teams_exact(
+                    team_id=value[3:].strip(), backend=backend
+                )
+            elif value.startswith("alias:"):
+                matches = await upstream.find_teams_exact(
+                    team_alias=value[6:].strip(), backend=backend
+                )
+            else:
+                matches = [
+                    *await upstream.find_teams_exact(team_id=value, backend=backend),
+                    *await upstream.find_teams_exact(team_alias=value, backend=backend),
+                ]
+            for record in matches:
+                identity = str(
+                    record.get("team_id")
+                    or record.get("teamId")
+                    or record.get("id")
+                    or ""
+                ).strip()
+                if identity:
+                    team_matches[identity] = record
+    if len(team_matches) > 1 or bool(upstream_organization_id) != bool(team_matches):
+        raise auth_http_error(
+            409,
+            "部门候选对象不是唯一匹配，未执行任何写入",
+            "ORGANIZATION_ADOPTION_CONFLICT",
+        )
+    action = "adopt" if upstream_organization_id else "create"
+    upstream_team_id = next(iter(team_matches), "")
+    if action == "create":
+        stable_material = (
+            backend_id,
+            data.organizationName,
+            data.departmentName,
+            data.adminEmail,
+            data.principalName,
+            *sorted(key_aliases),
+        )
+        upstream_organization_id = organization_adoption_stable_id(
+            "organization", *stable_material
+        )
+        upstream_team_id = organization_adoption_stable_id("team", *stable_material)
+
+    asset_records: list[dict[str, str]] = []
+    seen_hashes: set[str] = set()
+    user_ids: set[str] = set()
+    for alias in key_aliases:
+        matches = await upstream.list_keys_exact(key_alias=alias, backend=backend)
+        if len(matches) != 1:
+            raise auth_http_error(
+                409,
+                "历史资产不是唯一匹配，未执行任何写入",
+                "ORGANIZATION_ADOPTION_CONFLICT",
+            )
+        identity = upstream.report_only_key_identity(matches[0])
+        key_hash = str(identity.get("hash") or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", key_hash):
+            raise auth_http_error(
+                409,
+                "历史资产缺少稳定标识，未执行任何写入",
+                "ORGANIZATION_ADOPTION_CONFLICT",
+            )
+        scope_matches = (
+            identity.get("organizationId") == upstream_organization_id
+            and identity.get("teamId") == upstream_team_id
+        ) if action == "adopt" else (
+            not str(identity.get("organizationId") or "").strip()
+            and not str(identity.get("teamId") or "").strip()
+        )
+        if (
+            key_hash in seen_hashes
+            or not scope_matches
+            or not str(identity.get("userId") or "").strip()
+        ):
+            raise auth_http_error(
+                409,
+                "历史资产范围与候选企业不一致，未执行任何写入",
+                "ORGANIZATION_ADOPTION_CONFLICT",
+            )
+        seen_hashes.add(key_hash)
+        user_ids.add(str(identity.get("userId") or ""))
+        asset_records.append(
+            {
+                "alias": alias,
+                "keyHash": key_hash,
+                "maskedKey": f"sha256:...{key_hash[-8:]}",
+                "organizationId": upstream_organization_id,
+                "teamId": upstream_team_id,
+                "userId": str(identity.get("userId") or ""),
+                "models": list(identity.get("models") or []),
+                "maxBudget": identity.get("maxBudget"),
+                "budgetDuration": str(identity.get("budgetDuration") or ""),
+                "spend": identity.get("spend"),
+                "expiresAt": str(identity.get("expiresAt") or ""),
+                "blocked": bool(identity.get("blocked")),
+            }
+        )
+    fingerprint_source = {
+        "organizationName": data.organizationName,
+        "departmentName": data.departmentName,
+        "adminName": data.adminName,
+        "adminEmail": data.adminEmail.lower(),
+        "principalName": data.principalName,
+        "effectiveFrom": data.effectiveFrom.isoformat(),
+        "effectiveThrough": data.effectiveThrough.isoformat(),
+        "backendId": backend_id,
+        "action": action,
+        "upstreamOrganizationId": upstream_organization_id,
+        "upstreamTeamId": upstream_team_id,
+        "assets": sorted(asset_records, key=lambda item: item["keyHash"]),
+    }
+    preview_fingerprint = hashlib.sha256(
+        json.dumps(fingerprint_source, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "status": "ready",
+        "previewFingerprint": preview_fingerprint,
+        "idempotencyKey": hashlib.sha256(
+            json.dumps(fingerprint_source, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:32],
+        "organization": {
+            "action": action,
+            "name": data.organizationName,
+        },
+        "department": {
+            "action": action,
+            "name": data.departmentName,
+            "scopeConsistent": True,
+        },
+        "legacyAssets": {
+            "count": len(asset_records),
+            "originalIdentityCount": len({item for item in user_ids if item}),
+            "principalName": data.principalName,
+            "scopeConsistent": True,
+            "items": [
+                {
+                    "maskedKey": item["maskedKey"],
+                    "managementMode": "read_only",
+                    "billingMode": "report_only",
+                }
+                for item in asset_records
+            ],
+        },
+        "_apply": fingerprint_source,
+    }
+
+
+async def replayed_organization_adoption(
+    data: OrganizationAdoptionApplyRequest,
+    repository: PostgreSQLOrganizationRepository,
+) -> dict[str, Any] | None:
+    """Return a completed adoption before requiring the upstream preflight.
+
+    A retry after a successful apply must still work when the upstream is
+    temporarily unavailable. The stored request/preview fingerprints prove
+    that the idempotency key is being reused for the same public request.
+    """
+
+    operation = await repository.get_adoption_operation(data.idempotencyKey)
+    if not operation or str(operation.get("status") or "") != "applied":
+        return None
+    public_request = data.model_dump(
+        exclude={"previewFingerprint", "idempotencyKey"}, mode="json"
+    )
+    public_fingerprint = hashlib.sha256(
+        json.dumps(
+            public_request,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if (
+        str(operation.get("previewFingerprint") or "") != data.previewFingerprint
+        or str(operation.get("requestFingerprint") or "") != public_fingerprint
+    ):
+        raise auth_http_error(
+            409,
+            "幂等键已用于另一笔企业接管",
+            "ORGANIZATION_ADOPTION_CONFLICT",
+        )
+    result = operation.get("result") or {}
+    return result if isinstance(result, dict) else {"ok": True, "status": "applied"}
+
+
+@app.post("/api/platform/organization-adoptions/preview")
+async def platform_organization_adoption_preview(
+    data: OrganizationAdoptionPreviewRequest,
+    request: Request,
+) -> dict[str, Any]:
+    if not organization_real_enabled():
+        raise HTTPException(status_code=404, detail="企业接管功能尚未开放")
+    require_real_organization_capability()
+    await enforce_csrf(request)
+    require_platform_admin(request)
+    payload = await organization_adoption_preview_payload(data)
+    payload.pop("_apply", None)
+    return payload
+
+
+@app.post("/api/platform/organization-adoptions/apply")
+async def platform_organization_adoption_apply(
+    data: OrganizationAdoptionApplyRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Apply one previously fingerprinted, server-preflighted pilot adoption."""
+
+    if not organization_real_enabled():
+        raise HTTPException(status_code=404, detail="企业接管功能尚未开放")
+    require_real_organization_capability()
+    await enforce_csrf(request)
+    actor = require_platform_admin(request)
+    repository = organization_store()
+    if not isinstance(repository, PostgreSQLOrganizationRepository):
+        raise auth_http_error(
+            503,
+            "企业接管持久化能力暂不可用",
+            "ORGANIZATION_ADOPTION_UNAVAILABLE",
+        )
+    replay = await replayed_organization_adoption(data, repository)
+    if replay is not None:
+        return replay
+    preview = await organization_adoption_preview_payload(data)
+    if preview.get("previewFingerprint") != data.previewFingerprint:
+        raise auth_http_error(
+            409,
+            "接管预检指纹已变化，请重新执行预检",
+            "ORGANIZATION_ADOPTION_CONFLICT",
+        )
+    source = preview.get("_apply") or {}
+    upstream = client()
+    operation_key = data.idempotencyKey.strip()
+    request_fingerprint = hashlib.sha256(
+        json.dumps(
+            data.model_dump(
+                exclude={"previewFingerprint", "idempotencyKey"}, mode="json"
+            ),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    actor_id = str(actor.get("email") or actor.get("id") or "platform")
+    try:
+        operation = await repository.begin_adoption_operation(
+            operation_key,
+            request_fingerprint=request_fingerprint,
+            preview_fingerprint=data.previewFingerprint,
+            actor=actor_id,
+        )
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    if str(operation.get("status") or "") == "applied":
+        result = operation.get("result") or {}
+        return result if isinstance(result, dict) else {"ok": True, "status": "applied"}
+
+    operation_id = str(operation["id"])
+    try:
+        backend = next(
+            (
+                item
+                for item in upstream.backends
+                if item.id == source.get("backendId", "primary")
+            ),
+            None,
+        )
+        if backend is None:
+            raise RuntimeError("adoption backend is unavailable")
+        upstream_organization_id, upstream_team_id = (
+            await ensure_adoption_upstream_scope(
+                upstream,
+                backend,
+                source=source,
+                organization_name=data.organizationName,
+                department_name=data.departmentName,
+                changed_by=actor_id,
+            )
+        )
+
+        # Mappings created by a prior partial attempt are safe only when both
+        # point to the same local organization selected by this operation.
+        mapped_org = await repository.get_organization_by_upstream_id(
+            upstream_organization_id
+        )
+        mapped_team = await repository.get_department_by_upstream_id(upstream_team_id)
+        operation_organization_id = str(operation.get("organizationId") or "")
+        if mapped_org and not operation_organization_id:
+            operation_organization_id = str(mapped_org.get("id") or "")
+        if mapped_org and operation_organization_id and str(mapped_org.get("id")) != operation_organization_id:
+            raise OrganizationConflictError("upstream organization belongs to another adoption")
+        if mapped_team and operation_organization_id and str(mapped_team.get("organizationId") or "") not in {"", operation_organization_id}:
+            raise OrganizationConflictError("upstream team belongs to another adoption")
+        if mapped_org and mapped_team:
+            if str(mapped_team.get("organizationId") or "") != str(mapped_org.get("id") or ""):
+                raise OrganizationConflictError("upstream organization and team mappings conflict")
+            organization_id = str(mapped_org["id"])
+            department_id = str(mapped_team["id"])
+        elif mapped_org or mapped_team:
+            raise OrganizationConflictError("upstream adoption mapping is incomplete")
+        else:
+            organizations = await repository.list_organizations(
+                keyword=data.organizationName,
+                include_archived=False,
+                page=1,
+                page_size=10,
+            )
+            items = [
+                item for item in (organizations.get("items") or [])
+                if str(item.get("name") or "").casefold() == data.organizationName.casefold()
+            ]
+            if len(items) > 1:
+                raise OrganizationConflictError("local organization name is ambiguous")
+            if items:
+                organization_id = str(items[0]["id"])
+                snapshot = await repository.get_organization_snapshot(organization_id)
+                departments = [
+                    item for item in snapshot.get("departments", [])
+                    if str(item.get("name") or "").casefold() == data.departmentName.casefold()
+                ]
+                if len(departments) != 1:
+                    raise OrganizationConflictError("local department is ambiguous")
+                department_id = str(departments[0]["id"])
+            else:
+                created = await repository.create_organization_with_admin(
+                    data.organizationName,
+                    data.adminName,
+                    data.adminEmail,
+                    default_department_name=data.departmentName,
+                )
+                organization_id = str(created["organization"]["id"])
+                department_id = str(created["department"]["id"])
+            await repository.adopt_existing_upstream_scope(
+                organization_id,
+                department_id,
+                upstream_organization_id=upstream_organization_id,
+                upstream_team_id=upstream_team_id,
+            )
+
+        members = await repository.list_members(
+            organization_id=organization_id,
+            keyword=data.adminEmail,
+            page=1,
+            page_size=10,
+        )
+        admin_member = next(
+            (
+                item for item in members.get("items", [])
+                if str(item.get("email") or "").casefold() == data.adminEmail.casefold()
+            ),
+            None,
+        )
+        if admin_member is None:
+            admin_member = await repository.create_member_with_invitation(
+                data.adminName,
+                data.adminEmail,
+                department_id,
+                "admin",
+                team_role="leader",
+                organization_id=organization_id,
+            )
+        else:
+            await repository.ensure_member_invitation(
+                organization_id, str(admin_member["id"])
+            )
+
+        principal = await repository.ensure_principal(
+            organization_id, data.principalName
+        )
+        imported: list[dict[str, Any]] = []
+        effective_from = datetime.combine(
+            data.effectiveFrom, datetime.min.time(), tzinfo=timezone.utc
+        )
+        # Imported legacy keys remain report-only for future requests until a
+        # separate, explicit managed-key migration closes this open interval.
+        effective_through = None
+        for item in source.get("assets", []):
+            alias = str(item.get("alias") or "")
+            records = await upstream.list_keys_exact(key_alias=alias, backend=backend)
+            if len(records) != 1:
+                raise OrganizationConflictError("report-only key match changed")
+            identity = upstream.report_only_key_identity(records[0])
+            action = str(source.get("action") or "adopt")
+            identity_organization_id = str(identity.get("organizationId") or "")
+            identity_team_id = str(identity.get("teamId") or "")
+            expected_scope = (
+                identity_organization_id == upstream_organization_id
+                and identity_team_id == upstream_team_id
+            ) if action == "adopt" else (
+                not identity_organization_id and not identity_team_id
+            )
+            if (
+                str(identity.get("hash") or "") != str(item.get("keyHash") or "")
+                or not expected_scope
+                or str(identity.get("userId") or "") != str(item.get("userId") or "")
+            ):
+                raise OrganizationConflictError("report-only key fingerprint changed")
+            await repository.attach_principal_upstream_identity(
+                str(principal["id"]),
+                organization_id=organization_id,
+                backend_id=str(source.get("backendId") or "primary"),
+                upstream_user_id=str(identity.get("userId") or ""),
+            )
+            imported.append(
+                await repository.import_report_only_key_identity(
+                    organization_id,
+                    backend_id=str(source.get("backendId") or "primary"),
+                    upstream_key_hash=str(identity.get("hash") or ""),
+                    upstream_key_id=str(identity.get("id") or ""),
+                    key_alias=alias,
+                    principal_id=str(principal["id"]),
+                    member_id="",
+                    department_id=department_id,
+                    effective_from=effective_from,
+                    effective_through=effective_through,
+                    idempotency_key=f"{operation_key}:{identity['hash']}",
+                    upstream_organization_id_snapshot=upstream_organization_id,
+                    upstream_team_id_snapshot=upstream_team_id,
+                    upstream_user_id_snapshot=str(identity.get("userId") or ""),
+                    models_snapshot=list(identity.get("models") or []),
+                    max_budget_usd_snapshot=identity.get("maxBudget"),
+                    spend_usd_snapshot=identity.get("spend"),
+                    budget_duration_snapshot=str(
+                        identity.get("budgetDuration") or ""
+                    ),
+                    expires_at_snapshot=parse_optional_upstream_datetime(
+                        identity.get("expiresAt")
+                    ),
+                    blocked_snapshot=bool(identity.get("blocked")),
+                    import_batch_id=operation_key,
+                    reporting_requested_through=data.effectiveThrough,
+                    actor=actor_id,
+                )
+            )
+        # Queue historical log backfill separately from the durable asset
+        # import. Each worker window is capped at three days and can be
+        # retried without changing the report-only billing policy.
+        for imported_item in imported:
+            await repository.ensure_usage_backfill(
+                organization_id,
+                principal_id=str(principal["id"]),
+                usage_key_identity_id=str(imported_item["id"]),
+                backend_id=str(source.get("backendId") or "primary"),
+                requested_from=data.effectiveFrom,
+                requested_through=data.effectiveThrough,
+                import_batch_id=operation_key,
+            )
+        result = {
+            "ok": True,
+            "status": "applied",
+            "organization": await repository.get_organization(organization_id),
+            "admin": {
+                "memberId": str(admin_member["id"]),
+                "status": str(admin_member.get("status") or "invited"),
+            },
+            "principal": {
+                "id": str(principal["id"]),
+                "name": str(principal.get("name") or data.principalName),
+            },
+            "legacyAssets": {"count": len(imported), "items": imported},
+        }
+        await repository.record_audit(
+            organization_id,
+            "organization.adoption.applied",
+            actor=actor_id,
+            target_type="adoption",
+            target_id=operation_key,
+            details={
+                "previewFingerprint": data.previewFingerprint,
+                "legacyAssetCount": len(imported),
+                "principalId": str(principal["id"]),
+            },
+        )
+        await repository.complete_adoption_operation(
+            operation_id, organization_id, result
+        )
+        return result
+    except Exception as exc:
+        await repository.fail_adoption_operation(operation_id, str(exc))
+        if isinstance(exc, OrganizationStoreError):
+            raise organization_store_error(exc) from exc
+        raise
+
+
+@app.get("/api/platform/organizations/{organization_id}/membership-claims")
+async def platform_membership_claims(
+    organization_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    """List offline username claims for one selected customer."""
+
+    if not organization_real_enabled():
+        raise HTTPException(status_code=404, detail="企业账号认领功能尚未开放")
+    selected = await require_platform_claim_organization(request, organization_id)
+    items = await auth_store_call(
+        "list_membership_claims", str(selected["selectedOrganizationId"]), 200
+    )
+    return {"items": items, "total": len(items)}
+
+
+@app.post("/api/platform/organizations/{organization_id}/membership-claims")
+async def platform_create_membership_claim(
+    organization_id: str,
+    data: OrganizationMembershipClaimCreateRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Issue a short-lived link for an offline-verified enterprise account."""
+
+    if not organization_real_enabled():
+        raise HTTPException(status_code=404, detail="企业账号认领功能尚未开放")
+    if not password_login_configured() or not turnstile_enabled() or not turnstile_configured():
+        raise auth_http_error(
+            503,
+            "企业账号认领所需的登录与人机验证尚未配置完成",
+            "ORGANIZATION_CLAIM_NOT_READY",
+        )
+    await enforce_csrf(request)
+    selected = await require_platform_claim_organization(request, organization_id)
+    actor = str(selected.get("email") or selected.get("id") or "platform")
+    await enforce_rate_limit(
+        "organization_claim_issue",
+        f"{actor.casefold()}:{organization_id}:{data.loginName.casefold()}",
+        10,
+        3600,
+    )
+    repository = organization_store()
+    if not isinstance(repository, PostgreSQLOrganizationRepository):
+        raise auth_http_error(503, "企业账号数据暂不可用", "ORGANIZATION_CLAIM_UNAVAILABLE")
+    organization = await repository.get_organization(organization_id)
+    department = await repository.get_department(data.departmentId, organization_id=organization_id)
+    if not organization or not department or str(department.get("status") or "active") != "active":
+        raise auth_http_error(404, "未找到对应的企业或部门", "ORGANIZATION_CLAIM_SCOPE_NOT_FOUND")
+    if str(organization.get("name") or "").strip() != "北汽集团":
+        raise auth_http_error(
+            409,
+            "当前线下账号认领仅开放给北汽集团试点",
+            "ORGANIZATION_CLAIM_PILOT_ONLY",
+        )
+    if (
+        str(data.memberName or data.name or "").strip() != "梁海强"
+        or str(data.loginName or "").strip().casefold() != "lianghaiqiang"
+        or str(data.role or "") != "admin"
+        or str(department.get("name") or "").strip() != "企业管理"
+    ):
+        raise auth_http_error(
+            409,
+            "北汽试点认领信息与预留身份不一致",
+            "ORGANIZATION_CLAIM_IDENTITY_MISMATCH",
+        )
+    try:
+        member_name = str(data.memberName or data.name or "梁海强").strip()
+        principal = await repository.ensure_principal(
+            organization_id, member_name
+        )
+        claim = await auth_store_call(
+            "create_membership_claim",
+            organization_id,
+            str(organization["name"]),
+            data.departmentId,
+            member_name,
+            data.loginName,
+            data.role,
+            datetime.now(timezone.utc) + timedelta(hours=2),
+            actor,
+            principal_id=str(principal["id"]),
+        )
+    except (DuplicateLoginNameError, MembershipClaimStateError) as exc:
+        raise auth_http_error(409, str(exc), "ORGANIZATION_CLAIM_CONFLICT") from exc
+    token = str(claim.pop("token", ""))
+    await repository.record_audit(
+        organization_id,
+        "organization.membership_claim.created",
+        actor=actor,
+        target_type="membership_claim",
+        target_id=str(claim.get("id") or ""),
+        details={
+            "loginName": str(claim.get("loginName") or ""),
+            "principalId": str(claim.get("principalId") or ""),
+            "departmentId": str(claim.get("departmentId") or ""),
+            "role": str(claim.get("role") or ""),
+            "toStatus": str(claim.get("status") or "pending"),
+            "ipAddress": request_ip(request),
+        },
+    )
+    base_url = os.getenv("APP_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+    activation_url = f"{base_url}/?organization_claim={token}"
+    return {
+        "ok": True,
+        "claim": claim,
+        # This is the only response that includes the plaintext claim token.
+        "activationUrl": activation_url,
+        "claimUrl": activation_url,
+    }
+
+
+@app.post(
+    "/api/platform/organizations/{organization_id}/membership-claims/{claim_id}/approve"
+)
+async def platform_approve_membership_claim(
+    organization_id: str,
+    claim_id: str,
+    request: Request,
+    _data: OrganizationEmptyRequest | None = None,
+) -> dict[str, Any]:
+    """Approve identity, bind a local member, and queue upstream provisioning."""
+
+    if not organization_real_enabled():
+        raise HTTPException(status_code=404, detail="企业账号认领功能尚未开放")
+    await enforce_csrf(request)
+    selected = await require_platform_claim_organization(request, organization_id)
+    actor = str(selected.get("email") or selected.get("id") or "platform")
+    claim = await auth_store_call("get_membership_claim", claim_id)
+    if not claim or str(claim.get("organizationId") or "") != organization_id:
+        raise auth_http_error(404, "未找到对应的账号认领", "ORGANIZATION_CLAIM_NOT_FOUND")
+    try:
+        approved = await auth_store_call(
+            "approve_membership_claim",
+            claim_id,
+            actor,
+        )
+        if not approved:
+            raise auth_http_error(404, "未找到对应的账号认领", "ORGANIZATION_CLAIM_NOT_FOUND")
+        repository = organization_store()
+        if not isinstance(repository, PostgreSQLOrganizationRepository):
+            raise RuntimeError("organization repository is unavailable")
+        member = await repository.create_managed_member(
+            str(approved["memberName"]),
+            str(approved["loginName"]),
+            str(approved["departmentId"]),
+            str(approved.get("role") or "admin"),
+            auth_user_id=str(approved["authUserId"]),
+            team_role="leader" if str(approved.get("role")) == "admin" else "member",
+            organization_id=organization_id,
+        )
+        principal_id = str(approved.get("principalId") or "")
+        if principal_id:
+            await repository.link_principal_member(
+                organization_id, principal_id, str(member["id"])
+            )
+        await auth_store_call("mark_membership_claim_provisioning", claim_id, "")
+        # Do not wait for the periodic worker when the upstream is healthy;
+        # process the durable job once and then reconcile account activation.
+        await organization_outbox_if_available(limit=20)
+        claim_after = await auth_store_call("get_membership_claim", claim_id)
+        await repository.record_audit(
+            organization_id,
+            "organization.membership_claim.approved",
+            actor=actor,
+            target_type="membership_claim",
+            target_id=claim_id,
+            details={
+                "authUserId": str(approved.get("authUserId") or ""),
+                "memberId": str(member.get("id") or ""),
+                "principalId": principal_id,
+                "fromStatus": str(claim.get("status") or ""),
+                "toStatus": str((claim_after or {}).get("status") or "provisioning"),
+                "ipAddress": request_ip(request),
+            },
+        )
+    except MembershipClaimStateError as exc:
+        raise auth_http_error(409, str(exc), "ORGANIZATION_CLAIM_CONFLICT") from exc
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    return {
+        "ok": True,
+        "status": str((claim_after or {}).get("status") or "provisioning"),
+        "claim": claim_after,
+        "member": member,
+    }
+
+
+@app.post(
+    "/api/platform/organizations/{organization_id}/membership-claims/{claim_id}/revoke"
+)
+async def platform_revoke_membership_claim(
+    organization_id: str,
+    claim_id: str,
+    request: Request,
+    _data: OrganizationEmptyRequest | None = None,
+) -> dict[str, Any]:
+    if not organization_real_enabled():
+        raise HTTPException(status_code=404, detail="企业账号认领功能尚未开放")
+    await enforce_csrf(request)
+    selected = await require_platform_claim_organization(request, organization_id)
+    actor = str(selected.get("email") or selected.get("id") or "platform")
+    claim = await auth_store_call("get_membership_claim", claim_id)
+    if not claim or str(claim.get("organizationId") or "") != organization_id:
+        raise auth_http_error(404, "未找到对应的账号认领", "ORGANIZATION_CLAIM_NOT_FOUND")
+    try:
+        revoked = await auth_store_call(
+            "revoke_membership_claim",
+            claim_id,
+            actor,
+        )
+    except MembershipClaimStateError as exc:
+        raise auth_http_error(409, str(exc), "ORGANIZATION_CLAIM_CONFLICT") from exc
+    repository = organization_store()
+    if not isinstance(repository, PostgreSQLOrganizationRepository):
+        raise auth_http_error(503, "企业账号数据暂不可用", "ORGANIZATION_CLAIM_UNAVAILABLE")
+    await repository.record_audit(
+        organization_id,
+        "organization.membership_claim.revoked",
+        actor=actor,
+        target_type="membership_claim",
+        target_id=claim_id,
+        details={
+            "authUserId": str(claim.get("authUserId") or ""),
+            "principalId": str(claim.get("principalId") or ""),
+            "fromStatus": str(claim.get("status") or ""),
+            "toStatus": str((revoked or {}).get("status") or "revoked"),
+            "ipAddress": request_ip(request),
+        },
+    )
+    return {"ok": True, "claim": revoked}
+
+
+@app.post(
+    "/api/platform/organizations/{organization_id}/membership-claims/{claim_id}/password-reset"
+)
+async def platform_reset_membership_claim_password(
+    organization_id: str,
+    claim_id: str,
+    request: Request,
+    _data: OrganizationEmptyRequest | None = None,
+) -> dict[str, Any]:
+    """Issue a one-time offline password reset link for an active claim."""
+
+    if not organization_real_enabled():
+        raise HTTPException(status_code=404, detail="企业账号认领功能尚未开放")
+    if not password_login_configured():
+        raise auth_http_error(
+            503,
+            "企业账号登录能力尚未配置完成",
+            "ORGANIZATION_ACCOUNT_RESET_UNAVAILABLE",
+        )
+    await enforce_csrf(request)
+    selected = await require_platform_claim_organization(request, organization_id)
+    actor = str(selected.get("email") or selected.get("id") or "platform")
+    claim = await auth_store_call("get_membership_claim", claim_id)
+    if (
+        not claim
+        or str(claim.get("organizationId") or "") != organization_id
+        or str(claim.get("status") or "") != "active"
+        or not str(claim.get("authUserId") or "")
+    ):
+        raise auth_http_error(
+            409,
+            "只有已生效的企业账号可以签发密码重置链接",
+            "ORGANIZATION_ACCOUNT_RESET_NOT_ALLOWED",
+        )
+    await enforce_rate_limit(
+        "organization_managed_password_reset",
+        f"{actor.casefold()}:{claim_id}",
+        5,
+        3600,
+    )
+    try:
+        reset = await auth_store_call(
+            "create_managed_account_password_reset",
+            str(claim["authUserId"]),
+            datetime.now(timezone.utc) + timedelta(hours=2),
+        )
+    except ManagedAccountPasswordResetError as exc:
+        raise auth_http_error(
+            409,
+            str(exc),
+            "ORGANIZATION_ACCOUNT_RESET_NOT_ALLOWED",
+        ) from exc
+    token = str(reset.pop("token", ""))
+    repository = organization_store()
+    if not isinstance(repository, PostgreSQLOrganizationRepository):
+        raise auth_http_error(503, "企业账号数据暂不可用", "ORGANIZATION_CLAIM_UNAVAILABLE")
+    await repository.record_audit(
+        organization_id,
+        "organization.membership_claim.password_reset_issued",
+        actor=actor,
+        target_type="membership_claim",
+        target_id=claim_id,
+        details={
+            "authUserId": str(claim.get("authUserId") or ""),
+            "loginName": str(claim.get("loginName") or ""),
+            "expiresAt": str(reset.get("expiresAt") or ""),
+            "ipAddress": request_ip(request),
+        },
+    )
+    base_url = os.getenv("APP_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+    reset_url = f"{base_url}/?reset_token={token}"
+    return {
+        "ok": True,
+        "reset": reset,
+        # The plaintext reset token is present only in this response.
+        "resetUrl": reset_url,
+    }
+
+
+@app.post("/api/platform/organizations/{organization_id}/members/{member_id}/invitation/revoke")
+async def platform_revoke_member_invitation(
+    organization_id: str,
+    member_id: str,
+    request: Request,
+    _data: OrganizationInvitationMutationRequest | None = None,
+) -> dict[str, Any]:
+    """Let a seller operator revoke one customer's pending invitation."""
+
+    if not organization_real_enabled():
+        raise HTTPException(status_code=404, detail="企业邀请功能尚未开放")
+    await enforce_csrf(request)
+    await require_platform_organization(request, organization_id)
+    try:
+        await revoke_real_member_invitation(organization_id, member_id)
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    return {"ok": True, "memberId": member_id}
 
 
 @app.get("/api/platform/organizations/{organization_id}/usage")
@@ -4078,15 +7079,16 @@ async def platform_organization_usage(
     await require_platform_organization(request, organization_id)
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
-    payload = await cached_mock_organization_usage_payload(
-        "mock_organization_usage",
-        organization_id,
-        start_date=start_date,
-        end_date=end_date,
-        source=source,
-        employee=(employee or "").strip(),
-        refresh=refresh,
-    )
+    if organization_real_enabled():
+        payload = await real_organization_usage_payload(
+            organization_id, start_date=start_date, end_date=end_date, source=source,
+            employee=(employee or "").strip(), refresh=refresh,
+        )
+    else:
+        payload = await cached_mock_organization_usage_payload(
+            "mock_organization_usage", organization_id, start_date=start_date,
+            end_date=end_date, source=source, employee=(employee or "").strip(), refresh=refresh,
+        )
     return {"startDate": start_date, "endDate": end_date, "source": source, "employee": (employee or "").strip(), **payload}
 
 
@@ -4097,7 +7099,7 @@ async def platform_organization_billing(
     page: int = Query(1, ge=1, le=100000),
     pageSize: int = Query(20, ge=1, le=100),
 ) -> dict[str, Any]:
-    """Allow the seller to read one customer's Mock credit history only."""
+    """Allow the seller to read one customer's credit history."""
 
     selected = await require_platform_organization(request, organization_id)
     try:
@@ -4109,6 +7111,41 @@ async def platform_organization_billing(
         )
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
+
+
+@app.post("/api/platform/organizations/{organization_id}/billing/adjustments")
+async def platform_organization_billing_adjustment(
+    organization_id: str,
+    data: OrganizationCreditAdjustmentRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Apply an idempotent grant/revoke entry to the enterprise ledger."""
+
+    if not organization_enabled():
+        raise HTTPException(status_code=404, detail="企业组织功能尚未启用")
+    require_real_organization_capability()
+    await enforce_csrf(request)
+    selected = await require_platform_organization(request, organization_id)
+    selected_id = str(selected["selectedOrganizationId"])
+    try:
+        ledger = organization_store()
+        if not isinstance(ledger, PostgreSQLOrganizationRepository):
+            # Demo mode keeps the legacy top-up UI, but seller adjustments are
+            # intentionally real-only so tests cannot imply a production ledger.
+            raise auth_http_error(410, "企业授信调整仅在真实模式可用", "ORGANIZATION_BILLING_ADJUSTMENT_UNAVAILABLE")
+        result = await ledger.adjust_billing(
+            selected_id,
+            operation=data.operation,
+            amount_usd=data.amountUsd,
+            reason=data.reason,
+            operator=str(selected.get("id") or selected.get("email") or "platform"),
+            operator_email=str(selected.get("email") or ""),
+            external_reference=data.externalReference,
+            idempotency_key=data.idempotencyKey,
+        )
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    return {"ok": True, "record": result}
 
 
 @app.get("/api/platform/organizations/{organization_id}/tokens")
@@ -4158,15 +7195,16 @@ async def platform_organization_department_usage(
     await require_platform_organization(request, organization_id)
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
-    payload = await cached_mock_organization_usage_payload(
-        "mock_department_usage",
-        organization_id,
-        start_date=start_date,
-        end_date=end_date,
-        source=source,
-        department=(department or "").strip(),
-        refresh=refresh,
-    )
+    if organization_real_enabled():
+        payload = await real_organization_department_usage_payload(
+            organization_id, start_date=start_date, end_date=end_date, source=source,
+            department=(department or "").strip(), refresh=refresh,
+        )
+    else:
+        payload = await cached_mock_organization_usage_payload(
+            "mock_department_usage", organization_id, start_date=start_date,
+            end_date=end_date, source=source, department=(department or "").strip(), refresh=refresh,
+        )
     return {"startDate": start_date, "endDate": end_date, "source": source, "department": (department or "").strip(), **payload}
 
 
@@ -4195,6 +7233,10 @@ async def my_usage(
     refresh: bool = Query(False),
 ) -> dict[str, Any]:
     app_user = require_user(request)
+    if organization_real_enabled() and await active_real_organization_membership(app_user):
+        if not start_date or not end_date:
+            start_date, end_date = default_date_range()
+        return await personal_usage_payload(app_user, start_date, end_date, source, refresh)
     if await is_demo_customer_user(app_user):
         if not start_date or not end_date:
             start_date, end_date = default_date_range()
@@ -4338,6 +7380,20 @@ async def my_usage_logs(
     page_size: int = Query(50, ge=1, le=100),
 ) -> dict[str, Any]:
     app_user = require_user(request)
+    if organization_real_enabled() and await active_real_organization_membership(app_user):
+        if not start_date or not end_date:
+            start_date, end_date = default_date_range()
+        payload = await personal_usage_payload(app_user, start_date, end_date, source)
+        rows = payload["rows"]
+        start = (page - 1) * page_size
+        return {
+            "user": app_user,
+            "rows": rows[start : start + page_size],
+            "total": len(rows),
+            "page": page,
+            "pageSize": page_size,
+            "cache": payload.get("cache", {"hit": False, "ttlSeconds": 0}),
+        }
     if await is_demo_customer_user(app_user):
         if not start_date or not end_date:
             start_date, end_date = default_date_range()
@@ -4705,6 +7761,14 @@ async def billing_identity(request: Request) -> tuple[dict[str, Any], str]:
     才能拿到权限，若在这里挡住，新用户永远无法自助开通。
     """
     app_user = require_user(request)
+    if str(
+        app_user.get("accountType") or app_user.get("account_type") or "personal"
+    ) == "enterprise_managed":
+        raise auth_http_error(
+            403,
+            "企业托管账号使用企业额度，不提供个人充值",
+            "ORGANIZATION_BILLING_FORBIDDEN",
+        )
     if await is_demo_customer_user(app_user):
         raise auth_http_error(403, "企业演示账号不提供自助充值", "ORGANIZATION_BILLING_FORBIDDEN")
     await require_non_inactive_demo_identity(app_user)
@@ -5125,8 +8189,16 @@ async def admin_retry_billing_sync(request: Request) -> dict[str, Any]:
 @app.get("/api/models")
 async def models(request: Request) -> dict[str, Any]:
     app_user = require_user(request)
+    real_member = (
+        await active_real_organization_membership(app_user)
+        if organization_real_enabled()
+        else None
+    )
     if await is_demo_customer_user(app_user):
         raise auth_http_error(403, "企业演示账号不提供模型目录查询", "ORGANIZATION_MODELS_FORBIDDEN")
+    if real_member is not None:
+        require_real_organization_capability()
+        return {"models": await client().models(None)}
     await require_non_inactive_demo_identity(app_user)
     if app_user.get("id"):
         local_user = await auth_store_call("get_user", str(app_user["id"]))

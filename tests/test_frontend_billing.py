@@ -110,11 +110,29 @@ def test_topup_entry_hidden_when_billing_unavailable() -> None:
 
     # 个人充值未开放，或当前身份不具备企业额度能力时，直接切换到
     # 充值页也必须回退到我的用量。
-    assert 'el("accountAccessTopupButton").classList.toggle("hidden", !(state.topup && billingAvailable));' in source
+    assert "state.topup && billingAvailable && !isOrganizationCustomerIdentity()" in source
     assert 'if (view === "billing" && !canAccessBillingView()) view = "dashboard";' in source
     access_guard = source[source.index("function canAccessBillingView()") : source.index("function selectedCustomerOrganizationId()")]
     assert "isOrganizationBillingView()" in access_guard
-    assert "billingAvailable && !currentUser?.organizationDemoEnabled" in access_guard
+    assert "billingAvailable && !isOrganizationCustomerIdentity()" in access_guard
+    assert "organizationDemoEnabled" not in access_guard
+
+
+def test_enterprise_customer_never_gets_personal_topup_navigation() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    account_state = source[
+        source.index("function renderAccountAccessState()") : source.index("function updateHomeCard()")
+    ]
+    navigation = source[
+        source.index("function syncNavigationVisibility()") : source.index("function revealNavigation()")
+    ]
+
+    assert "state.topup && billingAvailable && !isOrganizationCustomerIdentity()" in account_state
+    assert "const isCustomer = isOrganizationCustomerIdentity();" in navigation
+    assert "? canViewOrganizationBilling()" in navigation
+    assert ": Boolean(billingAvailable);" in navigation
+    assert "organizationDemoEnabled" not in navigation
 
 
 def test_online_panel_hidden_until_a_channel_is_configured() -> None:
@@ -220,7 +238,7 @@ def test_logout_clears_billing_state() -> None:
         assert cleared in source
 
 
-def test_static_asset_version_bumped_for_organization_token_real_models_release() -> None:
+def test_static_asset_version_bumped_for_organization_account_claims_release() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
 
     # 不更新版本号线上用户会命中旧缓存：旧 app.js 把勾选框 value 当成模型名直接提交，
@@ -287,7 +305,8 @@ def test_mock_billing_sidebar_requires_customer_capability_not_platform_admin() 
     navigation = source[source.index("function syncNavigationVisibility()") : source.index("function renderCustomerUsageBreadcrumbs")]
     assert "const canUseBillingSidebar = isCustomer" in navigation
     assert "? canViewOrganizationBilling()" in navigation
-    assert ": Boolean(billingAvailable && !currentUser?.organizationDemoEnabled);" in navigation
+    assert ": Boolean(billingAvailable);" in navigation
+    assert "organizationDemoEnabled" not in navigation
     assert 'el("billingTab")?.classList.toggle("hidden", !canUseBillingSidebar);' in navigation
 
 
@@ -302,11 +321,12 @@ def test_organization_topup_modal_closes_only_via_existing_safe_modal_contract()
     assert '!el("organizationTopupModal").classList.contains("hidden")' in keyboard
 
 
-def test_mock_customer_billing_never_falls_back_to_personal_billing() -> None:
+def test_organization_customer_billing_never_falls_back_to_personal_billing() -> None:
     source = APP_JS.read_text(encoding="utf-8")
 
     billing_refresh = source[source.index("async function refreshBillingAvailability()") : source.index("function updateBillingNav()")]
-    assert "if (isMockCustomerIdentity())" in billing_refresh
+    assert "if (isOrganizationCustomerIdentity())" in billing_refresh
+    assert "isMockCustomerIdentity" not in source
     assert "billingAvailable = false;" in billing_refresh
     switch_view = source[source.index("function switchView(view)") : source.index("async function loadCurrentViewData")]
     assert "if (isOrganizationBillingView())" in switch_view

@@ -19,7 +19,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -34,6 +34,18 @@ class AuthStoreConfigError(AuthStoreError):
 
 class DuplicateEmailError(AuthStoreError):
     """Raised when attempting to create a user for an existing email."""
+
+
+class DuplicateLoginNameError(AuthStoreError):
+    """Raised when a managed login name is already reserved."""
+
+
+class MembershipClaimStateError(AuthStoreError):
+    """Raised when a membership claim cannot make the requested transition."""
+
+
+class ManagedAccountPasswordResetError(AuthStoreError):
+    """Raised when an account is not eligible for an offline password reset."""
 
 
 class AuthStore:
@@ -143,6 +155,13 @@ class AuthStore:
             raise ValueError("请输入有效邮箱")
         return f"{local}@{domain}"
 
+    @staticmethod
+    def normalize_login_name(login_name: str) -> str:
+        value = str(login_name or "").strip().casefold()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{2,63}", value):
+            raise ValueError("账号需为 3-64 位字母、数字、点、下划线或连字符")
+        return value
+
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(
@@ -171,15 +190,27 @@ class AuthStore:
             """
             CREATE TABLE IF NOT EXISTS auth_users (
                 id TEXT PRIMARY KEY,
-                email TEXT NOT NULL UNIQUE,
+                email TEXT,
+                login_name TEXT,
                 name TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
                 email_verified INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'active',
+                account_type TEXT NOT NULL DEFAULT 'personal',
+                identity_status TEXT NOT NULL DEFAULT 'verified',
+                identity_verified_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 last_login_at TEXT
             )
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_email_ci
+            ON auth_users(lower(email)) WHERE email IS NOT NULL
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_login_name_ci
+            ON auth_users(lower(login_name)) WHERE login_name IS NOT NULL
             """,
             """
             CREATE TABLE IF NOT EXISTS auth_identities (
@@ -278,12 +309,55 @@ class AuthStore:
                 updated_at TEXT NOT NULL
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS auth_membership_claims (
+                id TEXT PRIMARY KEY,
+                organization_id TEXT NOT NULL,
+                organization_name TEXT NOT NULL,
+                department_id TEXT NOT NULL,
+                principal_id TEXT,
+                member_name TEXT NOT NULL,
+                login_name TEXT NOT NULL,
+                role TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'pending',
+                auth_user_id TEXT REFERENCES auth_users(id) ON DELETE SET NULL,
+                expires_at TEXT NOT NULL,
+                token_consumed_at TEXT,
+                accepted_at TEXT,
+                approved_at TEXT,
+                provisioning_at TEXT,
+                activated_at TEXT,
+                revoked_at TEXT,
+                created_by TEXT NOT NULL DEFAULT '',
+                approved_by TEXT NOT NULL DEFAULT '',
+                revoked_by TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_membership_claim_open_login
+            ON auth_membership_claims(lower(login_name))
+            WHERE status IN ('pending', 'accepted_pending_approval', 'approved', 'provisioning')
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_auth_membership_claim_organization
+            ON auth_membership_claims(organization_id, created_at)
+            """,
         )
         with self._lock:
             try:
                 with self._connection() as connection:
+                    # Rebuilding auth_users is required to remove the legacy
+                    # NOT NULL constraint from email. Keep child-table DDL
+                    # pointing at auth_users while the table is replaced.
+                    connection.execute("PRAGMA foreign_keys = OFF")
                     connection.execute("BEGIN IMMEDIATE")
-                    for statement in schema:
+                    connection.execute(schema[0])
+                    self._migrate_auth_users(connection)
+                    for statement in schema[1:]:
                         connection.execute(statement)
                     reset_columns = {
                         str(row["name"])
@@ -302,13 +376,77 @@ class AuthStore:
                     }
                     if "claimed_at" not in verification_columns:
                         connection.execute("ALTER TABLE auth_verification_codes ADD COLUMN claimed_at TEXT")
+                    claim_columns = {
+                        str(row["name"])
+                        for row in connection.execute("PRAGMA table_info(auth_membership_claims)").fetchall()
+                    }
+                    if "principal_id" not in claim_columns:
+                        connection.execute("ALTER TABLE auth_membership_claims ADD COLUMN principal_id TEXT")
+                    violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+                    if violations:
+                        raise sqlite3.IntegrityError("authentication migration introduced invalid foreign keys")
                     connection.execute("COMMIT")
+                    connection.execute("PRAGMA foreign_keys = ON")
             except sqlite3.Error as exc:
                 raise AuthStoreError("无法初始化认证数据库") from exc
         try:
             self.database_path.chmod(0o600)
         except OSError:
             pass
+
+    @staticmethod
+    def _migrate_auth_users(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"]): row
+            for row in connection.execute("PRAGMA table_info(auth_users)").fetchall()
+        }
+        required = {"login_name", "account_type", "identity_status", "identity_verified_at"}
+        email_not_null = bool(columns.get("email") and int(columns["email"]["notnull"]))
+        if required.issubset(columns) and not email_not_null:
+            return
+
+        login_name = "login_name" if "login_name" in columns else "NULL"
+        account_type = "account_type" if "account_type" in columns else "'personal'"
+        identity_status = "identity_status" if "identity_status" in columns else "'verified'"
+        identity_verified_at = (
+            "identity_verified_at"
+            if "identity_verified_at" in columns
+            else "COALESCE(updated_at, created_at)"
+        )
+        connection.execute("DROP TABLE IF EXISTS auth_users_migration_new")
+        connection.execute(
+            """
+            CREATE TABLE auth_users_migration_new (
+                id TEXT PRIMARY KEY,
+                email TEXT,
+                login_name TEXT,
+                name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                email_verified INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                account_type TEXT NOT NULL DEFAULT 'personal',
+                identity_status TEXT NOT NULL DEFAULT 'verified',
+                identity_verified_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_login_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            f"""
+            INSERT INTO auth_users_migration_new
+                (id, email, login_name, name, password_hash, email_verified, status,
+                 account_type, identity_status, identity_verified_at,
+                 created_at, updated_at, last_login_at)
+            SELECT id, email, {login_name}, name, password_hash, email_verified, status,
+                   {account_type}, {identity_status}, {identity_verified_at},
+                   created_at, updated_at, last_login_at
+            FROM auth_users
+            """
+        )
+        connection.execute("DROP TABLE auth_users")
+        connection.execute("ALTER TABLE auth_users_migration_new RENAME TO auth_users")
 
     def health(self) -> dict[str, Any]:
         """Return a small readiness probe without exposing database details."""
@@ -354,10 +492,12 @@ class AuthStore:
                 connection.execute(
                     """
                     INSERT INTO auth_users
-                        (id, email, name, password_hash, email_verified, status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        (id, email, name, password_hash, email_verified, status,
+                         account_type, identity_status, identity_verified_at,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'personal', 'verified', ?, ?, ?)
                     """,
-                    (identifier, normalized, display, password_hash, int(email_verified), status, now, now),
+                    (identifier, normalized, display, password_hash, int(email_verified), status, now, now, now),
                 )
                 connection.execute("COMMIT")
         except sqlite3.IntegrityError as exc:
@@ -378,8 +518,61 @@ class AuthStore:
         except ValueError:
             return None
         with self._connection() as connection:
-            row = connection.execute("SELECT * FROM auth_users WHERE email = ?", (normalized,)).fetchone()
+            row = connection.execute("SELECT * FROM auth_users WHERE lower(email) = ?", (normalized,)).fetchone()
         return self._user_dict(row) if row else None
+
+    def get_user_by_login_name(self, login_name: str) -> dict[str, Any] | None:
+        try:
+            normalized = self.normalize_login_name(login_name)
+        except ValueError:
+            return None
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM auth_users WHERE lower(login_name) = ?",
+                (normalized,),
+            ).fetchone()
+        return self._user_dict(row) if row else None
+
+    def get_user_by_identifier(self, identifier: str) -> dict[str, Any] | None:
+        """Resolve a password-login identifier without guessing identities."""
+
+        value = str(identifier or "").strip()
+        if "@" in value:
+            return self.get_user_by_email(value)
+        return self.get_user_by_login_name(value)
+
+    def delete_unprovisioned_user(self, user_id: str) -> bool:
+        """Remove a just-created account only while it has no durable activity.
+
+        Invitation acceptance spans SQLite and PostgreSQL. If the PostgreSQL
+        consume loses a race, this narrowly scoped compensation prevents the
+        newly-created password account from becoming an orphan. Existing users,
+        signed-in users, and accounts with upstream provisioning state are never
+        eligible for this cleanup.
+        """
+
+        identifier = str(user_id or "").strip()
+        if not identifier:
+            return False
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            referenced = connection.execute(
+                "SELECT "
+                "EXISTS(SELECT 1 FROM auth_sessions WHERE user_id=?) OR "
+                "EXISTS(SELECT 1 FROM auth_upstream_accounts WHERE user_id=?) OR "
+                "EXISTS(SELECT 1 FROM auth_provisioning_jobs WHERE user_id=?) OR "
+                "EXISTS(SELECT 1 FROM auth_membership_claims WHERE auth_user_id=?)",
+                (identifier, identifier, identifier, identifier),
+            ).fetchone()
+            if referenced is None or bool(referenced[0]):
+                connection.execute("COMMIT")
+                return False
+            cursor = connection.execute(
+                "DELETE FROM auth_users WHERE id=? AND last_login_at IS NULL",
+                (identifier,),
+            )
+            connection.execute("COMMIT")
+        return cursor.rowcount == 1
 
     @staticmethod
     def _user_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -390,6 +583,12 @@ class AuthStore:
             {
                 "emailVerified": bool(data["email_verified"]),
                 "passwordHash": data["password_hash"],
+                "loginName": data.get("login_name"),
+                "contactEmail": data.get("email"),
+                "displayIdentifier": data.get("email") or data.get("login_name"),
+                "accountType": data.get("account_type") or "personal",
+                "identityStatus": data.get("identity_status") or "verified",
+                "identityVerifiedAt": data.get("identity_verified_at"),
                 "createdAt": data["created_at"],
                 "updatedAt": data["updated_at"],
                 "lastLoginAt": data["last_login_at"],
@@ -442,6 +641,545 @@ class AuthStore:
                 "UPDATE auth_users SET last_login_at = ?, updated_at = ? WHERE id = ?",
                 (now, now, str(user_id)),
             )
+
+    # ------------------------------------------------------ membership claims
+    def _expire_membership_claims(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        claim_id: str | None = None,
+        token_hash: str | None = None,
+        login_name: str | None = None,
+    ) -> set[str]:
+        """Expire due claims and remove their unapproved password identities.
+
+        Claim expiry and account cleanup must share a transaction. Otherwise a
+        process interruption can release the claim while leaving its reserved
+        username behind indefinitely.
+        """
+
+        clauses = ["status IN ('pending', 'accepted_pending_approval')"]
+        params: list[Any] = []
+        if claim_id is not None:
+            clauses.append("id = ?")
+            params.append(str(claim_id))
+        if token_hash is not None:
+            clauses.append("token_hash = ?")
+            params.append(str(token_hash))
+        if login_name is not None:
+            clauses.append("lower(login_name) = ?")
+            params.append(str(login_name).casefold())
+        rows = connection.execute(
+            "SELECT id, status, expires_at, auth_user_id FROM auth_membership_claims "
+            f"WHERE {' AND '.join(clauses)}",
+            params,
+        ).fetchall()
+        expired_rows = [row for row in rows if self._is_expired(row["expires_at"])]
+        if not expired_rows:
+            return set()
+
+        now = self._now().isoformat()
+        expired_ids: set[str] = set()
+        for row in expired_rows:
+            identifier = str(row["id"])
+            updated = connection.execute(
+                "UPDATE auth_membership_claims SET status='expired', updated_at=? "
+                "WHERE id=? AND status IN ('pending', 'accepted_pending_approval')",
+                (now, identifier),
+            )
+            if updated.rowcount != 1:
+                continue
+            expired_ids.add(identifier)
+            user_id = str(row["auth_user_id"] or "")
+            if str(row["status"]) != "accepted_pending_approval" or not user_id:
+                continue
+            # A pending-approval identity is not a durable account. Revoke any
+            # anomalous session before deleting it, while preserving identities
+            # that have already acquired provisioning or upstream state.
+            connection.execute(
+                "UPDATE auth_sessions SET revoked_at=COALESCE(revoked_at, ?) WHERE user_id=?",
+                (now, user_id),
+            )
+            connection.execute(
+                """
+                DELETE FROM auth_users
+                WHERE id=? AND account_type='enterprise_managed'
+                  AND identity_status='pending_approval'
+                  AND status='pending_approval'
+                  AND NOT EXISTS(
+                      SELECT 1 FROM auth_upstream_accounts WHERE user_id=auth_users.id
+                  )
+                  AND NOT EXISTS(
+                      SELECT 1 FROM auth_provisioning_jobs WHERE user_id=auth_users.id
+                  )
+                  AND NOT EXISTS(
+                      SELECT 1 FROM auth_membership_claims other
+                      WHERE other.auth_user_id=auth_users.id AND other.id<>?
+                        AND other.status NOT IN ('expired', 'revoked')
+                  )
+                """,
+                (user_id, identifier),
+            )
+        return expired_ids
+
+    @staticmethod
+    def _membership_claim_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        item = dict(row)
+        item.update(
+            {
+                "organizationId": item["organization_id"],
+                "organizationName": item["organization_name"],
+                "departmentId": item["department_id"],
+                "principalId": item.get("principal_id"),
+                "memberName": item["member_name"],
+                "loginName": item["login_name"],
+                "authUserId": item["auth_user_id"],
+                "expiresAt": item["expires_at"],
+                "tokenConsumedAt": item["token_consumed_at"],
+                "acceptedAt": item["accepted_at"],
+                "approvedAt": item["approved_at"],
+                "provisioningAt": item["provisioning_at"],
+                "activatedAt": item["activated_at"],
+                "revokedAt": item["revoked_at"],
+                "createdBy": item["created_by"],
+                "approvedBy": item["approved_by"],
+                "revokedBy": item["revoked_by"],
+                "lastError": item["last_error"],
+                "createdAt": item["created_at"],
+                "updatedAt": item["updated_at"],
+            }
+        )
+        item.pop("token_hash", None)
+        return item
+
+    def create_membership_claim(
+        self,
+        organization_id: str,
+        organization_name: str,
+        department_id: str,
+        member_name: str,
+        login_name: str,
+        role: str = "admin",
+        expires_at: datetime | str | float | int | None = None,
+        created_by: str = "",
+        *,
+        token: str | None = None,
+        claim_id: str | None = None,
+        principal_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Issue a one-time, offline-delivered enterprise account claim.
+
+        Reissuing an untouched claim revokes its former token atomically. Once
+        an account has accepted a claim, an explicit revoke/approve decision is
+        required so a second link cannot race the pending identity.
+        """
+
+        normalized_login = self.normalize_login_name(login_name)
+        normalized_role = str(role or "").strip().lower()
+        if normalized_role not in {"admin", "member"}:
+            raise ValueError("企业角色必须为 admin 或 member")
+        required_text = {
+            "organization_id": organization_id,
+            "organization_name": organization_name,
+            "department_id": department_id,
+            "member_name": member_name,
+        }
+        if any(not str(value or "").strip() for value in required_text.values()):
+            raise ValueError("企业、部门和成员信息不能为空")
+        raw_token = token or secrets.token_urlsafe(32)
+        if len(raw_token) < 24:
+            raise ValueError("认领 Token 长度不足")
+        identifier = str(claim_id or uuid.uuid4())
+        now = self._now().isoformat()
+        expiry = self._timestamp(expires_at or (self._now() + timedelta(hours=2)))
+        try:
+            with self._lock, self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                self._expire_membership_claims(connection, login_name=normalized_login)
+                existing_user = connection.execute(
+                    "SELECT id FROM auth_users WHERE lower(login_name) = ?",
+                    (normalized_login,),
+                ).fetchone()
+                if existing_user is not None:
+                    connection.execute("ROLLBACK")
+                    raise DuplicateLoginNameError("该企业账号已存在")
+                open_claim = connection.execute(
+                    """
+                    SELECT id, status, expires_at FROM auth_membership_claims
+                    WHERE lower(login_name) = ?
+                      AND status IN ('pending', 'accepted_pending_approval', 'approved', 'provisioning')
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (normalized_login,),
+                ).fetchone()
+                if open_claim is not None and str(open_claim["status"]) != "pending":
+                    connection.execute("ROLLBACK")
+                    raise MembershipClaimStateError("该账号已进入认领或开通流程")
+                if open_claim is not None:
+                    replacement_status = "expired" if self._is_expired(open_claim["expires_at"]) else "revoked"
+                    connection.execute(
+                        """
+                        UPDATE auth_membership_claims
+                        SET status=?, revoked_at=CASE WHEN ?='revoked' THEN ? ELSE revoked_at END,
+                            revoked_by=CASE WHEN ?='revoked' THEN ? ELSE revoked_by END,
+                            updated_at=?
+                        WHERE id=? AND status='pending'
+                        """,
+                        (
+                            replacement_status,
+                            replacement_status,
+                            now,
+                            replacement_status,
+                            str(created_by or ""),
+                            now,
+                            str(open_claim["id"]),
+                        ),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO auth_membership_claims
+                        (id, organization_id, organization_name, department_id, principal_id,
+                         member_name, login_name, role, token_hash, status,
+                         expires_at, created_by, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                    """,
+                    (
+                        identifier,
+                        str(organization_id).strip(),
+                        str(organization_name).strip(),
+                        str(department_id).strip(),
+                        str(principal_id or "").strip() or None,
+                        str(member_name).strip(),
+                        normalized_login,
+                        normalized_role,
+                        self._token_digest(raw_token),
+                        expiry,
+                        str(created_by or ""),
+                        now,
+                        now,
+                    ),
+                )
+                connection.execute("COMMIT")
+        except sqlite3.IntegrityError as exc:
+            message = str(exc).lower()
+            if "login_name" in message:
+                raise DuplicateLoginNameError("该企业账号已存在或正在认领") from exc
+            raise AuthStoreError("无法创建企业账号认领") from exc
+        claim = self.get_membership_claim(identifier) or {}
+        claim["token"] = raw_token
+        return claim
+
+    def get_membership_claim(self, claim_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_membership_claims(connection, claim_id=str(claim_id))
+            row = connection.execute(
+                "SELECT * FROM auth_membership_claims WHERE id = ?",
+                (str(claim_id),),
+            ).fetchone()
+            connection.execute("COMMIT")
+        return self._membership_claim_dict(row)
+
+    def get_membership_claim_by_token(self, token: str) -> dict[str, Any] | None:
+        digest = self._token_digest(str(token or ""))
+        now = self._now().isoformat()
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_membership_claims(connection, token_hash=digest)
+            row = connection.execute(
+                "SELECT * FROM auth_membership_claims WHERE token_hash = ?",
+                (digest,),
+            ).fetchone()
+            connection.execute("COMMIT")
+        if row is None or str(row["status"]) != "pending" or row["token_consumed_at"] is not None:
+            return None
+        return self._membership_claim_dict(row)
+
+    def list_membership_claims(
+        self,
+        organization_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM auth_membership_claims"
+        params: list[Any] = []
+        if organization_id:
+            query += " WHERE organization_id = ?"
+            params.append(str(organization_id))
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_membership_claims(connection)
+            rows = connection.execute(query, params).fetchall()
+            connection.execute("COMMIT")
+        return [self._membership_claim_dict(row) or {} for row in rows]
+
+    def accept_membership_claim(self, token: str, password_hash: str) -> dict[str, Any] | None:
+        """Consume one claim and create its password identity atomically."""
+
+        if not password_hash:
+            raise ValueError("密码哈希不能为空")
+        digest = self._token_digest(str(token or ""))
+        now = self._now().isoformat()
+        try:
+            with self._lock, self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                self._expire_membership_claims(connection, token_hash=digest)
+                claim = connection.execute(
+                    "SELECT * FROM auth_membership_claims WHERE token_hash = ?",
+                    (digest,),
+                ).fetchone()
+                if (
+                    claim is None
+                    or str(claim["status"]) != "pending"
+                    or claim["token_consumed_at"] is not None
+                    or claim["revoked_at"] is not None
+                ):
+                    connection.execute("COMMIT")
+                    return None
+                if self._is_expired(claim["expires_at"]):
+                    connection.execute(
+                        "UPDATE auth_membership_claims SET status='expired', updated_at=? WHERE id=? AND status='pending'",
+                        (now, str(claim["id"])),
+                    )
+                    connection.execute("COMMIT")
+                    return None
+                existing = connection.execute(
+                    "SELECT id FROM auth_users WHERE lower(login_name) = ?",
+                    (str(claim["login_name"]).casefold(),),
+                ).fetchone()
+                if existing is not None:
+                    connection.execute("ROLLBACK")
+                    raise DuplicateLoginNameError("该企业账号已存在")
+                user_id = str(uuid.uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO auth_users
+                        (id, email, login_name, name, password_hash, email_verified,
+                         status, account_type, identity_status, identity_verified_at,
+                         created_at, updated_at)
+                    VALUES (?, NULL, ?, ?, ?, 0, 'pending_approval',
+                            'enterprise_managed', 'pending_approval', NULL, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        str(claim["login_name"]),
+                        str(claim["member_name"]),
+                        password_hash,
+                        now,
+                        now,
+                    ),
+                )
+                updated = connection.execute(
+                    """
+                    UPDATE auth_membership_claims
+                    SET status='accepted_pending_approval', auth_user_id=?,
+                        token_consumed_at=?, accepted_at=?, updated_at=?
+                    WHERE id=? AND status='pending' AND token_consumed_at IS NULL
+                    """,
+                    (user_id, now, now, now, str(claim["id"])),
+                )
+                if updated.rowcount != 1:
+                    connection.execute("ROLLBACK")
+                    return None
+                connection.execute("COMMIT")
+        except sqlite3.IntegrityError as exc:
+            if "login_name" in str(exc).lower():
+                raise DuplicateLoginNameError("该企业账号已存在") from exc
+            raise AuthStoreError("无法接受企业账号认领") from exc
+        return {
+            "claim": self.get_membership_claim(str(claim["id"])),
+            "user": self.get_user(user_id),
+        }
+
+    def approve_membership_claim(self, claim_id: str, approved_by: str) -> dict[str, Any] | None:
+        """Verify a claimed identity while keeping login blocked for provisioning."""
+
+        now = self._now().isoformat()
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_membership_claims(connection, claim_id=str(claim_id))
+            claim = connection.execute(
+                "SELECT * FROM auth_membership_claims WHERE id = ?",
+                (str(claim_id),),
+            ).fetchone()
+            if claim is None:
+                connection.execute("COMMIT")
+                return None
+            status = str(claim["status"])
+            if status in {"approved", "provisioning", "active"}:
+                result = self._membership_claim_dict(claim)
+                connection.execute("COMMIT")
+                return result
+            if self._is_expired(claim["expires_at"]):
+                connection.execute(
+                    "UPDATE auth_membership_claims SET status='expired', updated_at=? "
+                    "WHERE id=? AND status='accepted_pending_approval'",
+                    (now, str(claim_id)),
+                )
+                connection.execute("COMMIT")
+                raise MembershipClaimStateError("该认领已过期")
+            if status != "accepted_pending_approval" or not claim["auth_user_id"]:
+                connection.execute("ROLLBACK")
+                raise MembershipClaimStateError("该认领当前不能批准")
+            user_id = str(claim["auth_user_id"])
+            updated_user = connection.execute(
+                """
+                UPDATE auth_users
+                SET identity_status='verified', identity_verified_at=?,
+                    status='provisioning', updated_at=?
+                WHERE id=? AND account_type='enterprise_managed'
+                  AND identity_status='pending_approval'
+                """,
+                (now, now, user_id),
+            )
+            if updated_user.rowcount != 1:
+                connection.execute("ROLLBACK")
+                raise MembershipClaimStateError("认领账号状态不一致")
+            connection.execute(
+                """
+                UPDATE auth_membership_claims
+                SET status='approved', approved_at=?, approved_by=?, updated_at=?
+                WHERE id=? AND status='accepted_pending_approval'
+                """,
+                (now, str(approved_by or ""), now, str(claim_id)),
+            )
+            connection.execute("COMMIT")
+        return self.get_membership_claim(str(claim_id))
+
+    def mark_membership_claim_provisioning(
+        self,
+        claim_id: str,
+        last_error: str = "",
+    ) -> dict[str, Any] | None:
+        now = self._now().isoformat()
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            claim = connection.execute(
+                "SELECT * FROM auth_membership_claims WHERE id=?",
+                (str(claim_id),),
+            ).fetchone()
+            if claim is None:
+                connection.execute("COMMIT")
+                return None
+            status = str(claim["status"])
+            if status == "active":
+                result = self._membership_claim_dict(claim)
+                connection.execute("COMMIT")
+                return result
+            if status not in {"approved", "provisioning"}:
+                connection.execute("ROLLBACK")
+                raise MembershipClaimStateError("该认领尚未获批")
+            connection.execute(
+                """
+                UPDATE auth_membership_claims
+                SET status='provisioning', provisioning_at=COALESCE(provisioning_at, ?),
+                    last_error=?, updated_at=? WHERE id=?
+                """,
+                (now, str(last_error or "")[:1000], now, str(claim_id)),
+            )
+            connection.execute("COMMIT")
+        return self.get_membership_claim(str(claim_id))
+
+    def activate_membership_claim(self, claim_id: str) -> dict[str, Any] | None:
+        """Activate login only after organization provisioning has succeeded."""
+
+        now = self._now().isoformat()
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            claim = connection.execute(
+                "SELECT * FROM auth_membership_claims WHERE id=?",
+                (str(claim_id),),
+            ).fetchone()
+            if claim is None:
+                connection.execute("COMMIT")
+                return None
+            if str(claim["status"]) == "active":
+                result = self._membership_claim_dict(claim)
+                connection.execute("COMMIT")
+                return result
+            if str(claim["status"]) != "provisioning" or not claim["auth_user_id"]:
+                connection.execute("ROLLBACK")
+                raise MembershipClaimStateError("该认领尚未完成开通")
+            user_id = str(claim["auth_user_id"])
+            updated_user = connection.execute(
+                """
+                UPDATE auth_users SET status='active', updated_at=?
+                WHERE id=? AND account_type='enterprise_managed'
+                  AND identity_status='verified' AND status='provisioning'
+                """,
+                (now, user_id),
+            )
+            if updated_user.rowcount != 1:
+                connection.execute("ROLLBACK")
+                raise MembershipClaimStateError("企业账号尚未具备登录条件")
+            connection.execute(
+                """
+                UPDATE auth_membership_claims
+                SET status='active', activated_at=?, last_error='', updated_at=?
+                WHERE id=? AND status='provisioning'
+                """,
+                (now, now, str(claim_id)),
+            )
+            connection.execute("COMMIT")
+        return self.get_membership_claim(str(claim_id))
+
+    def revoke_membership_claim(
+        self,
+        claim_id: str,
+        revoked_by: str = "",
+    ) -> dict[str, Any] | None:
+        """Revoke an unapproved claim and release its reserved login name."""
+
+        now = self._now().isoformat()
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            claim = connection.execute(
+                "SELECT * FROM auth_membership_claims WHERE id=?",
+                (str(claim_id),),
+            ).fetchone()
+            if claim is None:
+                connection.execute("COMMIT")
+                return None
+            status = str(claim["status"])
+            if status == "revoked":
+                result = self._membership_claim_dict(claim)
+                connection.execute("COMMIT")
+                return result
+            if status not in {"pending", "accepted_pending_approval"}:
+                connection.execute("ROLLBACK")
+                raise MembershipClaimStateError("该认领当前不能撤销")
+            user_id = str(claim["auth_user_id"] or "")
+            connection.execute(
+                """
+                UPDATE auth_membership_claims
+                SET status='revoked', revoked_at=?, revoked_by=?, updated_at=?
+                WHERE id=? AND status IN ('pending', 'accepted_pending_approval')
+                """,
+                (now, str(revoked_by or ""), now, str(claim_id)),
+            )
+            if user_id:
+                # Pending-approval identities must never retain a usable
+                # session. Revoke any anomalous row before deleting the
+                # disposable account; the FK cascade then removes the rows.
+                connection.execute(
+                    "UPDATE auth_sessions SET revoked_at=COALESCE(revoked_at, ?) "
+                    "WHERE user_id=?",
+                    (now, user_id),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM auth_users
+                    WHERE id=? AND account_type='enterprise_managed'
+                      AND identity_status='pending_approval'
+                      AND status='pending_approval'
+                    """,
+                    (user_id,),
+                )
+            connection.execute("COMMIT")
+        return self.get_membership_claim(str(claim_id))
 
     # ------------------------------------------------------------- verification
     @staticmethod
@@ -618,10 +1356,12 @@ class AuthStore:
                 connection.execute(
                     """
                     INSERT INTO auth_users
-                        (id, email, name, password_hash, email_verified, status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        (id, email, name, password_hash, email_verified, status,
+                         account_type, identity_status, identity_verified_at,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'personal', 'verified', ?, ?, ?)
                     """,
-                    (identifier, normalized, display, password_hash, 1, status, now, now),
+                    (identifier, normalized, display, password_hash, 1, status, now, now, now),
                 )
                 connection.execute("COMMIT")
         except sqlite3.IntegrityError as exc:
@@ -632,6 +1372,72 @@ class AuthStore:
         return self.consume_verification_code(email, purpose, code_or_hash)
 
     # --------------------------------------------------------------- reset token
+    def create_managed_account_password_reset(
+        self,
+        user_id: str,
+        expires_at: datetime | str | float | int | None = None,
+        *,
+        token: str | None = None,
+    ) -> dict[str, Any]:
+        """Issue a one-time reset link for a verified managed username account.
+
+        The plaintext token is returned only from this call. Reissuing a link
+        atomically invalidates every prior unconsumed link for the same account.
+        """
+
+        raw_token = token or secrets.token_urlsafe(32)
+        if len(raw_token) < 24:
+            raise ValueError("重置 Token 长度不足")
+        identifier = str(uuid.uuid4())
+        account_id = str(user_id or "").strip()
+        if not account_id:
+            raise ManagedAccountPasswordResetError("未找到可重置的企业账号")
+        now = self._now()
+        expiry = self._timestamp(expires_at or (now + timedelta(hours=2)))
+        now_text = now.isoformat()
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            user = connection.execute(
+                "SELECT account_type, identity_status FROM auth_users WHERE id=?",
+                (account_id,),
+            ).fetchone()
+            if (
+                user is None
+                or str(user["account_type"]) != "enterprise_managed"
+                or str(user["identity_status"]) != "verified"
+            ):
+                connection.execute("ROLLBACK")
+                raise ManagedAccountPasswordResetError("仅已核验的企业账号可签发线下重置链接")
+            connection.execute(
+                "UPDATE auth_password_reset_tokens SET used_at=? "
+                "WHERE user_id=? AND used_at IS NULL",
+                (now_text, account_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO auth_password_reset_tokens
+                    (id, user_id, token_hash, expires_at, activated_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    identifier,
+                    account_id,
+                    self._token_digest(raw_token),
+                    expiry,
+                    now_text,
+                    now_text,
+                ),
+            )
+            connection.execute("COMMIT")
+        return {
+            "id": identifier,
+            "user_id": account_id,
+            "userId": account_id,
+            "expires_at": expiry,
+            "expiresAt": expiry,
+            "token": raw_token,
+        }
+
     def create_password_reset_token(
         self,
         user_id: str,
@@ -890,7 +1696,16 @@ class AuthStore:
         metadata: dict[str, Any] | None = None,
     ) -> str:
         identifier = str(uuid.uuid4())
-        email_hash = self._token_digest(self.normalize_email(email)) if email else None
+        email_hash: str | None = None
+        audit_email = str(email or "").strip()
+        if audit_email:
+            try:
+                email_hash = self._token_digest(self.normalize_email(audit_email))
+            except ValueError:
+                # Username-only enterprise accounts have no email. Audit
+                # persistence must not fail the completed security operation
+                # when a legacy caller stringifies that NULL value.
+                email_hash = None
         try:
             metadata_json = json.dumps(metadata or {}, ensure_ascii=True, separators=(",", ":"), default=str)
         except (TypeError, ValueError):

@@ -5,7 +5,13 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from backend.auth import generate_auth_token, hash_auth_token, hash_password, verify_password
-from backend.auth_store import AuthStore, DuplicateEmailError
+from backend.auth_store import (
+    AuthStore,
+    DuplicateEmailError,
+    DuplicateLoginNameError,
+    ManagedAccountPasswordResetError,
+    MembershipClaimStateError,
+)
 
 
 def future(seconds: int = 300) -> datetime:
@@ -201,6 +207,325 @@ def test_legacy_reset_tokens_are_activated_during_schema_migration(tmp_path) -> 
     assert store.consume_password_reset_token("legacy-token") is not None
 
 
+def test_legacy_email_users_are_preserved_when_username_schema_is_added(tmp_path) -> None:
+    database = tmp_path / "auth.sqlite3"
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE auth_users (
+                id TEXT PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                email_verified INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_login_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE auth_sessions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE,
+                expires_at TEXT NOT NULL,
+                revoked_at TEXT,
+                created_at TEXT NOT NULL,
+                ip_address TEXT NOT NULL DEFAULT '',
+                user_agent TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO auth_users VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("user-1", "Person@Example.com", "Person", "hash", 1, "active", now, now, None),
+        )
+        connection.execute(
+            "INSERT INTO auth_sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("session-1", "user-1", hash_auth_token("session-token"), future().isoformat(), None, now, "", ""),
+        )
+
+    store = AuthStore(database)
+
+    user = store.get_user("user-1")
+    assert user["email"] == "Person@Example.com"
+    assert user["login_name"] is None
+    assert user["account_type"] == "personal"
+    assert user["identity_status"] == "verified"
+    assert store.get_session("session-token")["user_id"] == "user-1"
+    with sqlite3.connect(database) as connection:
+        email_not_null = next(row[3] for row in connection.execute("PRAGMA table_info(auth_users)") if row[1] == "email")
+        assert email_not_null == 0
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_auth_store_connections_keep_foreign_keys_enabled_after_migration(tmp_path) -> None:
+    store = AuthStore(tmp_path / "auth.sqlite3")
+
+    with store._connection() as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_enterprise_login_name_is_case_insensitive_and_email_can_be_null(tmp_path) -> None:
+    store = AuthStore(tmp_path / "auth.sqlite3")
+    raw_token = "claim-token-that-is-long-enough-001"
+    claim = store.create_membership_claim(
+        "org-1",
+        "北汽集团",
+        "dept-1",
+        "梁海强",
+        "LiangHaiQiang",
+        token=raw_token,
+    )
+
+    accepted = store.accept_membership_claim(raw_token, hash_password("password-123"))
+
+    assert claim["loginName"] == "lianghaiqiang"
+    assert accepted["user"]["email"] is None
+    assert accepted["user"]["loginName"] == "lianghaiqiang"
+    assert accepted["user"]["accountType"] == "enterprise_managed"
+    assert accepted["user"]["identityStatus"] == "pending_approval"
+    assert accepted["user"]["status"] == "pending_approval"
+    assert store.get_user_by_identifier("LIANGHAIQIANG")["id"] == accepted["user"]["id"]
+    with pytest.raises(DuplicateLoginNameError):
+        store.create_membership_claim(
+            "org-1",
+            "北汽集团",
+            "dept-1",
+            "梁海强",
+            "lianghaiqiang",
+        )
+
+
+def test_membership_claim_token_is_hashed_single_use_and_never_returned_by_lookup(tmp_path) -> None:
+    database = tmp_path / "auth.sqlite3"
+    store = AuthStore(database)
+    raw_token = "claim-token-that-is-long-enough-002"
+    created = store.create_membership_claim(
+        "org-1",
+        "北汽集团",
+        "dept-1",
+        "梁海强",
+        "lianghaiqiang",
+        token=raw_token,
+    )
+
+    with sqlite3.connect(database) as connection:
+        stored = connection.execute(
+            "SELECT token_hash FROM auth_membership_claims WHERE id=?",
+            (created["id"],),
+        ).fetchone()[0]
+    public_claim = store.get_membership_claim_by_token(raw_token)
+
+    assert stored == hash_auth_token(raw_token)
+    assert raw_token not in stored
+    assert "token" not in public_claim
+    assert "token_hash" not in public_claim
+    assert store.accept_membership_claim(raw_token, hash_password("password-123")) is not None
+    assert store.get_membership_claim_by_token(raw_token) is None
+    assert store.accept_membership_claim(raw_token, hash_password("password-456")) is None
+
+
+def test_membership_claim_accept_is_atomic_across_threads(tmp_path) -> None:
+    store = AuthStore(tmp_path / "auth.sqlite3")
+    raw_token = "claim-token-that-is-long-enough-003"
+    store.create_membership_claim(
+        "org-1",
+        "北汽集团",
+        "dept-1",
+        "梁海强",
+        "lianghaiqiang",
+        token=raw_token,
+    )
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(
+            pool.map(
+                lambda index: store.accept_membership_claim(
+                    raw_token,
+                    hash_password(f"password-{index}-long"),
+                ),
+                range(4),
+            )
+        )
+
+    assert sum(result is not None for result in results) == 1
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute("SELECT count(*) FROM auth_users WHERE login_name='lianghaiqiang'").fetchone()[0] == 1
+
+
+def test_membership_claim_expires_and_can_be_reissued(tmp_path) -> None:
+    store = AuthStore(tmp_path / "auth.sqlite3")
+    old_token = "claim-token-that-is-long-enough-004"
+    old = store.create_membership_claim(
+        "org-1",
+        "北汽集团",
+        "dept-1",
+        "梁海强",
+        "lianghaiqiang",
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        token=old_token,
+    )
+
+    assert store.accept_membership_claim(old_token, hash_password("password-123")) is None
+    assert store.get_membership_claim(old["id"])["status"] == "expired"
+    replacement = store.create_membership_claim(
+        "org-1",
+        "北汽集团",
+        "dept-1",
+        "梁海强",
+        "LIANGHAIQIANG",
+        token="claim-token-that-is-long-enough-005",
+    )
+    assert replacement["status"] == "pending"
+
+
+def test_membership_claim_requires_approval_and_provisioning_before_login_activation(tmp_path) -> None:
+    store = AuthStore(tmp_path / "auth.sqlite3")
+    raw_token = "claim-token-that-is-long-enough-006"
+    claim = store.create_membership_claim(
+        "org-1",
+        "北汽集团",
+        "dept-1",
+        "梁海强",
+        "lianghaiqiang",
+        token=raw_token,
+    )
+    accepted = store.accept_membership_claim(raw_token, hash_password("password-123"))
+    user_id = accepted["user"]["id"]
+
+    with pytest.raises(MembershipClaimStateError):
+        store.activate_membership_claim(claim["id"])
+    approved = store.approve_membership_claim(claim["id"], "platform-admin")
+    assert approved["status"] == "approved"
+    assert store.get_user(user_id)["status"] == "provisioning"
+    assert store.get_user(user_id)["identityStatus"] == "verified"
+    with pytest.raises(MembershipClaimStateError):
+        store.activate_membership_claim(claim["id"])
+    store.mark_membership_claim_provisioning(claim["id"])
+    active = store.activate_membership_claim(claim["id"])
+    assert active["status"] == "active"
+    assert store.get_user(user_id)["status"] == "active"
+    assert store.approve_membership_claim(claim["id"], "platform-admin")["status"] == "active"
+    assert store.activate_membership_claim(claim["id"])["status"] == "active"
+
+
+def test_revoking_pending_approval_claim_removes_only_unapproved_managed_account(tmp_path) -> None:
+    store = AuthStore(tmp_path / "auth.sqlite3")
+    raw_token = "claim-token-that-is-long-enough-007"
+    claim = store.create_membership_claim(
+        "org-1",
+        "北汽集团",
+        "dept-1",
+        "梁海强",
+        "lianghaiqiang",
+        token=raw_token,
+    )
+    accepted = store.accept_membership_claim(raw_token, hash_password("password-123"))
+
+    revoked = store.revoke_membership_claim(claim["id"], "platform-admin")
+
+    assert revoked["status"] == "revoked"
+    assert store.get_user(accepted["user"]["id"]) is None
+    assert store.get_user_by_login_name("lianghaiqiang") is None
+    replacement = store.create_membership_claim(
+        "org-1",
+        "北汽集团",
+        "dept-1",
+        "梁海强",
+        "lianghaiqiang",
+    )
+    assert replacement["status"] == "pending"
+
+
+def test_revoking_pending_claim_cleans_anomalous_session_and_releases_login_name(tmp_path) -> None:
+    store = AuthStore(tmp_path / "auth.sqlite3")
+    raw_token = "claim-token-that-is-long-enough-007b"
+    claim = store.create_membership_claim(
+        "org-1",
+        "北汽集团",
+        "dept-1",
+        "梁海强",
+        "lianghaiqiang",
+        token=raw_token,
+    )
+    accepted = store.accept_membership_claim(raw_token, hash_password("password-123"))
+    session = store.create_session(accepted["user"]["id"], future())
+
+    revoked = store.revoke_membership_claim(claim["id"], "platform-admin")
+
+    assert revoked["status"] == "revoked"
+    assert store.get_user(accepted["user"]["id"]) is None
+    assert store.get_session(session["token"]) is None
+    replacement = store.create_membership_claim(
+        "org-1",
+        "北汽集团",
+        "dept-1",
+        "梁海强",
+        "lianghaiqiang",
+    )
+    assert replacement["status"] == "pending"
+
+
+def test_reissuing_pending_claim_revokes_old_token_but_not_an_accepted_claim(tmp_path) -> None:
+    store = AuthStore(tmp_path / "auth.sqlite3")
+    old_token = "claim-token-that-is-long-enough-008"
+    old = store.create_membership_claim(
+        "org-1",
+        "北汽集团",
+        "dept-1",
+        "梁海强",
+        "lianghaiqiang",
+        token=old_token,
+    )
+    replacement_token = "claim-token-that-is-long-enough-009"
+    replacement = store.create_membership_claim(
+        "org-1",
+        "北汽集团",
+        "dept-1",
+        "梁海强",
+        "lianghaiqiang",
+        token=replacement_token,
+    )
+
+    assert store.get_membership_claim(old["id"])["status"] == "revoked"
+    assert store.get_membership_claim_by_token(old_token) is None
+    assert store.accept_membership_claim(replacement_token, hash_password("password-123")) is not None
+    with pytest.raises(DuplicateLoginNameError):
+        store.create_membership_claim(
+            "org-1",
+            "北汽集团",
+            "dept-1",
+            "梁海强",
+            "lianghaiqiang",
+        )
+    assert store.get_membership_claim(replacement["id"])["status"] == "accepted_pending_approval"
+
+
+def test_approved_membership_claim_cannot_be_revoked(tmp_path) -> None:
+    store = AuthStore(tmp_path / "auth.sqlite3")
+    raw_token = "claim-token-that-is-long-enough-010"
+    claim = store.create_membership_claim(
+        "org-1",
+        "北汽集团",
+        "dept-1",
+        "梁海强",
+        "lianghaiqiang",
+        token=raw_token,
+    )
+    store.accept_membership_claim(raw_token, hash_password("password-123"))
+    store.approve_membership_claim(claim["id"], "platform-admin")
+
+    with pytest.raises(MembershipClaimStateError):
+        store.revoke_membership_claim(claim["id"], "platform-admin")
+
+    assert store.get_membership_claim(claim["id"])["status"] == "approved"
+
+
 def test_activating_delivered_reset_token_invalidates_previous_token(tmp_path) -> None:
     store = AuthStore(tmp_path / "auth.sqlite3")
     user = store.create_user("person@example.com", "Person", hash_password("password-123"), email_verified=True)
@@ -257,6 +582,84 @@ def test_password_reset_update_is_atomic_and_revokes_sessions(tmp_path) -> None:
     assert store.reset_password_with_token(hash_auth_token(raw_token), hash_password("another-password")) is None
 
 
+def test_managed_account_password_reset_is_hashed_single_use_and_reissued(tmp_path) -> None:
+    database = tmp_path / "auth.sqlite3"
+    store = AuthStore(database)
+    claim_token = "claim-token-for-managed-reset-001"
+    claim = store.create_membership_claim(
+        "org-1",
+        "北汽集团",
+        "dept-1",
+        "梁海强",
+        "lianghaiqiang",
+        token=claim_token,
+    )
+    accepted = store.accept_membership_claim(claim_token, hash_password("password-123"))
+    store.approve_membership_claim(claim["id"], "platform-admin")
+    user_id = accepted["user"]["id"]
+
+    first = store.create_managed_account_password_reset(
+        user_id,
+        token="managed-reset-token-that-is-long-001",
+    )
+    second = store.create_managed_account_password_reset(
+        user_id,
+        token="managed-reset-token-that-is-long-002",
+    )
+
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            "SELECT id, token_hash, used_at FROM auth_password_reset_tokens "
+            "WHERE user_id=? ORDER BY created_at",
+            (user_id,),
+        ).fetchall()
+    assert first["token"] == "managed-reset-token-that-is-long-001"
+    assert second["token"] == "managed-reset-token-that-is-long-002"
+    assert rows[0][0] == first["id"]
+    assert rows[0][1] == hash_auth_token(first["token"])
+    assert rows[0][2] is not None
+    assert rows[1][0] == second["id"]
+    assert rows[1][1] == hash_auth_token(second["token"])
+    assert "managed-reset-token-that-is-long-002" not in rows[1][1]
+    assert store.consume_password_reset_token(first["token"]) is None
+    consumed = store.consume_password_reset_token(second["token"])
+    assert consumed is not None
+    assert consumed["user_id"] == user_id
+    assert store.consume_password_reset_token(second["token"]) is None
+
+
+def test_managed_account_password_reset_requires_verified_enterprise_identity(tmp_path) -> None:
+    store = AuthStore(tmp_path / "auth.sqlite3")
+    personal = store.create_user(
+        "person@example.com",
+        "Person",
+        hash_password("password-123"),
+        email_verified=True,
+    )
+    with pytest.raises(ManagedAccountPasswordResetError):
+        store.create_managed_account_password_reset(personal["id"])
+
+    claim_token = "claim-token-for-managed-reset-002"
+    claim = store.create_membership_claim(
+        "org-1",
+        "北汽集团",
+        "dept-1",
+        "梁海强",
+        "lianghaiqiang",
+        token=claim_token,
+    )
+    accepted = store.accept_membership_claim(claim_token, hash_password("password-123"))
+    managed_id = accepted["user"]["id"]
+    with pytest.raises(ManagedAccountPasswordResetError):
+        store.create_managed_account_password_reset(managed_id)
+
+    store.approve_membership_claim(claim["id"], "platform-admin")
+    assert store.create_managed_account_password_reset(
+        managed_id,
+        token="managed-reset-token-that-is-long-003",
+    )["userId"] == managed_id
+
+
 def test_invalid_reset_does_not_change_password(tmp_path) -> None:
     store = AuthStore(tmp_path / "auth.sqlite3")
     user = store.create_user("person@example.com", "Person", hash_password("password-123"), email_verified=True)
@@ -307,6 +710,32 @@ def test_audit_does_not_store_plain_email(tmp_path) -> None:
     assert row is not None
     assert row[0] != "person@example.com"
     assert "password" in row[1]
+
+
+def test_username_account_password_change_audit_accepts_missing_email(tmp_path) -> None:
+    database = tmp_path / "auth.sqlite3"
+    store = AuthStore(database)
+
+    event_id = store.record_audit_event(
+        "password_changed",
+        user_id="enterprise-user-1",
+        email=str(None),
+        success=True,
+        metadata={"identifierType": "login_name"},
+    )
+
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT event_type, user_id, email_hash, metadata_json "
+            "FROM auth_audit_events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+    assert row == (
+        "password_changed",
+        "enterprise-user-1",
+        None,
+        '{"identifierType":"login_name"}',
+    )
 
 
 def test_upstream_account_status_is_persisted(tmp_path) -> None:
