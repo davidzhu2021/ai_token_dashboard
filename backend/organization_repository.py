@@ -405,6 +405,8 @@ CREATE TABLE IF NOT EXISTS customer_usage_backfill (
     last_error TEXT NOT NULL DEFAULT '',
     last_synced_at TIMESTAMPTZ,
     import_batch_id TEXT NOT NULL DEFAULT '',
+    locked_at TIMESTAMPTZ,
+    lease_token TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (requested_from <= requested_through),
@@ -413,6 +415,8 @@ CREATE TABLE IF NOT EXISTS customer_usage_backfill (
 CREATE INDEX IF NOT EXISTS customer_usage_backfill_pending_idx
     ON customer_usage_backfill(status, next_date, created_at)
     WHERE status IN ('pending', 'partial', 'failed');
+ALTER TABLE customer_usage_backfill ADD COLUMN IF NOT EXISTS locked_at TIMESTAMPTZ;
+ALTER TABLE customer_usage_backfill ADD COLUMN IF NOT EXISTS lease_token TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS usage_event_attribution (
     backend_id TEXT NOT NULL,
@@ -2089,7 +2093,7 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
                 result = await pool.execute(
                     "UPDATE customer_outbox SET status='pending', locked_at=NULL, available_at=now()+$2::interval, last_error=$3 WHERE id=$1",
                     outbox_id,
-                    f"{delay_seconds} seconds",
+                    timedelta(seconds=delay_seconds),
                     error[:1000],
                 )
         else:
@@ -2681,6 +2685,9 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
             max_budget_usd_snapshot, "max_budget_usd_snapshot"
         )
         spend_snapshot = optional_decimal(spend_usd_snapshot, "spend_usd_snapshot")
+        # Idempotency protects the stable ownership decision. Operational
+        # snapshots such as spend, models, blocked state, and requested
+        # coverage naturally change between retries and are refreshed below.
         fingerprint_payload = {
             "organizationId": organization_id,
             "backendId": backend_id,
@@ -2695,24 +2702,6 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
             ).strip(),
             "upstreamTeamIdSnapshot": str(upstream_team_id_snapshot or "").strip(),
             "upstreamUserIdSnapshot": str(upstream_user_id_snapshot or "").strip(),
-            "modelsSnapshot": models_snapshot,
-            "maxBudgetUsdSnapshot": (
-                str(max_budget_snapshot) if max_budget_snapshot is not None else None
-            ),
-            "spendUsdSnapshot": (
-                str(spend_snapshot) if spend_snapshot is not None else None
-            ),
-            "budgetDurationSnapshot": str(budget_duration_snapshot or "").strip(),
-            "expiresAtSnapshot": (
-                expires_at_snapshot.isoformat() if expires_at_snapshot else None
-            ),
-            "blockedSnapshot": bool(blocked_snapshot),
-            "importBatchId": str(import_batch_id or "").strip(),
-            "reportingRequestedThrough": (
-                reporting_requested_through.isoformat()
-                if reporting_requested_through
-                else None
-            ),
             "effectiveFrom": effective_from.isoformat(),
             "effectiveThrough": (
                 effective_through.isoformat() if effective_through is not None else None
@@ -2740,7 +2729,26 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
                         raise OrganizationConflictError(
                             "idempotency key was already used for a different import"
                         )
-                    return self._usage_key_identity_payload(existing)
+                    row = await conn.fetchrow(
+                        "UPDATE customer_usage_key_identity SET "
+                        "models_snapshot=$2::jsonb,max_budget_usd_snapshot=$3,"
+                        "spend_usd_snapshot=$4,budget_duration_snapshot=$5,"
+                        "expires_at_snapshot=$6,blocked_snapshot=$7,"
+                        "import_batch_id=$8,"
+                        "reporting_requested_through=GREATEST("
+                        "COALESCE(reporting_requested_through,$9),$9) "
+                        "WHERE id=$1 RETURNING *",
+                        existing["id"],
+                        json.dumps(models_snapshot, ensure_ascii=False),
+                        max_budget_snapshot,
+                        spend_snapshot,
+                        str(budget_duration_snapshot or "").strip()[:64],
+                        expires_at_snapshot,
+                        bool(blocked_snapshot),
+                        str(import_batch_id or "").strip()[:128],
+                        reporting_requested_through,
+                    )
+                    return self._usage_key_identity_payload(row)
                 organization = await conn.fetchrow(
                     "SELECT id FROM customer_organization WHERE id=$1 AND status <> 'archived'",
                     organization_id,
@@ -2951,6 +2959,126 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
             "lastSyncedAt": _iso(row["last_synced_at"]),
         }
 
+    async def claim_usage_backfill_window(
+        self, *, max_window_days: int = 3
+    ) -> dict[str, Any] | None:
+        """Lock one pending historical import and advance it after completion."""
+
+        window_days = max(1, min(3, int(max_window_days)))
+        try:
+            lease_seconds = max(
+                60, int(os.getenv("ORGANIZATION_BACKFILL_LEASE_SECONDS", "900"))
+            )
+        except ValueError:
+            lease_seconds = 900
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                # A worker can die after claiming a window. Reclaim stale
+                # leases so a retry remains possible after a restart.
+                await conn.execute(
+                    "UPDATE customer_usage_backfill SET status='failed',"
+                    "locked_at=NULL,lease_token='',"
+                    "last_error='stale backfill lease reclaimed',"
+                    "updated_at=now() WHERE status='running' AND locked_at IS NOT NULL "
+                    "AND locked_at < now() - $1 * interval '1 second'",
+                    lease_seconds,
+                )
+                row = await conn.fetchrow(
+                    "SELECT b.*, k.upstream_key_hash, k.upstream_key_id, "
+                    "k.effective_from, k.effective_through, "
+                    "k.upstream_organization_id_snapshot, "
+                    "k.upstream_team_id_snapshot, k.upstream_user_id_snapshot, "
+                    "k.principal_id "
+                    "FROM customer_usage_backfill b "
+                    "JOIN customer_usage_key_identity k ON k.id=b.usage_key_identity_id "
+                    "WHERE b.status IN ('pending','partial','failed') "
+                    "AND b.next_date <= b.requested_through "
+                    "ORDER BY b.updated_at,b.created_at LIMIT 1 FOR UPDATE SKIP LOCKED"
+                )
+                if row is None:
+                    return None
+                start = row["next_date"]
+                through = min(
+                    row["requested_through"],
+                    start + timedelta(days=window_days - 1),
+                )
+                lease_token = secrets.token_urlsafe(32)
+                await conn.execute(
+                    "UPDATE customer_usage_backfill SET status='running',"
+                    "locked_at=now(),lease_token=$2,last_error='',updated_at=now() "
+                    "WHERE id=$1",
+                    row["id"],
+                    lease_token,
+                )
+        return {
+            "id": str(row["id"]),
+            "organizationId": str(row["organization_id"]),
+            "principalId": str(row["principal_id"]),
+            "usageKeyIdentityId": str(row["usage_key_identity_id"]),
+            "leaseToken": lease_token,
+            "backendId": str(row["backend_id"]),
+            "upstreamKeyHash": str(row["upstream_key_hash"]),
+            "upstreamKeyId": str(row["upstream_key_id"] or ""),
+            "upstreamOrganizationId": str(
+                row["upstream_organization_id_snapshot"] or ""
+            ),
+            "upstreamTeamId": str(row["upstream_team_id_snapshot"] or ""),
+            "upstreamUserId": str(row["upstream_user_id_snapshot"] or ""),
+            "effectiveFrom": _iso(row["effective_from"]),
+            "effectiveThrough": _iso(row["effective_through"]),
+            "windowFrom": start.isoformat(),
+            "windowThrough": through.isoformat(),
+            "requestedThrough": row["requested_through"].isoformat(),
+        }
+
+    async def complete_usage_backfill_window(
+        self,
+        backfill_id: str,
+        *,
+        lease_token: str,
+        covered_from: date,
+        covered_through: date,
+    ) -> dict[str, Any]:
+        """Persist monotonic coverage for one completed three-day window."""
+
+        row = await self._require_pool().fetchrow(
+            "UPDATE customer_usage_backfill SET "
+            "covered_from=LEAST(COALESCE(covered_from,$2),$2),"
+            "covered_through=GREATEST(COALESCE(covered_through,$3),$3),"
+            "next_date=$3+1,status=CASE WHEN $3>=requested_through "
+            "THEN 'complete' ELSE 'partial' END,last_error='',"
+            "locked_at=NULL,lease_token='',last_synced_at=now(),updated_at=now() "
+            "WHERE id=$1 AND status='running' AND lease_token=$4 RETURNING *",
+            backfill_id,
+            covered_from,
+            covered_through,
+            self._required_text(lease_token, "lease_token", 256),
+        )
+        if row is None:
+            raise OrganizationConflictError("usage backfill is no longer running")
+        return {
+            "id": str(row["id"]),
+            "status": str(row["status"]),
+            "coveredFrom": row["covered_from"].isoformat(),
+            "coveredThrough": row["covered_through"].isoformat(),
+            "nextDate": row["next_date"].isoformat(),
+        }
+
+    async def fail_usage_backfill_window(
+        self, backfill_id: str, error: str, *, lease_token: str
+    ) -> None:
+        result = await self._require_pool().execute(
+            "UPDATE customer_usage_backfill SET status='failed',locked_at=NULL,"
+            "lease_token='',last_error=$2,updated_at=now() WHERE id=$1 "
+            "AND status='running' AND lease_token=$3",
+            backfill_id,
+            str(error or "")[:1000],
+            self._required_text(lease_token, "lease_token", 256),
+        )
+        if not str(result).endswith(" 1"):
+            raise OrganizationConflictError("usage backfill lease is no longer current")
+
     async def adopt_organization_with_admin(
         self,
         name: str,
@@ -3087,6 +3215,552 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
             str(upstream_team_id or "").strip(),
         )
         return [{"kind": str(row["kind"]), "id": str(row["id"])} for row in rows]
+
+    @staticmethod
+    def _baic_pilot_credit_to_adopt(
+        ledger_rows: list[Any],
+        *,
+        balance: Decimal,
+        billing_status: str,
+        billing_effective_at: Any,
+    ) -> Any | None:
+        """Return the one untouched manual pilot grant, or reject ambiguity."""
+
+        if not ledger_rows:
+            if balance != 0:
+                raise OrganizationConflictError(
+                    "BAIC billing balance has no ledger evidence"
+                )
+            return None
+
+        ledger_tail = ledger_rows[-1]
+        if Decimal(str(ledger_tail["balance_after_usd"] or 0)) != balance:
+            raise OrganizationConflictError(
+                "BAIC billing balance does not match the ledger"
+            )
+        canonical_credit = next(
+            (
+                row
+                for row in ledger_rows
+                if str(row["idempotency_key"] or "")
+                == "baic-pilot-initial-credit-v1"
+                or str(row["external_reference"] or "")
+                == "BAIC-PILOT-INITIAL-5000"
+            ),
+            None,
+        )
+        if canonical_credit is not None:
+            raise OrganizationConflictError(
+                "BAIC pilot credit already exists before reconciliation"
+            )
+
+        # The known production pilot has exactly one manually-created grant
+        # named "赠送". Anything else may be legitimate customer billing and
+        # must never be silently relabelled by this one-off reconciliation.
+        legacy_credit = ledger_rows[0] if len(ledger_rows) == 1 else None
+        if (
+            legacy_credit is None
+            or str(legacy_credit["operation"] or "") != "grant"
+            or Decimal(str(legacy_credit["amount_usd"] or 0))
+            != Decimal("5000.00")
+            or Decimal(str(legacy_credit["balance_after_usd"] or 0))
+            != Decimal("5000.00")
+            or str(legacy_credit["reason"] or "").strip() != "赠送"
+            or balance != Decimal("5000.00")
+            or str(billing_status or "") != "active"
+            or billing_effective_at is None
+        ):
+            raise OrganizationConflictError(
+                "BAIC billing ledger is not the expected untouched pilot credit"
+            )
+        return legacy_credit
+
+    @staticmethod
+    def _validate_baic_key_ownership(
+        expected_key: dict[str, str],
+        rows: list[Any],
+        *,
+        organization_id: str,
+    ) -> None:
+        """Reject split or cross-tenant local claims for one upstream key."""
+
+        if any(str(row["organization_id"] or "") != organization_id for row in rows):
+            raise OrganizationConflictError(
+                "BAIC target key is mapped to another customer"
+            )
+        if len(rows) > 1:
+            raise OrganizationConflictError(
+                "BAIC target key is mapped by multiple local records"
+            )
+        if not rows:
+            return
+        row = rows[0]
+        record_source = str(_row_value(row, "record_source", "") or "")
+        if record_source == "usage" and str(
+            _row_value(row, "backend_id", "") or ""
+        ) != expected_key["backendId"]:
+            raise OrganizationConflictError(
+                "BAIC target key backend does not match the expected mapping"
+            )
+        if str(row["upstream_key_hash"] or "").lower() != expected_key[
+            "upstreamKeyHash"
+        ]:
+            raise OrganizationConflictError(
+                "BAIC target key hash/id resolve to different local records"
+            )
+        expected_id = expected_key["upstreamKeyId"]
+        stored_id = str(row["upstream_key_id"] or "")
+        if expected_id and stored_id != expected_id:
+            raise OrganizationConflictError(
+                "BAIC target key hash/id resolve to different local records"
+            )
+
+    async def reconcile_baic_pilot_state(
+        self,
+        *,
+        organization_id: str,
+        department_id: str,
+        member_id: str,
+        expected_organization_name: str,
+        expected_admin_email: str,
+        expected_current_upstream_organization_id: str,
+        expected_current_upstream_team_id: str,
+        target_upstream_organization_id: str,
+        target_upstream_team_id: str,
+        organization_name: str,
+        department_name: str,
+        member_name: str,
+        operation_key: str,
+        expected_report_only_keys: list[dict[str, str]] | None = None,
+        actor: str = "baic-pilot-reconciler",
+    ) -> dict[str, Any]:
+        """Atomically repair the one known partially-provisioned BAIC pilot.
+
+        This method only changes the local projection. Exact expected ids and
+        state make it unsuitable as a general remapping API, while a durable
+        operation row makes an operator retry harmless.
+        """
+
+        import json
+
+        values = {
+            "organizationId": self._required_text(
+                organization_id, "organization_id", 128
+            ),
+            "departmentId": self._required_text(department_id, "department_id", 128),
+            "memberId": self._required_text(member_id, "member_id", 128),
+            "expectedOrganizationName": self._required_text(
+                expected_organization_name, "expected_organization_name", 128
+            ),
+            "expectedAdminEmail": self.normalize_email(expected_admin_email),
+            "expectedCurrentUpstreamOrganizationId": self._required_text(
+                expected_current_upstream_organization_id,
+                "expected_current_upstream_organization_id",
+                128,
+            ),
+            "expectedCurrentUpstreamTeamId": self._required_text(
+                expected_current_upstream_team_id,
+                "expected_current_upstream_team_id",
+                128,
+            ),
+            "targetUpstreamOrganizationId": self._required_text(
+                target_upstream_organization_id,
+                "target_upstream_organization_id",
+                128,
+            ),
+            "targetUpstreamTeamId": self._required_text(
+                target_upstream_team_id, "target_upstream_team_id", 128
+            ),
+            "organizationName": self._required_text(
+                organization_name, "organization_name", 128
+            ),
+            "departmentName": self._required_text(
+                department_name, "department_name", 128
+            ),
+            "memberName": self._required_text(member_name, "member_name", 128),
+            "operationKey": self._required_text(operation_key, "operation_key", 128),
+            "expectedReportOnlyKeys": sorted(
+                [
+                    {
+                        "backendId": self._required_text(
+                            item.get("backendId"), "backend_id", 128
+                        ),
+                        "upstreamKeyHash": self._required_text(
+                            item.get("upstreamKeyHash"), "upstream_key_hash", 64
+                        ).lower(),
+                        "upstreamKeyId": str(item.get("upstreamKeyId") or "").strip()[:256],
+                    }
+                    for item in (expected_report_only_keys or [])
+                ],
+                key=lambda item: (
+                    item["backendId"],
+                    item["upstreamKeyHash"],
+                    item["upstreamKeyId"],
+                ),
+            ),
+        }
+        expected_keys = values["expectedReportOnlyKeys"]
+        if len(expected_keys) != 2:
+            raise OrganizationValidationError(
+                "BAIC reconciliation requires exactly two report-only keys"
+            )
+        hashes = [item["upstreamKeyHash"] for item in expected_keys]
+        if len(set(hashes)) != len(hashes):
+            raise OrganizationConflictError(
+                "BAIC reconciliation report-only key hashes must be distinct"
+            )
+        key_ids = [item["upstreamKeyId"] for item in expected_keys if item["upstreamKeyId"]]
+        if len(set(key_ids)) != len(key_ids):
+            raise OrganizationConflictError(
+                "BAIC reconciliation report-only key ids must be distinct"
+            )
+        seen_stable_identifiers: set[tuple[str, str]] = set()
+        for item in expected_keys:
+            identifiers = {item["upstreamKeyHash"]}
+            if item["upstreamKeyId"]:
+                identifiers.add(item["upstreamKeyId"])
+            stable_identifiers = {
+                (item["backendId"], identifier) for identifier in identifiers
+            }
+            if seen_stable_identifiers.intersection(stable_identifiers):
+                raise OrganizationConflictError(
+                    "BAIC reconciliation report-only key identifiers must be unique"
+                )
+            seen_stable_identifiers.update(stable_identifiers)
+        for item in values["expectedReportOnlyKeys"]:
+            import re
+
+            if not re.fullmatch(r"[0-9a-f]{64}", item["upstreamKeyHash"]):
+                raise OrganizationValidationError(
+                    "upstream key hash must be SHA-256"
+                )
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                values, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                operation = await conn.fetchrow(
+                    "SELECT * FROM customer_adoption_operation "
+                    "WHERE operation_key=$1 FOR UPDATE",
+                    values["operationKey"],
+                )
+                if operation is not None:
+                    if (
+                        str(operation["request_fingerprint"] or "") != fingerprint
+                        or str(operation["preview_fingerprint"] or "") != fingerprint
+                    ):
+                        raise OrganizationConflictError(
+                            "BAIC reconciliation key was used for another state"
+                        )
+                    if str(operation["status"] or "") != "applied":
+                        raise OrganizationConflictError(
+                            "BAIC reconciliation is already in progress"
+                        )
+                    result = _row_value(operation, "result", {}) or {}
+                    if isinstance(result, str):
+                        try:
+                            result = json.loads(result)
+                        except ValueError:
+                            result = {}
+                    return result if isinstance(result, dict) else {"ok": True}
+
+                operation_id = self._id()
+                await conn.execute(
+                    "INSERT INTO customer_adoption_operation("
+                    "id,operation_key,request_fingerprint,preview_fingerprint,created_by"
+                    ") VALUES($1,$2,$3,$3,$4)",
+                    operation_id,
+                    values["operationKey"],
+                    fingerprint,
+                    str(actor or "")[:254],
+                )
+
+                organization = await conn.fetchrow(
+                    "SELECT * FROM customer_organization WHERE id=$1 FOR UPDATE",
+                    values["organizationId"],
+                )
+                department = await conn.fetchrow(
+                    "SELECT * FROM customer_department "
+                    "WHERE id=$1 AND organization_id=$2 FOR UPDATE",
+                    values["departmentId"],
+                    values["organizationId"],
+                )
+                member = await conn.fetchrow(
+                    "SELECT * FROM customer_member "
+                    "WHERE id=$1 AND organization_id=$2 FOR UPDATE",
+                    values["memberId"],
+                    values["organizationId"],
+                )
+                if organization is None or department is None or member is None:
+                    raise OrganizationConflictError(
+                        "BAIC local pilot objects no longer match the expected ids"
+                    )
+                if (
+                    str(organization["name"] or "")
+                    != values["expectedOrganizationName"]
+                    or str(organization["upstream_organization_id"] or "")
+                    != values["expectedCurrentUpstreamOrganizationId"]
+                    or str(organization["status"] or "") != "active"
+                    or str(organization["upstream_status"] or "") != "active"
+                ):
+                    raise OrganizationConflictError(
+                        "BAIC organization state changed after preflight"
+                    )
+                if (
+                    str(department["upstream_team_id"] or "")
+                    != values["expectedCurrentUpstreamTeamId"]
+                    or str(department["status"] or "") != "active"
+                ):
+                    raise OrganizationConflictError(
+                        "BAIC department state changed after preflight"
+                    )
+                stable_upstream_user_id = f"customer-member-{values['memberId']}"
+                if (
+                    str(member["department_id"] or "") != values["departmentId"]
+                    or str(member["email"] or "").casefold()
+                    != values["expectedAdminEmail"].casefold()
+                    or str(member["role"] or "") != "admin"
+                    or str(member["team_role"] or "") != "leader"
+                    or str(member["status"] or "") != "invited"
+                    or not str(member["auth_user_id"] or "")
+                    or str(member["upstream_user_id"] or "")
+                    != stable_upstream_user_id
+                ):
+                    raise OrganizationConflictError(
+                        "BAIC administrator state changed after invitation acceptance"
+                    )
+
+                invitations = await conn.fetch(
+                    "SELECT id,email,consumed_at,revoked_at FROM customer_invitation "
+                    "WHERE organization_id=$1 AND member_id=$2 FOR UPDATE",
+                    values["organizationId"],
+                    values["memberId"],
+                )
+                consumed = [
+                    row
+                    for row in invitations
+                    if row["consumed_at"] is not None and row["revoked_at"] is None
+                ]
+                if (
+                    len(consumed) != 1
+                    or str(consumed[0]["email"] or "").casefold()
+                    != values["expectedAdminEmail"].casefold()
+                ):
+                    raise OrganizationConflictError(
+                        "BAIC invitation is not the expected consumed invitation"
+                    )
+
+                mapped_organization = await conn.fetchrow(
+                    "SELECT id FROM customer_organization "
+                    "WHERE upstream_organization_id=$1 AND id<>$2 FOR UPDATE",
+                    values["targetUpstreamOrganizationId"],
+                    values["organizationId"],
+                )
+                mapped_team = await conn.fetchrow(
+                    "SELECT id,organization_id FROM customer_department "
+                    "WHERE upstream_team_id=$1 AND id<>$2 FOR UPDATE",
+                    values["targetUpstreamTeamId"],
+                    values["departmentId"],
+                )
+                if mapped_organization is not None or mapped_team is not None:
+                    raise OrganizationConflictError(
+                        "BAIC target upstream scope is mapped to another customer"
+                    )
+
+                for expected_key in values["expectedReportOnlyKeys"]:
+                    usage_owners = await conn.fetch(
+                        "SELECT organization_id, backend_id, upstream_key_hash, "
+                        "upstream_key_id, 'usage' AS record_source "
+                        "FROM customer_usage_key_identity "
+                        "WHERE backend_id=$1 AND (upstream_key_hash=$2 OR "
+                        "($3 <> '' AND upstream_key_id=$3)) FOR UPDATE",
+                        expected_key["backendId"],
+                        expected_key["upstreamKeyHash"],
+                        expected_key["upstreamKeyId"],
+                    )
+                    managed_owners = await conn.fetch(
+                        "SELECT organization_id, upstream_key_hash, upstream_key_id, "
+                        "'managed' AS record_source "
+                        "FROM customer_access_token "
+                        "WHERE upstream_key_hash=$1 OR ($2 <> '' AND upstream_key_id=$2) "
+                        "FOR UPDATE",
+                        expected_key["upstreamKeyHash"],
+                        expected_key["upstreamKeyId"],
+                    )
+                    self._validate_baic_key_ownership(
+                        expected_key,
+                        [*usage_owners, *managed_owners],
+                        organization_id=values["organizationId"],
+                    )
+
+                managed_tokens = await conn.fetch(
+                    "SELECT id FROM customer_access_token "
+                    "WHERE organization_id=$1 FOR UPDATE",
+                    values["organizationId"],
+                )
+                if managed_tokens:
+                    raise OrganizationConflictError(
+                        "BAIC reconciliation refuses an organization with managed tokens"
+                    )
+                settlements = await conn.fetch(
+                    "SELECT usage_date FROM customer_usage_settlement "
+                    "WHERE organization_id=$1 FOR UPDATE",
+                    values["organizationId"],
+                )
+                if settlements:
+                    raise OrganizationConflictError(
+                        "BAIC reconciliation refuses an organization with settled usage"
+                    )
+                ledger_rows = await conn.fetch(
+                    "SELECT * FROM customer_billing_ledger "
+                    "WHERE organization_id=$1 ORDER BY created_at,id FOR UPDATE",
+                    values["organizationId"],
+                )
+                balance = Decimal(str(organization["billing_balance_usd"] or 0))
+                adopted_initial_credit_id = ""
+                adopted_initial_credit: dict[str, str] = {}
+                legacy_credit = self._baic_pilot_credit_to_adopt(
+                    ledger_rows,
+                    balance=balance,
+                    billing_status=str(organization["billing_status"] or ""),
+                    billing_effective_at=organization["billing_effective_at"],
+                )
+                if legacy_credit is not None:
+                    adopted_initial_credit = {
+                        "id": str(legacy_credit["id"]),
+                        "previousReason": str(legacy_credit["reason"] or ""),
+                        "previousExternalReference": str(
+                            legacy_credit["external_reference"] or ""
+                        ),
+                        "previousIdempotencyKey": str(
+                            legacy_credit["idempotency_key"] or ""
+                        ),
+                    }
+                    await conn.execute(
+                        "UPDATE customer_billing_ledger SET reason=$2,operator=$3,"
+                        "operator_email='',external_reference=$4,idempotency_key=$5 "
+                        "WHERE id=$1",
+                        str(legacy_credit["id"]),
+                        "北汽集团试点初始授信",
+                        str(actor or "")[:128],
+                        "BAIC-PILOT-INITIAL-5000",
+                        "baic-pilot-initial-credit-v1",
+                    )
+                    adopted_initial_credit_id = str(legacy_credit["id"])
+
+                await conn.execute(
+                    "UPDATE customer_organization SET name=$2,"
+                    "upstream_organization_id=$3,upstream_status='active',updated_at=now() "
+                    "WHERE id=$1",
+                    values["organizationId"],
+                    values["organizationName"],
+                    values["targetUpstreamOrganizationId"],
+                )
+                await conn.execute(
+                    "UPDATE customer_department SET name=$3,upstream_team_id=$4,"
+                    "updated_at=now() WHERE id=$1 AND organization_id=$2",
+                    values["departmentId"],
+                    values["organizationId"],
+                    values["departmentName"],
+                    values["targetUpstreamTeamId"],
+                )
+                await conn.execute(
+                    "UPDATE customer_member SET name=$3,updated_at=now() "
+                    "WHERE id=$1 AND organization_id=$2",
+                    values["memberId"],
+                    values["organizationId"],
+                    values["memberName"],
+                )
+
+                stale_jobs = await conn.fetch(
+                    "SELECT id FROM customer_outbox WHERE "
+                    "((kind='organization.member.provision' AND aggregate_id=$1) OR "
+                    " (kind='organization.billing.sync' AND aggregate_id=$2)) "
+                    "AND status IN ('pending','processing','failed') FOR UPDATE",
+                    values["memberId"],
+                    values["organizationId"],
+                )
+                stale_job_ids = [str(row["id"]) for row in stale_jobs]
+                if stale_job_ids:
+                    await conn.execute(
+                        "UPDATE customer_outbox SET status='superseded',locked_at=NULL,"
+                        "last_error=$2 WHERE id=ANY($1::text[])",
+                        stale_job_ids,
+                        f"superseded by {values['operationKey']}",
+                    )
+
+                member_payload = {
+                    "organizationId": values["organizationId"],
+                    "memberId": values["memberId"],
+                    "authUserId": str(member["auth_user_id"]),
+                    "email": values["expectedAdminEmail"],
+                }
+                await self._enqueue_projection_sync(
+                    conn,
+                    "organization.member.provision",
+                    values["memberId"],
+                    member_payload,
+                    version=f"baic-reconcile:{values['operationKey']}",
+                )
+
+                result = {
+                    "ok": True,
+                    "status": "reconciled",
+                    "organizationId": values["organizationId"],
+                    "departmentId": values["departmentId"],
+                    "memberId": values["memberId"],
+                    "upstreamOrganizationId": values[
+                        "targetUpstreamOrganizationId"
+                    ],
+                    "upstreamTeamId": values["targetUpstreamTeamId"],
+                    "supersededOutboxIds": stale_job_ids,
+                    "adoptedInitialCreditId": adopted_initial_credit_id,
+                }
+                audit_details = {
+                    "operationKey": values["operationKey"],
+                    "organizationName": {
+                        "from": values["expectedOrganizationName"],
+                        "to": values["organizationName"],
+                    },
+                    "memberName": {
+                        "from": str(member["name"] or ""),
+                        "to": values["memberName"],
+                    },
+                    "upstreamOrganizationId": {
+                        "from": values["expectedCurrentUpstreamOrganizationId"],
+                        "to": values["targetUpstreamOrganizationId"],
+                    },
+                    "upstreamTeamId": {
+                        "from": values["expectedCurrentUpstreamTeamId"],
+                        "to": values["targetUpstreamTeamId"],
+                    },
+                    "consumedInvitationId": str(consumed[0]["id"]),
+                    "supersededOutboxIds": stale_job_ids,
+                    "adoptedInitialCredit": adopted_initial_credit,
+                }
+                await conn.execute(
+                    "INSERT INTO customer_audit_log("
+                    "id,organization_id,audit_action,actor,target_type,target_id,details"
+                    ") VALUES($1,$2,'organization.baic_pilot.reconciled',$3,"
+                    "'adoption',$4,$5::jsonb)",
+                    self._id(),
+                    values["organizationId"],
+                    str(actor or "")[:254],
+                    values["operationKey"],
+                    json.dumps(audit_details, ensure_ascii=False),
+                )
+                await conn.execute(
+                    "UPDATE customer_adoption_operation SET organization_id=$2,"
+                    "status='applied',result=$3::jsonb,last_error='',updated_at=now() "
+                    "WHERE id=$1",
+                    operation_id,
+                    values["organizationId"],
+                    json.dumps(result, ensure_ascii=False),
+                )
+                return result
 
     async def begin_adoption_operation(
         self,
@@ -3801,8 +4475,20 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
                     "AND (idempotency_key=$2 OR ($3 <> '' AND external_reference=$3))",
                     organization_id, idempotency_key, external_reference,
                 )
-                if existing: return self._ledger_payload(existing)
                 previous = Decimal(str(organization["billing_balance_usd"] or 0)); delta = amount if operation in {"grant", "credit", "refund"} else -amount; balance = previous + delta
+                if existing:
+                    existing_amount = Decimal(str(existing["amount_usd"] or 0))
+                    if (
+                        str(existing["operation"] or "") != operation
+                        or existing_amount != delta
+                        or str(existing["reason"] or "") != reason[:500]
+                        or str(existing["external_reference"] or "") != external_reference[:128]
+                        or str(existing["idempotency_key"] or "") != idempotency_key[:128]
+                    ):
+                        raise OrganizationConflictError(
+                            "billing idempotency key or external reference was already used for another adjustment"
+                        )
+                    return self._ledger_payload(existing)
                 if balance < 0: raise OrganizationConflictError("organization credit is insufficient")
                 row = await conn.fetchrow("INSERT INTO customer_billing_ledger(id,organization_id,operation,amount_usd,balance_after_usd,reason,operator,operator_email,external_reference,idempotency_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *", self._id(), organization_id, operation, delta, balance, reason[:500], operator[:128], operator_email[:254], external_reference[:128], idempotency_key[:128])
                 current_status = str(organization["billing_status"] or "past_due")

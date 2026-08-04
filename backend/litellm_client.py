@@ -1499,6 +1499,7 @@ class LiteLLMClient:
             "expiration",
             default=None,
         )
+        created_at = _first(record, "created_at", "createdAt", default=None)
         return {
             "id": key_id,
             "hash": key_hash,
@@ -1514,6 +1515,7 @@ class LiteLLMClient:
                 _first(record, "budget_duration", "budgetDuration", default="")
             ),
             "spend": spend,
+            "createdAt": _clean_text(created_at),
             "expiresAt": _clean_text(expires),
             "blocked": bool(_first(record, "blocked", "disabled", default=False)),
         }
@@ -3067,6 +3069,8 @@ class LiteLLMClient:
         start_date: str,
         end_date: str,
         backend: LiteLLMBackend | None = None,
+        *,
+        api_key: str | None = None,
     ) -> tuple[dict[str, list[dict[str, Any]]], bool]:
         """按北京时间日界扫描全量日志，返回 {user_id: usage rows} 与是否完整覆盖。
 
@@ -3085,18 +3089,21 @@ class LiteLLMClient:
         concurrency = max(1, _env_int("USAGE_SYNC_LOG_CONCURRENCY", 8))
 
         async def fetch_page(page: int) -> tuple[list[dict[str, Any]], int]:
+            params: dict[str, Any] = {
+                "start_date": utc_start,
+                "end_date": utc_end,
+                "page": page,
+                "page_size": page_size,
+                "sort_by": "startTime",
+                "sort_order": "asc",
+            }
+            if api_key:
+                params["api_key"] = safe_key_id(api_key)
             payload = await self.request_backend(
                 backend,
                 "GET",
                 "/spend/logs/v2",
-                params={
-                    "start_date": utc_start,
-                    "end_date": utc_end,
-                    "page": page,
-                    "page_size": page_size,
-                    "sort_by": "startTime",
-                    "sort_order": "asc",
-                },
+                params=params,
             )
             total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=0)) if isinstance(payload, dict) else 0
             return _records(payload), total_pages

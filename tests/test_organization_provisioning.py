@@ -1,5 +1,7 @@
 import asyncio
 
+from fastapi import HTTPException
+
 from backend.organization_provisioning import OrganizationProvisioningService
 
 
@@ -552,3 +554,110 @@ def test_invited_member_loses_upstream_access_until_invitation_is_accepted():
             {"user_id": "user-upstream", "changed_by": "organization-provisioner"},
         ),
     ]
+
+
+class PremiumTeamAdminUpstream(Upstream):
+    """LiteLLM fixture for a non-enterprise proxy rejecting team admins."""
+
+    def __init__(self, *, has_existing_membership: bool) -> None:
+        super().__init__()
+        self.has_existing_membership = has_existing_membership
+
+    async def list_teams(self, **kwargs):
+        if self.has_existing_membership:
+            return [{"team_id": "team-upstream", "members_with_roles": []}]
+        return []
+
+    async def team_info(self, backend, team_id):
+        if self.has_existing_membership:
+            return {"team_id": team_id, "members_with_roles": []}
+        return None
+
+    async def update_organization_member(self, organization_id, **kwargs):
+        self.calls.append(("org_member_update", organization_id, kwargs))
+        return {}
+
+    async def add_team_member(self, team_id, role, **kwargs):
+        self.calls.append(("team_member", team_id, role, kwargs))
+        if role == "admin":
+            raise HTTPException(
+                status_code=400,
+                detail="Assigning team admins is a premium feature. You must be a LiteLLM Enterprise user.",
+            )
+        return {}
+
+    async def update_team_member(self, team_id, **kwargs):
+        self.calls.append(("team_member_update", team_id, kwargs))
+        if kwargs.get("role") == "admin":
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "Assigning team admins is a premium feature. Set LITELLM_LICENSE.",
+                },
+            )
+        return {}
+
+
+def test_provision_member_keeps_local_admin_when_upstream_team_admin_is_premium_only():
+    repo = Repo()
+    repo.org["upstreamOrganizationId"] = "org-upstream"
+    repo.departments[0]["upstreamTeamId"] = "team-upstream"
+    upstream = PremiumTeamAdminUpstream(has_existing_membership=False)
+
+    asyncio.run(
+        OrganizationProvisioningService(repo, upstream).provision_member(
+            "org-local", "member-local"
+        )
+    )
+
+    team_calls = [call for call in upstream.calls if call[0] == "team_member"]
+    assert [call[2] for call in team_calls] == ["admin", "user"]
+    assert repo.member["status"] == "active"
+    assert repo.member["role"] == "admin"
+
+
+def test_sync_member_downgrades_only_team_membership_role_when_upstream_lacks_premium():
+    repo = Repo()
+    repo.org["upstreamOrganizationId"] = "org-upstream"
+    repo.departments[0]["upstreamTeamId"] = "team-upstream"
+    repo.member["status"] = "active"
+    repo.member["upstreamUserId"] = "user-upstream"
+    upstream = PremiumTeamAdminUpstream(has_existing_membership=True)
+
+    result = asyncio.run(
+        OrganizationProvisioningService(repo, upstream).sync_member(
+            {
+                "organizationId": "org-local",
+                "memberId": "member-local",
+                "status": "active",
+            }
+        )
+    )
+
+    assert result["status"] == "active"
+    updates = [call for call in upstream.calls if call[0] == "team_member_update"]
+    assert [call[2]["role"] for call in updates] == ["admin", "user"]
+    assert repo.member["role"] == "admin"
+
+
+def test_team_admin_fallback_does_not_swallow_unrelated_upstream_error():
+    class BrokenUpstream(PremiumTeamAdminUpstream):
+        async def add_team_member(self, team_id, role, **kwargs):
+            if role == "admin":
+                raise HTTPException(status_code=400, detail="team membership is malformed")
+            return await super().add_team_member(team_id, role, **kwargs)
+
+    repo = Repo()
+    repo.org["upstreamOrganizationId"] = "org-upstream"
+    repo.departments[0]["upstreamTeamId"] = "team-upstream"
+
+    try:
+        asyncio.run(
+            OrganizationProvisioningService(
+                repo, BrokenUpstream(has_existing_membership=False)
+            ).provision_member("org-local", "member-local")
+        )
+    except HTTPException as exc:
+        assert exc.detail == "team membership is malformed"
+    else:
+        raise AssertionError("unrelated upstream error must be propagated")

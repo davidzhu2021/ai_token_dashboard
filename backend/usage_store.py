@@ -705,7 +705,9 @@ class UsageStore:
         async with pool.acquire() as connection:
             async with connection.transaction():
                 await connection.execute(
-                    "DELETE FROM usage_daily WHERE backend_id = $1 AND usage_date BETWEEN $2::date AND $3::date",
+                    "DELETE FROM usage_daily WHERE backend_id = $1 "
+                    "AND usage_date BETWEEN $2::date AND $3::date "
+                    "AND attribution_source <> 'legacy_report_only'",
                     backend_id,
                     _as_date(start_date),
                     _as_date(end_date),
@@ -725,7 +727,8 @@ class UsageStore:
                 if events is not None:
                     await connection.execute(
                         "DELETE FROM usage_event_attribution WHERE backend_id=$1 "
-                        "AND usage_date BETWEEN $2::date AND $3::date",
+                        "AND usage_date BETWEEN $2::date AND $3::date "
+                        "AND attribution_source <> 'legacy_report_only'",
                         backend_id,
                         _as_date(start_date),
                         _as_date(end_date),
@@ -828,6 +831,93 @@ class UsageStore:
                     _as_date(end_date),
                     collected_at,
                 )
+        return len(usage_records)
+
+    async def upsert_attributed_usage(
+        self,
+        backend_id: str,
+        rows: list[dict[str, Any]],
+        *,
+        events: list[dict[str, Any]],
+    ) -> int:
+        """Merge a key-scoped historical import without replacing other users."""
+
+        pool = self._require_pool()
+        collected_at = datetime.now(timezone.utc)
+        usage_records = [
+            self._usage_record(backend_id, row, collected_at)
+            for row in self._coalesce_usage_rows(rows)
+            if row.get("date")
+        ]
+        event_records = [
+            record
+            for row in events
+            if (record := self._event_record(backend_id, row, collected_at))
+        ]
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                if usage_records:
+                    await connection.executemany(
+                        """
+                        INSERT INTO usage_daily (
+                            backend_id, usage_date, user_id, employee_email, employee_name,
+                            source, model, prompt_tokens, completion_tokens, total_tokens,
+                            request_count, success_count, failure_count, spend, collected_at,
+                            organization_id, team_id, key_id, principal_id,
+                            attribution_source, billing_eligible
+                        ) VALUES ($1,$2::date,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+                        ON CONFLICT (
+                            backend_id, usage_date, user_id, source, model,
+                            organization_id, team_id, key_id, principal_id,
+                            attribution_source, billing_eligible
+                        ) DO UPDATE SET
+                            employee_email=EXCLUDED.employee_email,
+                            employee_name=EXCLUDED.employee_name,
+                            prompt_tokens=EXCLUDED.prompt_tokens,
+                            completion_tokens=EXCLUDED.completion_tokens,
+                            total_tokens=EXCLUDED.total_tokens,
+                            request_count=EXCLUDED.request_count,
+                            success_count=EXCLUDED.success_count,
+                            failure_count=EXCLUDED.failure_count,
+                            spend=EXCLUDED.spend,
+                            collected_at=EXCLUDED.collected_at
+                        """,
+                        usage_records,
+                    )
+                if event_records:
+                    await connection.executemany(
+                        """
+                        INSERT INTO usage_event_attribution (
+                            backend_id, request_id, event_time, usage_date,
+                            raw_user_id, organization_id, team_id, key_id,
+                            principal_id, source, model, prompt_tokens,
+                            completion_tokens, total_tokens, request_count,
+                            success_count, failure_count, spend,
+                            attribution_source, billing_eligible, collected_at
+                        ) VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::numeric,$19,$20,$21)
+                        ON CONFLICT (backend_id, request_id) DO UPDATE SET
+                            event_time=EXCLUDED.event_time,
+                            usage_date=EXCLUDED.usage_date,
+                            raw_user_id=EXCLUDED.raw_user_id,
+                            organization_id=EXCLUDED.organization_id,
+                            team_id=EXCLUDED.team_id,
+                            key_id=EXCLUDED.key_id,
+                            principal_id=EXCLUDED.principal_id,
+                            source=EXCLUDED.source,
+                            model=EXCLUDED.model,
+                            prompt_tokens=EXCLUDED.prompt_tokens,
+                            completion_tokens=EXCLUDED.completion_tokens,
+                            total_tokens=EXCLUDED.total_tokens,
+                            request_count=EXCLUDED.request_count,
+                            success_count=EXCLUDED.success_count,
+                            failure_count=EXCLUDED.failure_count,
+                            spend=EXCLUDED.spend,
+                            attribution_source=EXCLUDED.attribution_source,
+                            billing_eligible=EXCLUDED.billing_eligible,
+                            collected_at=EXCLUDED.collected_at
+                        """,
+                        event_records,
+                    )
         return len(usage_records)
 
     async def latest_sync_at(self, start_date: str, end_date: str, backend_ids: list[str] | None = None) -> datetime | None:

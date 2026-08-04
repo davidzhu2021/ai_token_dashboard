@@ -14,6 +14,7 @@ from backend.organization_repository import (
     PostgreSQLOrganizationRepository,
 )
 from backend.organization_validation import OrganizationConflictError
+from backend.organization_validation import OrganizationValidationError
 
 
 def test_repository_is_disabled_without_real_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -93,6 +94,8 @@ def test_schema_treats_existing_unique_constraint_indexes_as_idempotent() -> Non
     assert "ON customer_access_token(upstream_key_alias)" in ORGANIZATION_SCHEMA
     assert "last_sent_at" in ORGANIZATION_SCHEMA
     assert "upstream_team_id" in ORGANIZATION_SCHEMA
+    assert "locked_at TIMESTAMPTZ" in ORGANIZATION_SCHEMA
+    assert "lease_token TEXT NOT NULL DEFAULT ''" in ORGANIZATION_SCHEMA
 
 
 def test_payload_helpers_are_json_friendly() -> None:
@@ -802,6 +805,18 @@ def test_atomic_balance_snapshot_is_used_for_token_and_ledger_writes() -> None:
     assert "SELECT balance_after_usd" not in settle_source
 
 
+def test_billing_adjustment_rejects_changed_idempotent_payload() -> None:
+    import inspect
+
+    source = inspect.getsource(PostgreSQLOrganizationRepository.adjust_billing)
+
+    assert "existing_amount != delta" in source
+    assert 'existing["operation"]' in source
+    assert 'existing["reason"]' in source
+    assert 'existing["external_reference"]' in source
+    assert "already used for another adjustment" in source
+
+
 def test_member_department_move_revokes_keys_bound_to_the_previous_team() -> None:
     import inspect
 
@@ -842,3 +857,559 @@ def test_invitation_accept_rejects_an_auth_account_already_bound_elsewhere() -> 
     assert "WHERE auth_user_id=$1 AND auth_user_id<>'' FOR UPDATE" in source
     assert "customer_member_auth_user_idx" in source
     assert "auth account already belongs to another customer organization" in source
+
+
+def test_baic_reconciliation_is_strict_local_atomic_and_does_not_sync_upstream() -> None:
+    import inspect
+
+    source = inspect.getsource(PostgreSQLOrganizationRepository.reconcile_baic_pilot_state)
+    assert "expected_current_upstream_organization_id" in source
+    assert "expected_current_upstream_team_id" in source
+    assert "target_upstream_organization_id" in source
+    assert "target_upstream_team_id" in source
+    assert "customer_organization WHERE id=$1 FOR UPDATE" in source
+    assert "customer_department " in source and "FOR UPDATE" in source
+    assert "customer_member " in source and "FOR UPDATE" in source
+    assert "customer_access_token" in source
+    assert "managed tokens" in source
+    assert "customer_usage_settlement" in source
+    assert "settled usage" in source
+    assert "expected_report_only_keys" in source
+    assert "_validate_baic_key_ownership" in source
+    assert "_baic_pilot_credit_to_adopt" in source
+    credit_source = inspect.getsource(
+        PostgreSQLOrganizationRepository._baic_pilot_credit_to_adopt
+    )
+    assert "billing balance does not match the ledger" in credit_source
+    assert "BAIC billing ledger is not the expected untouched pilot credit" in credit_source
+    assert "baic-pilot-initial-credit-v1" in source
+    assert "BAIC-PILOT-INITIAL-5000" in source
+    assert "adoptedInitialCreditId" in source
+    assert "organization.baic_pilot.reconciled" in source
+    assert "organization.member.provision" in source
+    # Mapping repair must not enqueue a normal org/dept/billing projection:
+    # those jobs could mutate the old upstream scope before report-only import.
+    assert '"organization.billing.sync"' not in source
+    assert '"organization.sync"' not in source
+    assert '"department.sync"' not in source
+
+
+def _expected_baic_keys() -> list[dict[str, str]]:
+    return [
+        {
+            "backendId": "primary",
+            "upstreamKeyHash": "a" * 64,
+            "upstreamKeyId": "key-a",
+        },
+        {
+            "backendId": "primary",
+            "upstreamKeyHash": "b" * 64,
+            "upstreamKeyId": "key-b",
+        },
+    ]
+
+
+def _baic_reconciliation_kwargs(
+    expected_keys: list[dict[str, str]],
+) -> dict[str, object]:
+    return {
+        "organization_id": "org-baic",
+        "department_id": "dept-baic",
+        "member_id": "member-david",
+        "expected_organization_name": "北汽",
+        "expected_admin_email": "davidzhu2021@163.com",
+        "expected_current_upstream_organization_id": "org-old",
+        "expected_current_upstream_team_id": "team-old",
+        "target_upstream_organization_id": "org-target",
+        "target_upstream_team_id": "team-target",
+        "organization_name": "北汽集团",
+        "department_name": "企业管理",
+        "member_name": "David Zhu",
+        "operation_key": "baic-pilot-adoption-v1",
+        "expected_report_only_keys": expected_keys,
+    }
+
+
+@pytest.mark.parametrize(
+    "expected_keys",
+    [
+        [],
+        [_expected_baic_keys()[0]],
+        [*_expected_baic_keys(), {**_expected_baic_keys()[0], "upstreamKeyHash": "c" * 64}],
+    ],
+)
+def test_baic_reconciliation_requires_exactly_two_expected_keys(
+    expected_keys: list[dict[str, str]],
+) -> None:
+    repository = PostgreSQLOrganizationRepository("postgresql://unused")
+
+    with pytest.raises(OrganizationValidationError):
+        asyncio.run(
+            repository.reconcile_baic_pilot_state(
+                **_baic_reconciliation_kwargs(expected_keys)
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "second_key",
+    [
+        {**_expected_baic_keys()[1], "upstreamKeyHash": "a" * 64},
+        {**_expected_baic_keys()[1], "upstreamKeyId": "key-a"},
+        {**_expected_baic_keys()[1], "upstreamKeyId": "a" * 64},
+    ],
+)
+def test_baic_reconciliation_rejects_duplicate_stable_key_identifiers(
+    second_key: dict[str, str],
+) -> None:
+    repository = PostgreSQLOrganizationRepository("postgresql://unused")
+
+    with pytest.raises(OrganizationConflictError):
+        asyncio.run(
+            repository.reconcile_baic_pilot_state(
+                **_baic_reconciliation_kwargs(
+                    [_expected_baic_keys()[0], second_key]
+                )
+            )
+        )
+
+
+def test_baic_key_ownership_rejects_split_hash_and_id_rows() -> None:
+    expected = _expected_baic_keys()[0]
+    rows = [
+        {
+            "organization_id": "org-baic",
+            "backend_id": "primary",
+            "record_source": "usage",
+            "upstream_key_hash": expected["upstreamKeyHash"],
+            "upstream_key_id": "",
+        },
+        {
+            "organization_id": "org-baic",
+            "backend_id": "primary",
+            "record_source": "usage",
+            "upstream_key_hash": "c" * 64,
+            "upstream_key_id": expected["upstreamKeyId"],
+        },
+    ]
+
+    with pytest.raises(OrganizationConflictError, match="multiple local records"):
+        PostgreSQLOrganizationRepository._validate_baic_key_ownership(
+            expected, rows, organization_id="org-baic"
+        )
+
+
+def test_baic_key_ownership_rejects_any_cross_tenant_match() -> None:
+    expected = _expected_baic_keys()[0]
+    rows = [
+        {
+            "organization_id": "org-baic",
+            "backend_id": "primary",
+            "record_source": "usage",
+            "upstream_key_hash": expected["upstreamKeyHash"],
+            "upstream_key_id": expected["upstreamKeyId"],
+        },
+        {
+            "organization_id": "org-other",
+            "backend_id": "primary",
+            "record_source": "usage",
+            "upstream_key_hash": expected["upstreamKeyHash"],
+            "upstream_key_id": "",
+        },
+    ]
+
+    with pytest.raises(OrganizationConflictError, match="another customer"):
+        PostgreSQLOrganizationRepository._validate_baic_key_ownership(
+            expected, rows, organization_id="org-baic"
+        )
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {
+            "organization_id": "org-baic",
+            "backend_id": "other-backend",
+            "record_source": "usage",
+            "upstream_key_hash": "a" * 64,
+            "upstream_key_id": "key-a",
+        },
+        {
+            "organization_id": "org-baic",
+            "backend_id": "primary",
+            "record_source": "usage",
+            "upstream_key_hash": "c" * 64,
+            "upstream_key_id": "key-a",
+        },
+        {
+            "organization_id": "org-baic",
+            "record_source": "managed",
+            "upstream_key_hash": "a" * 64,
+            "upstream_key_id": "",
+        },
+    ],
+)
+def test_baic_key_ownership_requires_complete_stable_identity(
+    row: dict[str, str],
+) -> None:
+    with pytest.raises(OrganizationConflictError):
+        PostgreSQLOrganizationRepository._validate_baic_key_ownership(
+            _expected_baic_keys()[0], [row], organization_id="org-baic"
+        )
+
+
+def test_baic_key_ownership_allows_hash_only_when_expected_id_is_empty() -> None:
+    expected = {**_expected_baic_keys()[0], "upstreamKeyId": ""}
+    row = {
+        "organization_id": "org-baic",
+        "backend_id": "primary",
+        "record_source": "usage",
+        "upstream_key_hash": expected["upstreamKeyHash"],
+        "upstream_key_id": "stored-id-not-required-by-preview",
+    }
+
+    PostgreSQLOrganizationRepository._validate_baic_key_ownership(
+        expected, [row], organization_id="org-baic"
+    )
+
+
+class _BaicOwnershipConnection:
+    def __init__(self, ownership_rows: list[dict[str, str]]) -> None:
+        self.ownership_rows = ownership_rows
+        self.executed: list[str] = []
+
+    def transaction(self):
+        return _Transaction()
+
+    async def fetchrow(self, query, *args):
+        if "FROM customer_adoption_operation" in query:
+            return None
+        if "FROM customer_organization WHERE id=$1" in query:
+            return {
+                "id": "org-baic",
+                "name": "北汽",
+                "upstream_organization_id": "org-old",
+                "status": "active",
+                "upstream_status": "active",
+            }
+        if "FROM customer_department" in query and "WHERE id=$1" in query:
+            return {
+                "id": "dept-baic",
+                "organization_id": "org-baic",
+                "upstream_team_id": "team-old",
+                "status": "active",
+            }
+        if "FROM customer_member" in query:
+            return {
+                "id": "member-david",
+                "organization_id": "org-baic",
+                "department_id": "dept-baic",
+                "name": "David",
+                "email": "davidzhu2021@163.com",
+                "role": "admin",
+                "team_role": "leader",
+                "status": "invited",
+                "auth_user_id": "auth-david",
+                "upstream_user_id": "customer-member-member-david",
+            }
+        if "upstream_organization_id=$1 AND id<>$2" in query:
+            return None
+        if "upstream_team_id=$1 AND id<>$2" in query:
+            return None
+        if "customer_usage_key_identity" in query or "customer_access_token" in query:
+            raise AssertionError("ownership checks must fetch every matching row")
+        raise AssertionError(f"unexpected fetchrow: {query}")
+
+    async def fetch(self, query, *args):
+        if "FROM customer_invitation" in query:
+            return [
+                {
+                    "id": "invitation-1",
+                    "email": "davidzhu2021@163.com",
+                    "consumed_at": datetime(2026, 8, 4, tzinfo=timezone.utc),
+                    "revoked_at": None,
+                }
+            ]
+        if "FROM customer_usage_key_identity" in query:
+            if args[1] == "a" * 64:
+                return list(self.ownership_rows)
+            return []
+        if "FROM customer_access_token" in query:
+            return []
+        raise AssertionError(f"unexpected fetch: {query}")
+
+    async def execute(self, query, *_args):
+        self.executed.append(query)
+        return "INSERT 0 1"
+
+
+class _BaicOwnershipPool:
+    def __init__(self, connection: _BaicOwnershipConnection) -> None:
+        self.connection = connection
+
+    def acquire(self):
+        return _Acquire(self.connection)
+
+
+@pytest.mark.parametrize(
+    "ownership_rows",
+    [
+        [
+            {
+                "organization_id": "org-baic",
+                "backend_id": "primary",
+                "record_source": "usage",
+                "upstream_key_hash": "a" * 64,
+                "upstream_key_id": "",
+            },
+            {
+                "organization_id": "org-baic",
+                "backend_id": "primary",
+                "record_source": "usage",
+                "upstream_key_hash": "c" * 64,
+                "upstream_key_id": "key-a",
+            },
+        ],
+        [
+            {
+                "organization_id": "org-other",
+                "backend_id": "primary",
+                "record_source": "usage",
+                "upstream_key_hash": "a" * 64,
+                "upstream_key_id": "key-a",
+            }
+        ],
+    ],
+)
+def test_baic_reconciliation_fetches_all_key_owners_before_remap(
+    ownership_rows: list[dict[str, str]],
+) -> None:
+    connection = _BaicOwnershipConnection(ownership_rows)
+    repository = PostgreSQLOrganizationRepository("postgresql://unused")
+    repository.pool = _BaicOwnershipPool(connection)
+
+    with pytest.raises(OrganizationConflictError):
+        asyncio.run(
+            repository.reconcile_baic_pilot_state(
+                **_baic_reconciliation_kwargs(_expected_baic_keys())
+            )
+        )
+
+    assert not any(
+        "UPDATE customer_organization SET name" in query
+        or "UPDATE customer_department SET name" in query
+        for query in connection.executed
+    )
+
+
+def _legacy_baic_credit(**overrides):
+    row = {
+        "id": "ledger-gift",
+        "operation": "grant",
+        "amount_usd": Decimal("5000.00"),
+        "balance_after_usd": Decimal("5000.00"),
+        "reason": "赠送",
+        "external_reference": "",
+        "idempotency_key": "manual-random-key",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_baic_credit_metadata_adoption_accepts_only_the_known_untouched_grant() -> None:
+    row = _legacy_baic_credit()
+
+    adopted = PostgreSQLOrganizationRepository._baic_pilot_credit_to_adopt(
+        [row],
+        balance=Decimal("5000.00"),
+        billing_status="active",
+        billing_effective_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
+    )
+
+    assert adopted is row
+
+
+@pytest.mark.parametrize(
+    ("rows", "balance", "billing_status", "billing_effective_at"),
+    [
+        (
+            [_legacy_baic_credit(), _legacy_baic_credit(id="extra")],
+            Decimal("5000"),
+            "active",
+            datetime(2026, 8, 4, tzinfo=timezone.utc),
+        ),
+        (
+            [_legacy_baic_credit(reason="其他授信")],
+            Decimal("5000"),
+            "active",
+            datetime(2026, 8, 4, tzinfo=timezone.utc),
+        ),
+        (
+            [_legacy_baic_credit(amount_usd=Decimal("4999"))],
+            Decimal("5000"),
+            "active",
+            datetime(2026, 8, 4, tzinfo=timezone.utc),
+        ),
+        (
+            [_legacy_baic_credit()],
+            Decimal("4999"),
+            "active",
+            datetime(2026, 8, 4, tzinfo=timezone.utc),
+        ),
+        (
+            [_legacy_baic_credit()],
+            Decimal("5000"),
+            "past_due",
+            datetime(2026, 8, 4, tzinfo=timezone.utc),
+        ),
+        ([_legacy_baic_credit()], Decimal("5000"), "active", None),
+        (
+            [
+                _legacy_baic_credit(
+                    idempotency_key="baic-pilot-initial-credit-v1"
+                )
+            ],
+            Decimal("5000"),
+            "active",
+            datetime(2026, 8, 4, tzinfo=timezone.utc),
+        ),
+    ],
+)
+def test_baic_credit_metadata_adoption_rejects_any_ambiguous_state(
+    rows,
+    balance,
+    billing_status,
+    billing_effective_at,
+) -> None:
+    with pytest.raises(OrganizationConflictError):
+        PostgreSQLOrganizationRepository._baic_pilot_credit_to_adopt(
+            rows,
+            balance=balance,
+            billing_status=billing_status,
+            billing_effective_at=billing_effective_at,
+        )
+
+
+def test_baic_reconciliation_schema_supports_superseded_outbox_and_idempotency() -> None:
+    assert "customer_adoption_operation" in ORGANIZATION_SCHEMA
+    assert "operation_key TEXT NOT NULL UNIQUE" in ORGANIZATION_SCHEMA
+    assert "customer_outbox" in ORGANIZATION_SCHEMA
+    # Outbox status is intentionally open-ended so a durable superseded
+    # marker can preserve the original processing history without replay.
+    assert "status TEXT NOT NULL DEFAULT 'pending'" in ORGANIZATION_SCHEMA
+
+
+def test_report_only_import_idempotency_uses_stable_ownership_fields() -> None:
+    import inspect
+
+    source = inspect.getsource(
+        PostgreSQLOrganizationRepository.import_report_only_key_identity
+    )
+
+    fingerprint = source[
+        source.index("fingerprint_payload = {") : source.index(
+            "request_fingerprint =", source.index("fingerprint_payload = {")
+        )
+    ]
+    assert "upstreamKeyHash" in fingerprint
+    assert "upstreamUserIdSnapshot" in fingerprint
+    assert "spendUsdSnapshot" not in fingerprint
+    assert "modelsSnapshot" not in fingerprint
+    assert "reportingRequestedThrough" not in fingerprint
+    assert "UPDATE customer_usage_key_identity SET" in source
+    assert "reporting_requested_through=GREATEST" in source
+
+
+def test_usage_backfill_claim_reclaims_stale_running_leases() -> None:
+    import inspect
+
+    source = inspect.getsource(
+        PostgreSQLOrganizationRepository.claim_usage_backfill_window
+    )
+
+    assert "ORGANIZATION_BACKFILL_LEASE_SECONDS" in source
+    assert "stale backfill lease reclaimed" in source
+    assert "status='running' AND locked_at IS NOT NULL" in source
+    assert "locked_at=now()" in source
+    assert "lease_token" in source
+    assert "secrets.token_urlsafe" in source
+
+
+def test_usage_backfill_completion_and_failure_require_the_current_lease() -> None:
+    import inspect
+
+    complete_source = inspect.getsource(
+        PostgreSQLOrganizationRepository.complete_usage_backfill_window
+    )
+    fail_source = inspect.getsource(
+        PostgreSQLOrganizationRepository.fail_usage_backfill_window
+    )
+
+    assert "lease_token: str" in complete_source
+    assert "AND lease_token=$4" in complete_source
+    assert "lease_token=''" in complete_source
+    assert "lease_token: str" in fail_source
+    assert "AND lease_token=$3" in fail_source
+    assert "usage backfill lease is no longer current" in fail_source
+
+
+def test_stale_usage_backfill_worker_cannot_finish_a_reclaimed_lease() -> None:
+    class Pool:
+        status = "running"
+        lease_token = "new-lease"
+
+        async def fetchrow(self, query, *args):
+            assert "AND lease_token=$4" in query
+            backfill_id, covered_from, covered_through, lease_token = args
+            assert backfill_id == "backfill-1"
+            if self.status != "running" or lease_token != self.lease_token:
+                return None
+            self.status = "complete"
+            self.lease_token = ""
+            return {
+                "id": backfill_id,
+                "status": self.status,
+                "covered_from": covered_from,
+                "covered_through": covered_through,
+                "next_date": covered_through,
+            }
+
+        async def execute(self, query, *args):
+            assert "AND lease_token=$3" in query
+            _backfill_id, _error, lease_token = args
+            if self.status != "running" or lease_token != self.lease_token:
+                return "UPDATE 0"
+            self.status = "failed"
+            self.lease_token = ""
+            return "UPDATE 1"
+
+    repository = PostgreSQLOrganizationRepository("postgresql://unused")
+    pool = Pool()
+    repository.pool = pool
+    today = datetime.now(timezone.utc).date()
+
+    with pytest.raises(OrganizationConflictError):
+        asyncio.run(
+            repository.complete_usage_backfill_window(
+                "backfill-1",
+                lease_token="stale-lease",
+                covered_from=today,
+                covered_through=today,
+            )
+        )
+    with pytest.raises(OrganizationConflictError):
+        asyncio.run(
+            repository.fail_usage_backfill_window(
+                "backfill-1", "old worker failed", lease_token="stale-lease"
+            )
+        )
+
+    result = asyncio.run(
+        repository.complete_usage_backfill_window(
+            "backfill-1",
+            lease_token="new-lease",
+            covered_from=today,
+            covered_through=today,
+        )
+    )
+    assert result["status"] == "complete"

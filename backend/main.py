@@ -103,7 +103,11 @@ from .organization_store import (
 from .organization_repository import PostgreSQLOrganizationRepository
 from .organization_provisioning import OrganizationProvisioningService
 from .usage_store import UsageStore
-from .usage_sync import UsageSynchronizer, run_sync_with_recent_refresh
+from .usage_sync import (
+    UsageSynchronizer,
+    run_sync_with_recent_refresh,
+    run_usage_backfill_once,
+)
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -536,6 +540,12 @@ async def run_usage_sync(days: int) -> dict[str, Any]:
         result = await run_sync_with_recent_refresh(
             client(), store, days, repository, UsageSynchronizer
         )
+        if result.get("status") in {"ok", "partial"} and isinstance(
+            repository, PostgreSQLOrganizationRepository
+        ):
+            result["organizationBackfill"] = await run_usage_backfill_once(
+                client(), store, repository, max_windows=2
+            )
         settlement: dict[str, Any] | None = None
         if result.get("status") == "ok" and organization_real_enabled():
             if isinstance(repository, PostgreSQLOrganizationRepository):
@@ -923,11 +933,12 @@ async def reconcile_baic_pilot_credit() -> bool:
     if not isinstance(store, PostgreSQLOrganizationRepository):
         return False
     organizations = await store.list_organizations(
-        keyword="北汽集团", include_archived=False, page=1, page_size=10
+        keyword="", include_archived=False, page=1, page_size=10
     )
     candidates = [
         item for item in (organizations.get("items") or [])
-        if str(item.get("name") or "").strip() == "北汽集团"
+        if str(item.get("id") or "") == "4b13ec57df104522a59ee910824c7e70"
+        and str(item.get("name") or "").strip() == "北汽集团"
     ]
     if len(candidates) != 1:
         return False
@@ -954,9 +965,7 @@ async def reconcile_baic_pilot_credit() -> bool:
     # means the original adoption proof is stale and credit must not be issued.
     backend_id = os.getenv("ORGANIZATION_ADOPTION_BACKEND_ID", "primary").strip() or "primary"
     backend = next((item for item in client().backends if item.id == backend_id), None)
-    aliases = configured_organization_adoption_values(
-        "ORGANIZATION_ADOPTION_KEY_ALIASES"
-    )
+    aliases = ["claude-code-lianghaiqiang", "cursor-lianghaiqiang"]
     organization = await store.get_organization(organization_id)
     departments = await store.list_departments(organization_id=organization_id)
     upstream_organization_id = str(
@@ -970,6 +979,16 @@ async def reconcile_baic_pilot_credit() -> bool:
     if backend is None or not aliases or not upstream_organization_id or len(upstream_team_ids) != 1:
         return False
     upstream_team_id = next(iter(upstream_team_ids))
+    mappings = await store.usage_token_attribution_map()
+    report_only_hashes = {
+        str(item.get("upstreamKeyHash") or "").lower()
+        for item in mappings
+        if str(item.get("mode") or "") == "report_only"
+        and str(item.get("organizationId") or "") == upstream_organization_id
+        and str(item.get("teamId") or "") == upstream_team_id
+        and item.get("billingEligible") is False
+    }
+    expected_hashes: set[str] = set()
     for alias in aliases:
         records = await client().list_keys_exact(key_alias=alias, backend=backend)
         if len(records) != 1:
@@ -980,6 +999,14 @@ async def reconcile_baic_pilot_credit() -> bool:
             or str(identity.get("teamId") or "") != upstream_team_id
         ):
             return False
+        key_hash = str(identity.get("hash") or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", key_hash):
+            return False
+        expected_hashes.add(key_hash)
+    if len(expected_hashes) != len(aliases) or not expected_hashes.issubset(
+        report_only_hashes
+    ):
+        return False
     await store.adjust_billing(
         organization_id,
         operation="grant",

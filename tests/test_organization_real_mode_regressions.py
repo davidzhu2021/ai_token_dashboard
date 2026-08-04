@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -462,12 +462,22 @@ def test_adoption_replay_returns_saved_result_without_upstream_or_local_writes(
 
 
 class _BaicCreditRepository:
-    def __init__(self, member_status: str = "active") -> None:
+    def __init__(
+        self, member_status: str = "active", *, imported_assets: bool = True
+    ) -> None:
         self.member_status = member_status
+        self.imported_assets = imported_assets
         self.adjustments: list[dict[str, Any]] = []
 
     async def list_organizations(self, **_kwargs: Any) -> dict[str, Any]:
-        return {"items": [{"id": "org-baic", "name": "北汽集团"}]}
+        return {
+            "items": [
+                {
+                    "id": "4b13ec57df104522a59ee910824c7e70",
+                    "name": "北汽集团",
+                }
+            ]
+        }
 
     async def list_members(self, **_kwargs: Any) -> dict[str, Any]:
         return {
@@ -483,7 +493,7 @@ class _BaicCreditRepository:
         }
 
     async def get_organization(self, organization_id: str) -> dict[str, Any]:
-        assert organization_id == "org-baic"
+        assert organization_id == "4b13ec57df104522a59ee910824c7e70"
         return {
             "id": organization_id,
             "name": "北汽集团",
@@ -491,13 +501,33 @@ class _BaicCreditRepository:
         }
 
     async def list_departments(self, **kwargs: Any) -> list[dict[str, Any]]:
-        assert kwargs.get("organization_id") == "org-baic"
+        assert kwargs.get("organization_id") == "4b13ec57df104522a59ee910824c7e70"
         return [
             {
                 "id": "dept-management",
                 "name": "企业管理",
                 "upstreamTeamId": "team-upstream",
             }
+        ]
+
+    async def usage_token_attribution_map(self) -> list[dict[str, Any]]:
+        if not self.imported_assets:
+            return []
+        return [
+            {
+                "mode": "report_only",
+                "billingEligible": False,
+                "organizationId": "org-upstream",
+                "teamId": "team-upstream",
+                "upstreamKeyHash": "a" * 64,
+            },
+            {
+                "mode": "report_only",
+                "billingEligible": False,
+                "organizationId": "org-upstream",
+                "teamId": "team-upstream",
+                "upstreamKeyHash": "b" * 64,
+            },
         ]
 
     async def adjust_billing(self, organization_id: str, **kwargs: Any) -> dict[str, Any]:
@@ -521,7 +551,7 @@ def test_baic_initial_credit_waits_for_active_david_and_uses_stable_idempotency(
     assert asyncio.run(main.reconcile_baic_pilot_credit()) is True
     assert repository.adjustments == [
         {
-            "organizationId": "org-baic",
+            "organizationId": "4b13ec57df104522a59ee910824c7e70",
             "operation": "grant",
             "amount_usd": "5000.00",
             "reason": "北汽集团试点初始授信",
@@ -540,6 +570,23 @@ def test_baic_initial_credit_is_not_granted_while_david_is_invited(
     monkeypatch.setattr(main, "organization_real_enabled", lambda: True)
     monkeypatch.setattr(main, "organization_store", lambda: repository)
     monkeypatch.setattr(main, "PostgreSQLOrganizationRepository", _BaicCreditRepository)
+
+    assert asyncio.run(main.reconcile_baic_pilot_credit()) is False
+    assert repository.adjustments == []
+
+
+def test_baic_initial_credit_waits_until_report_only_assets_are_imported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = _BaicCreditRepository(imported_assets=False)
+    monkeypatch.setattr(main, "organization_real_enabled", lambda: True)
+    monkeypatch.setattr(main, "organization_store", lambda: repository)
+    monkeypatch.setattr(main, "PostgreSQLOrganizationRepository", _BaicCreditRepository)
+    monkeypatch.setenv(
+        "ORGANIZATION_ADOPTION_KEY_ALIASES",
+        "claude-code-lianghaiqiang,cursor-lianghaiqiang",
+    )
+    monkeypatch.setattr(main, "client", lambda: _AdoptionUpstream())
 
     assert asyncio.run(main.reconcile_baic_pilot_credit()) is False
     assert repository.adjustments == []
@@ -1073,6 +1120,7 @@ class _OutboxExhaustionPool:
             "created_at": datetime(2026, 7, 30, tzinfo=timezone.utc),
             "last_error": "",
         }
+        self.retry_interval = None
 
     def _apply_failed_update(self, query: str, error: str) -> None:
         normalized = " ".join(query.lower().split())
@@ -1085,7 +1133,9 @@ class _OutboxExhaustionPool:
 
     async def execute(self, query: str, *args: Any) -> str:
         if "update customer_outbox" in query.lower():
-            error = str(args[1]) if len(args) > 1 else ""
+            if "available_at=now()" in query.lower() and len(args) > 1:
+                self.retry_interval = args[1]
+            error = str(args[-1]) if len(args) > 1 else ""
             self._apply_failed_update(query, error)
             return "UPDATE 1"
         raise AssertionError(query)
@@ -1135,3 +1185,21 @@ def test_outbox_exhaustion_moves_job_to_failed_and_health_reports_it(
     assert pool.row["status"] == "failed"
     assert health["pendingCount"] == 0
     assert health["failedCount"] == 1
+
+
+def test_outbox_retry_passes_timedelta_interval_to_asyncpg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ORGANIZATION_OUTBOX_MAX_ATTEMPTS", "3")
+    pool = _OutboxExhaustionPool()
+    pool.row["attempts"] = 1
+    repository = PostgreSQLOrganizationRepository("postgresql://unused")
+    repository.pool = pool
+
+    completed = asyncio.run(
+        repository.complete_outbox("outbox-1", error="temporary upstream error")
+    )
+
+    assert completed is True
+    assert pool.row["status"] == "pending"
+    assert pool.retry_interval == timedelta(seconds=30)

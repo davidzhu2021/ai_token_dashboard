@@ -11,7 +11,11 @@ import asyncio
 import pytest
 
 from backend.litellm_client import LiteLLMBackend, LiteLLMClient
-from backend.usage_sync import UsageSynchronizer
+from backend.usage_sync import (
+    UsageSynchronizer,
+    run_pending_usage_backfills,
+    run_usage_backfill_once,
+)
 
 
 def _report_only_mapping(*, through: str = "2026-07-28T02:00:00+00:00") -> dict:
@@ -136,6 +140,22 @@ def test_scan_groups_all_users_in_one_pass(monkeypatch) -> None:
     assert rows["cursor-bob"][0]["totalTokens"] == 500, "跨页同账号要累加"
     # 每页各请求一次，不按账号放大请求数
     assert [int(r["page"]) for r in client.requests] == [1, 2]
+
+
+def test_log_sync_can_filter_by_stable_key_hash(monkeypatch) -> None:
+    monkeypatch.setenv("USAGE_TIMEZONE_OFFSET_MINUTES", "-480")
+    key_hash = "a" * 64
+    client = _LogClient(
+        [[_log("claude-code-alice", "2026-07-28T01:00:00+00:00", 100, "1.0")]]
+    )
+
+    asyncio.run(
+        client.sync_rows_from_logs(
+            "2026-07-28", "2026-07-28", PRIMARY, api_key=key_hash
+        )
+    )
+
+    assert client.requests[0]["api_key"] == key_hash
 
 
 def test_log_sync_retains_explicit_org_team_and_hashed_key_attribution(monkeypatch) -> None:
@@ -293,6 +313,208 @@ def test_report_only_mapping_is_backend_and_hash_scoped() -> None:
 
     assert primary[("key_hash", "a" * 64)][0]["organizationId"] == "org-baic-upstream"
     assert her[("key_hash", "a" * 64)][0]["organizationId"] == "other"
+
+
+def test_organization_mapping_repository_failure_fails_closed() -> None:
+    class Repository:
+        async def usage_token_attribution_map(self):
+            raise RuntimeError("database unavailable")
+
+    synchronizer = UsageSynchronizer(object(), object(), Repository())
+
+    with pytest.raises(
+        RuntimeError,
+        match="organization token attribution mappings are unavailable",
+    ):
+        asyncio.run(synchronizer._token_attribution_map("primary"))
+
+
+def test_report_only_mapping_falls_back_to_upstream_user_id() -> None:
+    row = {
+        "_userId": "liang-upstream-user",
+        "organizationId": "org-baic-upstream",
+        "teamId": "team-baic-upstream",
+        "eventTime": "2026-07-28T01:00:00+00:00",
+    }
+    mapping = {
+        **_report_only_mapping(through=""),
+        "userId": "liang-upstream-user",
+    }
+
+    UsageSynchronizer._apply_token_attribution(
+        [row], {("user_id", "liang-upstream-user"): [mapping]}
+    )
+
+    assert row["principalId"] == "principal-lianghaiqiang"
+    assert row["attributionSource"] == "legacy_report_only"
+    assert row["billingEligible"] is False
+
+
+def test_report_only_daily_fallback_stays_visible_but_not_billable() -> None:
+    row = {
+        "_userId": "liang-upstream-user",
+        "organizationId": "org-baic-upstream",
+        "teamId": "team-baic-upstream",
+        "keyId": "a" * 64,
+        "date": "2026-07-30",
+    }
+
+    UsageSynchronizer._apply_token_attribution(
+        [row], {("key_hash", "a" * 64): [_report_only_mapping(through="")]}
+    )
+
+    assert row["principalId"] == "principal-lianghaiqiang"
+    assert row["attributionSource"] == "legacy_report_only"
+    assert row["billingEligible"] is False
+
+
+def test_report_only_backfill_filters_by_hash_and_never_bills() -> None:
+    key_hash = "a" * 64
+
+    class Client:
+        backends = [PRIMARY]
+
+        async def sync_rows_from_logs(self, start, end, backend, *, api_key=None):
+            assert (start, end, backend.id, api_key) == (
+                "2026-07-29",
+                "2026-07-31",
+                "primary",
+                key_hash,
+            )
+            row = _log("claude-code-lianghaiqiang", "2026-07-30T01:00:00Z", 10, "1")
+            row.update({"date": "2026-07-30", "keyId": key_hash, "requestId": "req-1", "eventTime": "2026-07-30T01:00:00Z"})
+            return {"claude-code-lianghaiqiang": [row], "__events__": [dict(row)]}, True
+
+    class Repository:
+        completed = None
+        failed = None
+
+        async def claim_usage_backfill_window(self, **_kwargs):
+            if self.completed:
+                return None
+            return {
+                "id": "backfill-1",
+                "leaseToken": "lease-1",
+                "backendId": "primary",
+                "upstreamKeyHash": key_hash,
+                "upstreamKeyId": key_hash,
+                "upstreamUserId": "claude-code-lianghaiqiang",
+                "upstreamOrganizationId": "org-baic",
+                "upstreamTeamId": "team-baic",
+                "principalId": "principal-liang",
+                "effectiveFrom": "2026-07-29T00:00:00+00:00",
+                "effectiveThrough": None,
+                "windowFrom": "2026-07-29",
+                "windowThrough": "2026-07-31",
+            }
+
+        async def complete_usage_backfill_window(self, backfill_id, **kwargs):
+            self.completed = (backfill_id, kwargs)
+
+        async def fail_usage_backfill_window(self, backfill_id, error, *, lease_token):
+            self.failed = (backfill_id, error, lease_token)
+
+    class Store:
+        rows = None
+        events = None
+
+        async def upsert_attributed_usage(self, backend_id, rows, *, events):
+            self.rows = rows
+            self.events = events
+            assert backend_id == "primary"
+            return len(rows)
+
+    repository = Repository()
+    store = Store()
+    result = asyncio.run(
+        run_usage_backfill_once(Client(), store, repository, max_windows=1)
+    )
+
+    assert result == {"completedWindowCount": 1, "rowCount": 1}
+    assert repository.failed is None
+    assert store.rows[0]["principalId"] == "principal-liang"
+    assert store.rows[0]["billingEligible"] is False
+    assert store.events[0]["attributionSource"] == "legacy_report_only"
+
+
+def test_report_only_backfill_rejects_unconfirmed_key_filter() -> None:
+    key_hash = "a" * 64
+
+    class Client:
+        backends = [PRIMARY]
+
+        async def sync_rows_from_logs(self, *_args, **_kwargs):
+            row = _log(
+                "claude-code-lianghaiqiang",
+                "2026-07-30T01:00:00Z",
+                10,
+                "1",
+            )
+            row.update(
+                {
+                    "date": "2026-07-30",
+                    "requestId": "req-1",
+                    "eventTime": "2026-07-30T01:00:00Z",
+                }
+            )
+            return {"claude-code-lianghaiqiang": [row], "__events__": [dict(row)]}, True
+
+    class Repository:
+        failed = None
+
+        async def claim_usage_backfill_window(self, **_kwargs):
+            if self.failed:
+                return None
+            return {
+                "id": "backfill-1",
+                "leaseToken": "lease-1",
+                "backendId": "primary",
+                "upstreamKeyHash": key_hash,
+                "upstreamKeyId": key_hash,
+                "upstreamUserId": "claude-code-lianghaiqiang",
+                "upstreamOrganizationId": "org-baic",
+                "upstreamTeamId": "team-baic",
+                "principalId": "principal-liang",
+                "effectiveFrom": "2026-07-29T00:00:00+00:00",
+                "effectiveThrough": None,
+                "windowFrom": "2026-07-29",
+                "windowThrough": "2026-07-31",
+            }
+
+        async def fail_usage_backfill_window(self, backfill_id, error, *, lease_token):
+            self.failed = (backfill_id, error, lease_token)
+
+    class Store:
+        async def upsert_attributed_usage(self, *_args, **_kwargs):
+            raise AssertionError("unconfirmed logs must not be stored")
+
+    repository = Repository()
+    result = asyncio.run(
+        run_usage_backfill_once(Client(), Store(), repository, max_windows=1)
+    )
+
+    assert result == {"completedWindowCount": 0, "rowCount": 0}
+    assert "filter was not confirmed" in repository.failed[1]
+
+
+def test_pending_backfill_runner_stops_when_queue_is_empty(monkeypatch) -> None:
+    results = iter(
+        [
+            {"completedWindowCount": 1, "rowCount": 2},
+            {"completedWindowCount": 1, "rowCount": 3},
+            {"completedWindowCount": 0, "rowCount": 0},
+        ]
+    )
+
+    async def once(*_args, **_kwargs):
+        return next(results)
+
+    monkeypatch.setattr("backend.usage_sync.run_usage_backfill_once", once)
+
+    assert asyncio.run(run_pending_usage_backfills(object(), object(), object())) == {
+        "completedWindowCount": 2,
+        "rowCount": 5,
+    }
 
 
 def test_log_sync_prioritizes_claude_cli_tags_over_legacy_cursor_identity(monkeypatch) -> None:

@@ -220,6 +220,14 @@ def test_usage_schema_has_request_level_attribution_without_content_columns() ->
     assert "api_key TEXT" not in event_schema
 
 
+def test_snapshot_replacement_preserves_report_only_history() -> None:
+    import inspect
+
+    source = inspect.getsource(UsageStore.replace_backend_snapshot)
+
+    assert source.count("attribution_source <> 'legacy_report_only'") == 2
+
+
 def test_coalesce_keeps_distinct_event_time_team_and_key_attribution() -> None:
     rows = [
         {"date": "2026-07-22", "_userId": "alice", "source": "Codex", "model": "gpt-5", "teamId": "team-old", "keyId": "key-1", "totalTokens": 2},

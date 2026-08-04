@@ -88,6 +88,18 @@ def _not_found_error(exc: BaseException) -> bool:
     return getattr(exc, "status_code", None) == 404
 
 
+def _team_admin_requires_premium(exc: BaseException) -> bool:
+    """Match LiteLLM's explicit non-enterprise team-admin rejection only."""
+
+    if getattr(exc, "status_code", None) != 400:
+        return False
+    detail = getattr(exc, "detail", "")
+    if isinstance(detail, dict):
+        detail = detail.get("error") or detail.get("message") or ""
+    message = str(detail or exc).casefold()
+    return "assigning team admins is a premium feature" in message
+
+
 class OrganizationProvisioningService:
     """Provision organizations and invitation emails from PostgreSQL outbox rows."""
 
@@ -379,14 +391,49 @@ class OrganizationProvisioningService:
             )
             update_team_member = getattr(self.upstream, "update_team_member", None)
             if team_member and callable(update_team_member):
-                await update_team_member(
-                    team_id,
-                    user_id=user_id,
-                    role=team_role,
-                    changed_by=self.changed_by,
-                )
+                try:
+                    await update_team_member(
+                        team_id,
+                        user_id=user_id,
+                        role=team_role,
+                        changed_by=self.changed_by,
+                    )
+                except Exception as exc:
+                    if team_role != "admin" or not _team_admin_requires_premium(exc):
+                        raise
+                    logger.info(
+                        "upstream team-admin role unavailable; keeping local admin and using team member role user team_id=%s member_id=%s",
+                        team_id,
+                        member_id,
+                    )
+                    await update_team_member(
+                        team_id,
+                        user_id=user_id,
+                        role="user",
+                        changed_by=self.changed_by,
+                    )
             else:
-                await self.upstream.add_team_member(team_id, team_role, user_id=user_id, changed_by=self.changed_by)
+                try:
+                    await self.upstream.add_team_member(
+                        team_id,
+                        team_role,
+                        user_id=user_id,
+                        changed_by=self.changed_by,
+                    )
+                except Exception as exc:
+                    if team_role != "admin" or not _team_admin_requires_premium(exc):
+                        raise
+                    logger.info(
+                        "upstream team-admin role unavailable; keeping local admin and using team member role user team_id=%s member_id=%s",
+                        team_id,
+                        member_id,
+                    )
+                    await self.upstream.add_team_member(
+                        team_id,
+                        "user",
+                        user_id=user_id,
+                        changed_by=self.changed_by,
+                    )
         await self.repository.activate_member_upstream(organization_id, member_id, user_id)
         return {"organizationId": organization_id, "memberId": member_id, "upstreamUserId": user_id, "upstreamTeamId": team_id}
 
@@ -469,14 +516,42 @@ class OrganizationProvisioningService:
                     changed_by=self.changed_by,
                 )
             except Exception as exc:
-                if not _not_found_error(exc):
+                if _not_found_error(exc):
+                    try:
+                        await self.upstream.add_team_member(
+                            target_team_id,
+                            team_role,
+                            user_id=upstream_user_id,
+                            changed_by=self.changed_by,
+                        )
+                    except Exception as add_exc:
+                        if team_role != "admin" or not _team_admin_requires_premium(add_exc):
+                            raise
+                        logger.info(
+                            "upstream team-admin role unavailable; keeping local admin and using team member role user team_id=%s member_id=%s",
+                            target_team_id,
+                            member_id,
+                        )
+                        await self.upstream.add_team_member(
+                            target_team_id,
+                            "user",
+                            user_id=upstream_user_id,
+                            changed_by=self.changed_by,
+                        )
+                elif team_role == "admin" and _team_admin_requires_premium(exc):
+                    logger.info(
+                        "upstream team-admin role unavailable; keeping local admin and using team member role user team_id=%s member_id=%s",
+                        target_team_id,
+                        member_id,
+                    )
+                    await self.upstream.update_team_member(
+                        target_team_id,
+                        user_id=upstream_user_id,
+                        role="user",
+                        changed_by=self.changed_by,
+                    )
+                else:
                     raise
-                await self.upstream.add_team_member(
-                    target_team_id,
-                    team_role,
-                    user_id=upstream_user_id,
-                    changed_by=self.changed_by,
-                )
         return {"organizationId": organization_id, "memberId": member_id, "status": status, "upstreamTeamId": target_team_id}
 
     async def sync_billing(self, payload: dict[str, Any]) -> dict[str, Any]:

@@ -90,9 +90,15 @@ class UsageSynchronizer:
             return {}
         try:
             records = await loader()
-        except Exception:
+        except Exception as exc:
             logger.exception("failed to load organization token attribution mappings")
-            return {}
+            # Real-mode settlement depends on this map to distinguish imported
+            # report-only keys from managed traffic. Treating a repository
+            # outage as an empty map could make explicit Organization fields
+            # billable, so fail this backend snapshot without replacing data.
+            raise RuntimeError(
+                "organization token attribution mappings are unavailable"
+            ) from exc
         index: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for record in records if isinstance(records, list) else []:
             if not isinstance(record, dict):
@@ -109,6 +115,10 @@ class UsageSynchronizer:
             # report-only imports require the canonical upstream SHA-256 hash.
             if mode != "report_only":
                 fields += (("key_alias", "upstreamKeyAlias"),)
+            # Older spend logs can omit key identifiers. A persisted upstream
+            # user mapping is the final safe fallback; ambiguous matches stay
+            # quarantined below.
+            fields += (("user_id", "userId"),)
             for identifier_kind, field in fields:
                 value = _text(record.get(field))
                 if value:
@@ -129,10 +139,15 @@ class UsageSynchronizer:
             except ValueError:
                 return None
             return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-        # A report-only decision must use the request timestamp. A daily
-        # aggregate cannot prove which side of an intraday cutoff it belongs
-        # to, so fail closed instead of guessing from the date.
         return None
+
+    @staticmethod
+    def _row_usage_date(row: dict[str, Any]) -> date | None:
+        value = _text(row.get("date") or row.get("usageDate") or row.get("usage_date"))
+        try:
+            return date.fromisoformat(value[:10]) if value else None
+        except ValueError:
+            return None
 
     @staticmethod
     def _within_mapping_window(
@@ -141,8 +156,6 @@ class UsageSynchronizer:
         if _text(mapping.get("mode")) != "report_only":
             return True
         event_time = UsageSynchronizer._row_event_time(row)
-        if event_time is None:
-            return False
         try:
             effective_from = datetime.fromisoformat(
                 _text(mapping.get("effectiveFrom")).replace("Z", "+00:00")
@@ -152,6 +165,25 @@ class UsageSynchronizer:
         if effective_from.tzinfo is None:
             effective_from = effective_from.replace(tzinfo=timezone.utc)
         effective_through_text = _text(mapping.get("effectiveThrough"))
+        if event_time is None:
+            # Daily activity is less precise than raw logs, but a stable Key
+            # or User mapping still proves that this aggregate is report-only.
+            # Compare whole dates and keep it non-billable rather than letting
+            # the fallback path silently charge imported historical assets.
+            usage_date = UsageSynchronizer._row_usage_date(row)
+            if usage_date is None or usage_date < effective_from.date():
+                return False
+            if not effective_through_text:
+                return True
+            try:
+                effective_through = datetime.fromisoformat(
+                    effective_through_text.replace("Z", "+00:00")
+                )
+            except ValueError:
+                return False
+            if effective_through.tzinfo is None:
+                effective_through = effective_through.replace(tzinfo=timezone.utc)
+            return usage_date <= effective_through.date()
         if not effective_through_text:
             return effective_from <= event_time
         try:
@@ -183,6 +215,7 @@ class UsageSynchronizer:
                 ("key_id", _text(row.get("keyId") or row.get("key_id"))),
                 ("key_hash", _text(row.get("keyHash") or row.get("key_hash"))),
                 ("key_alias", _text(row.get("keyAlias") or row.get("key_alias"))),
+                ("user_id", _text(row.get("_userId") or row.get("userId") or row.get("user_id") or row.get("user"))),
             )
             for identifier_kind, value in identifiers:
                 if not value:
@@ -206,7 +239,14 @@ class UsageSynchronizer:
             unique = {id(item): item for item in candidates}
             if len(unique) != 1:
                 # An ambiguous alias/hash must remain unattributed rather than
-                # risking cross-tenant leakage.
+                # risking cross-tenant leakage. If any candidate is a
+                # report-only asset, also fail billing closed.
+                if any(
+                    _text(item.get("mode")) == "report_only"
+                    for item in unique.values()
+                ):
+                    row["attributionSource"] = "report_only_mapping_ambiguous"
+                    row["billingEligible"] = False
                 continue
             mapping = next(iter(unique.values()))
             explicit_organization_id = _text(
@@ -366,12 +406,6 @@ class UsageSynchronizer:
                             getattr(log_rows, "events", None)
                             or log_rows.pop("__events__", [])
                         )
-                        if token_mapping_index:
-                            for batch in log_rows.values():
-                                self._apply_token_attribution(batch, token_mapping_index)
-                            self._apply_token_attribution(
-                                event_rows, token_mapping_index
-                            )
                     else:
                         logger.warning(
                             "usage log scan incomplete for backend %s; falling back to daily activity",
@@ -441,6 +475,9 @@ class UsageSynchronizer:
                             ),
                         }
                     )
+        if token_mapping_index:
+            self._apply_token_attribution(rows, token_mapping_index)
+            self._apply_token_attribution(event_rows, token_mapping_index)
         logger.info(
             "usage snapshot collected backend=%s users=%s rows=%s start=%s end=%s",
             backend.id,
@@ -619,6 +656,128 @@ async def run_sync_with_recent_refresh(
             *list(recent_result.get("errors") or []),
         ]
     return output
+
+
+async def run_usage_backfill_once(
+    client: LiteLLMClient,
+    store: UsageStore,
+    organization_repository: Any,
+    *,
+    max_windows: int = 1,
+) -> dict[str, Any]:
+    """Consume bounded key-scoped historical imports without replacing snapshots."""
+
+    completed = 0
+    row_count = 0
+    for _ in range(max(1, max_windows)):
+        job = await organization_repository.claim_usage_backfill_window(
+            max_window_days=3
+        )
+        if job is None:
+            break
+        try:
+            backend = next(
+                item for item in client.backends if item.id == job["backendId"]
+            )
+            grouped, complete = await client.sync_rows_from_logs(
+                job["windowFrom"],
+                job["windowThrough"],
+                backend,
+                api_key=job["upstreamKeyHash"],
+            )
+            if not complete:
+                raise RuntimeError("historical key log scan is incomplete")
+            rows = [
+                row
+                for key, batch in grouped.items()
+                if key != "__events__"
+                for row in batch
+            ]
+            events = list(getattr(grouped, "events", None) or grouped.pop("__events__", []))
+            mapping = {
+                "backendId": job["backendId"],
+                "upstreamKeyId": job["upstreamKeyId"],
+                "upstreamKeyHash": job["upstreamKeyHash"],
+                "organizationId": job["upstreamOrganizationId"],
+                "teamId": job["upstreamTeamId"],
+                "principalId": job["principalId"],
+                "mode": "report_only",
+                "attributionSource": "legacy_report_only",
+                "billingEligible": False,
+                "effectiveFrom": job["effectiveFrom"],
+                "effectiveThrough": job["effectiveThrough"],
+            }
+            expected_key_ids = {
+                _text(job["upstreamKeyHash"]),
+                _text(job.get("upstreamKeyId")),
+            }
+            expected_key_ids.discard("")
+            for row in [*rows, *events]:
+                raw_user_id = _text(row.get("_userId") or row.get("userId") or row.get("user_id"))
+                expected_user_id = _text(job.get("upstreamUserId"))
+                if expected_user_id and raw_user_id and raw_user_id != expected_user_id:
+                    raise RuntimeError("historical key logs returned another upstream user")
+                returned_key_id = _text(
+                    row.get("keyId")
+                    or row.get("key_id")
+                    or row.get("keyHash")
+                    or row.get("key_hash")
+                )
+                if not returned_key_id or returned_key_id not in expected_key_ids:
+                    raise RuntimeError(
+                        "historical key log filter was not confirmed by each row"
+                    )
+            index = {("key_hash", job["upstreamKeyHash"]): [mapping]}
+            if job["upstreamKeyId"]:
+                index[("key_id", job["upstreamKeyId"])] = [mapping]
+            UsageSynchronizer._apply_token_attribution(rows, index)
+            UsageSynchronizer._apply_token_attribution(events, index)
+            unattributed = [
+                row
+                for row in [*rows, *events]
+                if _text(row.get("principalId")) != job["principalId"]
+            ]
+            if unattributed:
+                raise RuntimeError("historical key logs could not be attributed safely")
+            row_count += await store.upsert_attributed_usage(
+                job["backendId"], rows, events=events
+            )
+            await organization_repository.complete_usage_backfill_window(
+                job["id"],
+                lease_token=job["leaseToken"],
+                covered_from=date.fromisoformat(job["windowFrom"]),
+                covered_through=date.fromisoformat(job["windowThrough"]),
+            )
+            completed += 1
+        except Exception as exc:
+            await organization_repository.fail_usage_backfill_window(
+                job["id"], str(exc), lease_token=job["leaseToken"]
+            )
+            logger.exception("organization usage backfill failed id=%s", job["id"])
+            break
+    return {"completedWindowCount": completed, "rowCount": row_count}
+
+
+async def run_pending_usage_backfills(
+    client: LiteLLMClient,
+    store: UsageStore,
+    organization_repository: Any,
+    *,
+    max_windows: int = 128,
+) -> dict[str, Any]:
+    """Drain the bounded queue while retaining retry state on the first failure."""
+
+    completed = 0
+    row_count = 0
+    for _ in range(max(1, max_windows)):
+        result = await run_usage_backfill_once(
+            client, store, organization_repository, max_windows=1
+        )
+        if not result["completedWindowCount"]:
+            break
+        completed += int(result["completedWindowCount"])
+        row_count += int(result["rowCount"])
+    return {"completedWindowCount": completed, "rowCount": row_count}
 
 
 async def _run_cli(days: int) -> int:
