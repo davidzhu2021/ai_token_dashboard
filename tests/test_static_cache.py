@@ -17,7 +17,8 @@ def test_index_uses_fresh_app_asset_and_disables_html_cache() -> None:
     assert "Cache-Control" in response.headers
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["Referrer-Policy"] == "no-referrer"
-    assert "/assets/app.js?v=20260804-pending-adoption" in response.text
+    assert "/assets/app.js?v=20260804-organization-restore" in response.text
+    assert "20260804-pending-adoption" not in response.text
     assert "20260803-canonical-model-names" not in response.text
     assert "20260731-organization-real-mode-status" not in response.text
     assert "20260731-organization-member-avatar" not in response.text

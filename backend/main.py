@@ -5891,6 +5891,47 @@ async def platform_archive_organization(
     return {"organization": organization}
 
 
+@app.post("/api/platform/organizations/{organization_id}/restore")
+async def platform_restore_organization(
+    organization_id: str,
+    request: Request,
+    _data: OrganizationEmptyRequest | None = None,
+) -> dict[str, Any]:
+    """Undo an archive so a customer relationship can resume.
+
+    Archiving revoked every token upstream and that is not reversible, so this
+    restores the company, its departments and its members only. Tokens have to
+    be issued again by the customer's own administrator.
+    """
+
+    await enforce_csrf(request)
+    actor = await require_platform_organization(request, organization_id)
+    try:
+        organization = await platform_organization_store_call("restore_organization", organization_id)
+    except OrganizationConflictError as exc:
+        raise auth_http_error(
+            409,
+            "只有已归档的客户企业可以恢复，请确认当前状态",
+            "ORGANIZATION_NOT_ARCHIVED",
+        ) from exc
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    # Reviving a terminated customer relationship is high impact, so it is
+    # recorded even though archiving predates the audit log.
+    repository = organization_store()
+    if isinstance(repository, PostgreSQLOrganizationRepository):
+        await repository.record_audit(
+            organization_id,
+            "organization.restored",
+            actor=str(actor.get("email") or actor.get("id") or "platform"),
+            target_type="organization",
+            target_id=organization_id,
+            details={"toStatus": "active", "ipAddress": request_ip(request)},
+        )
+    invalidate_organization_usage_cache()
+    return {"organization": organization}
+
+
 @app.get("/api/platform/organizations/{organization_id}/members")
 async def platform_organization_members(
     organization_id: str,

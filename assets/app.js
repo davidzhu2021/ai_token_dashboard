@@ -5927,7 +5927,9 @@ function renderCustomerOrganizations() {
         <div class="customer-organization-card-actions">
           <button class="primary-btn" type="button" data-customer-organization-open="${escapeHtml(id)}">进入企业</button>
           <button class="ghost-btn" type="button" data-customer-organization-edit="${escapeHtml(id)}" ${isArchived ? "disabled" : ""}>改名</button>
-          <button class="danger-outline-btn" type="button" data-customer-organization-archive="${escapeHtml(id)}" ${isArchived ? "disabled" : ""}>归档</button>
+          ${isArchived
+            ? `<button class="ghost-btn" type="button" data-customer-organization-restore="${escapeHtml(id)}">恢复</button>`
+            : `<button class="danger-outline-btn" type="button" data-customer-organization-archive="${escapeHtml(id)}">归档</button>`}
         </div>
       </article>
     `;
@@ -6777,6 +6779,24 @@ async function archiveCustomerOrganization(organizationId) {
     showToast("客户企业已归档");
   } catch (error) {
     showToast(error.message || "客户企业归档失败");
+  }
+}
+
+async function restoreCustomerOrganization(organizationId) {
+  if (!customerOrganizationsAvailable() || !organizationId) return;
+  const item = customerOrganizations.find((candidate) => customerOrganizationId(candidate) === String(organizationId));
+  const organization = customerOrganizationRecord(item);
+  const name = organization.name || "这家客户企业";
+  // 归档时该企业的令牌已经真实失效且不可恢复，必须在确认前讲清楚，
+  // 否则运营会以为恢复企业就等于恢复调用能力。
+  if (!window.confirm(`恢复“${name}”？部门和成员会一并恢复，但归档时已失效的令牌不会恢复，需要由该企业管理员重新签发。`)) return;
+  try {
+    await ensureCsrfToken();
+    await api(`${customerOrganizationPath(organizationId)}/restore`, { method: "POST", body: JSON.stringify({}) });
+    await loadCustomerOrganizations();
+    showToast("客户企业已恢复");
+  } catch (error) {
+    showToast(error.message || "客户企业恢复失败");
   }
 }
 
@@ -8003,7 +8023,12 @@ el("customerOrganizationGrid").addEventListener("click", (event) => {
     return;
   }
   const archiveButton = event.target.closest("[data-customer-organization-archive]");
-  if (archiveButton) archiveCustomerOrganization(archiveButton.dataset.customerOrganizationArchive);
+  if (archiveButton) {
+    archiveCustomerOrganization(archiveButton.dataset.customerOrganizationArchive);
+    return;
+  }
+  const restoreButton = event.target.closest("[data-customer-organization-restore]");
+  if (restoreButton) restoreCustomerOrganization(restoreButton.dataset.customerOrganizationRestore);
 });
 
 el("customerOrganizationSearch").addEventListener("input", () => {

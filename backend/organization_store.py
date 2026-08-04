@@ -97,6 +97,8 @@ class OrganizationStore(Protocol):
 
     def archive_organization(self, organization_id: str) -> dict[str, Any]: ...
 
+    def restore_organization(self, organization_id: str) -> dict[str, Any]: ...
+
     def get_current(self, organization_id: str | None = None) -> dict[str, Any]: ...
 
     def list_departments(
@@ -1182,6 +1184,19 @@ class InMemoryOrganizationStore(OrganizationValidationMixin):
             now = self._now()
             state.organization["status"] = "archived"
             state.organization["archivedAt"] = now
+            self._touch_usage_scope(state, now)
+            return self._organization_summary_payload(state)
+
+    def restore_organization(self, organization_id: str) -> dict[str, Any]:
+        """Undo an archive. Suspension is a separate decision and stays put."""
+
+        with self._lock:
+            state = self._organization_or_raise(organization_id)
+            if state.organization.get("status") != "archived":
+                raise OrganizationConflictError("organization is not archived")
+            now = self._now()
+            state.organization["status"] = "active"
+            state.organization["archivedAt"] = None
             self._touch_usage_scope(state, now)
             return self._organization_summary_payload(state)
 

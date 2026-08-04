@@ -268,6 +268,26 @@ def test_archived_customer_controls_are_read_only_in_the_directory() -> None:
     assert 'data-customer-organization-edit="${escapeHtml(id)}" ${isArchived ? "disabled" : ""}' in source
 
 
+def test_archived_customer_offers_restore_instead_of_archive() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    # 归档与恢复互斥：已归档只给「恢复」，未归档只给「归档」。
+    assert 'data-customer-organization-restore="${escapeHtml(id)}">恢复' in source
+    assert 'data-customer-organization-archive="${escapeHtml(id)}">归档' in source
+    assert "async function restoreCustomerOrganization(organizationId)" in source
+    assert '/restore`, { method: "POST"' in source
+
+    restore = source[
+        source.index("async function restoreCustomerOrganization(organizationId)") : source.index(
+            "function resetCustomerOrganizationsDemo("
+        )
+    ]
+    # 令牌在归档时已真实失效且不可恢复，二次确认必须讲清楚。
+    assert "window.confirm(" in restore
+    assert "重新签发" in restore
+    assert "await ensureCsrfToken();" in restore
+
+
 def test_organization_copy_does_not_expose_backend_provider_terms() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
     source = APP_JS.read_text(encoding="utf-8")

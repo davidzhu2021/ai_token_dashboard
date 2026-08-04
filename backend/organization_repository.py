@@ -1057,6 +1057,50 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
                 )
         return self._org_payload(row)
 
+    async def restore_organization(self, organization_id: str) -> dict[str, Any]:
+        """Bring an archived customer back to active.
+
+        Archiving already revoked every token upstream and that cannot be
+        undone, so this restores the company record, its departments and its
+        members only. The customer's own administrator has to issue tokens
+        again. Only an archived company may be restored: reviving a suspended
+        one would silently clear an operator's deliberate suspension.
+        """
+
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                previous = await conn.fetchrow(
+                    "SELECT status FROM customer_organization WHERE id=$1 FOR UPDATE",
+                    organization_id,
+                )
+                if previous is None:
+                    raise OrganizationNotFoundError("organization was not found")
+                if str(previous["status"] or "") != "archived":
+                    raise OrganizationConflictError("organization is not archived")
+                row = await conn.fetchrow(
+                    "UPDATE customer_organization SET status='active', archived_at=NULL, updated_at=now() "
+                    "WHERE id=$1 RETURNING *",
+                    organization_id,
+                )
+                if row is None:
+                    raise OrganizationNotFoundError("organization was not found")
+                upstream_id = str(_row_value(row, "upstream_organization_id", "") or "")
+                if upstream_id:
+                    await self._enqueue_projection_sync(
+                        conn,
+                        "organization.sync",
+                        organization_id,
+                        {
+                            "organizationId": organization_id,
+                            "upstreamOrganizationId": upstream_id,
+                            "name": row["name"],
+                            "status": "active",
+                        },
+                        version=_iso(row["updated_at"]) or "restored",
+                    )
+        return self._org_payload(row)
+
     async def set_upstream_organization(self, organization_id: str, upstream_id: str, *, status: str = "active") -> dict[str, Any]:
         """Persist an upstream mapping without resurrecting a disabled tenant.
 
