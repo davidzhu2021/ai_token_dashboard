@@ -156,7 +156,9 @@ let navigationRevealTimer = null;
 // 权限探测的兜底时限。已开通员工的 /api/auth/scope 是 10ms 量级，永远赶得上；
 // 但上游查不到账号的邮箱（新入职、拼错地址）要翻完整个用户列表，实测 24-32 秒
 // ——那种情况下先揭示已知项，别让整栏空着。
-const NAVIGATION_REVEAL_TIMEOUT_MS = 800;
+// Keep the navigation grouped: the known cold team-scope lookup takes 24-32 seconds.
+// Fall back only after that window so personal usage and the team board reveal together.
+const NAVIGATION_REVEAL_TIMEOUT_MS = 35000;
 let selectedTopupAmount = 0;
 let pendingTopupTradeNo = "";
 let topupPollTimer = null;
