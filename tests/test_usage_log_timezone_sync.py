@@ -70,6 +70,22 @@ class _LogClient(LiteLLMClient):
         return {"data": data, "total_pages": len(self._pages), "page": page}
 
 
+class _ConcurrentPageClient(_LogClient):
+    def __init__(self, pages: list[list[dict]]) -> None:
+        super().__init__(pages)
+        self.active_requests = 0
+        self.max_active_requests = 0
+
+    async def request_backend(self, backend, method, path, **kwargs):  # type: ignore[override]
+        self.active_requests += 1
+        self.max_active_requests = max(self.max_active_requests, self.active_requests)
+        try:
+            await asyncio.sleep(0.01)
+            return await super().request_backend(backend, method, path, **kwargs)
+        finally:
+            self.active_requests -= 1
+
+
 def test_beijing_early_morning_usage_counts_toward_local_today(monkeypatch) -> None:
     """北京时间 07:00 的调用（UTC 前一天 23:00）应归到北京时间当天。"""
     monkeypatch.setenv("USAGE_TIMEZONE_OFFSET_MINUTES", "-480")
@@ -156,6 +172,44 @@ def test_log_sync_can_filter_by_stable_key_hash(monkeypatch) -> None:
     )
 
     assert client.requests[0]["api_key"] == key_hash
+
+
+def test_key_scoped_log_pages_are_fetched_sequentially(monkeypatch) -> None:
+    monkeypatch.setenv("USAGE_TIMEZONE_OFFSET_MINUTES", "-480")
+    monkeypatch.setenv("USAGE_SYNC_LOG_CONCURRENCY", "8")
+    key_hash = "a" * 64
+    client = _ConcurrentPageClient(
+        [
+            [_log("cursor-alice", "2026-07-28T01:00:00+00:00", page, "0.1")]
+            for page in range(1, 5)
+        ]
+    )
+
+    rows, complete = asyncio.run(
+        client.sync_rows_from_logs(
+            "2026-07-28", "2026-07-28", PRIMARY, api_key=key_hash
+        )
+    )
+
+    assert complete is True
+    assert client.max_active_requests == 1
+    assert [int(request["page"]) for request in client.requests] == [1, 2, 3, 4]
+    assert rows["cursor-alice"][0]["requestCount"] == 4
+
+
+def test_global_log_pages_still_use_configured_concurrency(monkeypatch) -> None:
+    monkeypatch.setenv("USAGE_TIMEZONE_OFFSET_MINUTES", "-480")
+    monkeypatch.setenv("USAGE_SYNC_LOG_CONCURRENCY", "4")
+    client = _ConcurrentPageClient(
+        [
+            [_log("cursor-alice", "2026-07-28T01:00:00+00:00", page, "0.1")]
+            for page in range(1, 5)
+        ]
+    )
+
+    asyncio.run(client.sync_rows_from_logs("2026-07-28", "2026-07-28", PRIMARY))
+
+    assert client.max_active_requests > 1
 
 
 def test_log_sync_retains_explicit_org_team_and_hashed_key_attribution(monkeypatch) -> None:

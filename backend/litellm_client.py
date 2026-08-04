@@ -3086,7 +3086,10 @@ class LiteLLMClient:
         # 上游 /spend/logs/v2 限制 page_size <= 100，单日约 800+ 页，需并发拉取。
         page_size = max(1, min(100, _env_int("USAGE_SYNC_LOG_PAGE_SIZE", 100)))
         max_pages = max(1, _env_int("USAGE_SYNC_LOG_MAX_PAGES", 5000))
-        concurrency = max(1, _env_int("USAGE_SYNC_LOG_CONCURRENCY", 8))
+        # LiteLLM's key-scoped spend-log pagination can expose a moving
+        # snapshot when pages are fetched concurrently. Keep historical
+        # imports deterministic; global scans retain the faster parallel path.
+        concurrency = 1 if api_key else max(1, _env_int("USAGE_SYNC_LOG_CONCURRENCY", 8))
 
         async def fetch_page(page: int) -> tuple[list[dict[str, Any]], int]:
             params: dict[str, Any] = {
