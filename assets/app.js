@@ -121,6 +121,8 @@ let customerOrganizationsFilters = { search: "", status: "" };
 let isCustomerOrganizationsLoading = false;
 let customerOrganizationsLoadError = "";
 let customerOrganizationsSearchTimer = null;
+let pendingAdoptionOrganizations = [];
+let pendingAdoptionUnavailable = false;
 let selectedCustomerOrganization = null;
 let customerOrganizationDetailTab = "info";
 let isCustomerOrganizationSaving = false;
@@ -3268,7 +3270,10 @@ function render() {
   if (canViewAdminUsage()) renderAdmin();
   if (canViewDepartmentUsage()) renderDepartment();
   if (currentUser?.isTeamLeader) renderTeam();
-  if (customerOrganizationsAvailable()) renderCustomerOrganizations();
+  if (customerOrganizationsAvailable()) {
+    renderCustomerOrganizations();
+    renderPendingAdoptionOrganizations();
+  }
   if (organizationCanView()) renderOrganization();
 }
 
@@ -5929,6 +5934,50 @@ function renderCustomerOrganizations() {
   }).join("");
 }
 
+function renderPendingAdoptionOrganizations() {
+  const panel = el("pendingAdoptionPanel");
+  const grid = el("pendingAdoptionGrid");
+  if (!panel || !grid) return;
+  const items = Array.isArray(pendingAdoptionOrganizations) ? pendingAdoptionOrganizations : [];
+  if (!items.length && !pendingAdoptionUnavailable) {
+    panel.classList.add("hidden");
+    grid.innerHTML = "";
+    return;
+  }
+  panel.classList.remove("hidden");
+  setText("pendingAdoptionCountChip", `${fmt.format(items.length)} 家`);
+  if (pendingAdoptionUnavailable && !items.length) {
+    grid.innerHTML = '<div class="customer-directory-empty">待接管企业暂时无法获取，请稍后重试。</div>';
+    return;
+  }
+  grid.innerHTML = items.map((item) => {
+    const name = String(item?.name || "未命名企业");
+    const memberCount = Number(item?.memberCount || 0);
+    const teamCount = Number(item?.teamCount || 0);
+    const spend = Number(item?.spendUsd || 0);
+    return `
+      <article class="customer-organization-card pending">
+        <div class="customer-organization-card-head">
+          <div>
+            <h3>${escapeHtml(name)}</h3>
+            <p>尚未建立企业档案</p>
+          </div>
+          <span class="customer-organization-status pending">未接管</span>
+        </div>
+        <div class="customer-organization-metrics">
+          <div><strong>${fmt.format(memberCount)}</strong><span>成员</span></div>
+          <div><strong>${fmt.format(teamCount)}</strong><span>团队</span></div>
+          <div><strong>${escapeHtml(money.format(spend))}</strong><span>累计消费</span></div>
+        </div>
+        <p class="customer-organization-card-note">接管前需先指定该企业的管理员账号。</p>
+        <div class="customer-organization-card-actions">
+          <button class="primary-btn" type="button" title="接管前需先指定该企业的管理员账号" disabled>接管</button>
+        </div>
+      </article>
+    `;
+  }).join("");
+}
+
 function renderCustomerOrganizationFilters() {
   const search = el("customerOrganizationSearch");
   const status = el("customerOrganizationStatusFilter");
@@ -5946,6 +5995,12 @@ async function loadCustomerOrganizations() {
     customerOrganizations = Array.isArray(payload?.items) ? payload.items : Array.isArray(payload?.organizations) ? payload.organizations : [];
     customerOrganizationsTotal = Number(payload?.total ?? customerOrganizations.length);
     customerOrganizationsPage = Number(payload?.page || customerOrganizationsPage || 1);
+    // Only the unfiltered first page carries candidates. Keep the previous
+    // result on filtered pages instead of blanking the panel.
+    if (payload?.pendingAdoption) {
+      pendingAdoptionOrganizations = Array.isArray(payload.pendingAdoption.items) ? payload.pendingAdoption.items : [];
+      pendingAdoptionUnavailable = Boolean(payload.pendingAdoption.unavailable);
+    }
   } catch (error) {
     customerOrganizations = [];
     customerOrganizationsTotal = 0;
@@ -5955,6 +6010,7 @@ async function loadCustomerOrganizations() {
     isCustomerOrganizationsLoading = false;
     renderCustomerOrganizationFilters();
     renderCustomerOrganizations();
+    renderPendingAdoptionOrganizations();
   }
 }
 

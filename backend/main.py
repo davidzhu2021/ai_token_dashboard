@@ -216,6 +216,10 @@ team_member_usage_cache = TTLCache()
 # Generated customer-demo boards are isolated from the production board
 # caches. Their keys are derived from the server-resolved organization scope.
 organization_usage_cache = TTLCache()
+# Upstream companies that have no local record yet are read-only candidates.
+# Cache them separately so browsing the customer directory does not depend on
+# an upstream round trip for every page render.
+pending_adoption_cache = TTLCache()
 _litellm_client: LiteLLMClient | None = None
 _key_vault: KeyVault | None = None
 _usage_store: UsageStore | None = UsageStore.from_environment()
@@ -5668,6 +5672,107 @@ async def organization_revoke_token(
     return {"ok": True, "token": token}
 
 
+def internal_upstream_organization_ids() -> set[str]:
+    """Upstream companies that belong to the seller, not to a customer.
+
+    These are excluded from the pending list so the operator never sees their
+    own operating entity offered for onboarding.
+    """
+
+    return {
+        item.strip()
+        for item in os.getenv("ORGANIZATION_INTERNAL_UPSTREAM_IDS", "").split(",")
+        if item.strip()
+    }
+
+
+def pending_adoption_entry(record: dict[str, Any]) -> dict[str, Any] | None:
+    """Project one upstream company into a secret-free read-only summary.
+
+    Upstream records carry member arrays and permission objects that must never
+    reach the browser, so only counted and displayable fields are kept.
+    """
+
+    upstream_id = str(
+        record.get("organization_id") or record.get("organizationId") or ""
+    ).strip()
+    if not upstream_id:
+        return None
+    name = str(
+        record.get("organization_alias")
+        or record.get("organizationAlias")
+        or ""
+    ).strip()
+    members = record.get("members")
+    teams = record.get("teams")
+    try:
+        spend = round(float(record.get("spend") or 0), 2)
+    except (TypeError, ValueError):
+        spend = 0.0
+    return {
+        "upstreamId": upstream_id,
+        "name": name or upstream_id,
+        "memberCount": len(members) if isinstance(members, list) else 0,
+        "teamCount": len(teams) if isinstance(teams, list) else 0,
+        "spendUsd": spend,
+        "createdAt": str(record.get("created_at") or record.get("createdAt") or ""),
+    }
+
+
+async def pending_adoption_organizations() -> dict[str, Any]:
+    """List real companies that still have no local customer record.
+
+    A failure here must stay contained: the adopted customer directory is the
+    primary content of the page and keeps rendering when the read fails.
+    """
+
+    if not organization_real_enabled():
+        return {"items": [], "unavailable": False}
+    repository = organization_store()
+    if not isinstance(repository, PostgreSQLOrganizationRepository):
+        return {"items": [], "unavailable": False}
+    try:
+        adopted = await repository.adopted_upstream_organization_ids()
+    except Exception:
+        logger.exception("failed to read adopted upstream organizations")
+        return {"items": [], "unavailable": True}
+    excluded = adopted | internal_upstream_organization_ids()
+    # Adopting a company must drop it from this list immediately, so the
+    # excluded set is part of the cache key rather than a plain TTL.
+    cache_key = hashlib.sha256(
+        "\x1f".join(sorted(excluded)).encode("utf-8")
+    ).hexdigest()
+    hit, value, _ = pending_adoption_cache.get(cache_key)
+    if hit:
+        return value
+    backend_id = os.getenv("ORGANIZATION_ADOPTION_BACKEND_ID", "primary").strip() or "primary"
+    upstream = client()
+    backend = next((item for item in upstream.backends if item.id == backend_id), None)
+    if backend is None:
+        return {"items": [], "unavailable": True}
+    try:
+        records = await upstream.list_organizations(backend=backend)
+    except Exception:
+        logger.exception("failed to list upstream organizations for adoption")
+        return {"items": [], "unavailable": True}
+    items = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        entry = pending_adoption_entry(record)
+        if entry is None or entry["upstreamId"] in excluded:
+            continue
+        items.append(entry)
+    items.sort(key=lambda item: (-item["spendUsd"], item["name"]))
+    payload = {"items": items, "unavailable": False}
+    pending_adoption_cache.set(
+        cache_key,
+        payload,
+        env_int("ORGANIZATION_PENDING_ADOPTION_CACHE_TTL_SECONDS", 300),
+    )
+    return payload
+
+
 @app.get("/api/platform/organizations")
 async def platform_organizations(
     request: Request,
@@ -5682,7 +5787,7 @@ async def platform_organizations(
         raise HTTPException(status_code=404, detail="客户企业演示功能尚未启用")
     require_platform_admin(request)
     try:
-        return await platform_organization_store_call(
+        payload = await platform_organization_store_call(
             "list_organizations",
             keyword=search,
             status=status,
@@ -5692,6 +5797,11 @@ async def platform_organizations(
         )
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
+    # Candidates are a property of the whole directory, not of one filtered
+    # page. Only the unfiltered first page carries them.
+    if page == 1 and not search and not status:
+        payload = {**payload, "pendingAdoption": await pending_adoption_organizations()}
+    return payload
 
 
 @app.post("/api/platform/organizations")

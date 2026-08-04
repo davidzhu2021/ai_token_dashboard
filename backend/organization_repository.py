@@ -814,6 +814,20 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
         )
         return self._org_payload(row) if row else None
 
+    async def adopted_upstream_organization_ids(self) -> set[str]:
+        """Return every upstream organization that already has a local record.
+
+        Archived customers stay in this set on purpose: an archived company is
+        still adopted, and must not reappear as a candidate waiting to be
+        onboarded a second time.
+        """
+
+        rows = await self._require_pool().fetch(
+            "SELECT upstream_organization_id FROM customer_organization "
+            "WHERE upstream_organization_id <> ''"
+        )
+        return {str(row["upstream_organization_id"]).strip() for row in rows}
+
     async def get_department_by_upstream_id(
         self, upstream_team_id: str
     ) -> dict[str, Any] | None:
