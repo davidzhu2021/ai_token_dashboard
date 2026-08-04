@@ -17,6 +17,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from base64 import urlsafe_b64encode
 from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
 from html import unescape
 from pathlib import Path
 from typing import Any, Literal
@@ -2710,6 +2711,9 @@ def send_auth_email_sync(recipient: str, subject: str, body: str) -> None:
     message["From"] = sender
     message["To"] = recipient
     message["Subject"] = subject
+    message["Date"] = formatdate(localtime=False, usegmt=True)
+    message_id_domain = sender.rsplit("@", 1)[1] if "@" in sender else None
+    message["Message-ID"] = make_msgid(domain=message_id_domain)
     message.set_content(body)
     if smtp_ssl:
         connection: smtplib.SMTP = smtplib.SMTP_SSL(host, port, timeout=15, context=ssl.create_default_context())

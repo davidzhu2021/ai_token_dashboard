@@ -147,6 +147,8 @@ def test_local_relay_send_path_drops_credentials_and_tls(monkeypatch) -> None:
         def send_message(self, message):
             calls["sent_to"] = message["To"]
             calls["sent_from"] = message["From"]
+            calls["date"] = message["Date"]
+            calls["message_id"] = message["Message-ID"]
 
         def quit(self):
             calls["quit"] = True
@@ -166,6 +168,9 @@ def test_local_relay_send_path_drops_credentials_and_tls(monkeypatch) -> None:
     assert calls["starttls"] is False
     assert calls["login"] is False
     assert calls["sent_to"] == "person@auto-link.com.cn"
+    assert calls["date"].endswith(" GMT")
+    assert calls["message_id"].startswith("<")
+    assert calls["message_id"].endswith("@example.com>")
     assert calls["quit"] is True
 
 
