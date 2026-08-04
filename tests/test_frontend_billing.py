@@ -243,7 +243,7 @@ def test_static_asset_version_bumped_for_organization_account_claims_release() -
 
     # 不更新版本号线上用户会命中旧缓存：旧 app.js 把勾选框 value 当成模型名直接提交，
     # 而新契约的 value 是目录下标，会被后端判成「不存在的模型」。
-    assert 'src="/assets/app.js?v=20260804-member-identity-binding"' in markup
+    assert 'src="/assets/app.js?v=20260804-member-removal"' in markup
     assert "20260804-organization-restore" not in markup
     assert "20260804-pending-adoption" not in markup
     assert "20260803-canonical-model-names" not in markup

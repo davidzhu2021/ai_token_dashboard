@@ -193,3 +193,74 @@ def test_duplicate_invites_are_atomic_across_threads() -> None:
 
     assert sum(result is not None for result in results) == 1
     assert store.get_member_by_email("same@example.com") is not None
+
+
+def test_suspended_member_removal_hides_the_row_and_frees_the_email() -> None:
+    """移除是墓碑：默认名册看不到，但记录仍在，邮箱可以重新邀请。"""
+
+    store = InMemoryOrganizationStore()
+    invited = store.create_member("Robin Leaver", "robin.leaver@example.com", "dept-product")
+    store.update_member(invited["id"], status="active")
+    store.update_member(invited["id"], status="suspended")
+    before = store.get_current()["stats"]
+    before_department = store.get_department("dept-product")
+
+    removed = store.remove_member(invited["id"])
+
+    assert removed["status"] == "removed"
+    assert removed["removedAt"]
+    # 姓名与邮箱留在墓碑上，历史用量才有署名。
+    assert removed["email"] == "robin.leaver@example.com"
+    after = store.get_current()["stats"]
+    assert after["memberCount"] == before["memberCount"] - 1
+    assert after["suspendedMemberCount"] == before["suspendedMemberCount"] - 1
+    default_ids = {item["id"] for item in store.list_members(page_size=50)["items"]}
+    assert invited["id"] not in default_ids
+    removed_page = store.list_members(status="removed", page_size=50)
+    assert [item["id"] for item in removed_page["items"]] == [invited["id"]]
+    # 部门人数不再算上离职成员。
+    department = store.get_department("dept-product")
+    assert department["memberCount"] == before_department["memberCount"] - 1
+    # 释放邮箱：同一个地址日后返岗时可以重新邀请。
+    rehired = store.create_member("Robin Leaver", "robin.leaver@example.com", "dept-product")
+    assert rehired["id"] != invited["id"]
+
+
+def test_only_suspended_members_can_be_removed_and_tombstones_stay_read_only() -> None:
+    store = InMemoryOrganizationStore()
+    invited = store.create_member("Casey Active", "casey.active@example.com", "dept-product")
+
+    with pytest.raises(OrganizationConflictError, match="only a suspended member"):
+        store.remove_member(invited["id"])
+    store.update_member(invited["id"], status="active")
+    with pytest.raises(OrganizationConflictError, match="only a suspended member"):
+        store.remove_member(invited["id"])
+    with pytest.raises(OrganizationNotFoundError):
+        store.remove_member("missing-member")
+
+    store.update_member(invited["id"], status="suspended")
+    store.remove_member(invited["id"])
+
+    with pytest.raises(OrganizationConflictError, match="already removed"):
+        store.remove_member(invited["id"])
+    # 令牌与账号绑定都撤销过了，改回可用状态只会得到一个没有访问能力的成员。
+    with pytest.raises(OrganizationConflictError, match="was removed"):
+        store.update_member(invited["id"], status="active")
+    # 移除状态不是可写状态，普通编辑接口不能绕过删除流程。
+    with pytest.raises(OrganizationValidationError):
+        store.update_member("member-001", status="removed")
+
+
+def test_member_removal_revokes_the_tokens_bound_to_that_member() -> None:
+    store = InMemoryOrganizationStore()
+    member = store.create_member("Dana Keys", "dana.keys@example.com", "dept-product")
+    store.update_member(member["id"], status="active")
+    created = store.create_token("org-demo", "Dana Codex", ["gpt-5.2"], member_id=member["id"])
+    token_id = created["token"]["id"]
+    store.update_member(member["id"], status="suspended")
+
+    store.remove_member(member["id"])
+
+    tokens = store.list_tokens("org-demo", page_size=50)["items"]
+    revoked = next(item for item in tokens if item["id"] == token_id)
+    assert revoked["status"] == "revoked"

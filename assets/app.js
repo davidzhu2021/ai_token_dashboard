@@ -4900,6 +4900,7 @@ const ORGANIZATION_STATUS_LABELS = {
   active: "已启用",
   invited: "待邀请",
   suspended: "已暂停",
+  removed: "已移除",
 };
 
 function isPlatformAdmin() {
@@ -5853,14 +5854,25 @@ function renderOrganizationMembers() {
     const departmentName = organizationField(member, "departmentName", "department_name") || "未分配部门";
     const joinedAt = organizationField(member, "createdAt", "created_at");
     const realMode = isRealOrganizationMode();
-    const statusActions = status === "invited" && realMode
-      ? `
+    // 已移除成员是只读墓碑：令牌与账号绑定都已撤销，没有可以就地恢复的操作，
+    // 保留这一行只是为了让历史用量有署名、并且管理员能回查移除了谁。
+    const isRemoved = status === "removed";
+    const removeButton = `<button class="danger-outline-btn" type="button" data-organization-member-remove="${escapeHtml(id)}" ${canManage ? "" : "disabled"}>删除</button>`;
+    let statusActions = "";
+    if (isRemoved) {
+      statusActions = "";
+    } else if (status === "invited" && realMode) {
+      statusActions = `
             <button class="ghost-btn" type="button" data-organization-member-invitation-resend="${escapeHtml(id)}" ${canManage ? "" : "disabled"}>重发邀请</button>
             <button class="danger-outline-btn" type="button" data-organization-member-invitation-revoke="${escapeHtml(id)}" ${canManage ? "" : "disabled"}>撤销邀请</button>
-          `
-      : status === "suspended" && realMode
-        ? `<button class="ghost-btn" type="button" data-organization-member-reinvite="${escapeHtml(id)}" ${canManage ? "" : "disabled"}>重新邀请</button>`
-        : `<button class="${status === "suspended" ? "ghost-btn" : "danger-outline-btn"}" type="button" data-organization-member-status="${escapeHtml(id)}" data-organization-member-next-status="${status === "suspended" ? "active" : "suspended"}" ${canManage ? "" : "disabled"}>${status === "suspended" ? "恢复" : "暂停"}</button>`;
+          `;
+    } else if (status === "suspended") {
+      statusActions = realMode
+        ? `<button class="ghost-btn" type="button" data-organization-member-reinvite="${escapeHtml(id)}" ${canManage ? "" : "disabled"}>重新邀请</button>${removeButton}`
+        : `<button class="ghost-btn" type="button" data-organization-member-status="${escapeHtml(id)}" data-organization-member-next-status="active" ${canManage ? "" : "disabled"}>恢复</button>${removeButton}`;
+    } else {
+      statusActions = `<button class="danger-outline-btn" type="button" data-organization-member-status="${escapeHtml(id)}" data-organization-member-next-status="suspended" ${canManage ? "" : "disabled"}>暂停</button>`;
+    }
     return `
       <tr>
         <td>
@@ -5875,11 +5887,12 @@ function renderOrganizationMembers() {
         <td>${escapeHtml(organizationDate(joinedAt))}</td>
         <td>
           <div class="organization-member-actions">
-            <button class="ghost-btn" type="button" data-organization-member-edit="${escapeHtml(id)}" ${canManage ? "" : "disabled"}>编辑</button>
-            ${canBindIdentity
+            ${isRemoved ? "" : `<button class="ghost-btn" type="button" data-organization-member-edit="${escapeHtml(id)}" ${canManage ? "" : "disabled"}>编辑</button>`}
+            ${!isRemoved && canBindIdentity
               ? `<button class="ghost-btn" type="button" data-organization-member-identity="${escapeHtml(id)}">身份绑定</button>`
               : ""}
             ${statusActions}
+            ${isRemoved ? "<span class=\"organization-member-actions-empty\">—</span>" : ""}
           </div>
         </td>
       </tr>
@@ -7176,6 +7189,30 @@ async function reinviteOrganizationMember(memberId) {
   }
 }
 
+async function removeOrganizationMember(memberId) {
+  if (!organizationCanManage()) return;
+  const member = organizationMembers.find((item) => organizationMemberId(item) === String(memberId));
+  const label = member?.name || member?.email || "该成员";
+  if (
+    !window.confirm(
+      `删除成员“${label}”？删除后该成员将移出企业，其访问令牌立即失效、登录账号解除绑定，此操作不可撤销。历史用量仍会保留在报表中。`,
+    )
+  ) {
+    return;
+  }
+  try {
+    await ensureCsrfToken();
+    await api(organizationApiPath(`/members/${encodeURIComponent(memberId)}`), {
+      method: "DELETE",
+    });
+    await loadOrganizationData();
+    showToast("成员已移除");
+  } catch (error) {
+    await loadOrganizationData();
+    showToast(error.message || "成员删除失败");
+  }
+}
+
 function switchView(view) {
   if (view === "customers" && !customerOrganizationsAvailable()) view = "dashboard";
   if (view === "admin" && !canViewAdminUsage()) view = "dashboard";
@@ -8413,7 +8450,12 @@ el("organizationMemberTable").addEventListener("click", (event) => {
     return;
   }
   const reinviteButton = event.target.closest("[data-organization-member-reinvite]");
-  if (reinviteButton) reinviteOrganizationMember(reinviteButton.dataset.organizationMemberReinvite);
+  if (reinviteButton) {
+    reinviteOrganizationMember(reinviteButton.dataset.organizationMemberReinvite);
+    return;
+  }
+  const removeButton = event.target.closest("[data-organization-member-remove]");
+  if (removeButton) removeOrganizationMember(removeButton.dataset.organizationMemberRemove);
 });
 
 el("organizationMemberSearch").addEventListener("input", () => {

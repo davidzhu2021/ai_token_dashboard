@@ -326,6 +326,100 @@ def test_platform_cross_customer_member_id_is_not_found(monkeypatch) -> None:
     assert error_code(response) == "ORGANIZATION_NOT_FOUND"
 
 
+def test_customer_admin_removes_a_suspended_member(monkeypatch) -> None:
+    """删除只对已暂停成员开放，成功后默认名册看不到、可按已移除筛选回查。"""
+
+    client = organization_client(monkeypatch, email="admin@demo.example")
+
+    active_removal = client.delete(
+        "/api/organization/current/members/member-001", headers=write_headers()
+    )
+    suspended = client.patch(
+        "/api/organization/current/members/member-001",
+        json={"status": "suspended"},
+        headers=write_headers(),
+    )
+    removed = client.delete(
+        "/api/organization/current/members/member-001", headers=write_headers()
+    )
+    repeat = client.delete(
+        "/api/organization/current/members/member-001", headers=write_headers()
+    )
+    default_list = client.get("/api/organization/current/members?pageSize=50")
+    removed_list = client.get("/api/organization/current/members?status=removed&pageSize=50")
+
+    assert active_removal.status_code == 409
+    assert error_code(active_removal) == "ORGANIZATION_MEMBER_REMOVE_NOT_SUSPENDED"
+    assert suspended.status_code == 200
+    assert removed.status_code == 200
+    assert removed.json()["member"]["status"] == "removed"
+    assert removed.json()["member"]["removedAt"]
+    assert repeat.status_code == 409
+    assert error_code(repeat) == "ORGANIZATION_MEMBER_ALREADY_REMOVED"
+    assert "member-001" not in {item["id"] for item in default_list.json()["items"]}
+    assert [item["id"] for item in removed_list.json()["items"]] == ["member-001"]
+
+
+def test_member_removal_requires_csrf_and_management_rights(monkeypatch) -> None:
+    admin_client = organization_client(monkeypatch, email="admin@demo.example")
+    member_client = organization_client(monkeypatch, email="avery.chen@demo.example")
+
+    missing_csrf = admin_client.delete("/api/organization/current/members/member-001")
+    forbidden = member_client.delete(
+        "/api/organization/current/members/member-001", headers=write_headers()
+    )
+    missing_member = admin_client.delete(
+        "/api/organization/current/members/member-missing", headers=write_headers()
+    )
+
+    assert missing_csrf.status_code == 403
+    assert forbidden.status_code == 403
+    assert missing_member.status_code == 404
+    assert error_code(missing_member) == "ORGANIZATION_NOT_FOUND"
+
+
+def test_member_edit_cannot_write_the_removed_status(monkeypatch) -> None:
+    """移除必须走删除接口，那里才会撤销令牌、作废邀请并解绑登录账号。"""
+
+    client = organization_client(monkeypatch, email="admin@demo.example")
+
+    response = client.patch(
+        "/api/organization/current/members/member-001",
+        json={"status": "removed"},
+        headers=write_headers(),
+    )
+
+    assert response.status_code == 400
+    assert error_code(response) == "ORGANIZATION_MEMBER_REMOVE_REQUIRED"
+
+
+def test_platform_admin_removes_a_suspended_customer_member(monkeypatch) -> None:
+    platform_client = organization_client(
+        monkeypatch, email=PLATFORM_EMAIL, platform_admin=True
+    )
+    customer_client = organization_client(monkeypatch, email="admin@demo.example")
+
+    platform_client.patch(
+        "/api/platform/organizations/org-demo/members/member-002",
+        json={"status": "suspended"},
+        headers=write_headers(),
+    )
+    removed = platform_client.delete(
+        "/api/platform/organizations/org-demo/members/member-002", headers=write_headers()
+    )
+    cross_tenant = platform_client.delete(
+        "/api/platform/organizations/org-aurora/members/member-002", headers=write_headers()
+    )
+    customer_attempt = customer_client.delete(
+        "/api/platform/organizations/org-demo/members/member-003", headers=write_headers()
+    )
+
+    assert removed.status_code == 200
+    assert removed.json()["member"]["status"] == "removed"
+    assert cross_tenant.status_code == 404
+    assert customer_attempt.status_code == 403
+
+
 def test_platform_reset_restores_all_seed_customers(monkeypatch) -> None:
     client = organization_client(monkeypatch, email=PLATFORM_EMAIL, platform_admin=True)
     created = client.post(

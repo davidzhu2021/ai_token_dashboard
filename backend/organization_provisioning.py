@@ -275,7 +275,7 @@ class OrganizationProvisioningService:
         if not member:
             raise ValueError("member was not found")
         member_status = str(member.get("status") or "")
-        if member_status in {"suspended", "archived"}:
+        if member_status in {"suspended", "archived", "removed"}:
             raise RuntimeError(f"member is {member_status}")
         user_id = _id(member, "upstreamUserId", "upstream_user_id")
         # Stable member ids, rather than an email/login alias, are the upstream
@@ -478,7 +478,9 @@ class OrganizationProvisioningService:
                 if not _not_found_error(exc):
                     raise
         status = str(member.get("status") or "").strip().lower()
-        if status in {"invited", "suspended"}:
+        # removed 与 invited/suspended 一样没有访问权：成员离职后必须从上游组织与
+        # 团队里摘掉，否则历史令牌之外的组织级授权仍然留着。
+        if status in {"invited", "suspended", "removed"}:
             try:
                 await self.upstream.delete_organization_member(
                     upstream_org_id,

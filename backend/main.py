@@ -90,6 +90,7 @@ from .organization_store import (
     DEFAULT_TOKEN_DAILY_BUDGET_USD,
     MAX_MODELS_PER_TOKEN,
     MAX_TOKEN_DAILY_BUDGET_USD,
+    MEMBER_REMOVED_STATUS,
     MIN_TOKEN_DAILY_BUDGET_USD,
     ORGANIZATION_TOKEN_MODELS,
     DuplicateMemberEmailError,
@@ -1480,6 +1481,22 @@ def reject_direct_real_member_activation(status: Any) -> None:
             409,
             "真实企业成员必须接受邀请并完成上游开通后才能启用",
             "ORGANIZATION_MEMBER_ACTIVATION_REQUIRES_PROVISIONING",
+        )
+
+
+def reject_member_removal_via_update(status: Any) -> None:
+    """Keep member removal on the dedicated DELETE route.
+
+    Only that route revokes the member's tokens, voids pending invitations and
+    unbinds the login account, so letting an edit write the tombstone status
+    would leave a member who looks removed but still has upstream access.
+    """
+
+    if str(status or "").strip().lower() == MEMBER_REMOVED_STATUS:
+        raise auth_http_error(
+            400,
+            "请通过删除成员操作移除成员",
+            "ORGANIZATION_MEMBER_REMOVE_REQUIRED",
         )
 
 
@@ -4042,7 +4059,9 @@ class OrganizationMemberUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
     departmentId: str | None = Field(default=None, min_length=1, max_length=128)
     role: Literal["admin", "member"] | None = None
-    status: Literal["invited", "pending", "active", "suspended"] | None = None
+    # removed 只为给出清晰错误提示而接受：移除必须走 DELETE 路由，那里才会撤销令牌、
+    # 作废邀请并解除登录账号绑定。这里放行到处理函数再拒绝，避免只给一个 422。
+    status: Literal["invited", "pending", "active", "suspended", "removed"] | None = None
     # 登录名只在平台侧路由的白名单里放开；客户管理员那条路径不读这个字段。
     loginName: str | None = Field(default=None, min_length=3, max_length=64)
 
@@ -5499,6 +5518,7 @@ async def organization_update_member(
     if "role" in fields:
         updates["role"] = data.role
     if "status" in fields:
+        reject_member_removal_via_update(data.status)
         reject_direct_real_member_activation(data.status)
         updates["status"] = "invited" if data.status == "pending" else data.status
     try:
@@ -5615,6 +5635,53 @@ async def organization_revoke_member_invitation(
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
     return {"ok": True, "memberId": member_id}
+
+
+async def remove_organization_member(organization_id: str, member_id: str) -> dict[str, Any]:
+    """把一名已暂停成员移出企业，并收尾其残留访问能力。
+
+    store 负责撤销令牌、作废邀请并解除登录账号绑定；这里补上会话撤销，否则对方
+    已登录的浏览器还能继续读这家企业的数据。
+    """
+
+    try:
+        member = await organization_scoped_store_call(
+            organization_id, "remove_member", member_id
+        )
+    except OrganizationConflictError as exc:
+        # 通用冲突文案（"请先调整成员或管理员"）解释不了"该成员还没暂停"这种情况。
+        detail = str(exc)
+        if "already removed" in detail:
+            raise auth_http_error(
+                409, "该成员已被移除", "ORGANIZATION_MEMBER_ALREADY_REMOVED"
+            ) from exc
+        if "suspended" in detail:
+            raise auth_http_error(
+                409,
+                "只能删除已暂停的成员，请先暂停该成员",
+                "ORGANIZATION_MEMBER_REMOVE_NOT_SUSPENDED",
+            ) from exc
+        raise organization_store_error(exc) from exc
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    if not isinstance(member, dict):
+        member = {}
+    previous_auth_user_id = str(member.pop("previousAuthUserId", "") or "")
+    if previous_auth_user_id:
+        await auth_store_call("revoke_user_sessions", previous_auth_user_id)
+    invalidate_organization_usage_cache()
+    return member
+
+
+@app.delete("/api/organization/current/members/{member_id}")
+async def organization_remove_member(member_id: str, request: Request) -> dict[str, Any]:
+    """Let a customer administrator move a suspended member out of the company."""
+
+    await enforce_csrf(request)
+    user = await require_organization_demo_manager(request)
+    organization_id = organization_identifier(organization_current_member(user))
+    member = await remove_organization_member(organization_id, member_id)
+    return {"ok": True, "member": member}
 
 
 @app.get("/api/organization/current/tokens")
@@ -6323,6 +6390,7 @@ async def platform_update_member(
     if "role" in fields:
         updates["role"] = data.role
     if "status" in fields:
+        reject_member_removal_via_update(data.status)
         reject_direct_real_member_activation(data.status)
         updates["status"] = "invited" if data.status == "pending" else data.status
     # 登录名只在平台侧放开：让客户管理员改别人的登录名等于交出账号接管能力。
@@ -6351,6 +6419,22 @@ async def platform_update_member(
         raise organization_store_error(exc) from exc
     invalidate_organization_usage_cache()
     return {"member": member}
+
+
+@app.delete("/api/platform/organizations/{organization_id}/members/{member_id}")
+async def platform_remove_member(
+    organization_id: str,
+    member_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    """Let seller operations move a suspended member out of a customer company."""
+
+    if organization_real_enabled():
+        require_real_organization_capability()
+    await enforce_csrf(request)
+    await require_platform_organization(request, organization_id)
+    member = await remove_organization_member(organization_id, member_id)
+    return {"ok": True, "member": member}
 
 
 @app.post("/api/platform/organizations/{organization_id}/members/{member_id}/invitation/resend")

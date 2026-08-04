@@ -408,6 +408,46 @@ def test_platform_member_mutation_returns_404_for_another_customer_and_rejects_b
     assert body_tenant_id.status_code == 422
 
 
+def test_platform_member_removal_cuts_that_member_off_from_the_customer(monkeypatch) -> None:
+    """乙方删除成员后，对方的会话身份不再解析到这家企业，归档企业则不允许删除。"""
+
+    store = InMemoryOrganizationStore()
+    platform_client = demo_client(
+        monkeypatch, PLATFORM_EMAIL, platform_admin=True, store=store
+    )
+    member_client = demo_client(monkeypatch, "indigo.xu@demo.example", store=store)
+
+    before = member_client.get("/api/auth/me")
+    removed = platform_client.delete(
+        "/api/platform/organizations/org-demo/members/member-009",
+        headers=csrf_headers(),
+    )
+    after = member_client.get("/api/auth/me")
+
+    # 暂停期间身份仍然解析得到这家企业，只是没有访问权。
+    assert before.json()["isKnownDemoCustomerIdentity"] is True
+    assert before.json()["organizationAccessStatus"] == "suspended"
+    assert removed.status_code == 200
+    assert removed.json()["member"]["status"] == "removed"
+    # 墓碑不再参与身份解析，离职成员的登录身份彻底与企业脱钩。
+    assert after.json()["isKnownDemoCustomerIdentity"] is False
+    assert after.json()["organizationAccessStatus"] is None
+    assert after.json()["organizationId"] is None
+    assert after.json()["organizationRole"] is None
+    assert after.json()["canViewOrganizationUsage"] is False
+
+    platform_client.post(
+        "/api/platform/organizations/org-demo/archive", json={}, headers=csrf_headers()
+    )
+    archived_removal = platform_client.delete(
+        "/api/platform/organizations/org-demo/members/member-010",
+        headers=csrf_headers(),
+    )
+
+    assert archived_removal.status_code == 409
+    assert error_code(archived_removal) == "ORGANIZATION_CONFLICT"
+
+
 def test_platform_nested_department_routes_hide_cross_customer_resources(monkeypatch) -> None:
     """Every nested customer route must resolve its resource inside the URL scope."""
 

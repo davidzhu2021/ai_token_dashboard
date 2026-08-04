@@ -14,6 +14,7 @@ from backend.organization_repository import (
     PostgreSQLOrganizationRepository,
 )
 from backend.organization_validation import OrganizationConflictError
+from backend.organization_validation import OrganizationNotFoundError
 from backend.organization_validation import OrganizationValidationError
 
 
@@ -1467,3 +1468,186 @@ def test_stale_usage_backfill_worker_cannot_finish_a_reclaimed_lease() -> None:
         )
     )
     assert result["status"] == "complete"
+
+
+def test_schema_keeps_removed_members_but_frees_their_email_and_login_name() -> None:
+    """墓碑保留成员行，唯一索引改为部分索引，离职后的地址可以重新邀请。"""
+
+    assert (
+        "ALTER TABLE customer_member ADD COLUMN IF NOT EXISTS removed_at TIMESTAMPTZ"
+        in ORGANIZATION_SCHEMA
+    )
+    assert (
+        "ON customer_member(lower(email)) WHERE email IS NOT NULL AND status <> 'removed'"
+        in ORGANIZATION_SCHEMA
+    )
+    assert (
+        "ON customer_member(lower(login_name)) "
+        "WHERE login_name IS NOT NULL AND status <> 'removed'" in ORGANIZATION_SCHEMA
+    )
+    # 旧的全表唯一索引必须先删掉，否则部分索引建不上，邮箱也永远释放不了。
+    assert "DROP INDEX IF EXISTS customer_member_email_idx" in ORGANIZATION_SCHEMA
+    assert "DROP INDEX IF EXISTS customer_member_login_name_idx" in ORGANIZATION_SCHEMA
+
+
+def test_member_list_hides_removed_members_unless_explicitly_filtered() -> None:
+    """默认名册只有现役成员，管理员显式选「已移除」才回查墓碑。"""
+
+    class Pool:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        async def fetchval(self, query, *_args):
+            self.queries.append(query)
+            return 0
+
+        async def fetch(self, query, *_args):
+            self.queries.append(query)
+            return []
+
+    repository = PostgreSQLOrganizationRepository("postgresql://unused")
+    default_pool = Pool()
+    repository.pool = default_pool
+    asyncio.run(repository.list_members(organization_id="org-1"))
+
+    removed_pool = Pool()
+    repository.pool = removed_pool
+    asyncio.run(repository.list_members(organization_id="org-1", status="removed"))
+
+    assert all("m.status <> 'removed'" in query for query in default_pool.queries)
+    assert all("m.status <> 'removed'" not in query for query in removed_pool.queries)
+    assert all("m.status=$2" in query for query in removed_pool.queries)
+
+
+class _RemovalConnection:
+    def __init__(self, status: str = "suspended", upstream_user_id: str = "user-upstream"):
+        self.member = {
+            "id": "member-1",
+            "organization_id": "org-1",
+            "name": "Robin Leaver",
+            "email": "robin.leaver@customer.example",
+            "login_name": None,
+            "department_id": "dept-1",
+            "department_name": "Product",
+            "role": "member",
+            "status": status,
+            "team_role": "member",
+            "auth_user_id": "auth-user-1",
+            "upstream_user_id": upstream_user_id,
+            "removed_at": None,
+            "created_at": datetime(2026, 7, 1, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 8, 4, tzinfo=timezone.utc),
+        }
+        self.executed: list[tuple[str, tuple]] = []
+
+    def transaction(self):
+        return _Transaction()
+
+    async def fetchrow(self, query, *args):
+        if "SELECT status, auth_user_id FROM customer_member" in query:
+            assert "FOR UPDATE" in query
+            return {
+                "status": self.member["status"],
+                "auth_user_id": self.member["auth_user_id"],
+            }
+        if query.startswith("UPDATE customer_member "):
+            assert "status='removed'" in query
+            assert "removed_at=now()" in query
+            assert "auth_user_id=''" in query
+            self.member.update(
+                status="removed",
+                removed_at=datetime(2026, 8, 4, 12, tzinfo=timezone.utc),
+                auth_user_id="",
+            )
+            return dict(self.member)
+        raise AssertionError(f"unexpected fetchrow: {query}")
+
+    async def fetch(self, query, *args):
+        self.executed.append((query, args))
+        if "FROM customer_access_token t" in query:
+            assert "AND t.member_id=$2" in query
+            return [
+                {
+                    "id": "token-1",
+                    "upstream_key_id": "key-1",
+                    "upstream_key_alias": "alias-1",
+                    "upstream_team_id": "team-1",
+                    "member_id": "member-1",
+                    "upstream_organization_id": "org-upstream",
+                    "upstream_user_id": "user-upstream",
+                }
+            ]
+        raise AssertionError(f"unexpected fetch: {query}")
+
+    async def execute(self, query, *args):
+        self.executed.append((query, args))
+        return "UPDATE 1"
+
+
+class _RemovalPool:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def acquire(self):
+        return _Acquire(self.connection)
+
+
+def test_member_removal_revokes_access_and_projects_the_tombstone_upstream() -> None:
+    """移除要一次做完：清绑定、作废邀请、撤销令牌、把成员从上游组织摘掉。"""
+
+    connection = _RemovalConnection()
+    repository = PostgreSQLOrganizationRepository("postgresql://unused")
+    repository.pool = _RemovalPool(connection)
+
+    member = asyncio.run(repository.remove_member("member-1", organization_id="org-1"))
+
+    assert member["status"] == "removed"
+    assert member["removedAt"]
+    assert member["authUserId"] is None
+    # 姓名与邮箱留在墓碑上，历史用量才有署名。
+    assert member["email"] == "robin.leaver@customer.example"
+    # 调用方据此撤销该账号残留的会话。
+    assert member["previousAuthUserId"] == "auth-user-1"
+    invitation_revocations = [
+        query for query, _ in connection.executed
+        if query.startswith("UPDATE customer_invitation SET revoked_at=now()")
+    ]
+    assert len(invitation_revocations) == 1
+    assert "consumed_at IS NULL AND revoked_at IS NULL" in invitation_revocations[0]
+    outbox_kinds = [
+        args[1] for query, args in connection.executed
+        if query.startswith("INSERT INTO customer_outbox")
+    ]
+    assert outbox_kinds == ["organization.member.sync", "organization.token.revoke"]
+
+
+def test_only_a_suspended_member_can_be_removed_in_real_mode() -> None:
+    for status, message in (
+        ("active", "only a suspended member"),
+        ("invited", "only a suspended member"),
+        ("removed", "already removed"),
+    ):
+        connection = _RemovalConnection(status=status)
+        repository = PostgreSQLOrganizationRepository("postgresql://unused")
+        repository.pool = _RemovalPool(connection)
+
+        with pytest.raises(OrganizationConflictError, match=message):
+            asyncio.run(repository.remove_member("member-1", organization_id="org-1"))
+        # 冲突必须在写入之前抛出，否则会留下半途的墓碑。
+        assert connection.executed == []
+        assert connection.member["status"] == status
+
+
+def test_removing_a_member_outside_the_tenant_is_reported_as_missing() -> None:
+    class Connection:
+        def transaction(self):
+            return _Transaction()
+
+        async def fetchrow(self, _query, *_args):
+            return None
+
+    repository = PostgreSQLOrganizationRepository("postgresql://unused")
+    repository.pool = _RemovalPool(Connection())
+
+    with pytest.raises(OrganizationNotFoundError):
+        asyncio.run(repository.remove_member("member-1", organization_id="org-other"))

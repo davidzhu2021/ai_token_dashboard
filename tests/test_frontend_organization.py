@@ -156,11 +156,49 @@ def test_real_member_rows_expose_invitation_lifecycle_without_direct_activation(
     assert 'data-organization-member-invitation-resend=' in renderer
     assert 'data-organization-member-invitation-revoke=' in renderer
     assert 'data-organization-member-reinvite=' in renderer
-    assert 'status === "suspended" && realMode' in renderer
+    assert 'status === "invited" && realMode' in renderer
+    assert 'data-organization-member-reinvite="${escapeHtml(id)}"' in renderer
     assert 'body: JSON.stringify({ status: "invited" })' in actions
     assert '...(!isRealOrganizationMode() ? { status } : {})' in source
     assert '/invitation/resend`)' in source
     assert '/invitation/revoke`)' in actions
+
+
+def test_suspended_member_rows_offer_removal_and_removed_rows_are_read_only() -> None:
+    """删除入口只出现在已暂停成员行；已移除成员整行只读，避免误以为可以恢复。"""
+
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+    renderer = source[
+        source.index("function renderOrganizationMembers()")
+        : source.index("function renderCustomerOrganizations()")
+    ]
+    remover = source[
+        source.index("async function removeOrganizationMember(memberId)")
+        : source.index("function switchView(")
+    ]
+
+    # 删除按钮只在 suspended 分支拼进操作列，两种模式都给。
+    assert 'data-organization-member-remove="${escapeHtml(id)}"' in renderer
+    assert 'const isRemoved = status === "removed";' in renderer
+    assert "${removeButton}" in renderer
+    assert 'isRemoved ? "" : `<button class="ghost-btn" type="button" data-organization-member-edit=' in renderer
+    assert "!isRemoved && canBindIdentity" in renderer
+    # 二次确认必须说明后果不可撤销，并说明历史用量仍然保留。
+    assert "window.confirm(" in remover
+    assert "不可撤销" in remover
+    assert "历史用量仍会保留在报表中" in remover
+    assert 'method: "DELETE",' in remover
+    assert '"成员已移除"' in remover
+    assert "data-organization-member-remove]" in source
+    # 状态筛选可以回查已移除成员，但成员编辑弹窗不提供这个状态。
+    assert 'removed: "已移除",' in source
+    assert '<option value="removed">已移除</option>' in markup
+    edit_modal = markup[
+        markup.index('<select id="organizationMemberStatusInput"')
+        : markup.index('<div class="modal-actions">', markup.index('<select id="organizationMemberStatusInput"'))
+    ]
+    assert "removed" not in edit_modal
 
 
 def test_employee_ranking_does_not_invent_a_mock_identity() -> None:

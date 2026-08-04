@@ -30,6 +30,7 @@ from .organization_validation import (
     MAX_SIMULATED_TOPUP_USD,
     MAX_TOKEN_DAILY_BUDGET_USD,
     MAX_TOKENS_PER_ORGANIZATION,
+    MEMBER_REMOVED_STATUS,
     MEMBER_STATUSES,
     MIN_SIMULATED_TOPUP_USD,
     MIN_TOKEN_DAILY_BUDGET_USD,
@@ -166,6 +167,13 @@ class OrganizationStore(Protocol):
         organization_id: str | None = None,
     ) -> dict[str, Any]: ...
 
+    def remove_member(
+        self,
+        member_id: str,
+        *,
+        organization_id: str | None = None,
+    ) -> dict[str, Any]: ...
+
     def billing_payload(
         self,
         organization_id: str,
@@ -241,6 +249,8 @@ class _Member:
     # members begin with no usage history, even after an operator activates
     # them, until the real data pipeline exists in a later phase.
     has_mock_usage: bool = True
+    # 移除时间戳；成员被移出企业后保留记录，供管理员回查与历史用量署名。
+    removed_at: str = ""
 
 
 @dataclass
@@ -623,7 +633,12 @@ class InMemoryOrganizationStore(OrganizationValidationMixin):
         return f"mock-{organization_id}-{department_id}"
 
     def _department_payload(self, state: _OrganizationState, department: _Department) -> dict[str, Any]:
-        members = [member for member in state.members.values() if member.department_id == department.identifier]
+        members = [
+            member
+            for member in state.members.values()
+            if member.department_id == department.identifier
+            and member.status != MEMBER_REMOVED_STATUS
+        ]
         return {
             "id": department.identifier,
             "name": department.name,
@@ -652,11 +667,17 @@ class InMemoryOrganizationStore(OrganizationValidationMixin):
             "isTeamLeader": member.team_role == "leader",
             "createdAt": member.created_at,
             "updatedAt": member.updated_at,
+            "removedAt": member.removed_at or None,
         }
 
     def _stats_payload(self, state: _OrganizationState) -> dict[str, Any]:
         departments = [item for item in state.departments.values() if item.status == "active"]
-        members = list(state.members.values())
+        # 已移除成员不再占企业名额，统计口径与部门卡片保持一致。
+        members = [
+            member
+            for member in state.members.values()
+            if member.status != MEMBER_REMOVED_STATUS
+        ]
         return {
             "departmentCount": len(departments),
             "memberCount": len(members),
@@ -983,6 +1004,9 @@ class InMemoryOrganizationStore(OrganizationValidationMixin):
 
         for organization_id, state in self._organizations.items():
             for member in state.members.values():
+                # 已移除成员的地址重新可用，否则离职员工返岗时无法再被邀请。
+                if member.status == MEMBER_REMOVED_STATUS:
+                    continue
                 if member.email == normalized_email:
                     return organization_id, state, member
         return None
@@ -1534,7 +1558,7 @@ class InMemoryOrganizationStore(OrganizationValidationMixin):
         if target_role:
             self._validate_role(target_role)
         if target_status:
-            self._validate_status(target_status)
+            self._validate_status_filter(target_status)
         current_page = self._page_value(page, "page", 100000)
         current_page_size = self._page_value(page_size, "page_size", 100)
         with self._lock:
@@ -1542,6 +1566,11 @@ class InMemoryOrganizationStore(OrganizationValidationMixin):
             if target_department_id and target_department_id not in state.departments:
                 raise OrganizationNotFoundError("department was not found")
             members = list(state.members.values())
+            if target_status != MEMBER_REMOVED_STATUS:
+                # 已移除成员只在管理员显式筛选该状态时出现，默认视图保持现役名册。
+                members = [
+                    member for member in members if member.status != MEMBER_REMOVED_STATUS
+                ]
             if needle:
                 members = [
                     member
@@ -1695,6 +1724,10 @@ class InMemoryOrganizationStore(OrganizationValidationMixin):
             if state.organization.get("status") != "active":
                 raise OrganizationConflictError("members cannot be changed for an inactive organization")
             member = self._member_or_raise(state, member_id)
+            if member.status == MEMBER_REMOVED_STATUS:
+                # 移除已经撤销了令牌与邀请，这些都无法就地复原。允许改回可用状态
+                # 只会得到一个看起来正常、实际没有访问能力的成员。
+                raise OrganizationConflictError("member was removed from the organization")
             proposed_role = member.role if normalized_role is _UNSET else normalized_role
             proposed_status = member.status if normalized_status is _UNSET else normalized_status
             proposed_team_role = member.team_role if normalized_team_role is _UNSET else normalized_team_role
@@ -1725,9 +1758,35 @@ class InMemoryOrganizationStore(OrganizationValidationMixin):
                 self._touch_usage_scope(state, now)
             return self._member_payload(state, member)
 
-    # ------------------------------------------------------------------
-    # Deterministic tenant-scoped usage and team adapters
-    # ------------------------------------------------------------------
+    def remove_member(self, member_id: str, *, organization_id: str | None = None) -> dict[str, Any]:
+        """把一名已暂停成员移出企业。
+
+        记录保留成墓碑：历史用量按成员行显示归属，管理员也要能回查移除了谁。只有
+        已暂停成员可以移除，所以访问权限在墓碑隐藏这一行之前就已经断开。
+        """
+
+        with self._lock:
+            state = self._state_for(organization_id)
+            if state.organization.get("status") != "active":
+                raise OrganizationConflictError("members cannot be changed for an inactive organization")
+            member = self._member_or_raise(state, member_id)
+            if member.status == MEMBER_REMOVED_STATUS:
+                raise OrganizationConflictError("member was already removed")
+            if member.status != "suspended":
+                raise OrganizationConflictError("only a suspended member can be removed")
+            now = self._now()
+            member.status = MEMBER_REMOVED_STATUS
+            member.removed_at = now
+            member.updated_at = now
+            for token in state.tokens.values():
+                # 绑定到该成员的令牌随之作废，避免离职后凭旧令牌继续调用。
+                if token.member_id == member.identifier and token.status == "active":
+                    token.status = "revoked"
+                    token.revoked_at = now
+                    token.updated_at = now
+            self._touch_usage_scope(state, now)
+            return self._member_payload(state, member)
+
 
     @staticmethod
     def _usage_days(start_date: str, end_date: str) -> list[date]:
@@ -2402,6 +2461,9 @@ class OrganizationScope:
 
     def update_member(self, member_id: str, **kwargs: Any) -> dict[str, Any]:
         return self._store.update_member(member_id, organization_id=self.organization_id, **kwargs)
+
+    def remove_member(self, member_id: str) -> dict[str, Any]:
+        return self._store.remove_member(member_id, organization_id=self.organization_id)
 
     def usage_payload(
         self,

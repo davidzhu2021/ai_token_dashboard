@@ -27,6 +27,7 @@ from .organization_validation import (
     DEFAULT_TOKEN_DAILY_BUDGET_USD,
     DuplicateMemberEmailError,
     MAX_TOKENS_PER_ORGANIZATION,
+    MEMBER_REMOVED_STATUS,
     OrganizationConflictError,
     OrganizationNotFoundError,
     OrganizationStoreError,
@@ -136,15 +137,20 @@ CREATE TABLE IF NOT EXISTS customer_member (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     suspended_at TIMESTAMPTZ
 );
+ALTER TABLE customer_member ADD COLUMN IF NOT EXISTS removed_at TIMESTAMPTZ;
 DROP INDEX IF EXISTS customer_member_email_idx;
+-- 已移除成员保留姓名与邮箱供历史用量显示，但不再占用邮箱唯一性：
+-- 离职员工日后返岗时管理员要能用同一个地址重新邀请。
 CREATE UNIQUE INDEX IF NOT EXISTS customer_member_email_idx
-    ON customer_member(lower(email)) WHERE email IS NOT NULL;
+    ON customer_member(lower(email)) WHERE email IS NOT NULL AND status <> 'removed';
 CREATE INDEX IF NOT EXISTS customer_member_org_idx ON customer_member(organization_id);
 ALTER TABLE customer_member ADD COLUMN IF NOT EXISTS auth_user_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE customer_member ADD COLUMN IF NOT EXISTS login_name TEXT;
 ALTER TABLE customer_member ALTER COLUMN email DROP NOT NULL;
+DROP INDEX IF EXISTS customer_member_login_name_idx;
 CREATE UNIQUE INDEX IF NOT EXISTS customer_member_login_name_idx
-    ON customer_member(lower(login_name)) WHERE login_name IS NOT NULL;
+    ON customer_member(lower(login_name)) WHERE login_name IS NOT NULL AND status <> 'removed';
+-- auth_user_id 的唯一索引已排除空串，移除成员时置空即自动释放绑定。
 CREATE UNIQUE INDEX IF NOT EXISTS customer_member_auth_user_idx
     ON customer_member(auth_user_id) WHERE auth_user_id <> '';
 
@@ -767,7 +773,8 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
         departments = await self.list_departments(organization_id=organization_id)
         pool = self._require_pool()
         member_stats = await pool.fetchrow(
-            "SELECT count(*) AS total, "
+            # 已移除成员不再占企业名额，所以统计口径按现役成员算。
+            "SELECT count(*) FILTER (WHERE status <> 'removed') AS total, "
             "count(*) FILTER (WHERE status='active') AS active, "
             "count(*) FILTER (WHERE status='invited') AS invited, "
             "count(*) FILTER (WHERE status='suspended') AS suspended, "
@@ -1006,6 +1013,7 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
             "role": row["role"], "status": row["status"], "teamRole": row["team_role"], "isTeamLeader": row["team_role"] == "leader",
             "authUserId": _row_value(row, "auth_user_id", "") or None,
             "upstreamUserId": row["upstream_user_id"] or None, "createdAt": _iso(row["created_at"]), "updatedAt": _iso(row["updated_at"]),
+            "removedAt": _iso(_row_value(row, "removed_at", None)),
         }
 
     async def update_organization(self, organization_id: str, name: Any = _UNSET, *, status: Any = _UNSET) -> dict[str, Any]:
@@ -1186,7 +1194,7 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
         if not include_archived: clauses.append("d.status='active'")
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         rows = await self._require_pool().fetch(
-            "SELECT d.*, count(m.id) AS member_count, "
+            "SELECT d.*, count(m.id) FILTER (WHERE m.status <> 'removed') AS member_count, "
             "count(m.id) FILTER (WHERE m.status='active') AS active_member_count, "
             "count(m.id) FILTER (WHERE m.status='invited') AS invited_member_count, "
             "count(m.id) FILTER (WHERE m.status='suspended') AS suspended_member_count "
@@ -1201,7 +1209,7 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
     ) -> dict[str, Any] | None:
         """Return one department while enforcing the optional tenant scope."""
 
-        query = "SELECT d.*, count(m.id) AS member_count, " \
+        query = "SELECT d.*, count(m.id) FILTER (WHERE m.status <> 'removed') AS member_count, " \
             "count(m.id) FILTER (WHERE m.status='active') AS active_member_count, " \
             "count(m.id) FILTER (WHERE m.status='invited') AS invited_member_count, " \
             "count(m.id) FILTER (WHERE m.status='suspended') AS suspended_member_count " \
@@ -1302,6 +1310,9 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
         clauses, args = ["m.organization_id=$1"], [organization_id]
         for field, value in (("department_id", department_id), ("role", role), ("status", status)):
             if value: args.append(value); clauses.append(f"m.{field}=${len(args)}")
+        if status != MEMBER_REMOVED_STATUS:
+            # 已移除成员只在管理员显式筛选该状态时出现，默认视图保持现役名册。
+            clauses.append(f"m.status <> '{MEMBER_REMOVED_STATUS}'")
         if keyword:
             args.append(f"%{keyword.strip()}%")
             clauses.append(f"(m.name ILIKE ${len(args)} OR m.email ILIKE ${len(args)})")
@@ -1388,7 +1399,9 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
         email = self.normalize_email(email)
         query = (
             "SELECT m.*, d.name AS department_name FROM customer_member m "
-            "JOIN customer_department d ON d.id=m.department_id WHERE lower(m.email)=lower($1)"
+            "JOIN customer_department d ON d.id=m.department_id WHERE lower(m.email)=lower($1) "
+            # 已移除成员的邮箱可以被重新邀请，所以按邮箱查人时不能再命中旧记录。
+            f"AND m.status <> '{MEMBER_REMOVED_STATUS}'"
             + (" AND m.organization_id=$2" if organization_id else "")
         )
         row = await self._require_pool().fetchrow(query, email, organization_id) if organization_id else await self._require_pool().fetchrow(query, email)
@@ -1405,7 +1418,8 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
             "o.updated_at AS organization_updated_at, o.archived_at AS organization_archived_at, "
             "d.name AS department_name, d.status AS department_status "
             "FROM customer_member m JOIN customer_organization o ON o.id=m.organization_id "
-            "JOIN customer_department d ON d.id=m.department_id WHERE lower(m.email)=lower($1)",
+            "JOIN customer_department d ON d.id=m.department_id WHERE lower(m.email)=lower($1) "
+            f"AND m.status <> '{MEMBER_REMOVED_STATUS}'",
             normalized,
         )
         if row is None:
@@ -1457,7 +1471,9 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
             "               WHERE p.organization_id=m.organization_id AND p.member_id=m.id "
             "               ORDER BY p.id), '{}'::text[]) AS principal_ids "
             "FROM customer_member m JOIN customer_organization o ON o.id=m.organization_id "
-            "JOIN customer_department d ON d.id=m.department_id WHERE m.auth_user_id=$1",
+            "JOIN customer_department d ON d.id=m.department_id WHERE m.auth_user_id=$1 "
+            # 移除成员时已经清空过 auth_user_id，这里是防止旧绑定残留后仍能读到企业数据。
+            f"AND m.status <> '{MEMBER_REMOVED_STATUS}'",
             user_id,
         )
         if row is None:
@@ -1702,6 +1718,10 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
                     )
                     if previous is None:
                         raise OrganizationNotFoundError("member was not found")
+                    if str(previous["status"] or "") == MEMBER_REMOVED_STATUS:
+                        # 移除已经撤销了令牌、邀请与账号绑定，这些都无法就地复原。
+                        # 允许改回可用状态只会得到一个看起来正常、实际没有访问能力的成员。
+                        raise OrganizationConflictError("member was removed from the organization")
                     row = await conn.fetchrow(
                         f"UPDATE customer_member SET {', '.join(fields)} WHERE id=$1 AND organization_id=$2 RETURNING *",
                         *args,
@@ -1756,6 +1776,77 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
                 raise OrganizationConflictError("login_name is already in use") from exc
             raise
         return await self._member_payload_with_department(row, organization_id=organization_id)
+
+    async def remove_member(self, member_id: str, *, organization_id: str) -> dict[str, Any]:
+        """Move one suspended member out of the customer for good.
+
+        The row survives as a tombstone because usage history, issued tokens and
+        invitations all reference it, and the department/company boards read the
+        member row to label historical usage. Only a suspended member may be
+        removed so access is already cut before the tombstone hides the row.
+        """
+
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                previous = await conn.fetchrow(
+                    "SELECT status, auth_user_id FROM customer_member "
+                    "WHERE id=$1 AND organization_id=$2 FOR UPDATE",
+                    member_id,
+                    organization_id,
+                )
+                if previous is None:
+                    raise OrganizationNotFoundError("member was not found")
+                previous_status = str(previous["status"] or "")
+                if previous_status == MEMBER_REMOVED_STATUS:
+                    raise OrganizationConflictError("member was already removed")
+                if previous_status != "suspended":
+                    raise OrganizationConflictError("only a suspended member can be removed")
+                row = await conn.fetchrow(
+                    # 姓名、邮箱与部门都留下：历史用量按成员行显示归属，管理员也要能回查移除了谁。
+                    # auth_user_id 必须清空，否则对方的登录账号仍然解析得到这个企业。
+                    "UPDATE customer_member "
+                    f"SET status='{MEMBER_REMOVED_STATUS}', removed_at=now(), auth_user_id='', updated_at=now() "
+                    "WHERE id=$1 AND organization_id=$2 RETURNING *",
+                    member_id,
+                    organization_id,
+                )
+                if row is None:  # pragma: no cover - the locked read already guards this
+                    raise OrganizationNotFoundError("member was not found")
+                await conn.execute(
+                    "UPDATE customer_invitation SET revoked_at=now() "
+                    "WHERE organization_id=$1 AND member_id=$2 "
+                    "AND consumed_at IS NULL AND revoked_at IS NULL",
+                    organization_id,
+                    member_id,
+                )
+                if str(row["upstream_user_id"] or ""):
+                    await self._enqueue_projection_sync(
+                        conn,
+                        "organization.member.sync",
+                        member_id,
+                        {
+                            "organizationId": organization_id,
+                            "memberId": member_id,
+                            "status": MEMBER_REMOVED_STATUS,
+                            "role": row["role"],
+                            "teamRole": row["team_role"],
+                            "departmentId": row["department_id"],
+                            "upstreamUserId": row["upstream_user_id"],
+                        },
+                        version=_iso(row["updated_at"]) or MEMBER_REMOVED_STATUS,
+                    )
+                await self._enqueue_token_revocations(
+                    conn,
+                    organization_id,
+                    reason="member_removed",
+                    member_id=member_id,
+                    version=_iso(row["updated_at"]) or self._id(),
+                )
+        member = await self._member_payload_with_department(row, organization_id=organization_id)
+        # 调用方据此踢掉该账号残留的会话，否则已登录的浏览器还能继续读这家企业的数据。
+        member["previousAuthUserId"] = str(_row_value(previous, "auth_user_id", "") or "")
+        return member
 
     async def create_invitation(self, organization_id: str, member_id: str, *, expires_in_hours: int = 72) -> dict[str, Any]:
         invitation_id = self._id(); token = self._invitation_token(invitation_id)

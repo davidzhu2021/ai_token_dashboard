@@ -20,7 +20,13 @@ from typing import Any
 
 
 ORGANIZATION_ROLES = frozenset({"admin", "member"})
+# 可写状态：成员编辑接口只允许落到这三个值。
 MEMBER_STATUSES = frozenset({"invited", "active", "suspended"})
+# 离职成员被移出企业后的终态。故意不放进 MEMBER_STATUSES：删除必须走专用接口，
+# 那里才会撤销令牌、作废邀请并解除登录账号绑定，普通成员编辑接口不能绕过这些收尾。
+MEMBER_REMOVED_STATUS = "removed"
+# 列表筛选允许回查已移除成员，因此比可写状态多一个终态。
+MEMBER_FILTER_STATUSES = MEMBER_STATUSES | {MEMBER_REMOVED_STATUS}
 ORGANIZATION_STATUSES = frozenset({"active", "suspended", "archived"})
 TEAM_ROLES = frozenset({"leader", "member"})
 ACTIVE_DEPARTMENT_MEMBER_STATUSES = frozenset({"invited", "active"})
@@ -177,6 +183,16 @@ class OrganizationValidationMixin:
     def _validate_status(cls, value: Any) -> str:
         if not isinstance(value, str) or value not in MEMBER_STATUSES:
             raise OrganizationValidationError("status must be invited, active, or suspended")
+        return value
+
+    @classmethod
+    def _validate_status_filter(cls, value: Any) -> str:
+        """校验列表筛选用的状态，比可写状态多接受已移除终态。"""
+
+        if not isinstance(value, str) or value not in MEMBER_FILTER_STATUSES:
+            raise OrganizationValidationError(
+                "status must be invited, active, suspended, or removed"
+            )
         return value
 
     @classmethod
