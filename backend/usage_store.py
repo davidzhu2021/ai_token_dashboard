@@ -657,7 +657,10 @@ class UsageStore:
             ).hexdigest()
         return (
             backend_id,
-            request_id[:256],
+            # Some upstream request ids embed nested trace material and can be
+            # longer than 256 characters. Truncation makes distinct requests
+            # collide in the event primary key, so preserve the full stable id.
+            request_id,
             event_time,
             _as_date(row.get("date") or event_time.date()),
             raw_user_id[:256],

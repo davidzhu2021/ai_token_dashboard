@@ -206,6 +206,31 @@ def test_event_record_persists_only_non_content_attribution_metadata() -> None:
     assert "sk-secret" not in repr(record)
 
 
+def test_event_record_preserves_long_request_ids_without_truncation() -> None:
+    request_id = "trace-" + ("x" * 500)
+    record = UsageStore._event_record(
+        "primary",
+        {
+            "requestId": request_id,
+            "eventTime": "2026-07-22T08:30:00+00:00",
+            "date": "2026-07-22",
+            "_userId": "cursor-lianghaiqiang",
+            "keyId": "a" * 64,
+            "source": "Cursor",
+            "model": "gpt-5.6-terra",
+            "requestCount": 1,
+            "successCount": 1,
+            "spend": 0.1,
+            "attributionSource": "legacy_report_only",
+            "billingEligible": False,
+        },
+        datetime.now(timezone.utc),
+    )
+
+    assert record is not None
+    assert record[1] == request_id
+
+
 def test_usage_schema_has_request_level_attribution_without_content_columns() -> None:
     from backend.usage_store import USAGE_SCHEMA
 
