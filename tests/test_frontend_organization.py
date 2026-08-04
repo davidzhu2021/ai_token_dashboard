@@ -344,6 +344,85 @@ def test_member_identity_styles_do_not_deform_the_avatar_letter() -> None:
     assert ".organization-member-name strong," not in markup
 
 
+def test_identity_binding_is_a_platform_only_entry_in_the_member_row() -> None:
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    # 换绑登录账号等于账号接管能力，只能给乙方运营；Mock 目录也没有登录账号与
+    # 用量身份的概念，所以 demo 下连入口都不出现。
+    assert "function organizationCanBindMemberIdentity() {\n  return isViewingCustomerOrganization() && isRealOrganizationMode();\n}" in source
+    assert "const canBindIdentity = organizationCanBindMemberIdentity();" in source
+    assert 'data-organization-member-identity="${escapeHtml(id)}">身份绑定</button>' in source
+
+    assert 'id="organizationMemberIdentityModal" class="modal-backdrop hidden" role="dialog" aria-modal="true"' in markup
+    for element_id in (
+        "organizationMemberLoginNameInput",
+        "saveOrganizationMemberLoginNameButton",
+        "organizationMemberIdentityAccount",
+        "organizationMemberAccountInput",
+        "bindOrganizationMemberAccountButton",
+        "unbindOrganizationMemberAccountButton",
+        "organizationMemberIdentityList",
+        "closeOrganizationMemberIdentityButton",
+    ):
+        assert f'id="{element_id}"' in markup
+
+    # 沿用既有的关闭契约：点遮罩与 Escape 都要能退出。
+    assert 'if (backdrop.id === "organizationMemberIdentityModal") closeOrganizationMemberIdentityModal();' in source
+    assert 'else if (!el("organizationMemberIdentityModal").classList.contains("hidden")) closeOrganizationMemberIdentityModal();' in source
+
+
+def test_identity_binding_confirms_before_invalidating_someone_else_session() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    binder = source[
+        source.index("async function bindOrganizationMemberAccount(") : source.index(
+            "async function bindOrganizationPrincipalMember("
+        )
+    ]
+    # 换绑与解绑都会踢掉对方的登录会话，不能静默执行。
+    assert binder.count("window.confirm(") == 2
+    assert "原账号已登录的会话会立即失效" in binder
+    assert "解除该成员的登录账号绑定？该账号已登录的会话会立即失效。" in binder
+
+
+def test_identity_binding_escapes_every_upstream_supplied_value() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    renderer = source[
+        source.index("function renderOrganizationMemberIdentity()") : source.index(
+            "async function saveOrganizationMemberLoginName("
+        )
+    ]
+    # 身份名与历史来源都来自上游数据，直接插进 innerHTML 就是一个存储型 XSS。
+    assert "${escapeHtml(String(item.name" in renderer
+    assert "${escapeHtml(binding)}" in renderer
+    assert "${escapeHtml(sources.join(" in renderer
+    assert "${item.name}" not in renderer
+
+
+def test_identity_binding_copy_does_not_expose_backend_provider_terms() -> None:
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    modal = markup[
+        markup.index('id="organizationMemberIdentityModal"') : markup.index(
+            'id="customerOrganizationModal"'
+        )
+    ]
+    renderer = source[
+        source.index("function renderOrganizationMemberIdentity()") : source.index(
+            "async function saveOrganizationMemberLoginName("
+        )
+    ]
+    for term in ("LiteLLM", "litellm", "Proxy", "Virtual Key", "principal", "Principal"):
+        assert term not in modal
+    # 渲染函数不读上游字段名，也不把它们印到界面上。
+    for term in ("LiteLLM", "litellm", "Proxy", "Virtual Key", "upstream"):
+        assert term not in renderer
+    assert "用量身份" in modal
+
+
 def test_token_management_is_a_sidebar_destination_for_the_customer_admin() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
     source = APP_JS.read_text(encoding="utf-8")

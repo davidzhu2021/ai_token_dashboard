@@ -112,6 +112,9 @@ let isOrganizationDepartmentSaving = false;
 let isOrganizationMemberSaving = false;
 let editingOrganizationDepartmentId = "";
 let editingOrganizationMemberId = "";
+let organizationMemberIdentityId = "";
+let organizationMemberIdentity = null;
+let isOrganizationMemberIdentityBusy = false;
 let organizationSearchTimer = null;
 let customerOrganizations = [];
 let customerOrganizationsTotal = 0;
@@ -5840,6 +5843,7 @@ function renderOrganizationMembers() {
     return;
   }
   const canManage = organizationCanManage();
+  const canBindIdentity = organizationCanBindMemberIdentity();
   table.innerHTML = organizationMembers.map((member) => {
     const id = organizationMemberId(member);
     const name = member.name || "未命名成员";
@@ -5872,6 +5876,9 @@ function renderOrganizationMembers() {
         <td>
           <div class="organization-member-actions">
             <button class="ghost-btn" type="button" data-organization-member-edit="${escapeHtml(id)}" ${canManage ? "" : "disabled"}>编辑</button>
+            ${canBindIdentity
+              ? `<button class="ghost-btn" type="button" data-organization-member-identity="${escapeHtml(id)}">身份绑定</button>`
+              : ""}
             ${statusActions}
           </div>
         </td>
@@ -6890,6 +6897,199 @@ function openOrganizationMemberModal(memberId = "") {
   el("organizationMemberStatusInput").value = member?.status || "invited";
   el("organizationMemberModal").classList.remove("hidden");
   window.setTimeout(() => el("organizationMemberNameInput").focus(), 0);
+}
+
+// 身份绑定只给平台运营：让客户管理员随意换绑登录账号等于交出账号接管能力。
+// 演示目录没有登录账号与用量身份的概念，所以那里连入口都不出现。
+function organizationCanBindMemberIdentity() {
+  return isViewingCustomerOrganization() && isRealOrganizationMode();
+}
+
+function closeOrganizationMemberIdentityModal(options = {}) {
+  if (isOrganizationMemberIdentityBusy && !options.force) return;
+  organizationMemberIdentityId = "";
+  organizationMemberIdentity = null;
+  el("organizationMemberAccountInput").value = "";
+  setText("organizationMemberIdentityError", "");
+  el("organizationMemberIdentityModal").classList.add("hidden");
+}
+
+async function openOrganizationMemberIdentityModal(memberId) {
+  if (!organizationCanBindMemberIdentity() || !memberId) return;
+  organizationMemberIdentityId = String(memberId);
+  organizationMemberIdentity = null;
+  setText("organizationMemberIdentityError", "");
+  el("organizationMemberAccountInput").value = "";
+  el("organizationMemberLoginNameInput").value = "";
+  el("organizationMemberIdentityList").innerHTML = '<p class="organization-modal-note">正在加载用量身份…</p>';
+  el("organizationMemberIdentityModal").classList.remove("hidden");
+  await loadOrganizationMemberIdentity();
+}
+
+async function loadOrganizationMemberIdentity() {
+  const memberId = organizationMemberIdentityId;
+  if (!memberId) return;
+  try {
+    const payload = await api(
+      organizationApiPath(`/members/${encodeURIComponent(memberId)}/identity`),
+    );
+    if (organizationMemberIdentityId !== memberId) return;
+    organizationMemberIdentity = payload;
+    renderOrganizationMemberIdentity();
+  } catch (error) {
+    if (organizationMemberIdentityId !== memberId) return;
+    organizationMemberIdentity = null;
+    el("organizationMemberIdentityList").innerHTML = "";
+    setText("organizationMemberIdentityError", error.message || "身份信息加载失败");
+  }
+}
+
+function renderOrganizationMemberIdentity() {
+  const payload = organizationMemberIdentity;
+  if (!payload) return;
+  const member = payload.member && typeof payload.member === "object" ? payload.member : {};
+  const memberId = String(organizationField(member, "id", "member_id") || organizationMemberIdentityId);
+  const memberName = String(member.name || "该成员");
+  setText("organizationMemberIdentityTitle", `身份绑定 · ${memberName}`);
+  el("organizationMemberLoginNameInput").value = String(
+    organizationField(member, "loginName", "login_name") || "",
+  );
+  const account = payload.account && typeof payload.account === "object" ? payload.account : null;
+  const accountLabel = account
+    ? [account.email, account.loginName].filter(Boolean).join(" / ") || String(account.id || "")
+    : payload.accountMissing
+      ? "原绑定账号已不存在，请重新绑定"
+      : "未绑定";
+  setText("organizationMemberIdentityAccount", `当前登录账号：${accountLabel}`);
+  const items = Array.isArray(payload.principals?.items) ? payload.principals.items : [];
+  const list = el("organizationMemberIdentityList");
+  if (!items.length) {
+    list.innerHTML = '<p class="organization-modal-note">这家企业还没有用量身份。企业接入历史用量后会自动生成。</p>';
+    return;
+  }
+  list.innerHTML = items.map((item) => {
+    const principalId = String(organizationField(item, "id", "principal_id") || "");
+    const boundMemberId = String(organizationField(item, "memberId", "member_id") || "");
+    const boundMemberName = String(organizationField(item, "memberName", "member_name") || "");
+    const isMine = boundMemberId && boundMemberId === memberId;
+    const sources = Array.isArray(item.historySources) ? item.historySources : [];
+    const binding = isMine
+      ? "已关联到当前成员"
+      : boundMemberId
+        ? `已关联到 ${boundMemberName || boundMemberId}`
+        : "未关联";
+    const action = isMine
+      ? `<button class="danger-outline-btn" type="button" data-organization-principal-unbind="${escapeHtml(principalId)}">解除</button>`
+      : `<button class="ghost-btn" type="button" data-organization-principal-bind="${escapeHtml(principalId)}">关联</button>`;
+    return `
+      <div class="organization-identity-item">
+        <div>
+          <strong>${escapeHtml(String(item.name || "未命名身份"))}</strong>
+          <span>${escapeHtml(binding)}</span>
+          ${sources.length ? `<span>历史来源：${escapeHtml(sources.join("、"))}</span>` : ""}
+        </div>
+        ${action}
+      </div>
+    `;
+  }).join("");
+}
+
+async function saveOrganizationMemberLoginName() {
+  if (!organizationCanBindMemberIdentity() || isOrganizationMemberIdentityBusy) return;
+  const memberId = organizationMemberIdentityId;
+  const loginName = el("organizationMemberLoginNameInput").value.trim();
+  if (!memberId || !loginName) {
+    setText("organizationMemberIdentityError", "请填写登录名");
+    return;
+  }
+  isOrganizationMemberIdentityBusy = true;
+  setButtonLoading("saveOrganizationMemberLoginNameButton", true, "保存中");
+  setText("organizationMemberIdentityError", "");
+  try {
+    await ensureCsrfToken();
+    await api(organizationApiPath(`/members/${encodeURIComponent(memberId)}`), {
+      method: "PATCH",
+      body: JSON.stringify({ loginName }),
+    });
+    await loadOrganizationMembers();
+    await loadOrganizationMemberIdentity();
+    showToast("登录名已保存");
+  } catch (error) {
+    setText("organizationMemberIdentityError", error.message || "登录名保存失败");
+  } finally {
+    isOrganizationMemberIdentityBusy = false;
+    setButtonLoading("saveOrganizationMemberLoginNameButton", false);
+  }
+}
+
+async function bindOrganizationMemberAccount(identifier) {
+  if (!organizationCanBindMemberIdentity() || isOrganizationMemberIdentityBusy) return;
+  const memberId = organizationMemberIdentityId;
+  if (!memberId) return;
+  const value = String(identifier || "").trim();
+  const hasAccount = Boolean(organizationMemberIdentity?.account);
+  if (value && !window.confirm(
+    hasAccount
+      ? `把该成员的登录账号换成“${value}”？原账号已登录的会话会立即失效。`
+      : `把“${value}”绑定为该成员的登录账号？绑定后对方登录即可看到自己的用量。`,
+  )) return;
+  if (!value && !window.confirm("解除该成员的登录账号绑定？该账号已登录的会话会立即失效。")) return;
+  const buttonId = value ? "bindOrganizationMemberAccountButton" : "unbindOrganizationMemberAccountButton";
+  isOrganizationMemberIdentityBusy = true;
+  setButtonLoading(buttonId, true, value ? "绑定中" : "解绑中");
+  setText("organizationMemberIdentityError", "");
+  try {
+    await ensureCsrfToken();
+    const payload = await api(
+      organizationApiPath(`/members/${encodeURIComponent(memberId)}/account`),
+      { method: "POST", body: JSON.stringify({ identifier: value }) },
+    );
+    if (organizationMemberIdentityId === memberId) {
+      organizationMemberIdentity = payload;
+      el("organizationMemberAccountInput").value = "";
+      renderOrganizationMemberIdentity();
+    }
+    await loadOrganizationMembers();
+    showToast(value ? "登录账号已绑定" : "登录账号已解绑");
+  } catch (error) {
+    setText("organizationMemberIdentityError", error.message || "登录账号绑定失败");
+  } finally {
+    isOrganizationMemberIdentityBusy = false;
+    setButtonLoading(buttonId, false);
+  }
+}
+
+async function bindOrganizationPrincipalMember(principalId, memberId) {
+  if (!organizationCanBindMemberIdentity() || isOrganizationMemberIdentityBusy) return;
+  if (!principalId) return;
+  const target = String(memberId || "");
+  const principal = (organizationMemberIdentity?.principals?.items || []).find(
+    (item) => String(organizationField(item, "id", "principal_id") || "") === String(principalId),
+  );
+  const principalName = String(principal?.name || "该用量身份");
+  const boundMemberName = String(organizationField(principal || {}, "memberName", "member_name") || "");
+  const memberName = String(organizationMemberIdentity?.member?.name || "该成员");
+  const question = target
+    ? boundMemberName
+      ? `“${principalName}”当前归属 ${boundMemberName}，改为归属 ${memberName}？该身份名下的历史用量与令牌会一并转移。`
+      : `把“${principalName}”的历史用量与令牌关联到 ${memberName}？`
+    : `解除“${principalName}”与 ${memberName} 的关联？解除后这部分历史用量不再计入该成员。`;
+  if (!window.confirm(question)) return;
+  isOrganizationMemberIdentityBusy = true;
+  setText("organizationMemberIdentityError", "");
+  try {
+    await ensureCsrfToken();
+    await api(
+      organizationApiPath(`/principals/${encodeURIComponent(principalId)}/member`),
+      { method: "POST", body: JSON.stringify({ memberId: target }) },
+    );
+    await loadOrganizationMemberIdentity();
+    showToast(target ? "用量身份已关联" : "用量身份已解除");
+  } catch (error) {
+    setText("organizationMemberIdentityError", error.message || "用量身份关联失败");
+  } finally {
+    isOrganizationMemberIdentityBusy = false;
+  }
 }
 
 async function archiveOrganizationDepartment(departmentId) {
@@ -7932,6 +8132,24 @@ el("createOrganizationDepartmentButton").addEventListener("click", () => openOrg
 el("inviteOrganizationMemberButton").addEventListener("click", () => openOrganizationMemberModal());
 el("cancelOrganizationDepartmentButton").addEventListener("click", closeOrganizationDepartmentModal);
 el("cancelOrganizationMemberButton").addEventListener("click", closeOrganizationMemberModal);
+el("closeOrganizationMemberIdentityButton")?.addEventListener("click", () => closeOrganizationMemberIdentityModal());
+el("saveOrganizationMemberLoginNameButton")?.addEventListener("click", saveOrganizationMemberLoginName);
+el("bindOrganizationMemberAccountButton")?.addEventListener("click", () => {
+  bindOrganizationMemberAccount(el("organizationMemberAccountInput").value);
+});
+el("unbindOrganizationMemberAccountButton")?.addEventListener("click", () => bindOrganizationMemberAccount(""));
+el("organizationMemberIdentityList")?.addEventListener("click", (event) => {
+  const bindButton = event.target.closest("[data-organization-principal-bind]");
+  if (bindButton) {
+    bindOrganizationPrincipalMember(
+      bindButton.dataset.organizationPrincipalBind,
+      organizationMemberIdentityId,
+    );
+    return;
+  }
+  const unbindButton = event.target.closest("[data-organization-principal-unbind]");
+  if (unbindButton) bindOrganizationPrincipalMember(unbindButton.dataset.organizationPrincipalUnbind, "");
+});
 el("openOrganizationTopupModalButton")?.addEventListener("click", openOrganizationTopupModal);
 el("openOrganizationCreditAdjustmentButton")?.addEventListener("click", () => openOrganizationCreditAdjustmentModal("grant"));
 el("openOrganizationCreditRevokeButton")?.addEventListener("click", () => openOrganizationCreditAdjustmentModal("revoke"));
@@ -8169,6 +8387,11 @@ el("organizationMemberTable").addEventListener("click", (event) => {
   const editButton = event.target.closest("[data-organization-member-edit]");
   if (editButton) {
     openOrganizationMemberModal(editButton.dataset.organizationMemberEdit);
+    return;
+  }
+  const identityButton = event.target.closest("[data-organization-member-identity]");
+  if (identityButton) {
+    openOrganizationMemberIdentityModal(identityButton.dataset.organizationMemberIdentity);
     return;
   }
   const statusButton = event.target.closest("[data-organization-member-status]");
@@ -8783,6 +9006,7 @@ document.querySelectorAll(".modal-backdrop").forEach((backdrop) => {
     if (backdrop.id === "customerOrganizationModal") closeCustomerOrganizationModal();
     if (backdrop.id === "organizationDepartmentModal") closeOrganizationDepartmentModal();
     if (backdrop.id === "organizationMemberModal") closeOrganizationMemberModal();
+    if (backdrop.id === "organizationMemberIdentityModal") closeOrganizationMemberIdentityModal();
     if (backdrop.id === "organizationTopupModal") closeOrganizationTopupModal();
     if (backdrop.id === "organizationCreditAdjustmentModal") closeOrganizationCreditAdjustmentModal();
   });
@@ -8796,6 +9020,7 @@ document.addEventListener("keydown", (event) => {
   else if (!el("createKeyModal").classList.contains("hidden")) closeCreateKeyModal();
   else if (!el("customerOrganizationModal").classList.contains("hidden")) closeCustomerOrganizationModal();
   else if (!el("organizationMemberModal").classList.contains("hidden")) closeOrganizationMemberModal();
+  else if (!el("organizationMemberIdentityModal").classList.contains("hidden")) closeOrganizationMemberIdentityModal();
   else if (!el("organizationDepartmentModal").classList.contains("hidden")) closeOrganizationDepartmentModal();
   else if (!el("organizationTopupModal").classList.contains("hidden")) closeOrganizationTopupModal();
   else if (!el("organizationCreditAdjustmentModal")?.classList.contains("hidden")) closeOrganizationCreditAdjustmentModal();

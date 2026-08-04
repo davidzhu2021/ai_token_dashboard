@@ -29,6 +29,7 @@ from .organization_validation import (
     MAX_TOKENS_PER_ORGANIZATION,
     OrganizationConflictError,
     OrganizationNotFoundError,
+    OrganizationStoreError,
     OrganizationValidationError,
     OrganizationValidationMixin,
     _UNSET,
@@ -1449,7 +1450,12 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
             "SELECT m.*, o.name AS organization_name, o.status AS organization_status, "
             "o.upstream_organization_id, o.upstream_status, o.created_at AS organization_created_at, "
             "o.updated_at AS organization_updated_at, o.archived_at AS organization_archived_at, "
-            "d.name AS department_name, d.status AS department_status "
+            "d.name AS department_name, d.status AS department_status, "
+            # A member may own several usage identities, so aggregate instead of
+            # joining: a join would multiply the row and fetchrow would keep one.
+            "COALESCE(ARRAY(SELECT p.id FROM customer_principal p "
+            "               WHERE p.organization_id=m.organization_id AND p.member_id=m.id "
+            "               ORDER BY p.id), '{}'::text[]) AS principal_ids "
             "FROM customer_member m JOIN customer_organization o ON o.id=m.organization_id "
             "JOIN customer_department d ON d.id=m.department_id WHERE m.auth_user_id=$1",
             user_id,
@@ -1459,6 +1465,9 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
         member = self._member_payload(row)
         member["departmentName"] = row["department_name"]
         member["departmentStatus"] = row["department_status"]
+        member["principalIds"] = [
+            str(item) for item in (_row_value(row, "principal_ids", []) or []) if str(item).strip()
+        ]
         organization = {
             "id": row["organization_id"], "name": row["organization_name"],
             "status": row["organization_status"],
@@ -1517,9 +1526,7 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
         import re
 
         name = self._required_text(name, "name", 128)
-        login_name = self._required_identifier(login_name, "login_name").casefold()
-        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{2,63}", login_name):
-            raise OrganizationValidationError("login_name contains invalid characters")
+        login_name = self._validate_login_name(login_name)
         role = self._validate_role(role)
         team_role = self._validate_team_role(team_role)
         auth_user_id = self._required_identifier(auth_user_id, "auth_user_id")
@@ -1664,79 +1671,90 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
         result["invitationStatus"] = "pending"
         return result
 
-    async def update_member(self, member_id: str, *, organization_id: str, name: Any = _UNSET, department_id: Any = _UNSET, role: Any = _UNSET, status: Any = _UNSET, team_role: Any = _UNSET) -> dict[str, Any]:
+    async def update_member(self, member_id: str, *, organization_id: str, name: Any = _UNSET, department_id: Any = _UNSET, role: Any = _UNSET, status: Any = _UNSET, team_role: Any = _UNSET, login_name: Any = _UNSET) -> dict[str, Any]:
         fields, args = [], [member_id, organization_id]
-        for column, value in (("name", name), ("department_id", department_id), ("role", role), ("status", status), ("team_role", team_role)):
+        for column, value in (("name", name), ("department_id", department_id), ("role", role), ("status", status), ("team_role", team_role), ("login_name", login_name)):
             if value is _UNSET: continue
             if column == "name": value = self._required_text(value, "name", 128)
             elif column == "role": value = self._validate_role(value)
             elif column == "status": value = self._validate_status(value)
             elif column == "team_role": value = self._validate_team_role(value)
+            elif column == "login_name": value = self._validate_login_name(value)
             fields.append(f"{column}=${len(args)+1}"); args.append(value)
         if not fields: return (await self.get_member(member_id, organization_id=organization_id)) or (_ for _ in ()).throw(OrganizationNotFoundError("member was not found"))
         fields.extend(["updated_at=now()"])
         pool = self._require_pool()
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                if department_id is not _UNSET:
-                    valid_department = await conn.fetchval(
-                        "SELECT true FROM customer_department WHERE id=$1 AND organization_id=$2 AND status='active'",
-                        department_id,
-                        organization_id,
-                    )
-                    if not valid_department:
-                        raise OrganizationNotFoundError("department was not found")
-                previous = await conn.fetchrow(
-                    "SELECT status, department_id FROM customer_member WHERE id=$1 AND organization_id=$2 FOR UPDATE",
-                    member_id,
-                    organization_id,
-                )
-                if previous is None:
-                    raise OrganizationNotFoundError("member was not found")
-                row = await conn.fetchrow(
-                    f"UPDATE customer_member SET {', '.join(fields)} WHERE id=$1 AND organization_id=$2 RETURNING *",
-                    *args,
-                )
-                if row is None:
-                    raise OrganizationNotFoundError("member was not found")
-                next_status = str(row["status"] or "")
-                if str(row["upstream_user_id"] or ""):
-                    await self._enqueue_projection_sync(
-                        conn,
-                        "organization.member.sync",
+        try:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    if department_id is not _UNSET:
+                        valid_department = await conn.fetchval(
+                            "SELECT true FROM customer_department WHERE id=$1 AND organization_id=$2 AND status='active'",
+                            department_id,
+                            organization_id,
+                        )
+                        if not valid_department:
+                            raise OrganizationNotFoundError("department was not found")
+                    previous = await conn.fetchrow(
+                        "SELECT status, department_id FROM customer_member WHERE id=$1 AND organization_id=$2 FOR UPDATE",
                         member_id,
-                        {
-                            "organizationId": organization_id,
-                            "memberId": member_id,
-                            "status": next_status,
-                            "role": row["role"],
-                            "teamRole": row["team_role"],
-                            "departmentId": row["department_id"],
-                            "upstreamUserId": row["upstream_user_id"],
-                        },
-                        version=_iso(row["updated_at"]) or next_status,
-                    )
-                department_changed = (
-                    department_id is not _UNSET
-                    and str(previous["department_id"] or "")
-                    != str(row["department_id"] or "")
-                )
-                revocation_reason = ""
-                if status is not _UNSET and next_status in {"invited", "suspended"}:
-                    revocation_reason = f"member_{next_status}"
-                elif department_changed:
-                    # Keys retain the Team captured when issued. Revoke them on
-                    # a move so no credential keeps the previous department's
-                    # access; usage history remains attributed to the old Team.
-                    revocation_reason = "member_department_changed"
-                if revocation_reason:
-                    await self._enqueue_token_revocations(
-                        conn,
                         organization_id,
-                        reason=revocation_reason,
-                        member_id=member_id,
-                        version=_iso(row["updated_at"]) or self._id(),
                     )
+                    if previous is None:
+                        raise OrganizationNotFoundError("member was not found")
+                    row = await conn.fetchrow(
+                        f"UPDATE customer_member SET {', '.join(fields)} WHERE id=$1 AND organization_id=$2 RETURNING *",
+                        *args,
+                    )
+                    if row is None:
+                        raise OrganizationNotFoundError("member was not found")
+                    next_status = str(row["status"] or "")
+                    if str(row["upstream_user_id"] or ""):
+                        await self._enqueue_projection_sync(
+                            conn,
+                            "organization.member.sync",
+                            member_id,
+                            {
+                                "organizationId": organization_id,
+                                "memberId": member_id,
+                                "status": next_status,
+                                "role": row["role"],
+                                "teamRole": row["team_role"],
+                                "departmentId": row["department_id"],
+                                "upstreamUserId": row["upstream_user_id"],
+                            },
+                            version=_iso(row["updated_at"]) or next_status,
+                        )
+                    department_changed = (
+                        department_id is not _UNSET
+                        and str(previous["department_id"] or "")
+                        != str(row["department_id"] or "")
+                    )
+                    revocation_reason = ""
+                    if status is not _UNSET and next_status in {"invited", "suspended"}:
+                        revocation_reason = f"member_{next_status}"
+                    elif department_changed:
+                        # Keys retain the Team captured when issued. Revoke them on
+                        # a move so no credential keeps the previous department's
+                        # access; usage history remains attributed to the old Team.
+                        revocation_reason = "member_department_changed"
+                    if revocation_reason:
+                        await self._enqueue_token_revocations(
+                            conn,
+                            organization_id,
+                            reason=revocation_reason,
+                            member_id=member_id,
+                            version=_iso(row["updated_at"]) or self._id(),
+                        )
+        except OrganizationStoreError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - narrowed below
+            message = str(exc)
+            if "customer_member_login_name_idx" in message or (
+                "duplicate key" in message and "login_name" in message
+            ):
+                raise OrganizationConflictError("login_name is already in use") from exc
+            raise
         return await self._member_payload_with_department(row, organization_id=organization_id)
 
     async def create_invitation(self, organization_id: str, member_id: str, *, expires_in_hours: int = 72) -> dict[str, Any]:
@@ -2051,17 +2069,52 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
             "completedAt": _iso(row["sent_at"]),
         }
 
-    async def bind_member_account(
-        self, organization_id: str, member_id: str, auth_user_id: str
+    async def set_member_account(
+        self, organization_id: str, member_id: str, auth_user_id: str | None
     ) -> dict[str, Any]:
-        row = await self._require_pool().fetchrow(
-            "UPDATE customer_member SET auth_user_id=$3, updated_at=now() "
-            "WHERE id=$1 AND organization_id=$2 AND status='invited' RETURNING *",
-            member_id, organization_id, auth_user_id,
-        )
-        if row is None:
-            raise OrganizationNotFoundError("invited member was not found")
-        return await self._member_payload_with_department(row, organization_id=organization_id)
+        """Point a member at a local login account, or release the current one.
+
+        Any member status is accepted because the person using an account can
+        change after activation — a temporary address gets replaced by a real
+        one.  The previous binding is returned so the caller can revoke the
+        sessions it left behind.
+        """
+
+        auth_user_id = str(auth_user_id or "").strip()
+        pool = self._require_pool()
+        try:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    previous = await conn.fetchrow(
+                        "SELECT auth_user_id FROM customer_member WHERE id=$1 AND organization_id=$2 FOR UPDATE",
+                        member_id,
+                        organization_id,
+                    )
+                    if previous is None:
+                        raise OrganizationNotFoundError("member was not found")
+                    row = await conn.fetchrow(
+                        "UPDATE customer_member SET auth_user_id=$3, updated_at=now() "
+                        "WHERE id=$1 AND organization_id=$2 RETURNING *",
+                        member_id,
+                        organization_id,
+                        auth_user_id,
+                    )
+        except OrganizationStoreError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - narrowed below
+            message = str(exc)
+            if "customer_member_auth_user_idx" in message or (
+                "duplicate key" in message and "auth_user_id" in message
+            ):
+                raise OrganizationConflictError(
+                    "account is already bound to another member"
+                ) from exc
+            raise
+        if row is None:  # pragma: no cover - the locked read already guards this
+            raise OrganizationNotFoundError("member was not found")
+        member = await self._member_payload_with_department(row, organization_id=organization_id)
+        member["previousAuthUserId"] = str(_row_value(previous, "auth_user_id", "") or "")
+        return member
 
     async def set_upstream_team(
         self, organization_id: str, department_id: str, upstream_team_id: str
@@ -2496,6 +2549,88 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
             row,
             upstream_user_ids=[str(_row_value(item, "upstream_user_id", "") or "") for item in identities],
         )
+
+    async def list_principals(self, organization_id: str) -> dict[str, Any]:
+        """List every usage identity in one tenant with its current binding."""
+
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT p.*, m.name AS member_name FROM customer_principal p "
+                "LEFT JOIN customer_member m ON m.id=p.member_id "
+                "WHERE p.organization_id=$1 ORDER BY lower(p.name), p.id",
+                organization_id,
+            )
+            identities = await conn.fetch(
+                "SELECT principal_id, upstream_user_id FROM customer_principal_upstream_identity "
+                "WHERE organization_id=$1 ORDER BY created_at, id",
+                organization_id,
+            )
+        owned: dict[str, list[str]] = {}
+        for item in identities:
+            owned.setdefault(str(_row_value(item, "principal_id", "") or ""), []).append(
+                str(_row_value(item, "upstream_user_id", "") or "")
+            )
+        items = []
+        for row in rows:
+            payload = self._principal_payload(
+                row, upstream_user_ids=owned.get(str(_row_value(row, "id", "") or ""), [])
+            )
+            payload["memberName"] = str(_row_value(row, "member_name", "") or "")
+            items.append(payload)
+        return {"items": items, "total": len(items)}
+
+    async def set_principal_member(
+        self, organization_id: str, principal_id: str, member_id: str | None
+    ) -> dict[str, Any]:
+        """Bind, rebind, or release a usage identity by platform operation.
+
+        Unlike link_principal_member this deliberately allows moving an already
+        bound identity: the person behind a local account can change, and the
+        alternative is a one-off script every time.  Imported key ownership is
+        rewritten unconditionally so a rebind cannot leave rows pointing at the
+        previous member.
+        """
+
+        member_id = str(member_id or "").strip() or None
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                principal = await conn.fetchrow(
+                    "SELECT * FROM customer_principal WHERE organization_id=$1 AND id=$2 FOR UPDATE",
+                    organization_id,
+                    principal_id,
+                )
+                if principal is None:
+                    raise OrganizationNotFoundError("principal was not found")
+                if member_id is not None:
+                    member = await conn.fetchrow(
+                        "SELECT id FROM customer_member WHERE organization_id=$1 AND id=$2 FOR UPDATE",
+                        organization_id,
+                        member_id,
+                    )
+                    if member is None:
+                        raise OrganizationNotFoundError("member was not found")
+                await conn.execute(
+                    "UPDATE customer_principal SET member_id=$3, "
+                    "status=CASE WHEN $3 IS NULL THEN status "
+                    "            WHEN status='pending' THEN 'active' ELSE status END, "
+                    "updated_at=now() WHERE organization_id=$1 AND id=$2",
+                    organization_id,
+                    principal_id,
+                    member_id,
+                )
+                await conn.execute(
+                    "UPDATE customer_usage_key_identity SET member_id=$3 "
+                    "WHERE organization_id=$1 AND principal_id=$2",
+                    organization_id,
+                    principal_id,
+                    member_id,
+                )
+        result = await self.get_principal(organization_id, principal_id)
+        if result is None:  # pragma: no cover
+            raise OrganizationNotFoundError("principal was not found")
+        return result
 
     async def ensure_principal(
         self,

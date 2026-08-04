@@ -3265,7 +3265,16 @@ async def real_organization_member_usage_payload(
         else ""
     ).strip()
     upstream_user_id = str(membership.get("upstreamUserId") or "").strip()
-    if not upstream_organization_id or not upstream_user_id:
+    upstream_user_ids = [upstream_user_id] if upstream_user_id else []
+    # Spend earned before the tenant was adopted is attributed to a usage
+    # identity rather than to the synthetic upstream id minted at signup, and it
+    # commonly spans several upstream ids, so both must be queried together.
+    principal_ids = [
+        str(item).strip()
+        for item in (membership.get("principalIds") or [])
+        if str(item).strip()
+    ]
+    if not upstream_organization_id or not (upstream_user_ids or principal_ids):
         raise auth_http_error(
             409,
             "企业账号仍在开通中，请稍后重试",
@@ -3281,9 +3290,10 @@ async def real_organization_member_usage_payload(
     try:
         await store.connect()
         await prepare_usage_refresh(start_date, end_date, refresh)
-        stored = await store.organization_member_rows(
+        stored = await store.organization_identity_rows(
             upstream_organization_id,
-            upstream_user_id,
+            upstream_user_ids,
+            principal_ids,
             start_date,
             end_date,
             source,
@@ -3323,7 +3333,7 @@ async def real_organization_member_usage_payload(
         "dataQuality": {
             "summarySource": "database",
             "organizationScoped": True,
-            "memberIdentityMatch": "upstream_user_id",
+            "memberIdentityMatch": "principal" if principal_ids else "upstream_user_id",
         },
         "cache": {"hit": False, "ttlSeconds": 0},
     }
@@ -4033,11 +4043,40 @@ class OrganizationMemberUpdateRequest(BaseModel):
     departmentId: str | None = Field(default=None, min_length=1, max_length=128)
     role: Literal["admin", "member"] | None = None
     status: Literal["invited", "pending", "active", "suspended"] | None = None
+    # 登录名只在平台侧路由的白名单里放开；客户管理员那条路径不读这个字段。
+    loginName: str | None = Field(default=None, min_length=3, max_length=64)
 
-    @field_validator("name", "departmentId")
+    @field_validator("name", "departmentId", "loginName")
     @classmethod
     def strip_optional_member_text(cls, value: str | None) -> str | None:
         return value.strip() if value is not None else value
+
+
+class OrganizationMemberAccountRequest(BaseModel):
+    """Bind, rebind, or release the local login account behind one member."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # 空串是显式的解绑意图，不是缺参数，所以不设 min_length。
+    identifier: str = Field(default="", max_length=254)
+
+    @field_validator("identifier")
+    @classmethod
+    def strip_identifier(cls, value: str) -> str:
+        return value.strip()
+
+
+class OrganizationPrincipalMemberRequest(BaseModel):
+    """Associate a usage identity with a member, or release it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    memberId: str = Field(default="", max_length=128)
+
+    @field_validator("memberId")
+    @classmethod
+    def strip_member_id(cls, value: str) -> str:
+        return value.strip()
 
 
 class OrganizationEmptyRequest(BaseModel):
@@ -5966,6 +6005,207 @@ async def platform_organization_members(
         raise organization_store_error(exc) from exc
 
 
+def require_platform_organization_repository() -> PostgreSQLOrganizationRepository:
+    """Return the durable directory or refuse the identity-binding operation.
+
+    Binding decisions are permanent records, so the Mock directory must never
+    accept them: a bind that vanishes on restart is worse than a clear refusal.
+    """
+
+    repository = organization_store()
+    if not isinstance(repository, PostgreSQLOrganizationRepository):
+        raise auth_http_error(503, "企业身份数据暂不可用", "ORGANIZATION_IDENTITY_UNAVAILABLE")
+    return repository
+
+
+def platform_account_summary(account: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Describe a login account with the fields an operator needs to confirm it."""
+
+    if not isinstance(account, dict):
+        return None
+    return {
+        "id": str(account.get("id") or ""),
+        "email": str(account.get("email") or ""),
+        "loginName": str(account.get("login_name") or account.get("loginName") or ""),
+        "status": str(account.get("status") or ""),
+    }
+
+
+def platform_identity_item(principal: dict[str, Any] | None) -> dict[str, Any]:
+    """Re-shape one usage identity for the browser.
+
+    The stored field is named after the upstream gateway's user ids; the
+    employee-facing dialog only ever calls them 历史来源, so the browser payload
+    must not carry provider vocabulary at all.
+    """
+
+    entry = dict(principal or {})
+    entry["historySources"] = [
+        str(item) for item in (entry.pop("upstreamUserIds", None) or []) if str(item)
+    ]
+    return entry
+
+
+def platform_identity_list(principals: dict[str, Any] | None) -> dict[str, Any]:
+    """Re-shape a whole usage-identity list for the browser."""
+
+    items = [platform_identity_item(item) for item in ((principals or {}).get("items") or [])]
+    return {"items": items, "total": len(items)}
+
+
+async def platform_member_identity_payload(
+    repository: PostgreSQLOrganizationRepository, organization_id: str, member_id: str
+) -> dict[str, Any]:
+    """Assemble everything the identity-binding dialog renders in one read."""
+
+    member = await repository.get_member(member_id, organization_id=organization_id)
+    if not isinstance(member, dict):
+        raise auth_http_error(404, "未找到对应成员", "ORGANIZATION_MEMBER_NOT_FOUND")
+    auth_user_id = str(member.get("authUserId") or "").strip()
+    account = (
+        await auth_store_call("get_user", auth_user_id) if auth_user_id else None
+    )
+    principals = await repository.list_principals(organization_id)
+    return {
+        "member": member,
+        # A bound id whose account is gone still has to be visible, otherwise the
+        # operator sees "未绑定" and cannot explain why the member has no usage.
+        "account": platform_account_summary(account),
+        "accountMissing": bool(auth_user_id) and account is None,
+        "principals": platform_identity_list(principals),
+    }
+
+
+@app.get("/api/platform/organizations/{organization_id}/members/{member_id}/identity")
+async def platform_member_identity(
+    organization_id: str,
+    member_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    """Show one member's login account and every usage identity in the tenant."""
+
+    await require_platform_organization(request, organization_id)
+    repository = require_platform_organization_repository()
+    try:
+        return await platform_member_identity_payload(repository, organization_id, member_id)
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+
+
+@app.post("/api/platform/organizations/{organization_id}/members/{member_id}/account")
+async def platform_bind_member_account(
+    organization_id: str,
+    member_id: str,
+    data: OrganizationMemberAccountRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Point a member at a login account, or release the current one.
+
+    A temporary address gets replaced by a real one, so this has to work after
+    activation. Sessions belonging to the replaced account are revoked because
+    otherwise its browser would keep reading this customer's data.
+    """
+
+    await enforce_csrf(request)
+    actor = await require_platform_organization(request, organization_id)
+    repository = require_platform_organization_repository()
+    identifier = data.identifier
+    account: dict[str, Any] | None = None
+    if identifier:
+        account = await auth_store_call("get_user_by_identifier", identifier)
+        if not isinstance(account, dict):
+            raise auth_http_error(
+                404,
+                "找不到该登录账号，请确认对方已完成注册",
+                "ORGANIZATION_ACCOUNT_NOT_FOUND",
+            )
+        if str(account.get("status") or "") != "active":
+            raise auth_http_error(
+                409,
+                "该登录账号当前不可用，无法绑定",
+                "ORGANIZATION_ACCOUNT_NOT_ACTIVE",
+            )
+    try:
+        member = await repository.set_member_account(
+            organization_id,
+            member_id,
+            str((account or {}).get("id") or "") if identifier else "",
+        )
+    except OrganizationConflictError as exc:
+        raise auth_http_error(
+            409,
+            "该登录账号已绑定到其他成员，请先解除原有绑定",
+            "ORGANIZATION_ACCOUNT_ALREADY_BOUND",
+        ) from exc
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    previous_auth_user_id = str(member.pop("previousAuthUserId", "") or "")
+    auth_user_id = str(member.get("authUserId") or "")
+    if previous_auth_user_id and previous_auth_user_id != auth_user_id:
+        await auth_store_call("revoke_user_sessions", previous_auth_user_id)
+    await repository.record_audit(
+        organization_id,
+        "organization.member.account_bound" if identifier else "organization.member.account_unbound",
+        actor=str(actor.get("email") or actor.get("id") or "platform"),
+        target_type="member",
+        target_id=member_id,
+        details={
+            "memberId": member_id,
+            "authUserId": auth_user_id,
+            "previousAuthUserId": previous_auth_user_id,
+            "ipAddress": request_ip(request),
+        },
+    )
+    invalidate_organization_usage_cache()
+    return {
+        "ok": True,
+        **await platform_member_identity_payload(repository, organization_id, member_id),
+    }
+
+
+@app.post("/api/platform/organizations/{organization_id}/principals/{principal_id}/member")
+async def platform_bind_principal_member(
+    organization_id: str,
+    principal_id: str,
+    data: OrganizationPrincipalMemberRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Attach a usage identity to a member so their spend is attributed."""
+
+    await enforce_csrf(request)
+    actor = await require_platform_organization(request, organization_id)
+    repository = require_platform_organization_repository()
+    member_id = data.memberId
+    try:
+        existing = await repository.get_principal(organization_id, principal_id)
+        principal = await repository.set_principal_member(
+            organization_id, principal_id, member_id or None
+        )
+    except OrganizationStoreError as exc:
+        raise organization_store_error(exc) from exc
+    await repository.record_audit(
+        organization_id,
+        "organization.principal.bound" if member_id else "organization.principal.unbound",
+        actor=str(actor.get("email") or actor.get("id") or "platform"),
+        target_type="principal",
+        target_id=principal_id,
+        details={
+            "principalId": principal_id,
+            "memberId": member_id,
+            "previousMemberId": str((existing or {}).get("memberId") or ""),
+            "ipAddress": request_ip(request),
+        },
+    )
+    invalidate_organization_usage_cache()
+    # The dialog keeps its own member, so only the identity list has to be
+    # refreshed here — the caller re-reads the member when it needs one.
+    return {
+        "ok": True,
+        "principal": platform_identity_item(principal),
+        "principals": platform_identity_list(await repository.list_principals(organization_id)),
+    }
+
+
 @app.post("/api/platform/organizations/{organization_id}/departments")
 async def platform_create_department(
     organization_id: str, data: OrganizationDepartmentRequest, request: Request
@@ -6085,6 +6325,11 @@ async def platform_update_member(
     if "status" in fields:
         reject_direct_real_member_activation(data.status)
         updates["status"] = "invited" if data.status == "pending" else data.status
+    # 登录名只在平台侧放开：让客户管理员改别人的登录名等于交出账号接管能力。
+    # Mock 目录里的成员没有登录名这个概念，所以那里直接拒绝而不是静默忽略。
+    if "loginName" in fields:
+        require_platform_organization_repository()
+        updates["login_name"] = data.loginName
     try:
         member = await organization_scoped_store_call(
             organization_id, "update_member", member_id, **updates
@@ -6093,6 +6338,15 @@ async def platform_update_member(
             store = organization_store()
             if isinstance(store, PostgreSQLOrganizationRepository):
                 await store.create_invitation(organization_id, member_id)
+    except OrganizationConflictError as exc:
+        # 通用冲突文案（"请先调整成员或管理员"）解释不了登录名被占用这种情况。
+        if "loginName" in fields:
+            raise auth_http_error(
+                409,
+                "该登录名已被占用，请换一个",
+                "ORGANIZATION_LOGIN_NAME_TAKEN",
+            ) from exc
+        raise organization_store_error(exc) from exc
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
     invalidate_organization_usage_cache()

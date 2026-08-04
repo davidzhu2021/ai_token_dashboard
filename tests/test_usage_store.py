@@ -290,13 +290,16 @@ def test_organization_query_groups_multiple_upstream_users_by_principal() -> Non
     assert "principal_id" in summaries
 
 
-def test_principal_rows_preserve_original_upstream_user_ids() -> None:
+def test_identity_rows_preserve_original_upstream_user_ids() -> None:
     class Pool:
         async def fetch(self, query, *args):
             if "FROM usage_sync_coverage" in query:
                 return [{"backend_id": "primary"}]
-            assert "principal_id=$2" in query
-            assert args[0:2] == ("org-upstream", "principal-1")
+            # 一条 SQL 完成联合：同一行既可能命中 user_id 又可能命中 principal_id，
+            # 分两次查再相加会重复计费。
+            assert "user_id=ANY($2::text[]) OR principal_id=ANY($3::text[])" in query
+            assert "SUM(total_tokens) AS total_tokens" in query
+            assert args[0:3] == ("org-upstream", ["customer-member-1"], ["principal-1"])
             return [
                 {
                     "usage_date": date(2026, 7, 30),
@@ -309,7 +312,7 @@ def test_principal_rows_preserve_original_upstream_user_ids() -> None:
                     "success_count": 2,
                     "failure_count": 0,
                     "spend": 1.25,
-                    "upstream_user_ids": ["claude-code-lianghaiqiang", "cursor-lianghaiqiang"],
+                    "matched_user_ids": ["claude-code-lianghaiqiang", "cursor-lianghaiqiang"],
                 },
                 {
                     "usage_date": date(2026, 7, 30),
@@ -322,7 +325,7 @@ def test_principal_rows_preserve_original_upstream_user_ids() -> None:
                     "success_count": 2,
                     "failure_count": 1,
                     "spend": 2.75,
-                    "upstream_user_ids": ["cursor-lianghaiqiang", "codex-lianghaiqiang"],
+                    "matched_user_ids": ["cursor-lianghaiqiang", "codex-lianghaiqiang"],
                 },
             ]
 
@@ -335,9 +338,10 @@ def test_principal_rows_preserve_original_upstream_user_ids() -> None:
     store.pool = Pool()
 
     result = asyncio.run(
-        store.organization_principal_rows(
+        store.organization_identity_rows(
             "org-upstream",
-            "principal-1",
+            ["customer-member-1"],
+            ["principal-1"],
             "2026-07-30",
             "2026-07-30",
             "all",
@@ -345,7 +349,7 @@ def test_principal_rows_preserve_original_upstream_user_ids() -> None:
         )
     )
 
-    assert result["principalId"] == "principal-1"
+    assert result["principalIds"] == ["principal-1"]
     assert result["upstreamUserIds"] == [
         "claude-code-lianghaiqiang",
         "codex-lianghaiqiang",
@@ -358,6 +362,115 @@ def test_principal_rows_preserve_original_upstream_user_ids() -> None:
     assert result["rows"][0]["successCount"] == 4
     assert result["rows"][0]["failureCount"] == 1
     assert result["rows"][0]["spend"] == pytest.approx(4.0)
+
+
+def test_identity_rows_query_once_so_dual_matches_are_not_doubled() -> None:
+    """同一行同时命中两种身份时只能计一次。"""
+
+    calls: list[str] = []
+
+    class Pool:
+        async def fetch(self, query, *args):
+            if "FROM usage_sync_coverage" in query:
+                return [{"backend_id": "primary"}]
+            calls.append(query)
+            return [
+                {
+                    "usage_date": date(2026, 8, 3),
+                    "source": "Claude Code",
+                    "model": "claude-opus-5",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 20,
+                    "total_tokens": 30,
+                    "request_count": 4,
+                    "success_count": 4,
+                    "failure_count": 0,
+                    "spend": 12.5,
+                    # 该行的 user_id 与 principal_id 都属于这位成员。
+                    "matched_user_ids": ["customer-member-1"],
+                }
+            ]
+
+        async def fetchval(self, query, *args):
+            return None
+
+    store = UsageStore("postgresql://unused")
+    store.pool = Pool()
+
+    result = asyncio.run(
+        store.organization_identity_rows(
+            "org-upstream",
+            ["customer-member-1"],
+            ["principal-1"],
+            "2026-08-03",
+            "2026-08-03",
+            "all",
+            ["primary"],
+        )
+    )
+
+    assert len(calls) == 1
+    assert len(result["rows"]) == 1
+    assert result["rows"][0]["totalTokens"] == 30
+    assert result["rows"][0]["spend"] == pytest.approx(12.5)
+    assert result["upstreamUserIds"] == ["customer-member-1"]
+
+
+def test_identity_rows_accept_a_member_without_any_principal() -> None:
+    class Pool:
+        async def fetch(self, query, *args):
+            if "FROM usage_sync_coverage" in query:
+                return [{"backend_id": "primary"}]
+            assert args[1] == ["customer-member-1"]
+            assert args[2] == []
+            return []
+
+        async def fetchval(self, query, *args):
+            return None
+
+    store = UsageStore("postgresql://unused")
+    store.pool = Pool()
+
+    result = asyncio.run(
+        store.organization_identity_rows(
+            "org-upstream",
+            ["customer-member-1", " ", "customer-member-1"],
+            [],
+            "2026-08-03",
+            "2026-08-03",
+            "all",
+            ["primary"],
+        )
+    )
+
+    assert result["rows"] == []
+    assert result["principalIds"] == []
+    assert result["upstreamUserIds"] == []
+
+
+def test_identity_rows_return_none_when_a_backend_is_not_synced() -> None:
+    class Pool:
+        async def fetch(self, query, *args):
+            if "FROM usage_sync_coverage" in query:
+                return [{"backend_id": "primary"}]
+            raise AssertionError("must not query usage before coverage is complete")
+
+    store = UsageStore("postgresql://unused")
+    store.pool = Pool()
+
+    result = asyncio.run(
+        store.organization_identity_rows(
+            "org-upstream",
+            ["customer-member-1"],
+            ["principal-1"],
+            "2026-08-03",
+            "2026-08-03",
+            "all",
+            ["primary", "secondary"],
+        )
+    )
+
+    assert result is None
 
 
 def test_organization_rows_preserve_department_before_canonical_merge() -> None:

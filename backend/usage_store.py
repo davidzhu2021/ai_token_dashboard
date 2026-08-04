@@ -1353,102 +1353,70 @@ class UsageStore:
         ]
         return {"rows": self._group_rows(rows, ("date", "source", "model")), "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered)}
 
-    async def organization_member_rows(
+    async def organization_identity_rows(
         self,
         organization_id: str,
-        user_id: str,
+        upstream_user_ids: list[str],
+        principal_ids: list[str],
         start_date: str,
         end_date: str,
         source: str,
         backend_ids: list[str],
     ) -> dict[str, Any] | None:
-        """Read one real member using persisted tenant and upstream-user ids."""
+        """Aggregate one member across every identity that carries their spend.
+
+        A member owns two kinds of identity: the stable upstream user id issued
+        when their profile was created, and any local principal preserving the
+        upstream ids they used before the tenant was adopted.  Historical
+        report-only spend often splits across several upstream ids, so no single
+        id can cover it.  The union runs as one query because a row can match on
+        both columns at once — summing two separate reads would double-count it.
+        """
 
         covered = await self.covered_backend_ids(start_date, end_date, backend_ids)
         if set(covered) != set(backend_ids):
             return None
+        user_ids = sorted({str(item).strip() for item in upstream_user_ids if str(item).strip()})
+        principals = sorted({str(item).strip() for item in principal_ids if str(item).strip()})
         records = await self._require_pool().fetch(
             """
-            SELECT usage_date, source, model, prompt_tokens, completion_tokens, total_tokens,
-                   request_count, success_count, failure_count, spend
+            SELECT usage_date, source, model,
+                   SUM(prompt_tokens) AS prompt_tokens,
+                   SUM(completion_tokens) AS completion_tokens,
+                   SUM(total_tokens) AS total_tokens,
+                   SUM(request_count) AS request_count,
+                   SUM(success_count) AS success_count,
+                   SUM(failure_count) AS failure_count,
+                   SUM(spend) AS spend,
+                   ARRAY_AGG(DISTINCT user_id) AS matched_user_ids
             FROM usage_daily
-            WHERE organization_id=$1 AND user_id=$2
-              AND usage_date BETWEEN $3::date AND $4::date
-              AND backend_id=ANY($5::text[])
-              AND ($6='all' OR source=$6)
-            """,
-            organization_id,
-            user_id,
-            _as_date(start_date),
-            _as_date(end_date),
-            covered,
-            source or "all",
-        )
-        rows = [
-            {
-                "date": record["usage_date"].isoformat(),
-                "source": record["source"],
-                "model": normalize_model_display_name(record["model"]) or "未知模型",
-                "promptTokens": _as_int(record["prompt_tokens"]),
-                "completionTokens": _as_int(record["completion_tokens"]),
-                "totalTokens": _as_int(record["total_tokens"]),
-                "requestCount": _as_int(record["request_count"]),
-                "successCount": _as_int(record["success_count"]),
-                "failureCount": _as_int(record["failure_count"]),
-                "spend": _as_float(record["spend"]),
-            }
-            for record in records
-        ]
-        return {
-            "rows": self._group_rows(rows, ("date", "source", "model")),
-            "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered),
-        }
-
-    async def organization_principal_rows(
-        self,
-        organization_id: str,
-        principal_id: str,
-        start_date: str,
-        end_date: str,
-        source: str,
-        backend_ids: list[str],
-    ) -> dict[str, Any] | None:
-        """Aggregate every preserved upstream identity for one local principal."""
-
-        covered = await self.covered_backend_ids(start_date, end_date, backend_ids)
-        if set(covered) != set(backend_ids):
-            return None
-        records = await self._require_pool().fetch(
-            """
-            SELECT usage_date, source, model, prompt_tokens, completion_tokens, total_tokens,
-                   request_count, success_count, failure_count, spend,
-                   ARRAY_AGG(DISTINCT user_id) AS upstream_user_ids
-            FROM usage_daily
-            WHERE organization_id=$1 AND principal_id=$2
-              AND usage_date BETWEEN $3::date AND $4::date
-              AND backend_id=ANY($5::text[])
-              AND ($6='all' OR source=$6)
+            WHERE organization_id=$1
+              AND (user_id=ANY($2::text[]) OR principal_id=ANY($3::text[]))
+              AND usage_date BETWEEN $4::date AND $5::date
+              AND backend_id=ANY($6::text[])
+              AND ($7='all' OR source=$7)
             GROUP BY usage_date, source, model
             ORDER BY usage_date, source, model
             """,
             organization_id,
-            principal_id,
+            user_ids,
+            principals,
             _as_date(start_date),
             _as_date(end_date),
             covered,
             source or "all",
         )
         rows: list[dict[str, Any]] = []
-        upstream_user_ids: set[str] = set()
+        matched_user_ids: set[str] = set()
         for record in records:
-            upstream_user_ids.update(
-                str(item) for item in (record["upstream_user_ids"] or []) if item
+            matched_user_ids.update(
+                str(item) for item in (record["matched_user_ids"] or []) if item
             )
             rows.append(
                 {
                     "date": record["usage_date"].isoformat(),
                     "source": record["source"],
-                    "model": normalize_model_display_name(record["model"]) or "鏈煡妯″瀷",
+                    "model": normalize_model_display_name(record["model"]) or "未知模型",
                     "promptTokens": _as_int(record["prompt_tokens"]),
                     "completionTokens": _as_int(record["completion_tokens"]),
                     "totalTokens": _as_int(record["total_tokens"]),
@@ -1456,13 +1424,12 @@ class UsageStore:
                     "successCount": _as_int(record["success_count"]),
                     "failureCount": _as_int(record["failure_count"]),
                     "spend": _as_float(record["spend"]),
-                    "principalId": principal_id,
                 }
             )
         return {
-            "rows": self._group_rows(rows, ("date", "source", "model", "principalId")),
-            "principalId": principal_id,
-            "upstreamUserIds": sorted(upstream_user_ids),
+            "rows": self._group_rows(rows, ("date", "source", "model")),
+            "principalIds": principals,
+            "upstreamUserIds": sorted(matched_user_ids),
             "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered),
         }
 

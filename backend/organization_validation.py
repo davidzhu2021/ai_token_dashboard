@@ -191,6 +191,15 @@ class OrganizationValidationMixin:
             raise OrganizationValidationError("team_role must be leader or member")
         return value
 
+    @classmethod
+    def _validate_login_name(cls, value: Any) -> str:
+        """Normalize a managed login name the way account creation does."""
+
+        login_name = cls._required_identifier(value, "login_name").casefold()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{2,63}", login_name):
+            raise OrganizationValidationError("login_name contains invalid characters")
+        return login_name
+
     @staticmethod
     def _page_value(value: Any, field_name: str, maximum: int) -> int:
         if isinstance(value, bool):

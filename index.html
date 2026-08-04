@@ -5590,6 +5590,68 @@
         line-height: 1.65;
       }
 
+      /* Identity binding groups three independent operations in one dialog, so
+         each section needs its own frame and its own action row. */
+      .organization-identity-modal {
+        max-height: min(86vh, 760px);
+        overflow-y: auto;
+      }
+
+      .organization-identity-section {
+        margin-top: 14px;
+        padding: 14px;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .organization-identity-section h4 {
+        margin: 0;
+        font-size: 14px;
+      }
+
+      .organization-identity-current {
+        margin: 0;
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      .organization-identity-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .organization-identity-list {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .organization-identity-item {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 10px 12px;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+      }
+
+      .organization-identity-item strong {
+        font-size: 13px;
+      }
+
+      .organization-identity-item span {
+        display: block;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.6;
+      }
+
       /* Access tokens list one chip per granted model, so the cell has to wrap
          instead of stretching the enterprise table. */
       .organization-token-models {
@@ -8294,6 +8356,46 @@
       </form>
     </div>
 
+    <div id="organizationMemberIdentityModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="organizationMemberIdentityTitle">
+      <div class="modal organization-identity-modal">
+        <h3 id="organizationMemberIdentityTitle">身份绑定</h3>
+        <p id="organizationMemberIdentityDescription">为该成员维护登录名、登录账号与用量身份。用量身份决定历史消费归属到谁名下。</p>
+        <p id="organizationMemberIdentityError" class="field-error" aria-live="polite"></p>
+        <section class="organization-identity-section">
+          <h4>登录名</h4>
+          <p class="organization-modal-note">登录名用于账号密码登录，只能包含小写字母、数字、点、下划线和短横线。</p>
+          <div class="field">
+            <label for="organizationMemberLoginNameInput">登录名</label>
+            <input id="organizationMemberLoginNameInput" class="input" type="text" maxlength="64" autocomplete="off" placeholder="例如：zhangsan" />
+          </div>
+          <div class="organization-identity-actions">
+            <button id="saveOrganizationMemberLoginNameButton" class="primary-btn" type="button">保存登录名</button>
+          </div>
+        </section>
+        <section class="organization-identity-section">
+          <h4>登录账号</h4>
+          <p class="organization-modal-note">换绑或解绑后，原账号已登录的会话会立即失效，需要用新账号重新登录。</p>
+          <p id="organizationMemberIdentityAccount" class="organization-identity-current">未绑定</p>
+          <div class="field">
+            <label for="organizationMemberAccountInput">邮箱或登录名</label>
+            <input id="organizationMemberAccountInput" class="input" type="text" maxlength="254" autocomplete="off" placeholder="name@company.com 或 zhangsan" />
+          </div>
+          <div class="organization-identity-actions">
+            <button id="bindOrganizationMemberAccountButton" class="primary-btn" type="button">绑定账号</button>
+            <button id="unbindOrganizationMemberAccountButton" class="danger-outline-btn" type="button">解绑账号</button>
+          </div>
+        </section>
+        <section class="organization-identity-section">
+          <h4>用量身份</h4>
+          <p class="organization-modal-note">关联后，该身份名下的历史用量与令牌会归到这位成员，「我的用量」也会一并展示。</p>
+          <div id="organizationMemberIdentityList" class="organization-identity-list"></div>
+        </section>
+        <div class="modal-actions">
+          <button id="closeOrganizationMemberIdentityButton" class="ghost-btn" type="button">关闭</button>
+        </div>
+      </div>
+    </div>
+
     <div id="customerOrganizationModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="customerOrganizationModalTitle">
       <form id="customerOrganizationForm" class="modal">
         <h3 id="customerOrganizationModalTitle">新增客户企业</h3>
@@ -8440,6 +8542,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260804-organization-restore"></script>
+    <script src="/assets/app.js?v=20260804-member-identity-binding"></script>
   </body>
 </html>

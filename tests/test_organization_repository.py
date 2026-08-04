@@ -163,10 +163,12 @@ def test_compatibility_aliases_and_resolvers_are_async() -> None:
     assert inspect.iscoroutinefunction(PostgreSQLOrganizationRepository.organization_snapshot)
     assert inspect.iscoroutinefunction(PostgreSQLOrganizationRepository.resolve_member_by_email)
     assert inspect.iscoroutinefunction(PostgreSQLOrganizationRepository.resolve_members_by_email)
-    assert inspect.iscoroutinefunction(PostgreSQLOrganizationRepository.bind_member_account)
+    assert inspect.iscoroutinefunction(PostgreSQLOrganizationRepository.set_member_account)
     assert inspect.iscoroutinefunction(PostgreSQLOrganizationRepository.ensure_principal)
     assert inspect.iscoroutinefunction(PostgreSQLOrganizationRepository.attach_principal_upstream_identity)
     assert inspect.iscoroutinefunction(PostgreSQLOrganizationRepository.link_principal_member)
+    assert inspect.iscoroutinefunction(PostgreSQLOrganizationRepository.list_principals)
+    assert inspect.iscoroutinefunction(PostgreSQLOrganizationRepository.set_principal_member)
 
 
 def test_list_organizations_includes_directory_card_stats() -> None:
