@@ -61,6 +61,13 @@ def test_schema_contains_durable_security_and_idempotency_constraints() -> None:
     assert "WHERE external_reference <> ''" in ORGANIZATION_SCHEMA
     assert "upstream_organization_id" in ORGANIZATION_SCHEMA
     assert "upstream_team_id" in ORGANIZATION_SCHEMA
+
+
+def test_schema_treats_existing_unique_constraint_indexes_as_idempotent() -> None:
+    # PostgreSQL reports an existing UNIQUE constraint's backing relation as
+    # duplicate_table on reconnect, while ADD CONSTRAINT may use
+    # duplicate_object. Real-mode startup must tolerate both.
+    assert "WHEN duplicate_object OR duplicate_table THEN NULL;" in ORGANIZATION_SCHEMA
     assert "customer_principal_upstream_identity" in ORGANIZATION_SCHEMA
     assert "customer_principal_identity_org_principal_fk" in ORGANIZATION_SCHEMA
     assert "customer_usage_key_identity_org_principal_fk" in ORGANIZATION_SCHEMA

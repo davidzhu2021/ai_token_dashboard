@@ -64,7 +64,7 @@ BEGIN
         ADD CONSTRAINT customer_organization_billing_status_check
         CHECK (billing_status IN ('active', 'past_due', 'suspended'));
 EXCEPTION
-    WHEN duplicate_object THEN NULL;
+    WHEN duplicate_object OR duplicate_table THEN NULL;
 END $$;
 
 -- Imported reporting identities may exist before the person has a login.
@@ -218,21 +218,21 @@ BEGIN
     ALTER TABLE customer_member
         ADD CONSTRAINT customer_member_org_id_unique UNIQUE (organization_id, id);
 EXCEPTION
-    WHEN duplicate_object THEN NULL;
+    WHEN duplicate_object OR duplicate_table THEN NULL;
 END $$;
 DO $$
 BEGIN
     ALTER TABLE customer_department
         ADD CONSTRAINT customer_department_org_id_unique UNIQUE (organization_id, id);
 EXCEPTION
-    WHEN duplicate_object THEN NULL;
+    WHEN duplicate_object OR duplicate_table THEN NULL;
 END $$;
 DO $$
 BEGIN
     ALTER TABLE customer_principal
         ADD CONSTRAINT customer_principal_org_id_unique UNIQUE (organization_id, id);
 EXCEPTION
-    WHEN duplicate_object THEN NULL;
+    WHEN duplicate_object OR duplicate_table THEN NULL;
 END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS customer_principal_org_member_idx
     ON customer_principal(organization_id, member_id)
@@ -244,7 +244,7 @@ BEGIN
         FOREIGN KEY (organization_id, member_id)
         REFERENCES customer_member(organization_id, id);
 EXCEPTION
-    WHEN duplicate_object THEN NULL;
+    WHEN duplicate_object OR duplicate_table THEN NULL;
 END $$;
 DO $$
 BEGIN
@@ -253,7 +253,7 @@ BEGIN
         FOREIGN KEY (organization_id, principal_id)
         REFERENCES customer_principal(organization_id, id);
 EXCEPTION
-    WHEN duplicate_object THEN NULL;
+    WHEN duplicate_object OR duplicate_table THEN NULL;
 END $$;
 DO $$
 BEGIN
@@ -262,7 +262,7 @@ BEGIN
         FOREIGN KEY (organization_id, principal_id)
         REFERENCES customer_principal(organization_id, id);
 EXCEPTION
-    WHEN duplicate_object THEN NULL;
+    WHEN duplicate_object OR duplicate_table THEN NULL;
 END $$;
 
 -- Historical upstream identities are reporting evidence, not credentials.
@@ -386,7 +386,7 @@ BEGIN
         FOREIGN KEY (organization_id, principal_id)
         REFERENCES customer_principal(organization_id, id);
 EXCEPTION
-    WHEN duplicate_object THEN NULL;
+    WHEN duplicate_object OR duplicate_table THEN NULL;
 END $$;
 
 CREATE TABLE IF NOT EXISTS customer_usage_backfill (
