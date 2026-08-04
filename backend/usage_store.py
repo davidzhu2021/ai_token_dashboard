@@ -1840,23 +1840,27 @@ class UsageStore:
             return None
         department_filter = normalize_team_text(department)
         args: list[Any] = [_as_date(start_date), _as_date(end_date), covered, source or "all", department_filter]
-        team_id_sql = "lower(btrim(m.team_id))"
-        team_name_sql = "lower(regexp_replace(btrim(m.team_name), '\\s+', ' ', 'g'))"
+        # Keep the team recorded on the usage event authoritative. Membership
+        # snapshots are only a display-name fallback and may be late or contain
+        # multiple rows for one account.
+        team_id_sql = "lower(btrim(u.team_id))"
+        team_name_sql = "lower(regexp_replace(btrim(COALESCE(dn.team_name, u.team_id)), '\\s+', ' ', 'g'))"
         logical_key_sql = f"{team_id_sql} || '::' || {team_name_sql}"
         where_sql = f"""
             u.usage_date BETWEEN $1::date AND $2::date
             AND u.backend_id = ANY($3::text[])
             AND ($4 = 'all' OR u.source = $4)
-            AND ($5 = '' OR {logical_key_sql} = $5 OR (
-                ({team_id_sql} = $5 OR {team_name_sql} = $5)
-                AND 1 = (
-                    SELECT COUNT(DISTINCT lower(btrim(mx.team_id)) || '::' || lower(regexp_replace(btrim(mx.team_name), '\\s+', ' ', 'g')))
-                    FROM usage_team_membership_daily mx
-                    WHERE mx.snapshot_date BETWEEN $1::date AND $2::date
-                      AND mx.backend_id = ANY($3::text[])
-                      AND (lower(btrim(mx.team_id)) = $5 OR lower(regexp_replace(btrim(mx.team_name), '\\s+', ' ', 'g')) = $5)
-                )
-            ))
+            AND u.team_id <> ''
+            AND ($5 = '' OR {logical_key_sql} = $5 OR {team_id_sql} = $5 OR {team_name_sql} = $5)
+        """
+        department_join_sql = """
+            LEFT JOIN (
+                SELECT backend_id, team_id, MAX(NULLIF(team_name, '')) AS team_name
+                FROM usage_team_membership_daily
+                WHERE snapshot_date BETWEEN $1::date AND $2::date
+                  AND backend_id = ANY($3::text[])
+                GROUP BY backend_id, team_id
+            ) dn ON dn.backend_id = u.backend_id AND dn.team_id = u.team_id
         """
         model_sql = "u.model"
         pool = self._require_pool()
@@ -1868,15 +1872,14 @@ class UsageStore:
             SELECT u.backend_id, u.usage_date, u.user_id,
                    MAX(u.employee_email) AS employee_email,
                    MAX(u.employee_name) AS employee_name,
-                   m.team_id, MAX(m.team_name) AS team_name, MAX(m.team_role) AS team_role,
+                   u.team_id, MAX(dn.team_name) AS team_name, '' AS team_role,
                    u.source, {model_sql} AS model_name,
                    {self._aggregate_metrics_sql('u.')}
             FROM usage_daily u
-            JOIN usage_team_membership_daily m
-              ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
+            {department_join_sql}
             WHERE {where_sql}
-            GROUP BY u.backend_id, u.usage_date, u.user_id, m.team_id, m.team_name, u.source, {model_sql}
-            ORDER BY u.usage_date, MAX(m.team_name), MAX(u.employee_name), u.source, model_name
+            GROUP BY u.backend_id, u.usage_date, u.user_id, u.team_id, u.source, {model_sql}
+            ORDER BY u.usage_date, MAX(dn.team_name), MAX(u.employee_name), u.source, model_name
             """,
                 *args,
             )
@@ -1903,12 +1906,11 @@ class UsageStore:
         employee_records = await pool.fetch(
             f"""
             WITH filtered AS (
-                SELECT u.*, m.team_id, m.team_name,
+                SELECT u.*, dn.team_name,
                        lower(COALESCE(NULLIF(u.employee_email, ''), u.user_id)) AS employee_key,
                        {model_sql} AS model_name
                 FROM usage_daily u
-                JOIN usage_team_membership_daily m
-                  ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
+                {department_join_sql}
                 WHERE {where_sql}
             ), totals AS (
                 SELECT employee_key, MIN(user_id) AS employee_id,
@@ -1958,10 +1960,9 @@ class UsageStore:
         department_records = await pool.fetch(
             f"""
             WITH filtered AS (
-                SELECT u.*, m.team_id, m.team_name, {logical_key_sql} AS department_key, {model_sql} AS model_name
+                SELECT u.*, dn.team_name, {logical_key_sql} AS department_key, {model_sql} AS model_name
                 FROM usage_daily u
-                JOIN usage_team_membership_daily m
-                  ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
+                {department_join_sql}
                 WHERE {where_sql}
             ), source_totals AS (
                 SELECT department_key, source, SUM(total_tokens)::bigint AS source_tokens
@@ -2001,8 +2002,7 @@ class UsageStore:
             f"""
             SELECT u.usage_date, u.source, {model_sql} AS model_name, {self._aggregate_metrics_sql('u.')}
             FROM usage_daily u
-            JOIN usage_team_membership_daily m
-              ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id
+            {department_join_sql}
             WHERE {where_sql}
             GROUP BY u.usage_date, u.source, {model_sql}
             ORDER BY u.usage_date, u.source, model_name
