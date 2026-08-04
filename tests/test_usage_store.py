@@ -791,6 +791,19 @@ def test_usage_schema_contains_query_indexes() -> None:
     assert "usage_team_membership_team_filter_idx" in USAGE_SCHEMA
 
 
+def test_usage_schema_adds_organization_columns_before_dependent_indexes() -> None:
+    from backend.usage_store import USAGE_SCHEMA
+
+    add_column = USAGE_SCHEMA.index(
+        "ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS organization_id"
+    )
+    create_index = USAGE_SCHEMA.index(
+        "CREATE INDEX IF NOT EXISTS usage_daily_org_date_idx"
+    )
+
+    assert add_column < create_index
+
+
 def test_model_usage_counts_uses_complete_database_coverage_and_normalizes_models() -> None:
     class FakePool:
         async def fetch(self, query, *_args):

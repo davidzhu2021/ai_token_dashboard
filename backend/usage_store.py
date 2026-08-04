@@ -45,6 +45,19 @@ CREATE TABLE IF NOT EXISTS usage_daily (
     )
 );
 
+-- Keep deployments created before organization mode compatible with the
+-- richer attribution snapshot. Existing aggregate rows remain queryable with
+-- empty attribution fields until the next sync fills them.
+ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS organization_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS team_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS key_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS principal_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS attribution_source TEXT NOT NULL DEFAULT 'unattributed';
+ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS billing_eligible BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Create indexes only after compatibility columns exist. Older production
+-- databases predate organization attribution and would otherwise fail startup
+-- while planning an index on a column that has not been added yet.
 CREATE INDEX IF NOT EXISTS usage_daily_employee_date_idx
     ON usage_daily (employee_email, usage_date);
 CREATE INDEX IF NOT EXISTS usage_daily_date_idx
@@ -60,15 +73,6 @@ CREATE INDEX IF NOT EXISTS usage_daily_key_date_idx
 CREATE INDEX IF NOT EXISTS usage_daily_date_source_model_idx
     ON usage_daily (usage_date, source, model);
 
--- Keep deployments created before organization mode compatible with the
--- richer attribution snapshot. Existing aggregate rows remain queryable with
--- empty attribution fields until the next sync fills them.
-ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS organization_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS team_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS key_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS principal_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS attribution_source TEXT NOT NULL DEFAULT 'unattributed';
-ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS billing_eligible BOOLEAN NOT NULL DEFAULT FALSE;
 -- Older deployments keyed aggregates only by user/source/model, which makes
 -- two enterprise tokens overwrite one another. Rebuild the key so event-time
 -- attribution remains stable across team moves and key rotation.
