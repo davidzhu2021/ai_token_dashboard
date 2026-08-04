@@ -1320,6 +1320,18 @@ def test_report_only_import_idempotency_uses_stable_ownership_fields() -> None:
     assert "reporting_requested_through=GREATEST" in source
 
 
+def test_report_only_snapshot_amounts_quantize_upstream_float_noise() -> None:
+    import inspect
+
+    source = inspect.getsource(
+        PostgreSQLOrganizationRepository.import_report_only_key_identity
+    )
+
+    assert "ROUND_HALF_UP" in source
+    assert 'Decimal("0.000001")' in source
+    assert "parsed.as_tuple().exponent < -6" not in source
+
+
 def test_usage_backfill_claim_reclaims_stale_running_leases() -> None:
     import inspect
 

@@ -15,7 +15,7 @@ import os
 import secrets
 import uuid
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
 try:  # Keep importing the application in environments without asyncpg.
@@ -2675,11 +2675,14 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
                 parsed = Decimal(str(value))
             except Exception as exc:
                 raise OrganizationValidationError(f"{field} must be numeric") from exc
-            if not parsed.is_finite() or parsed < 0 or parsed.as_tuple().exponent < -6:
+            if not parsed.is_finite() or parsed < 0:
                 raise OrganizationValidationError(
-                    f"{field} must be a non-negative amount with at most six decimals"
+                    f"{field} must be a non-negative finite amount"
                 )
-            return parsed.quantize(Decimal("0.000001"))
+            # Upstream JSON numbers are decoded as binary floats, so values
+            # such as 9.052846 can arrive as 9.052845999999999. These fields
+            # are read-only snapshots, not customer-entered ledger amounts.
+            return parsed.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
 
         max_budget_snapshot = optional_decimal(
             max_budget_usd_snapshot, "max_budget_usd_snapshot"
