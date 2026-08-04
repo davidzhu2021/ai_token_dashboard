@@ -720,6 +720,20 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
             "archivedAt": _iso(row["archived_at"]),
         }
 
+    @classmethod
+    def _org_summary_payload(cls, row: Any) -> dict[str, Any]:
+        return {
+            **cls._org_payload(row),
+            "stats": {
+                "departmentCount": int(_row_value(row, "department_count", 0) or 0),
+                "memberCount": int(_row_value(row, "member_count", 0) or 0),
+                "activeMemberCount": int(_row_value(row, "active_member_count", 0) or 0),
+                "invitedMemberCount": int(_row_value(row, "invited_member_count", 0) or 0),
+                "suspendedMemberCount": int(_row_value(row, "suspended_member_count", 0) or 0),
+                "activeAdminCount": int(_row_value(row, "active_admin_count", 0) or 0),
+            },
+        }
+
     @staticmethod
     def _dept_payload(row: Any) -> dict[str, Any]:
         return {
@@ -792,18 +806,40 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
         clauses, args = [], []
         if keyword:
             args.append(f"%{keyword.strip()}%")
-            clauses.append(f"(name ILIKE ${len(args)} OR id ILIKE ${len(args)})")
+            clauses.append(f"(o.name ILIKE ${len(args)} OR o.id ILIKE ${len(args)})")
         if status:
             args.append(status)
-            clauses.append(f"status = ${len(args)}")
+            clauses.append(f"o.status = ${len(args)}")
         elif not include_archived:
-            clauses.append("status <> 'archived'")
+            clauses.append("o.status <> 'archived'")
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         pool = self._require_pool()
-        total = await pool.fetchval(f"SELECT count(*) FROM customer_organization{where}", *args)
+        total = await pool.fetchval(f"SELECT count(*) FROM customer_organization o{where}", *args)
         args.extend([page_size, (page - 1) * page_size])
-        rows = await pool.fetch(f"SELECT * FROM customer_organization{where} ORDER BY created_at DESC LIMIT ${len(args)-1} OFFSET ${len(args)}", *args)
-        return {"items": [self._org_payload(row) for row in rows], "total": int(total or 0), "page": page, "pageSize": page_size}
+        rows = await pool.fetch(
+            "SELECT o.*, "
+            "(SELECT count(*) FROM customer_department d "
+            " WHERE d.organization_id=o.id AND d.status='active') AS department_count, "
+            "(SELECT count(*) FROM customer_member m "
+            " WHERE m.organization_id=o.id) AS member_count, "
+            "(SELECT count(*) FROM customer_member m "
+            " WHERE m.organization_id=o.id AND m.status='active') AS active_member_count, "
+            "(SELECT count(*) FROM customer_member m "
+            " WHERE m.organization_id=o.id AND m.status='invited') AS invited_member_count, "
+            "(SELECT count(*) FROM customer_member m "
+            " WHERE m.organization_id=o.id AND m.status='suspended') AS suspended_member_count, "
+            "(SELECT count(*) FROM customer_member m "
+            " WHERE m.organization_id=o.id AND m.status='active' AND m.role='admin') AS active_admin_count "
+            f"FROM customer_organization o{where} ORDER BY o.created_at DESC "
+            f"LIMIT ${len(args)-1} OFFSET ${len(args)}",
+            *args,
+        )
+        return {
+            "items": [self._org_summary_payload(row) for row in rows],
+            "total": int(total or 0),
+            "page": page,
+            "pageSize": page_size,
+        }
 
     async def get_organization_by_upstream_id(
         self, upstream_organization_id: str

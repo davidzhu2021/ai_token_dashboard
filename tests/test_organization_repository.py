@@ -169,6 +169,46 @@ def test_compatibility_aliases_and_resolvers_are_async() -> None:
     assert inspect.iscoroutinefunction(PostgreSQLOrganizationRepository.link_principal_member)
 
 
+def test_list_organizations_includes_directory_card_stats() -> None:
+    now = datetime(2026, 8, 4, tzinfo=timezone.utc)
+
+    class Pool:
+        async def fetchval(self, query, *args):
+            assert "FROM customer_organization o" in query
+            assert args == ("%baic%", "active")
+            return 1
+
+        async def fetch(self, query, *args):
+            assert "AS department_count" in query
+            assert "AS active_member_count" in query
+            assert "d.status='active'" in query
+            assert "o.name ILIKE $1" in query
+            assert "o.status = $2" in query
+            assert args == ("%baic%", "active", 12, 12)
+            return [{
+                "id": "org-1", "name": "BAIC", "status": "active",
+                "billing_status": "active", "billing_balance_usd": Decimal("100.00"),
+                "billing_effective_at": None, "upstream_organization_id": "upstream-org-1",
+                "upstream_status": "active", "created_at": now, "updated_at": now,
+                "archived_at": None, "department_count": 2, "member_count": 4,
+                "active_member_count": 3, "invited_member_count": 1,
+                "suspended_member_count": 0, "active_admin_count": 1,
+            }]
+
+    repository = PostgreSQLOrganizationRepository("postgresql://unused")
+    repository.pool = Pool()
+    result = asyncio.run(repository.list_organizations(
+        keyword="baic", status="active", page=2, page_size=12
+    ))
+
+    assert result["total"] == 1
+    assert result["page"] == 2
+    assert result["items"][0]["stats"] == {
+        "departmentCount": 2, "memberCount": 4, "activeMemberCount": 3,
+        "invitedMemberCount": 1, "suspendedMemberCount": 0, "activeAdminCount": 1,
+    }
+
+
 def test_billing_operation_validation_happens_before_database_access() -> None:
     repository = PostgreSQLOrganizationRepository("postgresql://unused")
     with pytest.raises(OrganizationConflictError, match="unsupported"):
