@@ -5915,36 +5915,107 @@
         font-variant-numeric: tabular-nums;
       }
 
+      /* 工作台条：返回出口、当前范围、五个标签同处一张浅色卡片。标签做成分段控件而
+         不是一排白药丸，否则「白按钮 + 蓝底盒子」会读成盒中盒。 */
       .organization-workspace-bar {
         display: flex;
         align-items: center;
         flex-wrap: wrap;
-        gap: 10px;
+        gap: 6px;
         margin-bottom: 18px;
+        padding: 7px 10px;
+        border: 1px solid rgba(6, 115, 210, 0.12);
+        border-radius: 16px;
+        background: linear-gradient(115deg, rgba(255, 255, 255, 0.94), rgba(232, 243, 253, 0.76));
+        box-shadow: var(--shadow-soft);
+      }
+
+      /* 返回是这条导航的左边界，做成轻量文字按钮，不跟标签抢视觉重量。 */
+      .organization-workspace-bar > .ghost-btn {
+        min-height: 32px;
+        gap: 6px;
+        padding: 0 12px;
+        border-color: transparent;
+        border-radius: 999px;
+        background: transparent;
+        color: #0a5cad;
+        font-size: 13px;
+      }
+
+      .organization-workspace-bar > .ghost-btn::before {
+        content: "←";
+        font-size: 14px;
+        line-height: 1;
+      }
+
+      .organization-workspace-bar > .ghost-btn:hover:not(:disabled) {
+        border-color: transparent;
+        background: rgba(255, 255, 255, 0.92);
+        box-shadow: 0 6px 16px rgba(20, 40, 68, 0.08);
       }
 
       .organization-usage-tabs {
         display: inline-flex;
         align-items: center;
         flex-wrap: wrap;
-        gap: 7px;
-        padding: 8px;
-        border: 1px solid rgba(6, 115, 210, 0.14);
-        border-radius: 13px;
-        background: rgba(232, 243, 253, 0.58);
+        gap: 4px;
+        min-width: 0;
       }
 
+      /* 只有返回按钮真的显示时才补竖线，甲方的企业管理页不会留下悬空分隔。 */
+      .organization-workspace-bar > .ghost-btn:not(.hidden) + .organization-usage-tabs::before {
+        content: "";
+        width: 1px;
+        height: 20px;
+        margin: 0 8px 0 2px;
+        background: rgba(6, 115, 210, 0.16);
+      }
+
+      /* 当前范围是上下文而不是第六个标签，所以用实色文字加竖线与标签组分开。 */
       .organization-usage-scope {
-        padding: 0 4px 0 2px;
-        color: var(--muted);
-        font-size: 11px;
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        margin-right: 6px;
+        padding: 0 2px 0 6px;
+        color: var(--ink);
+        font-size: 13px;
         font-weight: 800;
+        white-space: nowrap;
+      }
+
+      .organization-usage-scope::after {
+        content: "";
+        width: 1px;
+        height: 20px;
+        background: rgba(6, 115, 210, 0.16);
       }
 
       .organization-usage-tabs .ghost-btn {
-        min-height: 31px;
-        padding: 0 10px;
-        font-size: 12px;
+        min-height: 32px;
+        padding: 0 13px;
+        border-color: transparent;
+        border-radius: 999px;
+        background: transparent;
+        color: #5a6473;
+        font-size: 13px;
+        font-weight: 750;
+      }
+
+      /* hover 必须排除激活项，否则白色悬停底色的选择器权重会盖掉蓝色激活态。 */
+      .organization-usage-tabs .ghost-btn:not(.active):hover:not(:disabled) {
+        border-color: transparent;
+        background: rgba(255, 255, 255, 0.92);
+        box-shadow: none;
+        color: var(--ink);
+      }
+
+      .organization-usage-tabs .ghost-btn.active,
+      .organization-usage-tabs .ghost-btn.active:hover:not(:disabled) {
+        border-color: transparent;
+        background: linear-gradient(180deg, #1a86ea, var(--brand));
+        box-shadow: 0 8px 18px rgba(6, 115, 210, 0.22);
+        color: #fff;
       }
 
       @media (max-width: 1180px) {
