@@ -89,6 +89,18 @@ let disablingOldKeyIds = new Set();
 let isCreatingKey = false;
 let isRegeneratingKey = false;
 let isDeletingKey = false;
+let teamMemberKeys = [];
+let teamKeyTeams = [];
+let selectedTeamKeyRef = "";
+let teamKeyFilters = { search: "", status: "all" };
+let isTeamKeysLoading = false;
+let teamKeyLoadError = "";
+let teamKeyRequestId = 0;
+let revokingTeamKeyId = "";
+let deletingTeamKeyId = "";
+let teamKeySearchTimer = null;
+let isTeamKeyRevoking = false;
+let isTeamKeyDeleting = false;
 let isDashboardLoading = false;
 let isAdminLoading = false;
 let isDepartmentLoading = false;
@@ -3781,6 +3793,261 @@ async function loadKeys(forceRefresh = false) {
   }
 }
 
+// ---- 团队成员密钥（团队负责人） ----
+
+function canManageTeamKeys() {
+  return Boolean(currentUser?.isTeamLeader) && !isOrganizationCustomerIdentity();
+}
+
+function renderTeamKeySelector() {
+  const field = el("teamKeySelectField");
+  const select = el("teamKeySelect");
+  if (!field || !select) return;
+  const teams = teamKeyTeams.length ? teamKeyTeams : leaderTeams;
+  field.classList.toggle("hidden", teams.length <= 1);
+  select.innerHTML = teams
+    .map(
+      (team) =>
+        `<option value="${escapeHtml(team.teamRef || "")}">${escapeHtml(team.name || team.id || "团队")}</option>`,
+    )
+    .join("");
+  if (!selectedTeamKeyRef && teams.length) selectedTeamKeyRef = teams[0].teamRef || "";
+  if (selectedTeamKeyRef) select.value = selectedTeamKeyRef;
+}
+
+function teamKeyEmptyMessage() {
+  if (teamKeyFilters.search || teamKeyFilters.status !== "all") return "没有符合筛选条件的成员密钥。";
+  return "该团队的普通成员还没有可管理的密钥。";
+}
+
+function renderTeamKeys() {
+  const panel = el("teamKeysPanel");
+  if (!panel) return;
+  panel.classList.toggle("hidden", !canManageTeamKeys());
+  if (!canManageTeamKeys()) return;
+  renderTeamKeySelector();
+  const tableBody = el("teamKeyTableBody");
+  const cardList = el("teamKeyCardList");
+  if (!tableBody || !cardList) return;
+  setText("teamKeyCountChip", isTeamKeysLoading ? "加载中" : `${fmt.format(teamMemberKeys.length)} 个`);
+
+  if (isTeamKeysLoading) {
+    tableBody.innerHTML = `<tr><td colspan="7" class="key-loading">正在加载团队成员密钥...</td></tr>`;
+    cardList.innerHTML = `<article class="panel key-loading">正在加载团队成员密钥...</article>`;
+    return;
+  }
+  if (teamKeyLoadError) {
+    const message = escapeHtml(teamKeyLoadError);
+    tableBody.innerHTML = `<tr><td colspan="7" class="key-empty">${message}</td></tr>`;
+    cardList.innerHTML = `<article class="panel key-empty">${message}</article>`;
+    return;
+  }
+  if (!teamMemberKeys.length) {
+    const message = escapeHtml(teamKeyEmptyMessage());
+    tableBody.innerHTML = `<tr><td colspan="7" class="key-empty">${message}</td></tr>`;
+    cardList.innerHTML = `<article class="panel key-empty">${message}</article>`;
+    return;
+  }
+
+  const actionsMarkup = (key) => {
+    const id = escapeHtml(key.id || "");
+    const status = String(key.status || "");
+    const canRevoke = status === "正常";
+    const canDelete = status === "已禁用" || status === "已过期";
+    return `
+      <button class="ghost-btn" type="button" data-team-key-revoke="${id}" ${canRevoke ? "" : 'disabled title="该密钥已失效，无需撤销"'}>撤销</button>
+      <button class="danger-outline-btn" type="button" data-team-key-delete="${id}" ${canDelete ? "" : 'disabled title="请先撤销该密钥再删除"'}>删除</button>
+    `;
+  };
+
+  tableBody.innerHTML = teamMemberKeys
+    .map((key) => {
+      const memberName = escapeHtml(key.memberName || key.memberEmail || "未知成员");
+      const memberEmail = escapeHtml(key.memberEmail || "-");
+      return `
+        <tr>
+          <td><div class="key-name-cell"><strong>${memberName}</strong><span>${memberEmail}</span></div></td>
+          <td>${escapeHtml(key.name || "个人访问密钥")}</td>
+          <td><span class="chip ${keyStatusClass(key.status)}">${escapeHtml(key.status || "正常")}</span></td>
+          <td><code class="key-masked-value">${escapeHtml(key.masked || "sk-...----")}</code></td>
+          <td>${escapeHtml(key.createdAt || "-")}</td>
+          <td>${escapeHtml(key.lastUsed || "-")}</td>
+          <td><div class="key-row-actions">${actionsMarkup(key)}</div></td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  cardList.innerHTML = teamMemberKeys
+    .map(
+      (key) => `
+      <article class="panel key-mobile-card">
+        <div class="key-mobile-head">
+          <div class="key-name-cell">
+            <strong>${escapeHtml(key.memberName || key.memberEmail || "未知成员")}</strong>
+            <span>${escapeHtml(key.memberEmail || "-")}</span>
+          </div>
+          <span class="chip ${keyStatusClass(key.status)}">${escapeHtml(key.status || "正常")}</span>
+        </div>
+        <div class="key-mobile-row"><span>名称</span><strong>${escapeHtml(key.name || "个人访问密钥")}</strong></div>
+        <div class="key-mobile-row"><span>密钥</span><code class="key-masked-value">${escapeHtml(key.masked || "sk-...----")}</code></div>
+        <div class="key-mobile-row"><span>创建时间</span><strong>${escapeHtml(key.createdAt || "-")}</strong></div>
+        <div class="key-mobile-row"><span>最近使用</span><strong>${escapeHtml(key.lastUsed || "-")}</strong></div>
+        <div class="key-mobile-actions">${actionsMarkup(key)}</div>
+      </article>
+    `,
+    )
+    .join("");
+}
+
+async function loadTeamKeys(forceRefresh = false) {
+  if (!canManageTeamKeys()) {
+    teamMemberKeys = [];
+    renderTeamKeys();
+    return;
+  }
+  const requestId = ++teamKeyRequestId;
+  isTeamKeysLoading = true;
+  teamKeyLoadError = "";
+  renderTeamKeys();
+  const params = new URLSearchParams();
+  if (selectedTeamKeyRef) params.set("team_ref", selectedTeamKeyRef);
+  if (teamKeyFilters.search) params.set("search", teamKeyFilters.search);
+  if (teamKeyFilters.status && teamKeyFilters.status !== "all") params.set("status", teamKeyFilters.status);
+  if (forceRefresh) params.set("refresh", "1");
+  try {
+    const payload = await api(`/api/team/keys?${params.toString()}`);
+    if (requestId !== teamKeyRequestId) return;
+    teamMemberKeys = Array.isArray(payload.keys) ? payload.keys : [];
+    teamKeyTeams = Array.isArray(payload.teams) ? payload.teams : [];
+    selectedTeamKeyRef = payload.team?.teamRef || selectedTeamKeyRef;
+  } catch (error) {
+    if (requestId !== teamKeyRequestId) return;
+    teamMemberKeys = [];
+    // 面板内展示错误，不打断个人密钥表格。
+    teamKeyLoadError = error.message || "团队成员密钥加载失败，请稍后重试。";
+  } finally {
+    if (requestId === teamKeyRequestId) {
+      isTeamKeysLoading = false;
+      renderTeamKeys();
+    }
+  }
+}
+
+function scheduleTeamKeyReload() {
+  window.clearTimeout(teamKeySearchTimer);
+  teamKeySearchTimer = window.setTimeout(() => loadTeamKeys(), 260);
+}
+
+function resetTeamKeyState() {
+  window.clearTimeout(teamKeySearchTimer);
+  teamKeySearchTimer = null;
+  teamMemberKeys = [];
+  teamKeyTeams = [];
+  selectedTeamKeyRef = "";
+  teamKeyFilters = { search: "", status: "all" };
+  isTeamKeysLoading = false;
+  teamKeyLoadError = "";
+  teamKeyRequestId += 1;
+  revokingTeamKeyId = "";
+  deletingTeamKeyId = "";
+  isTeamKeyRevoking = false;
+  isTeamKeyDeleting = false;
+  if (el("teamKeySearch")) el("teamKeySearch").value = "";
+  if (el("teamKeyStatusFilter")) el("teamKeyStatusFilter").value = "all";
+  el("teamKeyRevokeModal")?.classList.add("hidden");
+  el("teamKeyDeleteModal")?.classList.add("hidden");
+  el("teamKeysPanel")?.classList.add("hidden");
+}
+
+function findTeamMemberKey(keyId) {  return teamMemberKeys.find((item) => String(item.id || "") === String(keyId)) || null;
+}
+
+function closeTeamKeyRevokeModal(options = {}) {
+  if (isTeamKeyRevoking && !options.force) return;
+  revokingTeamKeyId = "";
+  el("teamKeyRevokeModal")?.classList.add("hidden");
+}
+
+function openTeamKeyRevokeModal(keyId) {
+  if (!canManageTeamKeys() || !keyId) return;
+  const key = findTeamMemberKey(keyId);
+  if (!key || String(key.status || "") !== "正常") return;
+  revokingTeamKeyId = String(keyId);
+  setText("teamKeyRevokeMember", key.memberName || key.memberEmail || "未知成员");
+  setText("teamKeyRevokeName", key.name || "个人访问密钥");
+  setText("teamKeyRevokeMasked", key.masked || "sk-...----");
+  el("teamKeyRevokeModal")?.classList.remove("hidden");
+}
+
+async function confirmTeamKeyRevoke() {
+  if (!canManageTeamKeys() || !revokingTeamKeyId || isTeamKeyRevoking) return;
+  const keyId = revokingTeamKeyId;
+  isTeamKeyRevoking = true;
+  setButtonLoading("confirmTeamKeyRevokeButton", true, "撤销中");
+  try {
+    await ensureCsrfToken();
+    await api(`/api/team/keys/${encodeURIComponent(keyId)}/revoke`, {
+      method: "POST",
+      body: JSON.stringify({ teamRef: selectedTeamKeyRef || "" }),
+    });
+    isTeamKeyRevoking = false;
+    closeTeamKeyRevokeModal({ force: true });
+    await loadTeamKeys(true);
+    showToast("成员密钥已撤销，立即失效。");
+  } catch (error) {
+    showToast(error.message || "成员密钥撤销失败，请稍后重试。");
+  } finally {
+    isTeamKeyRevoking = false;
+    setButtonLoading("confirmTeamKeyRevokeButton", false);
+  }
+}
+
+function closeTeamKeyDeleteModal(options = {}) {
+  if (isTeamKeyDeleting && !options.force) return;
+  deletingTeamKeyId = "";
+  el("teamKeyDeleteModal")?.classList.add("hidden");
+}
+
+function openTeamKeyDeleteModal(keyId) {
+  if (!canManageTeamKeys() || !keyId) return;
+  const key = findTeamMemberKey(keyId);
+  if (!key) return;
+  const status = String(key.status || "");
+  if (status !== "已禁用" && status !== "已过期") {
+    showToast("请先撤销该密钥再删除。");
+    return;
+  }
+  deletingTeamKeyId = String(keyId);
+  setText("teamKeyDeleteMember", key.memberName || key.memberEmail || "未知成员");
+  setText("teamKeyDeleteName", key.name || "个人访问密钥");
+  setText("teamKeyDeleteMasked", key.masked || "sk-...----");
+  el("teamKeyDeleteModal")?.classList.remove("hidden");
+}
+
+async function confirmTeamKeyDelete() {
+  if (!canManageTeamKeys() || !deletingTeamKeyId || isTeamKeyDeleting) return;
+  const keyId = deletingTeamKeyId;
+  isTeamKeyDeleting = true;
+  setButtonLoading("confirmTeamKeyDeleteButton", true, "删除中");
+  try {
+    await ensureCsrfToken();
+    const payload = await api(`/api/team/keys/${encodeURIComponent(keyId)}/delete`, {
+      method: "POST",
+      body: JSON.stringify({ teamRef: selectedTeamKeyRef || "" }),
+    });
+    isTeamKeyDeleting = false;
+    closeTeamKeyDeleteModal({ force: true });
+    await loadTeamKeys(true);
+    showToast(payload.warning || "成员密钥已删除。");
+  } catch (error) {
+    showToast(error.message || "成员密钥删除失败，请稍后重试。");
+  } finally {
+    isTeamKeyDeleting = false;
+    setButtonLoading("confirmTeamKeyDeleteButton", false);
+  }
+}
+
 // ---- 充值中心 ----
 
 async function refreshEntitlementAfterTopup() {
@@ -7325,7 +7592,9 @@ function switchView(view) {
   }
   if (view === "keys") {
     renderKeys();
+    renderTeamKeys();
     if (!personalKeys.length && !isKeysLoading) loadKeys();
+    if (canManageTeamKeys() && !teamMemberKeys.length && !isTeamKeysLoading) loadTeamKeys();
   }
   if (view === "billing") {
     renderBilling();
@@ -7356,7 +7625,11 @@ function switchView(view) {
 
 async function loadCurrentViewData(forceRefresh = false) {
   if (currentView === "customers") return loadCustomerOrganizations();
-  if (currentView === "keys") return loadKeys();
+  if (currentView === "keys") {
+    // 团队成员密钥独立加载，负责人身份不满足时会自己收起面板。
+    loadTeamKeys();
+    return loadKeys();
+  }
   if (currentView === "billing") return isOrganizationBillingView() ? loadOrganizationBillingData() : loadBillingData();
   if (currentView === "models") return loadModels();
   if (currentView === "admin") return loadAdminData(forceRefresh);
@@ -7702,6 +7975,7 @@ async function showApp(user) {
   if (currentUser?.csrfToken) authCsrfToken = currentUser.csrfToken;
   leaderTeams = normalizeLeaderTeams(currentUser);
   selectedTeamRef = currentUser.team?.teamRef || leaderTeams[0]?.teamRef || "";
+  selectedTeamKeyRef = selectedTeamRef;
   resetTeamMemberSelection();
   ensureSelectedTeamRef();
   el("authLoadingView").classList.add("hidden");
@@ -7826,6 +8100,7 @@ function showLogin() {
   el("billingPayPanel")?.classList.add("hidden");
   resetOrganizationBillingData();
   resetOrganizationTokenData();
+  resetTeamKeyState();
   adminRedemptions = [];
   adminRedemptionTotal = 0;
   adminBillingOrders = [];
@@ -8728,6 +9003,7 @@ el("usageDetailReset").addEventListener("click", resetUsageTableFilters);
 el("refreshButton").addEventListener("click", async () => {
   if (currentView === "keys") {
     await loadKeys(true);
+    await loadTeamKeys(true);
     showToast(keyLoadError ? "密钥列表刷新失败" : "已刷新密钥列表");
   } else if (currentView === "models") {
     await loadModels();
@@ -9010,6 +9286,16 @@ el("keysView").addEventListener("click", (event) => {
     toggleKeyReveal(revealButton.dataset.revealKey);
     return;
   }
+  const teamRevokeButton = event.target.closest("[data-team-key-revoke]");
+  if (teamRevokeButton) {
+    openTeamKeyRevokeModal(teamRevokeButton.dataset.teamKeyRevoke);
+    return;
+  }
+  const teamDeleteButton = event.target.closest("[data-team-key-delete]");
+  if (teamDeleteButton) {
+    openTeamKeyDeleteModal(teamDeleteButton.dataset.teamKeyDelete);
+    return;
+  }
   const deleteButton = event.target.closest("[data-delete-key]");
   if (deleteButton) {
     requestDeleteKey(deleteButton.dataset.deleteKey);
@@ -9022,6 +9308,35 @@ el("keysView").addEventListener("click", (event) => {
   }
   const button = event.target.closest("[data-regenerate-key]");
   if (button) requestRegenerateKey(button.dataset.regenerateKey);
+});
+
+el("teamKeySelect")?.addEventListener("change", (event) => {
+  selectedTeamKeyRef = event.target.value;
+  loadTeamKeys();
+});
+el("teamKeySearch")?.addEventListener("input", (event) => {
+  teamKeyFilters.search = event.target.value.trim();
+  scheduleTeamKeyReload();
+});
+el("teamKeyStatusFilter")?.addEventListener("change", (event) => {
+  teamKeyFilters.status = event.target.value || "all";
+  loadTeamKeys();
+});
+el("resetTeamKeyFiltersButton")?.addEventListener("click", () => {
+  teamKeyFilters = { search: "", status: "all" };
+  if (el("teamKeySearch")) el("teamKeySearch").value = "";
+  if (el("teamKeyStatusFilter")) el("teamKeyStatusFilter").value = "all";
+  loadTeamKeys();
+});
+el("cancelTeamKeyRevokeButton")?.addEventListener("click", () => closeTeamKeyRevokeModal());
+el("confirmTeamKeyRevokeButton")?.addEventListener("click", confirmTeamKeyRevoke);
+el("teamKeyRevokeModal")?.addEventListener("click", (event) => {
+  if (event.target === el("teamKeyRevokeModal")) closeTeamKeyRevokeModal();
+});
+el("cancelTeamKeyDeleteButton")?.addEventListener("click", () => closeTeamKeyDeleteModal());
+el("confirmTeamKeyDeleteButton")?.addEventListener("click", confirmTeamKeyDelete);
+el("teamKeyDeleteModal")?.addEventListener("click", (event) => {
+  if (event.target === el("teamKeyDeleteModal")) closeTeamKeyDeleteModal();
 });
 
 el("deleteKeyConfirmInput").addEventListener("input", updateDeleteKeyConfirmation);

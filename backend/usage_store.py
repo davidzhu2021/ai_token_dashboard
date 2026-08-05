@@ -2038,6 +2038,71 @@ class UsageStore:
             "leaderTeams": leader_teams,
         }
 
+    async def team_member_directory(self, team_scopes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """列出团队的最新成员名册，不受用量日期范围限制。
+
+        团队看板的成员列表按快照日期过滤，成员在所选区间没有调用就会消失；
+        权限判断必须覆盖全部在册成员，因此这里只取每个账号最新的一条成员记录。
+        """
+
+        pairs = [
+            (str(scope.get("backend") or "").strip(), str(scope.get("id") or "").strip())
+            for scope in team_scopes or []
+        ]
+        pairs = [pair for pair in pairs if pair[0] and pair[1]]
+        if not pairs:
+            return []
+        conditions: list[str] = []
+        args: list[Any] = []
+        for backend_id, team_id in pairs:
+            args.extend([backend_id, team_id])
+            conditions.append(f"(backend_id = ${len(args) - 1} AND team_id = ${len(args)})")
+        records = await self._require_pool().fetch(
+            """
+            SELECT DISTINCT ON (backend_id, team_id, user_id)
+                   backend_id, team_id, user_id,
+                   employee_email, employee_name, team_role
+            FROM usage_team_membership_daily
+            WHERE """
+            + " OR ".join(conditions)
+            + """
+            ORDER BY backend_id, team_id, user_id, snapshot_date DESC
+            """,
+            *args,
+        )
+        members: dict[str, dict[str, Any]] = {}
+        for row in records:
+            backend_id = str(row["backend_id"] or "").strip()
+            user_id = str(row["user_id"] or "").strip()
+            if not backend_id or not user_id:
+                continue
+            email = str(row["employee_email"] or "").strip()
+            role = str(row["team_role"] or "").strip().lower() or "user"
+            account_id = f"{backend_id}:{user_id}"
+            existing = members.get(account_id)
+            if existing is None:
+                members[account_id] = {
+                    "backendId": backend_id,
+                    "userId": user_id,
+                    "accountId": account_id,
+                    "employeeEmail": email,
+                    "employeeName": str(row["employee_name"] or "").strip() or email or user_id,
+                    "teamRole": role,
+                }
+                continue
+            if role == "admin":
+                existing["teamRole"] = "admin"
+        # 同一个人可能在多个后端有账号，只要有一条是负责人就整体按负责人处理。
+        admin_emails = {
+            item["employeeEmail"].lower()
+            for item in members.values()
+            if item["teamRole"] == "admin" and item["employeeEmail"]
+        }
+        for item in members.values():
+            if item["employeeEmail"] and item["employeeEmail"].lower() in admin_emails:
+                item["teamRole"] = "admin"
+        return sorted(members.values(), key=lambda item: (str(item["employeeName"]).lower(), item["accountId"]))
+
     async def organization_identity_rows(
         self,
         organization_id: str,

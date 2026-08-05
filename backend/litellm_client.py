@@ -3266,6 +3266,28 @@ class LiteLLMClient:
         self.invalidate_key_cache(raw_user_id, backend)
         return {"id": key_id}
 
+    async def block_key(self, key_id: str, user_id: str, changed_by: str) -> dict[str, str]:
+        """停用指定访问密钥，密钥仍保留在上游列表中并标记为已禁用。"""
+        backend, raw_user_id = self._decode_account_id(user_id)
+        if backend.source:
+            raise HTTPException(status_code=403, detail="该来源访问密钥暂不支持在这里停用")
+        owned_keys = await self.keys_for_user(raw_user_id, backend, refresh=True)
+        if not any(key["id"] == key_id for key in owned_keys):
+            raise HTTPException(status_code=403, detail="不能停用不属于该成员的访问密钥")
+
+        payload = await self.request_backend(
+            backend,
+            "POST",
+            "/key/block",
+            headers=self._management_headers(changed_by),
+            json={"key": key_id},
+        )
+        blocked = payload.get("blocked") if isinstance(payload, dict) else None
+        if blocked is False:
+            raise HTTPException(status_code=502, detail="上游未确认访问密钥已停用")
+        self.invalidate_key_cache(raw_user_id, backend)
+        return {"id": key_id}
+
     @staticmethod
     def _delete_confirmed(deleted_keys: Any, key_id: str) -> bool:
         if isinstance(deleted_keys, list):

@@ -471,6 +471,72 @@ def test_delete_requires_upstream_confirmation(monkeypatch) -> None:
     assert exc.value.status_code == 502
 
 
+def test_block_checks_ownership_calls_upstream_and_clears_cache(monkeypatch) -> None:
+    client, backend = make_client()
+    client._key_cache.set("keys:primary:user-primary", [{"id": "stale"}], 300)
+    captured: dict[str, Any] = {}
+
+    async def fake_keys_for_user(_user_id: str, _backend: LiteLLMBackend | None = None, refresh: bool = False):
+        assert (_user_id, _backend, refresh) == ("user-primary", backend, True)
+        return [{"id": "owned-hash"}]
+
+    async def fake_request_backend(_backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        captured.update({"backend": _backend, "method": method, "path": path, **kwargs})
+        return {"token": "owned-hash", "blocked": True}
+
+    monkeypatch.setattr(client, "keys_for_user", fake_keys_for_user)
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    blocked = asyncio.run(client.block_key("owned-hash", "user-primary", "leader@example.com"))
+
+    assert blocked == {"id": "owned-hash"}
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/key/block"
+    assert captured["json"] == {"key": "owned-hash"}
+    assert captured["headers"] == {"litellm-changed-by": "leader@example.com"}
+    assert client._key_cache.get("keys:primary:user-primary")[0] is False
+
+
+def test_block_rejects_unowned_key_without_upstream_request(monkeypatch) -> None:
+    client, _ = make_client()
+    requested = False
+
+    async def fake_keys_for_user(*_args: Any, **_kwargs: Any):
+        return [{"id": "owned-hash"}]
+
+    async def fake_request_backend(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal requested
+        requested = True
+        return {"blocked": True}
+
+    monkeypatch.setattr(client, "keys_for_user", fake_keys_for_user)
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(client.block_key("other-hash", "user-primary", "leader@example.com"))
+
+    assert exc.value.status_code == 403
+    assert requested is False
+
+
+def test_block_requires_upstream_confirmation(monkeypatch) -> None:
+    client, _ = make_client()
+
+    async def fake_keys_for_user(*_args: Any, **_kwargs: Any):
+        return [{"id": "owned-hash"}]
+
+    async def fake_request_backend(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"token": "owned-hash", "blocked": False}
+
+    monkeypatch.setattr(client, "keys_for_user", fake_keys_for_user)
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(client.block_key("owned-hash", "user-primary", "leader@example.com"))
+
+    assert exc.value.status_code == 502
+
+
 def test_primary_account_selection_ignores_history_backends() -> None:
     upstream_user = {
         "matched_user_ids": ["history:old-user", "user-primary"],

@@ -4210,6 +4210,18 @@ class DisableOldKeyRequest(BaseModel):
     replacementKeyId: str = Field(min_length=1, max_length=128)
 
 
+class TeamKeyMutationRequest(BaseModel):
+    """团队负责人处置成员密钥的请求体。
+
+    只接受团队标识：密钥归属的上游账号一律由服务端重新推导，浏览器拿不到也
+    改不了，避免把上游账号 id 变成可篡改的授权句柄。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    teamRef: str = Field(default="", max_length=128)
+
+
 class VerificationRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320)
     purpose: Literal["signup"] = "signup"
@@ -8684,6 +8696,185 @@ async def reveal_my_key(key_id: str, request: Request) -> JSONResponse:
         raise HTTPException(status_code=404, detail="该密钥创建时未保管完整值，请再生成后查看")
     write_key_audit("reveal", app_user["email"], key_id, request, "success")
     return JSONResponse({"key": plaintext}, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
+
+# ---- 团队负责人管理成员密钥 ----
+
+
+TEAM_KEY_DELETABLE_STATUSES = {"已禁用", "已过期"}
+
+
+async def team_member_accounts(
+    app_user: dict[str, Any],
+    team_ref_value: str | None,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    """解析当前负责人可管理的团队与其中的普通成员。
+
+    只服务企业 SSO 负责人：本地账号（含甲方企业部门负责人）的成员令牌走企业
+    令牌管理页，与这里的上游个人密钥不是同一套数据。
+    """
+
+    if app_user.get("id"):
+        raise HTTPException(status_code=403, detail="当前账号还没有团队负责人权限")
+    scope = await team_scope_for_user(app_user, False)
+    if not scope.get("isTeamLeader"):
+        raise HTTPException(status_code=403, detail="当前账号还没有团队负责人权限")
+    team = select_authorized_team(scope, (team_ref_value or "").strip() or None)
+    store = usage_store()
+    directory_loader = getattr(store, "team_member_directory", None) if store is not None else None
+    if not callable(directory_loader):
+        raise HTTPException(status_code=503, detail="团队成员快照尚未就绪，请等待后台同步完成")
+    await store.connect()
+    try:
+        rows = await directory_loader(team_scope_items(team))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("failed to load team member directory")
+        raise HTTPException(status_code=503, detail="团队成员名单暂时不可用，请稍后重试") from exc
+    leader_email = str(app_user.get("email") or "").strip().lower()
+    members = [
+        row
+        for row in rows
+        if str(row.get("teamRole") or "user").lower() != "admin"
+        and str(row.get("employeeEmail") or "").strip().lower() != leader_email
+    ]
+    return scope, team, members
+
+
+async def team_member_keys(members: list[dict[str, Any]], refresh: bool) -> list[dict[str, Any]]:
+    """按成员账号拉取上游密钥，并回填成员身份信息。"""
+
+    if not members:
+        return []
+    member_by_account = {str(item["accountId"]): item for item in members}
+    keys = await client().keys_for_user_ids(list(member_by_account.keys()), refresh)
+    enriched: list[dict[str, Any]] = []
+    for key in keys:
+        account_id = f"{key.get('_backendId') or 'primary'}:{key.get('_userId') or ''}"
+        member = member_by_account.get(account_id)
+        if member is None:
+            # 上游返回了不在名册里的账号，宁可漏掉也不越权展示。
+            continue
+        enriched.append(
+            {
+                **public_key(key, False),
+                "memberName": member.get("employeeName") or member.get("employeeEmail") or "",
+                "memberEmail": member.get("employeeEmail") or "",
+                "_accountId": account_id,
+            }
+        )
+    return enriched
+
+
+async def locate_team_member_key(
+    app_user: dict[str, Any],
+    team_ref_value: str | None,
+    key_id: str,
+) -> tuple[dict[str, Any], str]:
+    """重新在服务端推导密钥归属账号，浏览器只需提供团队标识与密钥 id。"""
+
+    _scope, _team, members = await team_member_accounts(app_user, team_ref_value)
+    keys = await team_member_keys(members, refresh=True)
+    owned = next((item for item in keys if str(item.get("id") or "") == key_id), None)
+    if owned is None:
+        raise HTTPException(status_code=403, detail="无权管理该密钥")
+    return owned, str(owned.pop("_accountId", ""))
+
+
+@app.get("/api/team/keys")
+async def team_keys(
+    request: Request,
+    team_ref: str | None = None,
+    search: str = Query(""),
+    status: str = Query("all"),
+    refresh: bool = Query(False),
+) -> dict[str, Any]:
+    app_user = require_user(request)
+    await require_non_inactive_demo_identity(app_user)
+    scope, team, members = await team_member_accounts(app_user, team_ref)
+    keys = await team_member_keys(members, refresh)
+    for key in keys:
+        key.pop("_accountId", None)
+    stats = {
+        "total": len(keys),
+        "active": sum(1 for item in keys if str(item.get("status") or "") == "正常"),
+        "disabled": sum(1 for item in keys if str(item.get("status") or "") == "已禁用"),
+        "expired": sum(1 for item in keys if str(item.get("status") or "") == "已过期"),
+    }
+    keyword = " ".join(str(search or "").split()).lower()
+    if keyword:
+        keys = [
+            item
+            for item in keys
+            if keyword in str(item.get("memberName") or "").lower()
+            or keyword in str(item.get("memberEmail") or "").lower()
+            or keyword in str(item.get("name") or "").lower()
+            or keyword in str(item.get("masked") or "").lower()
+        ]
+    normalized_status = str(status or "all").strip() or "all"
+    if normalized_status != "all":
+        keys = [item for item in keys if str(item.get("status") or "") == normalized_status]
+    return {
+        "team": public_team(team),
+        "teams": [item for item in (public_team(entry) for entry in scope.get("leaderTeams") or []) if item],
+        "memberCount": len(members),
+        "keys": keys,
+        "stats": stats,
+    }
+
+
+@app.post("/api/team/keys/{key_id:path}/revoke")
+async def revoke_team_key(
+    key_id: str,
+    request: Request,
+    data: TeamKeyMutationRequest | None = None,
+) -> dict[str, Any]:
+    """停用团队普通成员的密钥：立即失效，但仍保留在列表里以保住用量归属。"""
+
+    await enforce_csrf(request)
+    app_user = require_user(request)
+    await require_non_inactive_demo_identity(app_user)
+    owned, account_id = await locate_team_member_key(app_user, (data.teamRef if data else None), key_id)
+    if str(owned.get("status") or "") == "已禁用":
+        raise HTTPException(status_code=409, detail="该密钥已经是停用状态")
+    try:
+        await client().block_key(key_id, account_id, app_user["email"])
+    except HTTPException:
+        write_key_audit("team_revoke", app_user["email"], key_id, request, "failed")
+        raise
+    write_key_audit("team_revoke", app_user["email"], key_id, request, "success")
+    return {"ok": True, "keyId": key_id}
+
+
+@app.post("/api/team/keys/{key_id:path}/delete")
+async def delete_team_key(
+    key_id: str,
+    request: Request,
+    data: TeamKeyMutationRequest | None = None,
+) -> dict[str, Any]:
+    """删除团队普通成员的密钥，必须先撤销，避免一步误删仍在使用的密钥。"""
+
+    await enforce_csrf(request)
+    app_user = require_user(request)
+    await require_non_inactive_demo_identity(app_user)
+    owned, account_id = await locate_team_member_key(app_user, (data.teamRef if data else None), key_id)
+    if str(owned.get("status") or "") not in TEAM_KEY_DELETABLE_STATUSES:
+        raise HTTPException(status_code=409, detail="请先撤销该密钥再删除")
+    try:
+        await client().delete_key(key_id, account_id, app_user["email"])
+    except HTTPException:
+        write_key_audit("team_delete", app_user["email"], key_id, request, "failed")
+        raise
+    backend_id, _, raw_user_id = account_id.partition(":")
+    try:
+        key_vault().delete(backend_id or "primary", raw_user_id, key_id)
+        warning = ""
+    except KeyVaultError:
+        logger.exception("failed to delete team member key from vault")
+        warning = "密钥已删除并立即失效，但本地加密保管记录清理失败，请联系管理员处理。"
+    write_key_audit("team_delete", app_user["email"], key_id, request, "success_vault_failed" if warning else "success")
+    return {"ok": True, "keyId": key_id, "warning": warning}
 
 
 # ---- 充值中心 ----
