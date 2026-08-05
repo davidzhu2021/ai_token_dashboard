@@ -243,7 +243,8 @@ def test_static_asset_version_bumped_for_organization_account_claims_release() -
 
     # 不更新版本号线上用户会命中旧缓存：旧 app.js 把勾选框 value 当成模型名直接提交，
     # 而新契约的 value 是目录下标，会被后端判成「不存在的模型」。
-    assert 'src="/assets/app.js?v=20260805-invited-member-delete"' in markup
+    assert 'src="/assets/app.js?v=20260805-customer-workspace-bar"' in markup
+    assert "20260805-invited-member-delete" not in markup
     assert "20260805-token-delete" not in markup
     assert "20260804-member-removal" not in markup
     assert "20260804-organization-restore" not in markup
@@ -307,7 +308,7 @@ def test_organization_billing_records_can_page_beyond_the_initial_response() -> 
 def test_mock_billing_sidebar_requires_customer_capability_not_platform_admin() -> None:
     source = APP_JS.read_text(encoding="utf-8")
 
-    navigation = source[source.index("function syncNavigationVisibility()") : source.index("function renderCustomerUsageBreadcrumbs")]
+    navigation = source[source.index("function syncNavigationVisibility()") : source.index("function revealNavigation()")]
     assert "const canUseBillingSidebar = isCustomer" in navigation
     assert "? canViewOrganizationBilling()" in navigation
     assert ": Boolean(billingAvailable);" in navigation

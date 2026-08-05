@@ -43,7 +43,11 @@ def test_enterprise_admin_workspace_hides_customer_lifecycle_controls() -> None:
 
     # 企业名称修改、归档、返回客户目录、重置演示数据都是乙方生命周期操作，
     # 甲方管理员进入同一个工作区时不得出现。
-    assert 'el("backToCustomersButton")?.classList.toggle("hidden", !isPlatformCustomer);' in source
+    workspace_bar = source[
+        source.index("function renderOrganizationWorkspaceBar(") : source.index("function organizationApiBasePath()")
+    ]
+    assert "const isPlatformCustomer = isViewingCustomerOrganization();" in workspace_bar
+    assert 'el("backToCustomersButton")?.classList.toggle("hidden", !isPlatformCustomer);' in workspace_bar
     assert "async function resetCustomerOrganizationsDemo() {\n  if (!customerOrganizationsAvailable()) return;" in source
     assert 'const isPlatformCustomer = customerOrganizationsAvailable() && Boolean(selectedCustomerOrganizationId());' in source
 
@@ -247,19 +251,83 @@ def test_customer_usage_detail_has_working_return_controls_and_mock_safe_bootstr
     markup = INDEX_HTML.read_text(encoding="utf-8")
     source = APP_JS.read_text(encoding="utf-8")
 
-    for required in (
+    # 客户范围的五个页面共用正文顶部的常驻工作台条，出口和范围标识只有这一处。
+    bar = markup[
+        markup.index('<div id="organizationWorkspaceBar"') : markup.index('<section id="dashboardView"')
+    ]
+    assert 'id="backToCustomersButton"' in bar
+    for tab in ("info", "usage", "departments-usage", "billing", "tokens"):
+        assert f'data-organization-usage-view="{tab}"' in bar
+    assert "function renderOrganizationWorkspaceBar" in source
+    assert 'renderOrganizationWorkspaceBar(view);' in source
+    assert 'el("backToCustomersButton").addEventListener("click", closeCustomerOrganization);' in source
+    # 旧的四条重复面包屑已被工作台条取代，不得再留下孤立的返回入口。
+    for removed in (
         'id="customerUsageBreadcrumb"',
         'id="customerDepartmentBreadcrumb"',
-        'id="backToCustomerOrganizationButton"',
-        'id="backToCustomerOrganizationDepartmentButton"',
+        'id="customerBillingBreadcrumb"',
+        'id="organizationTokenBreadcrumb"',
     ):
-        assert required in markup
-    assert "function renderCustomerUsageBreadcrumbs" in source
-    assert 'renderCustomerUsageBreadcrumbs(view);' in source
-    assert 'el("backToCustomerOrganizationButton").addEventListener("click", () => showOrganizationUsage("info"));' in source
-    assert 'el("backToCustomerOrganizationDepartmentButton").addEventListener("click", () => showOrganizationUsage("info"));' in source
+        assert removed not in markup
+    assert "renderCustomerUsageBreadcrumbs" not in source
     assert "const isCustomer = isOrganizationCustomerIdentity();" in source
     assert "if (isCustomer) {" in source
+
+
+def test_workspace_bar_follows_the_customer_scope_and_stays_out_of_platform_views() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    bar = source[
+        source.index("const ORGANIZATION_WORKSPACE_VIEWS") : source.index("function organizationApiBasePath()")
+    ]
+    # 乙方下钻时五个页面都带工作台条；甲方只在企业管理页出现，避免和侧边栏
+    # 的同名一级入口重复。
+    assert (
+        'const ORGANIZATION_WORKSPACE_VIEWS = ["organization", "admin", "department", "billing", "organization-tokens"];'
+        in bar
+    )
+    assert "? ORGANIZATION_WORKSPACE_VIEWS.includes(view)" in bar
+    assert ': view === "organization" && canViewCurrentOrganizationUsage();' in bar
+    # 标签高亮按落地视图反推，从侧边栏或其他路径进入时也不会错位。
+    assert "customerOrganizationDetailTab = ORGANIZATION_WORKSPACE_TABS[view] || \"info\";" in bar
+    for view, tab in (
+        ("organization", "info"),
+        ("admin", "usage"),
+        ("department", "departments-usage"),
+        ("billing", "billing"),
+    ):
+        assert f'{view}: "{tab}"' in bar
+    assert '"organization-tokens": "tokens"' in bar
+
+
+def test_sidebar_always_leaves_the_customer_scope_before_switching_view() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    # 侧边栏是平台全局入口。下钻状态下点「全员看板」必须先退出客户范围，
+    # 否则平台级导航会静默显示某一家客户的数据。
+    assert (
+        'document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => {\n'
+        "  if (isViewingCustomerOrganization()) {\n"
+        "    clearCustomerOrganizationScope();\n"
+        "    syncNavigationVisibility();\n"
+        "  }\n"
+        "  switchView(button.dataset.view);\n"
+        "}));"
+    ) in source
+    # 「返回客户企业」和侧边栏共用同一份清理，任何一条路径都不会漏掉客户缓存。
+    close = source[
+        source.index("function closeCustomerOrganization()") : source.index("function renderOrganization()")
+    ]
+    assert "clearCustomerOrganizationScope();" in close
+    clear = source[
+        source.index("function clearCustomerOrganizationScope()") : source.index("function closeCustomerOrganization()")
+    ]
+    assert "selectedCustomerOrganization = null;" in clear
+    assert "resetOrganizationUsageViews();" in clear
+    assert "resetOrganizationBillingData();" in clear
+    assert "resetOrganizationTokenData();" in clear
+    assert 'customerOrganizationDetailTab = "info";' in clear
+    assert "switchView(" not in clear
 
 
 def test_customer_usage_detail_hides_platform_billing_management() -> None:
@@ -580,9 +648,11 @@ def test_platform_can_create_and_review_username_claims_inside_a_customer() -> N
 
     open_customer = source[
         source.index("async function openCustomerOrganization(")
-        : source.index("function closeCustomerOrganization()")
+        : source.index("function clearCustomerOrganizationScope()")
     ]
-    assert open_customer.count("resetOrganizationClaims();") == 1
+    # 进入客户前统一走一次范围清理，claim 缓存不会重复重置也不会漏掉。
+    assert open_customer.count("clearCustomerOrganizationScope();") == 1
+    assert "resetOrganizationClaims();" not in open_customer
 
 
 def test_imported_legacy_tokens_are_report_only_and_never_revocable() -> None:
@@ -798,3 +868,16 @@ def test_token_copy_does_not_expose_backend_provider_terms() -> None:
     for term in ("LiteLLM", "Proxy", "Virtual Key", "upstream", "admin key"):
         assert term not in token_markup
         assert term not in token_source
+
+
+def test_department_search_uses_directory_options_and_labels_zero_usage() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert "payload.departmentOptions" in source
+    assert "当前范围暂无用量" in source
+    selected_info = source[
+        source.index("function selectedDepartmentInfo()") : source.index(
+            "function departmentScopeLabel()"
+        )
+    ]
+    assert "departmentPickerOptions" in selected_info

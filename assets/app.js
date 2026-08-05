@@ -5219,20 +5219,32 @@ function resetNavigationToPending() {
   });
 }
 
-function renderCustomerUsageBreadcrumbs(view = currentView) {
-  const isCustomerUsage = isViewingCustomerOrganization()
-    && ["admin", "department", "billing", "organization-tokens"].includes(view);
-  const scopeLabel = isCustomerUsage ? `客户企业：${selectedCustomerOrganizationName()}` : "";
-  el("customerUsageBreadcrumb")?.classList.toggle("hidden", !(isCustomerUsage && view === "admin"));
-  el("customerDepartmentBreadcrumb")?.classList.toggle("hidden", !(isCustomerUsage && view === "department"));
-  el("customerBillingBreadcrumb")?.classList.toggle("hidden", !(isCustomerUsage && view === "billing"));
-  el("organizationTokenBreadcrumb")?.classList.toggle("hidden", !(isCustomerUsage && view === "organization-tokens"));
-  if (isCustomerUsage) {
-    setText("customerUsageBreadcrumbLabel", scopeLabel);
-    setText("customerDepartmentBreadcrumbLabel", scopeLabel);
-    setText("customerBillingBreadcrumbLabel", scopeLabel);
-    setText("organizationTokenBreadcrumbLabel", scopeLabel);
-  }
+// 客户/企业范围的五个页面共用正文顶部这一条工作台导航。乙方下钻时它常驻，
+// 让「组织信息 ↔ 全员看板 ↔ 部门看板 ↔ 企业额度 ↔ 令牌管理」可以直接互切；
+// 甲方只在企业管理页出现，避免和侧边栏的同名一级入口重复。
+const ORGANIZATION_WORKSPACE_VIEWS = ["organization", "admin", "department", "billing", "organization-tokens"];
+
+const ORGANIZATION_WORKSPACE_TABS = {
+  organization: "info",
+  admin: "usage",
+  department: "departments-usage",
+  billing: "billing",
+  "organization-tokens": "tokens",
+};
+
+function renderOrganizationWorkspaceBar(view = currentView) {
+  const bar = el("organizationWorkspaceBar");
+  if (!bar) return;
+  const isPlatformCustomer = isViewingCustomerOrganization();
+  const visible = isPlatformCustomer
+    ? ORGANIZATION_WORKSPACE_VIEWS.includes(view)
+    : view === "organization" && canViewCurrentOrganizationUsage();
+  bar.classList.toggle("hidden", !visible);
+  el("backToCustomersButton")?.classList.toggle("hidden", !isPlatformCustomer);
+  if (!visible) return;
+  // 高亮按当前视图反推，这样从侧边栏、面包屑或深链进入时标签态都不会错位。
+  customerOrganizationDetailTab = ORGANIZATION_WORKSPACE_TABS[view] || "info";
+  renderOrganizationUsageTabs();
 }
 
 function organizationApiBasePath() {
@@ -6046,26 +6058,10 @@ async function loadCustomerOrganizations() {
 async function openCustomerOrganization(organizationId) {
   if (!customerOrganizationsAvailable() || !organizationId) return;
   const id = String(organizationId);
+  // 先按退出客户范围清空一遍，再挂上新客户，避免上一家企业的快照、成员筛选或
+  // 在途请求泄漏到这一家。
+  clearCustomerOrganizationScope();
   selectedCustomerOrganization = customerOrganizations.find((item) => customerOrganizationId(item) === id) || { id };
-  resetOrganizationUsageViews();
-  organizationDataRequestId += 1;
-  organizationMemberRequestId += 1;
-  isOrganizationLoading = false;
-  isOrganizationMemberLoading = false;
-  organizationDataLoadingScopeKey = "";
-  organizationMemberLoadingScopeKey = "";
-  organizationLoadError = "";
-  organizationMemberLoadError = "";
-  organizationSnapshot = null;
-  organizationMembers = [];
-  organizationMemberTotal = 0;
-  organizationMemberPage = 1;
-  organizationMemberFilters = { search: "", departmentId: "", role: "", status: "" };
-  resetOrganizationBillingData();
-  resetOrganizationTokenData();
-  resetOrganizationClaims();
-  resetOrganizationAdoption();
-  customerOrganizationDetailTab = "info";
   syncNavigationVisibility();
   switchView("organization");
   await loadOrganizationData();
@@ -6077,7 +6073,9 @@ async function openCustomerOrganization(organizationId) {
   if (platformCanManageOrganizationClaims()) await loadOrganizationClaims();
 }
 
-function closeCustomerOrganization() {
+// 退出客户下钻的纯状态清理，不切换视图。侧边栏（回到平台全局）和「返回客户企业」
+// 共用它，避免任何一条路径漏掉某个客户范围的缓存。
+function clearCustomerOrganizationScope() {
   selectedCustomerOrganization = null;
   resetOrganizationUsageViews();
   resetOrganizationBillingData();
@@ -6097,6 +6095,11 @@ function closeCustomerOrganization() {
   organizationMemberTotal = 0;
   organizationMemberPage = 1;
   organizationMemberFilters = { search: "", departmentId: "", role: "", status: "" };
+  customerOrganizationDetailTab = "info";
+}
+
+function closeCustomerOrganization() {
+  clearCustomerOrganizationScope();
   syncNavigationVisibility();
   switchView("customers");
   loadCustomerOrganizations();
@@ -6129,15 +6132,13 @@ function renderOrganization() {
   const inviteMemberButton = el("inviteOrganizationMemberButton");
   if (createDepartmentButton) createDepartmentButton.disabled = !canManage;
   if (inviteMemberButton) inviteMemberButton.disabled = !canManage;
-  el("backToCustomersButton")?.classList.toggle("hidden", !isPlatformCustomer);
   if (isPlatformCustomer && customerOrganizationStatus(selectedCustomerOrganization) === "archived") {
     setText("organizationSubtitle", `${name} · 已归档客户企业，仅可查看历史组织信息。`);
   }
-  el("organizationUsageTabs")?.classList.toggle("hidden", !isPlatformCustomer && !canViewCurrentOrganizationUsage());
   el("organizationManagementWorkspace")?.classList.toggle("hidden", !canManage);
   renderOrganizationClaims();
   renderOrganizationAdoption();
-  renderOrganizationUsageTabs();
+  renderOrganizationWorkspaceBar();
   renderOrganizationFilters();
   renderOrganizationDepartments();
   renderOrganizationMembers();
@@ -6158,9 +6159,7 @@ function organizationMembersUrl() {
 function renderOrganizationUsageTabs() {
   const scope = organizationUsageScope();
   const tabs = el("organizationUsageTabs");
-  if (!tabs) return;
-  tabs.classList.toggle("hidden", !scope);
-  if (!scope) return;
+  if (!tabs || !scope) return;
   const scopeName = scope.name || "企业";
   const selected = customerOrganizationDetailTab || "info";
   tabs.querySelectorAll("[data-organization-usage-view]").forEach((button) => {
@@ -6179,17 +6178,16 @@ function renderOrganizationUsageTabs() {
 function showOrganizationUsage(view) {
   const scope = organizationUsageScope();
   if (!scope) return;
-  customerOrganizationDetailTab = ["info", "usage", "departments-usage", "billing", "tokens"].includes(view)
-    ? view
-    : "info";
-  renderOrganizationUsageTabs();
-  if (customerOrganizationDetailTab === "info") {
+  const tab = ["info", "usage", "departments-usage", "billing", "tokens"].includes(view) ? view : "info";
+  // 工作台条的高亮由 switchView → renderOrganizationWorkspaceBar 按落地视图反推，
+  // 这里只负责把标签映射成视图。
+  if (tab === "info") {
     switchView("organization");
-  } else if (customerOrganizationDetailTab === "usage") {
+  } else if (tab === "usage") {
     switchView("admin");
-  } else if (customerOrganizationDetailTab === "billing") {
+  } else if (tab === "billing") {
     switchView("billing");
-  } else if (customerOrganizationDetailTab === "tokens") {
+  } else if (tab === "tokens") {
     switchView("organization-tokens");
   } else {
     switchView("department");
@@ -7299,7 +7297,7 @@ function switchView(view) {
   el("billingView").classList.toggle("hidden", view !== "billing");
   el("modelsView").classList.toggle("hidden", view !== "models");
   el("dashboardFilters").classList.toggle("hidden", view === "models" || view === "keys" || view === "billing" || view === "customers" || view === "organization" || view === "organization-tokens");
-  renderCustomerUsageBreadcrumbs(view);
+  renderOrganizationWorkspaceBar(view);
   const isCustomerDetailView = isViewingCustomerOrganization()
     && ["organization", "organization-tokens", "admin", "department", "billing"].includes(view);
   let activeButton = null;
@@ -8218,9 +8216,6 @@ el("createCustomerOrganizationButton").addEventListener("click", () => openCusto
 el("resetCustomerOrganizationsDemoButton")?.addEventListener("click", resetCustomerOrganizationsDemo);
 el("cancelCustomerOrganizationButton").addEventListener("click", closeCustomerOrganizationModal);
 el("backToCustomersButton").addEventListener("click", closeCustomerOrganization);
-el("backToCustomerOrganizationButton").addEventListener("click", () => showOrganizationUsage("info"));
-el("backToCustomerOrganizationDepartmentButton").addEventListener("click", () => showOrganizationUsage("info"));
-el("backToCustomerOrganizationBillingButton").addEventListener("click", () => showOrganizationUsage("info"));
 el("createOrganizationDepartmentButton").addEventListener("click", () => openOrganizationDepartmentModal());
 el("inviteOrganizationMemberButton").addEventListener("click", () => openOrganizationMemberModal());
 el("cancelOrganizationDepartmentButton").addEventListener("click", closeOrganizationDepartmentModal);
@@ -8559,7 +8554,6 @@ document.querySelectorAll("[data-organization-usage-view]").forEach((button) => 
   button.addEventListener("click", () => showOrganizationUsage(button.dataset.organizationUsageView));
 });
 
-el("backToCustomerOrganizationTokensButton").addEventListener("click", () => showOrganizationUsage("info"));
 el("createOrganizationTokenButton").addEventListener("click", openOrganizationTokenModal);
 el("retryOrganizationTokenCatalogButton")?.addEventListener("click", loadOrganizationTokens);
 el("cancelOrganizationTokenButton").addEventListener("click", () => closeOrganizationTokenModal());
@@ -8671,7 +8665,15 @@ el("topupOptions").addEventListener("click", (event) => {
   setFieldError("topupError", "");
 });
 
-document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
+// 侧边栏永远是平台全局入口：下钻中的客户范围先退出，再进入目标页面，
+// 否则「全员看板」会静默变成某一家客户的看板。
+document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => {
+  if (isViewingCustomerOrganization()) {
+    clearCustomerOrganizationScope();
+    syncNavigationVisibility();
+  }
+  switchView(button.dataset.view);
+}));
 document.querySelectorAll("[data-global-page]").forEach((item) => item.addEventListener("click", () => navigateGlobalPage(item.dataset.globalPage)));
 document.querySelectorAll("[data-auth-entry]").forEach((item) => item.addEventListener("click", () => showAuthPage(item.dataset.authEntry)));
 
