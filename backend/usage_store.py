@@ -129,6 +129,9 @@ CREATE INDEX IF NOT EXISTS usage_team_membership_usage_join_idx
     ON usage_team_membership_daily (backend_id, snapshot_date, user_id);
 CREATE INDEX IF NOT EXISTS usage_team_membership_team_filter_idx
     ON usage_team_membership_daily (backend_id, snapshot_date, team_id, user_id);
+-- 权限解析对每个 (后端, 团队, 成员) 只取最新一天，没有这条索引要全表扫 17 万行排序。
+CREATE INDEX IF NOT EXISTS usage_team_membership_latest_idx
+    ON usage_team_membership_daily (backend_id, team_id, user_id, snapshot_date DESC);
 
 CREATE TABLE IF NOT EXISTS usage_sync_runs (
     id BIGSERIAL PRIMARY KEY,
