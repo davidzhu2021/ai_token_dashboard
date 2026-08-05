@@ -1501,8 +1501,7 @@
         color: var(--brand);
       }
 
-      /* 权限探测期间的导航占位。骨架条高度对齐 .sidebar .view-tab 的 42px，
-         让一次性揭示时不产生布局跳动。揭示时由 JS 加 .hidden 收走。 */
+      /* 登录身份确认前的短暂导航占位。auth/me 返回后会立即收走，不等待上游权限探测。 */
       .nav-skeleton {
         display: flex;
         flex-direction: column;
@@ -6697,8 +6696,8 @@
         <aside class="sidebar" aria-label="主导航">
           <p class="sidebar-label">用量导航</p>
           <div class="nav-zone">
-            <!-- 导航项的可见性全部由权限决定，所以每一项都先隐藏，等权限落地后由
-                 syncNavigationVisibility() 一次性揭示。骨架占位避免逐项蹦出。 -->
+            <!-- 防止旧身份入口闪现：每项初始隐藏，auth/me 返回后立即揭示已知入口，
+                 较慢的团队权限随后只补充对应入口。 -->
             <div id="navSkeleton" class="nav-skeleton" aria-hidden="true">
               <span class="loading-line"></span>
               <span class="loading-line"></span>
@@ -8627,6 +8626,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260805-customer-workspace-bar"></script>
+    <script src="/assets/app.js?v=20260805-fast-navigation"></script>
   </body>
 </html>

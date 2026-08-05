@@ -2022,6 +2022,53 @@ class LiteLLMClient:
             for source in sorted(entry.get("sources", set())) or ["her_user_alias_unique"]:
                 add_user_id(backend, user_id, "her_user_alias_unique" if source.startswith("her_") else source)
 
+    async def _targeted_identity_users(
+        self,
+        backend: LiteLLMBackend,
+        email: str,
+        aliases: set[str],
+    ) -> list[dict[str, Any]] | None:
+        """Use LiteLLM's indexed user filters instead of scanning every page."""
+
+        async def fetch(params: dict[str, Any]) -> list[dict[str, Any]] | None:
+            try:
+                payload = await self.request_backend(
+                    backend,
+                    "GET",
+                    "/user/list",
+                    params={"page": 1, "page_size": 100, **params},
+                )
+            except HTTPException as exc:
+                # Older upstreams may reject newer filter fields. Preserve the
+                # legacy full scan only for that compatibility case.
+                if exc.status_code in {400, 404, 422}:
+                    return None
+                raise
+            return _records(payload)
+
+        batches = await asyncio.gather(
+            fetch({"user_email": email}),
+            fetch({"sso_user_ids": email}),
+            fetch({"user_ids": ",".join(sorted(aliases))}),
+        )
+        if any(batch is None for batch in batches):
+            return None
+
+        records: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for batch in batches:
+            assert batch is not None
+            for user in batch:
+                identity = tuple(
+                    str(user.get(field) or "").strip().casefold()
+                    for field in ("user_id", "user_email", "sso_user_id", "user_alias")
+                )
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                records.append(user)
+        return records
+
     async def resolve_user(self, email: str, name: str | None = None) -> dict[str, Any]:
         email_lower = email.lower()
         email_prefix = email_lower.split("@", 1)[0]
@@ -2049,26 +2096,48 @@ class LiteLLMClient:
             if account is not None and source not in account["matchSources"]:
                 account["matchSources"].append(source)
 
-        for backend in self.backends:
+        def add_matching_users(backend: LiteLLMBackend, users: list[dict[str, Any]]) -> None:
+            for user in users:
+                user_id = user.get("user_id")
+                email_candidates = [user.get("user_email"), user.get("sso_user_id")]
+                legacy_candidates = [user.get("user_id"), user.get("user_alias")]
+                if any(str(candidate or "").lower() == email_lower for candidate in email_candidates):
+                    matched_users.append(user)
+                    add_user_id(backend, user_id, "user_email")
+                elif any(str(candidate or "").lower() in legacy_aliases for candidate in legacy_candidates):
+                    matched_users.append(user)
+                    add_user_id(backend, user_id, "tool_account_alias")
+
+        async def scan_all_users(backend: LiteLLMBackend) -> list[dict[str, Any]]:
+            users: list[dict[str, Any]] = []
             for page in range(1, 51):
-                payload = await self.request_backend(backend, "GET", "/user/list", params={"page": page, "page_size": 100})
-                for user in _records(payload):
-                    user_id = user.get("user_id")
-                    email_candidates = [user.get("user_email"), user.get("sso_user_id")]
-                    legacy_candidates = [user.get("user_id"), user.get("user_alias")]
-                    if any(str(candidate or "").lower() == email_lower for candidate in email_candidates):
-                        matched_users.append(user)
-                        add_user_id(backend, user_id, "user_email")
-                    elif any(str(candidate or "").lower() in legacy_aliases for candidate in legacy_candidates):
-                        matched_users.append(user)
-                        add_user_id(backend, user_id, "tool_account_alias")
+                payload = await self.request_backend(
+                    backend,
+                    "GET",
+                    "/user/list",
+                    params={"page": page, "page_size": 100},
+                )
+                users.extend(_records(payload))
                 total_pages = _as_int(payload.get("total_pages")) if isinstance(payload, dict) else 0
                 if total_pages and page >= total_pages:
                     break
+            return users
+
+        for backend in self.backends:
+            users = await self._targeted_identity_users(backend, email_lower, legacy_aliases)
+            used_targeted_filters = users is not None
+            if users is None:
+                users = await scan_all_users(backend)
+            add_matching_users(backend, users)
 
             if backend.source != "Her":
                 for user_id in await self.user_ids_from_key_alias(email_prefix, backend):
                     add_user_id(backend, user_id, "key_alias")
+                backend_has_match = any(account.get("backend") == backend.id for account in matched_accounts)
+                if used_targeted_filters and not users and not backend_has_match:
+                    # Official filters cannot search user_alias. Keep that rare
+                    # legacy mapping path without penalizing normal accounts.
+                    add_matching_users(backend, await scan_all_users(backend))
                 if not matched_user_ids:
                     for user_id in await self.user_ids_from_recent_logs(email_prefix, backend):
                         add_user_id(backend, user_id, "recent_usage_log")

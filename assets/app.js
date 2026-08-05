@@ -153,12 +153,8 @@ let isCreatingTopup = false;
 let isSubmittingManualPay = false;
 let billingLoadError = "";
 let billingAvailable = false;
-// 侧边栏导航整栏一次性揭示的闸门：为 false 时 syncNavigationVisibility() 不动 DOM。
+// 登录身份落地后立即揭示已知入口；异步权限结果随后只补充团队/企业入口。
 let isNavigationRevealed = false;
-let navigationRevealTimer = null;
-// 权限请求正常返回时一次性揭示整栏，避免「我的用量」先出现、团队看板稍后补入。
-// 只有权限解析异常缓慢时才降级揭示已知项；正常的 24-32 秒冷查询仍有机会完整返回。
-const NAVIGATION_REVEAL_TIMEOUT_MS = 35000;
 let selectedTopupAmount = 0;
 let pendingTopupTradeNo = "";
 let topupPollTimer = null;
@@ -5137,12 +5133,10 @@ function organizationUsageScopeLabel() {
   return organizationUsageScope()?.name || "全员";
 }
 
-// 侧边栏的每一项都由权限决定，逐项揭示会让「我的用量」「令牌管理」先蹦出来、
-// 其余项随各自的探测请求陆续追加。这里改成整栏一次性揭示：权限没落地前导航保持
-// 骨架占位，落地后同一帧内决定全部 7 项。
+// /api/auth/me 已经包含身份与企业权限，因此登录后可以立即决定绝大多数入口。
+// 只有旧版 SSO 团队负责人范围需要等待 /api/auth/scope，回来后再补充团队看板。
 function syncNavigationVisibility() {
-  // 权限尚未落地时不动导航：否则先返回的探测（如充值账本）会把自己那一项揭示到
-  // 骨架旁边，又变成逐项蹦出。revealNavigation() 负责放开这道闸。
+  // 切换账号时先关闸，避免上一身份的入口短暂泄漏给下一身份。
   if (!isNavigationRevealed) return;
   const canBrowseCustomers = customerOrganizationsAvailable();
   const canManageCurrentOrganization = Boolean(currentUser?.canManageOrganization);
@@ -5167,7 +5161,7 @@ function syncNavigationVisibility() {
   el("adminTab").classList.toggle("hidden", !canViewAdmin);
   el("departmentTab").classList.toggle("hidden", !canViewDepartments);
   el("teamTab").classList.toggle("hidden", !currentUser?.isTeamLeader);
-  // 个人用量对每个登录身份都成立，但仍在这里统一揭示，避免它比其他项先出现。
+  // 个人用量对每个登录身份都成立，不依赖任何上游权限探测。
   el("dashboardTab")?.classList.remove("hidden");
   // Customer identities use their tenant-scoped views only; never expose
   // seller account functions that lack a customer-local contract.
@@ -5180,10 +5174,8 @@ function syncNavigationVisibility() {
   });
 }
 
-// 权限探测完成，收走骨架并让导航栏整体成形。重复调用是安全的。
+// 身份落地后立即收走骨架。scope 随后到达时重复调用会补齐新增入口。
 function revealNavigation() {
-  window.clearTimeout(navigationRevealTimer);
-  navigationRevealTimer = null;
   isNavigationRevealed = true;
   syncNavigationVisibility();
   el("navSkeleton")?.classList.add("hidden");
@@ -5194,19 +5186,8 @@ function revealNavigation() {
   }
 }
 
-// 卡死兜底：权限迟迟不回来时先按已知信息揭示，团队看板等 scope 落地后再补上。
-// 正常员工的 scope 远快于这个时限，所以实际上不会触发。
-function scheduleNavigationRevealFallback() {
-  window.clearTimeout(navigationRevealTimer);
-  navigationRevealTimer = window.setTimeout(() => {
-    if (!isNavigationRevealed) revealNavigation();
-  }, NAVIGATION_REVEAL_TIMEOUT_MS);
-}
-
 // 换账号或退出登录时把导航退回骨架态，避免上一个身份的可见项闪现给下一个身份。
 function resetNavigationToPending() {
-  window.clearTimeout(navigationRevealTimer);
-  navigationRevealTimer = null;
   isNavigationRevealed = false;
   el("navSkeleton")?.classList.remove("hidden");
   const tabs = el("viewTabs");
@@ -7710,9 +7691,9 @@ async function showApp(user) {
   el("landingView").classList.add("hidden");
   el("loginView").classList.add("hidden");
   el("appView").classList.remove("hidden");
-  // 导航退回骨架态：本次身份的权限还没落地，先不揭示任何一项。
+  // 先清掉上一身份，再用 /api/auth/me 已知字段立即生成本次导航。
   resetNavigationToPending();
-  scheduleNavigationRevealFallback();
+  revealNavigation();
   const organizationName = String(currentUser.organizationName || currentUser.organization?.name || "").trim();
   const displayIdentifier = authDisplayIdentifier();
   el("userEmail").textContent = organizationName && currentUser.organizationRole
@@ -7730,12 +7711,12 @@ async function showApp(user) {
     // credit APIs. In particular, never probe the personal billing endpoint.
     billingAvailable = false;
     modelCatalog = [];
-    // Customer navigation is derived from /api/auth/scope capabilities.
+    // auth/me 已经给出客户身份的企业权限；scope 在后台补充兼容字段。
     const scopePromise = loadAuthScope();
     await Promise.all([loadCurrentViewData(), scopePromise]);
     return;
   }
-  // 团队权限与充值可见性都在 /api/auth/scope 里，一次往返就能决定整栏导航。
+  // 团队负责人范围在 /api/auth/scope 里异步补齐；基础导航已经可用。
   // 余额与订单仍留给充值页按需加载，不在引导路径上等它。
   const scopePromise = loadAuthScope();
   if (accountAccessCopy(currentUser)) {
@@ -7763,7 +7744,7 @@ async function loadAuthScope() {
       billingAvailable = Boolean(scope.billingAvailable);
     }
     el("teamWelcomeTitle").textContent = `所选范围 · ${teamScopeLabel()}`;
-    // 团队权限与充值可见性都已确定，导航栏整栏一次成形。
+    // 补齐团队与充值入口；不会阻塞已经显示的基础导航。
     revealNavigation();
     // isAdmin 到这里才确定，充值管理面板的可见性随之更新。
     renderAdminBilling();

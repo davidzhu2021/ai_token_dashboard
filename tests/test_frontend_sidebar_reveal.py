@@ -1,9 +1,4 @@
-"""侧边栏导航整栏一次性揭示的前端契约。
-
-「我的用量」「令牌管理」曾是静态可见的标签，其余项各自等自己的权限探测回来才
-揭示，管理员/团队 leader 登录后会看到导航项逐个蹦出来。这些断言锁定修复后的
-契约：所有标签初始隐藏、导航先呈骨架态、权限落地后由一处代码统一揭示。
-"""
+"""侧边栏登录后立即可用、异步补齐权限入口的前端契约。"""
 
 from pathlib import Path
 
@@ -55,52 +50,29 @@ def test_every_sidebar_tab_starts_hidden_behind_a_skeleton() -> None:
     ) == len(SIDEBAR_TABS)
 
 
-def test_navigation_reveal_is_gated_until_permissions_land() -> None:
+def test_navigation_reveals_immediately_from_auth_identity() -> None:
     source = APP_JS.read_text(encoding="utf-8")
 
-    # 闸门：权限没落地前 syncNavigationVisibility() 不动 DOM，否则先返回的探测
-    # 会把自己那一项揭示到骨架旁边，又退化成逐项蹦出。
+    # 闸门只用于隔离上一身份；auth/me 落地后同一调用栈立即揭示基础导航。
     assert "let isNavigationRevealed = false;" in source
     assert "if (!isNavigationRevealed) return;" in source
-
     assert "function revealNavigation() {" in source
     assert "function resetNavigationToPending() {" in source
-
-    # 团队看板与我的用量都在统一揭示里决定，不再各自单独 toggle。
     assert 'el("teamTab").classList.toggle("hidden", !currentUser?.isTeamLeader);' in source
     assert 'el("dashboardTab")?.classList.remove("hidden");' in source
-
-    # 揭示与失败兜底都要经过 revealNavigation()，否则用户会卡在骨架态。
-    assert source.count("revealNavigation();") >= 2
-
-
-def test_reveal_has_a_timeout_fallback_for_cold_upstream_lookups() -> None:
-    source = APP_JS.read_text(encoding="utf-8")
-
-    # 上游查不到账号的邮箱（新入职、拼错地址）会让 team_scope_for_user 翻完整个
-    # 用户列表，实测 24-32 秒。兜底必须晚于这个窗口，否则会先揭示「我的用量」，
-    # 等权限回来后再补出团队看板；35 秒后仍未返回时再降级，避免永久卡在骨架态。
-    assert "const NAVIGATION_REVEAL_TIMEOUT_MS = 35000;" in source
-    assert "function scheduleNavigationRevealFallback() {" in source
-    assert "if (!isNavigationRevealed) revealNavigation();" in source
-    assert "scheduleNavigationRevealFallback();" in source
-
-    # 兜底先触发时，随后到达的 scope 仍要把团队看板补上——revealNavigation()
-    # 会重跑 syncNavigationVisibility()，所以计时器必须在那里被清掉。
-    reveal = source[source.index("function revealNavigation() {") : source.index("function scheduleNavigationRevealFallback()")]
-    assert "window.clearTimeout(navigationRevealTimer);" in reveal
-    assert "syncNavigationVisibility();" in reveal
-
-    # 退回骨架态时也要清掉计时器，避免上一个身份的兜底揭示下一个身份的导航。
-    pending = source[source.index("function resetNavigationToPending() {") :]
-    assert "window.clearTimeout(navigationRevealTimer);" in pending[: pending.index("}")]
+    show_app = source[
+        source.index("async function showApp(user) {") : source.index("async function loadAuthScope() {")
+    ]
+    assert show_app.index("resetNavigationToPending();") < show_app.index("revealNavigation();")
+    assert show_app.index("revealNavigation();") < show_app.index("const scopePromise = loadAuthScope();")
+    assert "NAVIGATION_REVEAL_TIMEOUT_MS" not in source
+    assert "scheduleNavigationRevealFallback" not in source
 
 
 def test_billing_visibility_comes_from_the_scope_response() -> None:
     source = APP_JS.read_text(encoding="utf-8")
 
-    # 充值入口的可见性改由 /api/auth/scope 的零成本字段给出，不再等
-    # /api/me/billing 的上游往返。
+    # 充值入口由 /api/auth/scope 的零成本字段异步补齐，不再等真实账本。
     assert "if (scope?.billingAvailable !== undefined) {" in source
     assert "billingAvailable = Boolean(scope.billingAvailable);" in source
     # 老后端没有该字段时退回按需探测，混合版本部署期间入口不会凭空消失。

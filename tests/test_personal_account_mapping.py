@@ -1,6 +1,8 @@
 import asyncio
 from typing import Any
 
+from fastapi import HTTPException
+
 from backend.litellm_client import LiteLLMBackend, LiteLLMClient
 
 
@@ -14,9 +16,11 @@ def make_client() -> LiteLLMClient:
 
 def test_resolve_user_matches_tool_prefixed_accounts() -> None:
     client = make_client()
+    user_list_calls: list[dict[str, Any]] = []
 
     async def fake_request_backend(backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> Any:
         if path == "/user/list":
+            user_list_calls.append(dict(kwargs["params"]))
             return {
                 "users": [
                     {"user_id": "cursor-zhuyida", "user_alias": "cursor-zhuyida"},
@@ -37,6 +41,40 @@ def test_resolve_user_matches_tool_prefixed_accounts() -> None:
     assert user["matched_user_ids"] == ["claude-code-zhuyida", "cursor-zhuyida"]
     assert {account["user_id"] for account in user["matched_accounts"]} == {"cursor-zhuyida", "claude-code-zhuyida"}
     assert all("tool_account_alias" in account["matchSources"] for account in user["matched_accounts"])
+    assert {next(key for key in call if key not in {"page", "page_size"}) for call in user_list_calls} == {
+        "user_email",
+        "sso_user_ids",
+        "user_ids",
+    }
+    assert all(call["page"] == 1 and call["page_size"] == 100 for call in user_list_calls)
+
+
+def test_resolve_user_falls_back_to_full_scan_when_filters_are_rejected() -> None:
+    client = make_client()
+    calls: list[dict[str, Any]] = []
+
+    async def fake_request_backend(backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> Any:
+        if path == "/user/list":
+            params = dict(kwargs["params"])
+            calls.append(params)
+            if any(key in params for key in ("user_email", "sso_user_ids", "user_ids")):
+                raise HTTPException(status_code=422, detail="unsupported filter")
+            return {
+                "users": [{"user_id": "cursor-zhuyida", "user_alias": "cursor-zhuyida"}],
+                "total_pages": 1,
+            }
+        if path == "/key/list":
+            return {"keys": [], "total_pages": 1}
+        if path == "/spend/logs/v2":
+            return {"logs": [], "total_pages": 1}
+        raise AssertionError(f"unexpected call {backend.id} {method} {path}")
+
+    client.request_backend = fake_request_backend  # type: ignore[assignment]
+
+    user = asyncio.run(client.resolve_user("zhuyida@auto-link.com.cn", "Zhuyida"))
+
+    assert user["matched_user_ids"] == ["cursor-zhuyida"]
+    assert calls[-1] == {"page": 1, "page_size": 100}
 
 
 def test_resolve_user_falls_back_to_recent_logs() -> None:
