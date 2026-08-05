@@ -74,6 +74,7 @@ def upstream_key(key_id: str, user_id: str, status: str, name: str) -> dict[str,
         "_userId": user_id,
         "_rotation": {"key_alias": f"alias-{key_id}"},
         "id": key_id,
+        "keyType": "Claude Code" if user_id == "alice" else "Codex",
         "name": name,
         "purpose": "",
         "masked": "sk-...ABCD",
@@ -211,6 +212,9 @@ def test_team_keys_apply_search_and_status_filters(leader_env) -> None:
     assert [item["id"] for item in searched["keys"]] == ["key-alice"]
     # 统计始终反映团队全量，不随筛选变化。
     assert searched["stats"]["total"] == 2
+
+    searched_by_type = client.get("/api/team/keys", params={"search": "Claude Code"}).json()
+    assert [item["id"] for item in searched_by_type["keys"]] == ["key-alice"]
 
     filtered = client.get("/api/team/keys", params={"status": "已禁用"}).json()
     assert [item["id"] for item in filtered["keys"]] == ["key-bob-blocked"]

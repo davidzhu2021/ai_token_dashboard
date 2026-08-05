@@ -58,6 +58,7 @@ def test_key_list_only_returns_mask_and_hash_identifier(monkeypatch) -> None:
     assert keys[0]["masked"] == "sk-...ABCD"
     assert raw_key not in str(keys)
     assert keys[0]["name"] == "我的 Codex"
+    assert keys[0]["keyType"] == "-"
     assert keys[0]["models"] == ["gpt-5"]
     assert keys[0]["lastUsed"] == "2026-07-10"
     assert keys[0]["_backendId"] == "primary"
@@ -85,6 +86,24 @@ def test_key_list_accepts_legacy_last_used_at(monkeypatch) -> None:
     keys = asyncio.run(client.keys_for_user("user-1", backend))
 
     assert keys[0]["lastUsed"] == "2026-07-10"
+
+
+@pytest.mark.parametrize(
+    ("user_id", "expected_type"),
+    [("claude-code-alice", "Claude Code"), ("cursor-alice", "Codex"), ("alice", "-")],
+)
+def test_key_list_maps_tool_account_to_display_type(monkeypatch, user_id: str, expected_type: str) -> None:
+    client, backend = make_client()
+
+    async def fake_request_backend(
+        _backend: LiteLLMBackend, _method: str, _path: str, **_kwargs: Any
+    ) -> dict[str, Any]:
+        return {"keys": [{"token": f"key-{user_id}", "metadata": {}}]}
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+    keys = asyncio.run(client.keys_for_user(user_id, backend))
+
+    assert keys[0]["keyType"] == expected_type
 
 
 def test_key_list_does_not_fake_suffix_from_hash(monkeypatch) -> None:

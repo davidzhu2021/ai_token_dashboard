@@ -3864,19 +3864,19 @@ function renderTeamKeys() {
   setText("teamKeyCountChip", isTeamKeysLoading ? "加载中" : `${fmt.format(teamMemberKeys.length)} 个`);
 
   if (isTeamKeysLoading) {
-    tableBody.innerHTML = `<tr><td colspan="7" class="key-loading">正在加载团队成员密钥...</td></tr>`;
+    tableBody.innerHTML = `<tr><td colspan="8" class="key-loading">正在加载团队成员密钥...</td></tr>`;
     cardList.innerHTML = `<article class="panel key-loading">正在加载团队成员密钥...</article>`;
     return;
   }
   if (teamKeyLoadError) {
     const message = escapeHtml(teamKeyLoadError);
-    tableBody.innerHTML = `<tr><td colspan="7" class="key-empty">${message}</td></tr>`;
+    tableBody.innerHTML = `<tr><td colspan="8" class="key-empty">${message}</td></tr>`;
     cardList.innerHTML = `<article class="panel key-empty">${message}</article>`;
     return;
   }
   if (!teamMemberKeys.length) {
     const message = escapeHtml(teamKeyEmptyMessage());
-    tableBody.innerHTML = `<tr><td colspan="7" class="key-empty">${message}</td></tr>`;
+    tableBody.innerHTML = `<tr><td colspan="8" class="key-empty">${message}</td></tr>`;
     cardList.innerHTML = `<article class="panel key-empty">${message}</article>`;
     return;
   }
@@ -3899,6 +3899,7 @@ function renderTeamKeys() {
       return `
         <tr>
           <td><div class="key-name-cell"><strong>${memberName}</strong><span>${memberEmail}</span></div></td>
+          <td><span class="key-type-label">${escapeHtml(key.keyType || "-")}</span></td>
           <td>${escapeHtml(key.name || "个人访问密钥")}</td>
           <td><span class="chip ${keyStatusClass(key.status)}">${escapeHtml(key.status || "正常")}</span></td>
           <td><code class="key-masked-value">${escapeHtml(key.masked || "sk-...----")}</code></td>
@@ -3921,6 +3922,7 @@ function renderTeamKeys() {
           </div>
           <span class="chip ${keyStatusClass(key.status)}">${escapeHtml(key.status || "正常")}</span>
         </div>
+        <div class="key-mobile-row"><span>类型</span><strong>${escapeHtml(key.keyType || "-")}</strong></div>
         <div class="key-mobile-row"><span>名称</span><strong>${escapeHtml(key.name || "个人访问密钥")}</strong></div>
         <div class="key-mobile-row"><span>密钥</span><code class="key-masked-value">${escapeHtml(key.masked || "sk-...----")}</code></div>
         <div class="key-mobile-row"><span>创建时间</span><strong>${escapeHtml(key.createdAt || "-")}</strong></div>

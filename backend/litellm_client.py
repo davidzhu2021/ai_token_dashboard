@@ -318,6 +318,22 @@ def detect_source_from_key(key: dict[str, Any]) -> str:
     return "其他"
 
 
+def key_display_type(key: dict[str, Any], user_id: str = "") -> str:
+    """Map internal client identifiers to employee-facing product names."""
+
+    metadata = _metadata_dict(key.get("metadata"))
+    explicit_metadata = [
+        metadata.get(name)
+        for name in ("source", "tool", "client", "application", "key_type", "type", "created_for")
+    ]
+    haystack = _source_text(user_id, key.get("key_alias"), explicit_metadata).casefold()
+    if any(word in haystack for word in ("claude code", "claude-code", "claudecode", "claude-cli")):
+        return "Claude Code"
+    if any(word in haystack for word in ("cursor", "curosr", "codex")):
+        return "Codex"
+    return "-"
+
+
 def tool_account_aliases(email_prefix: str) -> list[str]:
     aliases = [email_prefix, f"cursor-{email_prefix}", f"claude-code-{email_prefix}"]
     return [alias for alias in aliases if alias]
@@ -2707,6 +2723,7 @@ class LiteLLMClient:
                     "_backendId": backend.id,
                     "_userId": user_id,
                     "id": token_hash,
+                    "keyType": key_display_type(item, user_id),
                     "name": alias,
                     "purpose": _clean_text(metadata.get("purpose")) or "用于个人 AI 工具访问。",
                     "masked": safe_key_name(item.get("key_name")),

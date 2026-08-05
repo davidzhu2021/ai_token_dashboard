@@ -2972,6 +2972,19 @@
         line-height: 1.5;
       }
 
+      .key-type-label {
+        display: inline-flex;
+        align-items: center;
+        min-height: 26px;
+        padding: 0 9px;
+        color: #1f547f;
+        background: rgba(232, 243, 253, 0.82);
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 700;
+        white-space: nowrap;
+      }
+
       .key-cleanup-state {
         display: inline-flex;
         align-items: center;
@@ -8149,7 +8162,7 @@
               </div>
               <div class="organization-filter-field">
                 <label for="teamKeySearch">搜索</label>
-                <input id="teamKeySearch" class="input" type="search" placeholder="成员姓名、邮箱或密钥名称" autocomplete="off" />
+                <input id="teamKeySearch" class="input" type="search" placeholder="成员姓名、邮箱、类型或密钥名称" autocomplete="off" />
               </div>
               <div class="organization-filter-field">
                 <label for="teamKeyStatusFilter">状态</label>
@@ -8169,6 +8182,7 @@
                 <thead>
                   <tr>
                     <th>成员</th>
+                    <th>类型</th>
                     <th>名称</th>
                     <th>状态</th>
                     <th>密钥</th>
@@ -8864,6 +8878,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260805-custom-range"></script>
+    <script src="/assets/app.js?v=20260805-key-type"></script>
   </body>
 </html>

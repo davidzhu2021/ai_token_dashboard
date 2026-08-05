@@ -8808,6 +8808,7 @@ async def team_keys(
             for item in keys
             if keyword in str(item.get("memberName") or "").lower()
             or keyword in str(item.get("memberEmail") or "").lower()
+            or keyword in str(item.get("keyType") or "").lower()
             or keyword in str(item.get("name") or "").lower()
             or keyword in str(item.get("masked") or "").lower()
         ]
