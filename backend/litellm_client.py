@@ -187,6 +187,25 @@ def _has_cjk(value: str) -> bool:
     return any("\u4e00" <= char <= "\u9fff" for char in value)
 
 
+# 这些占位名会同时出现在多个账号上，不能当成员工姓名参与匹配。
+_GENERIC_ACCOUNT_NAMES = {
+    "admin",
+    "administrator",
+    "default",
+    "default_user_id",
+    "guest",
+    "n/a",
+    "na",
+    "none",
+    "null",
+    "root",
+    "system",
+    "test",
+    "unknown",
+    "user",
+}
+
+
 def _date_text(value: Any) -> str:
     if not value:
         return date.today().isoformat()
@@ -1777,9 +1796,57 @@ class LiteLLMClient:
     def _empty_account_index(self) -> dict[str, Any]:
         return {
             "emails": defaultdict(dict),
+            # 共享账号的 used_by 姓名等次级线索，仅在 owner 匹配落空时兜底。
             "names": defaultdict(dict),
+            # 账号持有人姓名 -> {owner_key: {"userIds", "emails", "sources"}}。
+            "owners": defaultdict(dict),
+            "identities": {},
             "profiles": {},
         }
+
+    @staticmethod
+    def _account_owner_key(user_id: Any, email: Any, metadata: dict[str, Any] | None = None) -> str:
+        """把同一个人在上游的多个账号归并到一个身份键。
+
+        上游按飞书通讯录建号，同一员工可能持有多个 ``carher-*`` 账号；
+        ``lark_open_id`` 是唯一稳定的人员标识，缺失时才退回邮箱/账号 ID。
+        """
+
+        metadata = metadata or {}
+        open_id = _clean_text(metadata.get("lark_open_id") or metadata.get("open_id"))
+        if open_id:
+            return f"lark:{open_id}"
+        email_text = _normal_email(email)
+        if email_text:
+            return f"email:{email_text}"
+        return f"uid:{_clean_text(user_id)}"
+
+    def _add_account_owner_entry(
+        self,
+        index: dict[str, Any],
+        user_id: Any,
+        owner_key: str,
+        source: str,
+        email: Any = None,
+        names: list[Any] | None = None,
+    ) -> None:
+        text_user_id = _clean_text(user_id)
+        if not text_user_id or not owner_key:
+            return
+        index.setdefault("identities", {})[text_user_id] = owner_key
+        owners = index.setdefault("owners", defaultdict(dict))
+        email_text = _normal_email(email)
+        for raw_name in names or []:
+            name = _clean_text(raw_name)
+            if not name:
+                continue
+            bucket = owners[name].setdefault(
+                owner_key, {"userIds": set(), "emails": set(), "sources": set()}
+            )
+            bucket["userIds"].add(text_user_id)
+            bucket["sources"].add(source)
+            if email_text:
+                bucket["emails"].add(email_text)
 
     def _add_account_index_entry(
         self,
@@ -1820,19 +1887,29 @@ class LiteLLMClient:
                 metadata = _metadata_dict(user.get("metadata"))
                 user_id = user.get("user_id")
                 email = _normal_email(user.get("user_email") or user.get("sso_user_id") or metadata.get("email"))
-                names = [
+                owner_names = [
                     user.get("user_alias"),
                     metadata.get("display_name"),
                     metadata.get("owner_name"),
                 ]
+                names = list(owner_names)
                 for used_by in metadata.get("used_by") or []:
                     if isinstance(used_by, dict):
                         names.append(used_by.get("name"))
                 if self._is_backend_usage_account(backend, user_id):
                     user_id_text = _clean_text(user_id)
                     alias_name = _clean_text(user.get("user_alias") or metadata.get("display_name") or metadata.get("owner_name"))
-                    index["profiles"][user_id_text] = {"email": email, "name": alias_name}
-                    self._add_account_index_entry(index, user_id, "her_user_email" if email else "her_user_alias", email, names)
+                    owner_key = self._account_owner_key(user_id_text, email, metadata)
+                    index["profiles"][user_id_text] = {
+                        "email": email,
+                        "name": alias_name,
+                        "ownerKey": owner_key,
+                        "department": _clean_text(metadata.get("department") or metadata.get("team_alias")),
+                        "emailSource": _clean_text(metadata.get("email_source")) or ("upstream" if email else ""),
+                    }
+                    source = "her_user_email" if email else "her_user_alias"
+                    self._add_account_index_entry(index, user_id, source, email, names)
+                    self._add_account_owner_entry(index, user_id, owner_key, source, email, owner_names)
             total_pages = _as_int(payload.get("total_pages")) if isinstance(payload, dict) else 0
             if total_pages and page >= total_pages:
                 break
@@ -1851,23 +1928,44 @@ class LiteLLMClient:
             for key in keys:
                 metadata = _metadata_dict(key.get("metadata"))
                 email = _normal_email(metadata.get("email"))
-                names = [
+                owner_names = [
                     metadata.get("display_name"),
                     metadata.get("owner_name"),
                     key.get("user_alias"),
-                    key.get("key_alias"),
                 ]
+                names = [*owner_names, key.get("key_alias")]
                 for used_by in metadata.get("used_by") or []:
                     if isinstance(used_by, dict):
                         names.append(used_by.get("name"))
                 if self._is_backend_usage_account(backend, key.get("user_id")):
                     user_id_text = _clean_text(key.get("user_id"))
+                    source = "her_key_metadata_email" if email else "her_key_metadata_name"
+                    owner_key = ""
                     if user_id_text:
                         existing = index["profiles"].get(user_id_text, {})
                         profile_email = email or _normal_email(existing.get("email"))
                         profile_name = _clean_text(metadata.get("display_name") or metadata.get("owner_name") or existing.get("name"))
-                        index["profiles"][user_id_text] = {"email": profile_email, "name": profile_name}
-                    self._add_account_index_entry(index, key.get("user_id"), "her_key_metadata_email" if email else "her_key_metadata_name", email, names)
+                        # 账号本身的身份键优先，密钥元数据只在账号缺失时兜底建键。
+                        owner_key = _clean_text(existing.get("ownerKey")) or self._account_owner_key(
+                            user_id_text, profile_email, metadata
+                        )
+                        index["profiles"][user_id_text] = {
+                            **existing,
+                            "email": profile_email,
+                            "name": profile_name,
+                            "ownerKey": owner_key,
+                            "department": _clean_text(
+                                existing.get("department") or metadata.get("department") or metadata.get("team_alias")
+                            ),
+                            "emailSource": _clean_text(existing.get("emailSource"))
+                            or (_clean_text(metadata.get("email_source")) if profile_email else "")
+                            or ("upstream" if profile_email else ""),
+                        }
+                    self._add_account_index_entry(index, key.get("user_id"), source, email, names)
+                    if owner_key:
+                        self._add_account_owner_entry(
+                            index, key.get("user_id"), owner_key, source, email, owner_names
+                        )
             total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=0)) if isinstance(payload, dict) else 0
             if total_pages and page >= total_pages:
                 break
@@ -1976,6 +2074,22 @@ class LiteLLMClient:
                         profile_name = _clean_text(profile.get("name")) or (profile_email.split("@", 1)[0] if profile_email else user_id)
                         return {"id": profile_email or user_id, "name": profile_name, "email": profile_email, "bindStatus": "已绑定邮箱" if profile_email else "未绑定邮箱"}
             for name in names:
+                owner_match = self._owner_name_matches(account_index, name)
+                if owner_match:
+                    user_id, profile = self._owner_profile_from_index(
+                        account_index, owner_match.get("userIds", set())
+                    )
+                    if user_id and user_id.lower() in user_map:
+                        return user_map[user_id.lower()]
+                    profile_email = _normal_email(profile.get("email"))
+                    profile_name = _clean_text(profile.get("name")) or name or user_id
+                    return {
+                        "id": profile_email or user_id,
+                        "name": profile_name,
+                        "email": profile_email,
+                        "bindStatus": "已绑定邮箱" if profile_email else "未绑定邮箱",
+                    }
+            for name in names:
                 matches = self._name_index_matches(account_index, name)
                 if len(matches) == 1:
                     user_id = next(iter(matches.keys()))
@@ -2002,6 +2116,40 @@ class LiteLLMClient:
             return candidates
         return {}
 
+    def _owner_name_matches(self, index: dict[str, Any], name: str) -> dict[str, Any]:
+        """按"人"而不是按账号判断姓名是否唯一。
+
+        上游同一员工可能持有多个账号，旧的"姓名只能对应一个 user_id"规则会把
+        这种情况误判成重名而放弃匹配。这里先用 ``lark_open_id`` 归并到同一个人，
+        只有当一个姓名确实落在两个不同的人身上时才判定歧义。
+        """
+
+        clean_name = _clean_text(name)
+        if len(clean_name) < 2 or clean_name.lower() in _GENERIC_ACCOUNT_NAMES:
+            return {}
+        candidates = index.get("owners", {}).get(clean_name, {})
+        if len(candidates) != 1:
+            return {}
+        return next(iter(candidates.values()))
+
+    def _owner_profile_from_index(
+        self,
+        index: dict[str, Any],
+        user_ids: Any,
+    ) -> tuple[str, dict[str, Any]]:
+        """在一个人的多个账号里挑出信息最全的一个作为展示身份。"""
+
+        profiles = index.get("profiles", {})
+        best_user_id = ""
+        best_profile: dict[str, Any] = {}
+        for user_id in sorted(user_ids or []):
+            profile = profiles.get(user_id) or {}
+            if not best_user_id:
+                best_user_id, best_profile = user_id, profile
+            if _normal_email(profile.get("email")) and not _normal_email(best_profile.get("email")):
+                best_user_id, best_profile = user_id, profile
+        return best_user_id, best_profile
+
     async def add_her_index_matches(
         self,
         backend: LiteLLMBackend,
@@ -2018,9 +2166,15 @@ class LiteLLMClient:
         if email_matches:
             return
 
+        owner_match = self._owner_name_matches(index, _clean_text(name))
+        if owner_match:
+            for user_id in sorted(owner_match.get("userIds", set())):
+                add_user_id(backend, user_id, "her_user_alias_owner")
+            return
+
         for user_id, entry in self._name_index_matches(index, _clean_text(name)).items():
-            for source in sorted(entry.get("sources", set())) or ["her_user_alias_unique"]:
-                add_user_id(backend, user_id, "her_user_alias_unique" if source.startswith("her_") else source)
+            for source in sorted(entry.get("sources", set())) or ["her_shared_account_name"]:
+                add_user_id(backend, user_id, "her_shared_account_name" if source.startswith("her_") else source)
 
     async def _targeted_identity_users(
         self,

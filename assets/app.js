@@ -1914,6 +1914,20 @@ function employeeDepartmentText(employee) {
   return names.length ? names.join("、") : "未绑定部门";
 }
 
+// 邮箱有三种来源：账号自带、按姓名从另一份员工目录推断、完全没有。推断出来的
+// 邮箱可能对应同名的另一个人，必须在界面上和真实邮箱区分开。
+const BIND_STATUS_STYLES = {
+  未绑定邮箱: { chip: "rose", hint: "该账号在系统里没有邮箱，暂时只能按账号编号统计" },
+  邮箱推断: { chip: "gold", hint: "邮箱由员工目录按姓名推断，可能存在同名误差，仅供参考" },
+  已绑定邮箱: { chip: "blue", hint: "邮箱来自账号本身" },
+};
+
+function bindStatusChip(status) {
+  const label = String(status || "已绑定邮箱");
+  const style = BIND_STATUS_STYLES[label] || BIND_STATUS_STYLES["已绑定邮箱"];
+  return `<span class="chip ${style.chip}" title="${escapeHtml(style.hint)}">${escapeHtml(label)}</span>`;
+}
+
 function updateAdminChartTitles() {
   const scopeName = selectedAdminEmployee ? selectedAdminEmployeeLabel() : "全员";
   const customerName = organizationUsageScope()?.kind === "platformCustomer" ? organizationUsageScope()?.name : "";
@@ -2737,7 +2751,7 @@ function renderEmployeeRanking(tableId, countId, employees, emptyText) {
               <td class="num"><strong>${formatTokens(item.totalTokens || 0)}</strong></td>
               <td class="num">${money.format(item.spend || 0)}</td>
               <td class="num">${successRate}%</td>
-              <td><span class="chip ${item.bindStatus === "未绑定邮箱" ? "rose" : "blue"}">${item.bindStatus || "已绑定邮箱"}</span></td>
+              <td>${bindStatusChip(item.bindStatus)}</td>
             </tr>
           `;
         })

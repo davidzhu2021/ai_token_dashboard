@@ -66,6 +66,8 @@ class BackendSnapshot:
     # must not be replaced by a daily-activity fallback.
     events: list[dict[str, Any]] | None = None
     departments: list[dict[str, Any]] | None = None
+    # 本次识别出的账号身份，用于把姓名/邮箱回填到同步窗口之外的历史行。
+    identities: list[dict[str, Any]] | None = None
 
 
 class UsageSynchronizer:
@@ -81,6 +83,88 @@ class UsageSynchronizer:
         # their lightweight construction. Real mode supplies the durable token
         # mapping used when SpendLogs omit organization/team identifiers.
         self.organization_repository = organization_repository
+
+    async def _identity_directory(self) -> dict[str, Any]:
+        """跨后端的员工身份目录。
+
+        两套上游共用同一份 ``carher-*`` 账号编号，但姓名/邮箱只在其中一侧齐全：
+        带 ``source`` 的后端有姓名和部门，主站那份同号账号则完全空白。这里把两边
+        的目录合成一份，让任一侧缺失的身份信息都能补齐。
+        """
+
+        by_user_id: dict[str, dict[str, str]] = {}
+        name_to_email: dict[str, set[str]] = {}
+        for backend in getattr(self.client, "backends", None) or []:
+            if getattr(backend, "source", ""):
+                loader = getattr(self.client, "her_account_index", None)
+                if not callable(loader):
+                    continue
+                try:
+                    index = await loader(backend)
+                except Exception:
+                    logger.exception("failed to load account directory for backend %s", backend.id)
+                    continue
+                for user_id, profile in (index.get("profiles") or {}).items():
+                    if not _text(user_id):
+                        continue
+                    by_user_id[_text(user_id)] = {
+                        "name": _text(profile.get("name")),
+                        "email": _email(profile.get("email")),
+                        "department": _text(profile.get("department")),
+                        "emailSource": _text(profile.get("emailSource")) or ("upstream" if _email(profile.get("email")) else ""),
+                    }
+                continue
+            try:
+                users = await self.client.users(backend)
+            except Exception:
+                logger.exception("failed to load user directory for backend %s", backend.id)
+                continue
+            for user in users:
+                name = _text(user.get("user_alias"))
+                email = _email(user.get("user_email") or user.get("sso_user_id"))
+                if name and email:
+                    name_to_email.setdefault(name, set()).add(email)
+        return {
+            "byUserId": by_user_id,
+            # 只保留唯一映射，同名对应多个邮箱时不做推断。
+            "nameToEmail": {name: next(iter(emails)) for name, emails in name_to_email.items() if len(emails) == 1},
+        }
+
+    def _apply_identity_directory(
+        self,
+        backend: LiteLLMBackend,
+        user_id: str,
+        info: dict[str, Any],
+        directory: dict[str, Any],
+    ) -> dict[str, Any]:
+        """用跨后端目录补齐单个账号的姓名/邮箱，并标记邮箱来源。"""
+
+        name = _text(info.get("name"))
+        email = _email(info.get("email"))
+        department = _text(info.get("department"))
+        email_source = "upstream" if email else ""
+        if not getattr(backend, "source", ""):
+            profile = (directory.get("byUserId") or {}).get(user_id) or {}
+            if profile and (not name or name == user_id or not email):
+                name = name if name and name != user_id else _text(profile.get("name")) or name
+                if not email:
+                    email = _email(profile.get("email"))
+                    email_source = _text(profile.get("emailSource")) if email else ""
+                department = department or _text(profile.get("department"))
+        if not email:
+            # 上游没有邮箱时，用另一侧目录的「姓名 -> 邮箱」唯一映射推断，
+            # 仅用于展示与归并，不参与 resolve_user 的邮箱匹配。
+            inferred = (directory.get("nameToEmail") or {}).get(name)
+            if inferred:
+                email = inferred
+                email_source = "inferred_primary_directory"
+        return {
+            **info,
+            "name": name or user_id,
+            "email": email,
+            "department": department,
+            "emailSource": email_source,
+        }
 
     @staticmethod
     def _department_records(teams: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -335,9 +419,10 @@ class UsageSynchronizer:
         snapshots: list[BackendSnapshot] = []
         errors: list[str] = []
         try:
+            directory = await self._identity_directory()
             for backend in self.client.backends:
                 try:
-                    snapshots.append(await self.collect_backend(backend, start_date, end_date))
+                    snapshots.append(await self.collect_backend(backend, start_date, end_date, directory))
                 except Exception as exc:
                     logger.exception("usage snapshot failed for backend %s", backend.id)
                     errors.append(f"{backend.id}: {exc.__class__.__name__}")
@@ -389,6 +474,7 @@ class UsageSynchronizer:
                         **kwargs,
                     )
             status = "partial" if errors and snapshots else "failed" if errors else "ok"
+            await self._refresh_historical_identity(snapshots)
             await self.store.finish_sync_run(run_id, status, len(snapshots), row_count, "; ".join(errors))
             return {
                 "status": status,
@@ -404,9 +490,36 @@ class UsageSynchronizer:
             if lock is not None:
                 await self.store.release_sync_lock(lock)
 
-    async def collect_backend(self, backend: LiteLLMBackend, start_date: str, end_date: str) -> BackendSnapshot:
+    async def _refresh_historical_identity(self, snapshots: list[BackendSnapshot]) -> None:
+        """把本次识别到的姓名/邮箱回填到同步窗口之外的历史行。
+
+        匹配规则升级后，旧日期的行仍留着当时写入的空姓名。这一步只更新身份列，
+        失败不影响本次同步结果。
+        """
+
+        refresh = getattr(self.store, "refresh_account_identity", None)
+        if not callable(refresh):
+            return
+        for snapshot in snapshots:
+            identities = getattr(snapshot, "identities", None)
+            if not identities:
+                continue
+            try:
+                await refresh(snapshot.backend_id, identities)
+            except Exception:
+                logger.exception("usage identity refresh failed for backend %s", snapshot.backend_id)
+
+    async def collect_backend(
+        self,
+        backend: LiteLLMBackend,
+        start_date: str,
+        end_date: str,
+        directory: dict[str, Any] | None = None,
+    ) -> BackendSnapshot:
         users = await self.client.users(backend)
         user_map = self.client._admin_user_map(users)
+        if directory is None:
+            directory = await self._identity_directory()
         account_index: dict[str, Any] = {}
         if backend.source == "Her":
             try:
@@ -424,11 +537,14 @@ class UsageSynchronizer:
                 "email": _email(user.get("user_email") or user.get("sso_user_id")),
                 "bindStatus": "已绑定邮箱" if _email(user.get("user_email") or user.get("sso_user_id")) else "未绑定邮箱",
             }
+            profile = account_index.get("profiles", {}).get(user_id) or {}
             info = {
                 **info,
-                "email": _email(info.get("email")) or _email((account_index.get("profiles", {}).get(user_id) or {}).get("email")),
-                "name": _text(info.get("name")) or _text((account_index.get("profiles", {}).get(user_id) or {}).get("name")) or user_id,
+                "email": _email(info.get("email")) or _email(profile.get("email")),
+                "name": _text(info.get("name")) or _text(profile.get("name")) or user_id,
+                "department": _text(info.get("department")) or _text(profile.get("department")),
             }
+            info = self._apply_identity_directory(backend, user_id, info, directory)
             account_users[user_id] = {**info, "userId": user_id}
 
         # 优先按北京时间日界扫描原始日志：上游 daily activity 按 UTC 归日，会把
@@ -485,6 +601,7 @@ class UsageSynchronizer:
                         "_userId": user_id,
                         "employeeEmail": _email(info.get("email")),
                         "employeeName": _text(info.get("name")) or user_id,
+                        "emailSource": _text(info.get("emailSource")),
                     }
                 )
                 # Explicit request-log attribution stays authoritative. Only
@@ -514,17 +631,19 @@ class UsageSynchronizer:
             for raw_user_id, raw_rows in log_rows.items():
                 if raw_user_id in known_user_ids:
                     continue
+                # 全量扫描可能带出 /user/list 里没有的账号，跨后端目录仍可能认识它。
+                profile = (directory.get("byUserId") or {}).get(raw_user_id) or {}
+                fallback_name = _text(profile.get("name")) or (
+                    raw_user_id if raw_user_id != "unattributed" else "未归属请求"
+                )
                 for row in raw_rows:
                     rows.append(
                         {
                             **row,
                             "_userId": raw_user_id,
-                            "employeeEmail": "",
-                            "employeeName": (
-                                raw_user_id
-                                if raw_user_id != "unattributed"
-                                else "未归属请求"
-                            ),
+                            "employeeEmail": _email(profile.get("email")),
+                            "employeeName": fallback_name,
+                            "emailSource": _text(profile.get("emailSource")) if _email(profile.get("email")) else "",
                         }
                     )
         if token_mapping_index:
@@ -546,12 +665,22 @@ class UsageSynchronizer:
             except TypeError:
                 directory_teams = await self.client.teams(backend)
         departments = self._department_records(directory_teams)
+        identities = [
+            {
+                "userId": user_id,
+                "name": _text(info.get("name")) or user_id,
+                "email": _email(info.get("email")),
+                "emailSource": _text(info.get("emailSource")),
+            }
+            for user_id, info in account_users.items()
+        ]
         return BackendSnapshot(
             backend.id,
             rows,
             memberships,
             event_rows if log_rows is not None else None,
             departments,
+            identities,
         )
 
     async def collect_memberships(

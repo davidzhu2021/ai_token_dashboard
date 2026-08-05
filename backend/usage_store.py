@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS usage_daily (
     billing_eligible BOOLEAN NOT NULL DEFAULT FALSE,
     employee_email TEXT NOT NULL DEFAULT '',
     employee_name TEXT NOT NULL DEFAULT '',
+    email_source TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL,
     model TEXT NOT NULL,
     prompt_tokens BIGINT NOT NULL DEFAULT 0,
@@ -60,6 +61,8 @@ ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS key_id TEXT NOT NULL DEFAULT ''
 ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS principal_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS attribution_source TEXT NOT NULL DEFAULT 'unattributed';
 ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS billing_eligible BOOLEAN NOT NULL DEFAULT FALSE;
+-- 邮箱来源：'' 未知/无邮箱、'upstream' 上游真实邮箱、'inferred_primary_directory' 按姓名推断。
+ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS email_source TEXT NOT NULL DEFAULT '';
 
 -- Create indexes only after compatibility columns exist. Older production
 -- databases predate organization attribution and would otherwise fail startup
@@ -219,6 +222,24 @@ def _record_value(record: Any, key: str, default: Any = None) -> Any:
         return record[key]
     except (KeyError, IndexError, TypeError):
         return default
+
+
+# 按姓名从另一侧目录反填的邮箱只用于展示，必须和上游真实邮箱区分开。
+INFERRED_EMAIL_SOURCE = "inferred_primary_directory"
+
+
+def bind_status(email: Any, email_source: Any = "") -> str:
+    """员工邮箱绑定状态：已绑定 / 推断 / 未绑定。"""
+
+    if not _clean_text(email):
+        return "未绑定邮箱"
+    if _clean_text(email_source) == INFERRED_EMAIL_SOURCE:
+        return "邮箱推断"
+    return "已绑定邮箱"
+
+
+def _record_bind_status(record: Any, email_key: str = "employee_email", source_key: str = "email_source") -> str:
+    return bind_status(_record_value(record, email_key), _record_value(record, source_key, ""))
 
 
 def _first_nonempty(row: dict[str, Any], *keys: str) -> str:
@@ -637,13 +658,13 @@ class UsageStore:
                 WHERE m.snapshot_date BETWEEN $3::date AND $4::date
                 ORDER BY m.backend_id, m.user_id, m.snapshot_date DESC
             )
-            SELECT 'member' AS kind, m.backend_id, m.team_id, m.team_name, m.user_id, m.employee_email, m.employee_name, m.team_role,
+            SELECT 'member' AS kind, m.backend_id, m.team_id, m.team_name, m.user_id, m.employee_email, m.employee_name, ''::text AS email_source, m.team_role,
                    NULL::date AS usage_date, NULL::text AS source, NULL::text AS model_name,
                    0::bigint AS prompt_tokens, 0::bigint AS completion_tokens, 0::bigint AS total_tokens,
                    0::bigint AS request_count, 0::bigint AS success_count, 0::bigint AS failure_count, 0::double precision AS spend
             FROM members m
             UNION ALL
-            SELECT 'usage', u.backend_id, NULL, NULL, u.user_id, MAX(u.employee_email), MAX(u.employee_name), NULL,
+            SELECT 'usage', u.backend_id, NULL, NULL, u.user_id, MAX(u.employee_email), MAX(u.employee_name), MAX(u.email_source), NULL,
                    u.usage_date, u.source, {model_sql}, {self._aggregate_metrics_sql('u.')}
             FROM usage_daily u
             WHERE u.backend_id = ANY($1::text[])
@@ -685,7 +706,7 @@ class UsageStore:
                     "employeeId": record["user_id"],
                     "employeeName": record["employee_name"] or record["user_id"],
                     "employeeEmail": record["employee_email"] or "",
-                    "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱",
+                    "bindStatus": _record_bind_status(record),
                 }
             )
             rows.append(row)
@@ -744,6 +765,7 @@ class UsageStore:
             principal_id,
             attribution_source,
             billing_eligible,
+            _clean_text(row.get("emailSource") or row.get("email_source")),
         )
 
     @staticmethod
@@ -782,6 +804,8 @@ class UsageStore:
                 current["employeeEmail"] = row["employeeEmail"]
             if not current.get("employeeName") and row.get("employeeName"):
                 current["employeeName"] = row["employeeName"]
+            if not current.get("emailSource") and row.get("emailSource"):
+                current["emailSource"] = row["emailSource"]
             for field, value in (
                 ("organizationId", organization_id),
                 ("teamId", team_id),
@@ -961,8 +985,8 @@ class UsageStore:
                             source, model, prompt_tokens, completion_tokens, total_tokens,
                             request_count, success_count, failure_count, spend, collected_at,
                             organization_id, team_id, key_id, principal_id,
-                            attribution_source, billing_eligible
-                        ) VALUES ($1, $2::date, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+                            attribution_source, billing_eligible, email_source
+                        ) VALUES ($1, $2::date, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
                         ON CONFLICT (
                             backend_id, usage_date, user_id, source, model,
                             organization_id, team_id, key_id, principal_id,
@@ -976,6 +1000,7 @@ class UsageStore:
                             billing_eligible = EXCLUDED.billing_eligible,
                             employee_email = EXCLUDED.employee_email,
                             employee_name = EXCLUDED.employee_name,
+                            email_source = EXCLUDED.email_source,
                             prompt_tokens = EXCLUDED.prompt_tokens,
                             completion_tokens = EXCLUDED.completion_tokens,
                             total_tokens = EXCLUDED.total_tokens,
@@ -1142,7 +1167,7 @@ class UsageStore:
                             "completion_tokens", "total_tokens", "request_count",
                             "success_count", "failure_count", "spend", "collected_at",
                             "organization_id", "team_id", "key_id", "principal_id",
-                            "attribution_source", "billing_eligible",
+                            "attribution_source", "billing_eligible", "email_source",
                         ),
                     )
                 if membership_records:
@@ -1294,8 +1319,8 @@ class UsageStore:
                             source, model, prompt_tokens, completion_tokens, total_tokens,
                             request_count, success_count, failure_count, spend, collected_at,
                             organization_id, team_id, key_id, principal_id,
-                            attribution_source, billing_eligible
-                        ) VALUES ($1,$2::date,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+                            attribution_source, billing_eligible, email_source
+                        ) VALUES ($1,$2::date,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
                         ON CONFLICT (
                             backend_id, usage_date, user_id, source, model,
                             organization_id, team_id, key_id, principal_id,
@@ -1303,6 +1328,7 @@ class UsageStore:
                         ) DO UPDATE SET
                             employee_email=EXCLUDED.employee_email,
                             employee_name=EXCLUDED.employee_name,
+                            email_source=EXCLUDED.email_source,
                             prompt_tokens=EXCLUDED.prompt_tokens,
                             completion_tokens=EXCLUDED.completion_tokens,
                             total_tokens=EXCLUDED.total_tokens,
@@ -1349,6 +1375,51 @@ class UsageStore:
                         event_records,
                     )
         return len(usage_records)
+
+    async def refresh_account_identity(
+        self, backend_id: str, identities: list[dict[str, Any]]
+    ) -> int:
+        """按账号回填历史行的姓名/邮箱，不改动任何用量数字。
+
+        ``employee_name``/``employee_email`` 是写快照时固化在 ``usage_daily`` 里的，
+        匹配规则升级后旧日期的行仍留着当时的空姓名。这里只做一次身份列的批量更新，
+        避免为了改一个显示字段重新拉一遍上游用量。
+        """
+
+        records = [
+            (
+                _clean_text(item.get("userId") or item.get("user_id")),
+                _clean_text(item.get("name") or item.get("employeeName")),
+                _clean_text(item.get("email") or item.get("employeeEmail")),
+                _clean_text(item.get("emailSource") or item.get("email_source")),
+            )
+            for item in identities
+        ]
+        records = [item for item in records if item[0] and (item[1] or item[2])]
+        if not records:
+            return 0
+        pool = self.pool
+        if pool is None:
+            return 0
+        async with pool.acquire() as connection:
+            await connection.executemany(
+                """
+                UPDATE usage_daily
+                SET employee_name = $2,
+                    employee_email = $3,
+                    email_source = $4
+                WHERE backend_id = $1 AND user_id = $5
+                  AND (employee_name IS DISTINCT FROM $2
+                       OR employee_email IS DISTINCT FROM $3
+                       OR email_source IS DISTINCT FROM $4)
+                """,
+                [
+                    (backend_id, name, email, email_source, user_id)
+                    for user_id, name, email, email_source in records
+                ],
+            )
+        logger.info("usage identity refreshed backend=%s accounts=%s", backend_id, len(records))
+        return len(records)
 
     async def latest_sync_at(self, start_date: str, end_date: str, backend_ids: list[str] | None = None) -> datetime | None:
         backend_filter = ""
@@ -1583,7 +1654,7 @@ class UsageStore:
         records = await self._require_pool().fetch(
             f"""
             SELECT backend_id, usage_date, user_id, principal_id, MAX(employee_email) AS employee_email,
-                   MAX(employee_name) AS employee_name, source, team_id,
+                   MAX(employee_name) AS employee_name, MAX(email_source) AS email_source, source, team_id,
                    model AS model_name,
                    {self._aggregate_metrics_sql()}
             FROM usage_daily
@@ -1601,7 +1672,7 @@ class UsageStore:
                     "employeeId": principal_id or record["user_id"],
                     "employeeEmail": record["employee_email"] or "",
                     "employeeName": record["employee_name"] or record["user_id"],
-                    "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱",
+                    "bindStatus": _record_bind_status(record),
                     "principalId": principal_id,
                     "_userId": record["user_id"],
                 }
@@ -1707,7 +1778,7 @@ class UsageStore:
         records = await self._require_pool().fetch(
             f"""
             SELECT backend_id, usage_date, user_id, organization_id, team_id, key_id, principal_id,
-                   employee_email, employee_name,
+                   employee_email, employee_name, email_source,
                    source, model, prompt_tokens, completion_tokens, total_tokens,
                    request_count, success_count, failure_count, spend, collected_at
             FROM usage_daily
@@ -1743,6 +1814,8 @@ class UsageStore:
             "principalId": _record_value(record, "principal_id", "") or "",
             "employeeEmail": record["employee_email"],
             "employeeName": record["employee_name"],
+            "emailSource": _record_value(record, "email_source", "") or "",
+            "bindStatus": _record_bind_status(record),
         }
 
     @staticmethod
@@ -2163,6 +2236,7 @@ class UsageStore:
             SELECT u.backend_id, u.usage_date, u.user_id,
                    MAX(u.employee_email) AS employee_email,
                    MAX(u.employee_name) AS employee_name,
+                   MAX(u.email_source) AS email_source,
                    u.source, {model_sql} AS model_name,
                    {self._aggregate_metrics_sql('u.')}
             FROM usage_daily u
@@ -2201,7 +2275,7 @@ class UsageStore:
             await pool.fetch(
                 f"""
             SELECT backend_id, usage_date, user_id, MAX(employee_email) AS employee_email,
-                   MAX(employee_name) AS employee_name, source, {model_sql} AS model_name,
+                   MAX(employee_name) AS employee_name, MAX(email_source) AS email_source, source, {model_sql} AS model_name,
                    {self._aggregate_metrics_sql()}
             FROM usage_daily
             WHERE {where_sql}
@@ -2221,7 +2295,7 @@ class UsageStore:
                     "employeeId": record["user_id"],
                     "employeeName": record["employee_name"] or record["user_id"],
                     "employeeEmail": record["employee_email"] or "",
-                    "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱",
+                    "bindStatus": _record_bind_status(record),
                 }
             )
             enriched.append(row)
@@ -2237,6 +2311,7 @@ class UsageStore:
                 SELECT employee_key, MIN(user_id) AS employee_id,
                        MAX(NULLIF(employee_email, '')) AS employee_email,
                        MAX(NULLIF(employee_name, '')) AS employee_name,
+                       MAX(NULLIF(email_source, '')) AS email_source,
                        -- user_ids 在这一次分组里顺便聚出来。写成相关子查询
                        -- （ARRAY(SELECT ... WHERE employee_key = totals.employee_key)）
                        -- 会让 Postgres 对每个员工重扫一遍 filtered：近 30 天是
@@ -2271,7 +2346,7 @@ class UsageStore:
                 "employeeId": record["employee_id"],
                 "employeeName": record["employee_name"] or record["employee_id"],
                 "employeeEmail": record["employee_email"] or "",
-                "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱",
+                "bindStatus": _record_bind_status(record),
                 **{
                     "promptTokens": _as_int(record["prompt_tokens"]),
                     "completionTokens": _as_int(record["completion_tokens"]),
@@ -2447,6 +2522,7 @@ class UsageStore:
             SELECT u.backend_id, u.usage_date, u.user_id,
                    MAX(u.employee_email) AS employee_email,
                    MAX(u.employee_name) AS employee_name,
+                   MAX(u.email_source) AS email_source,
                    u.team_id, MAX(dn.team_name) AS team_name, '' AS team_role,
                    u.source, {model_sql} AS model_name,
                    {self._aggregate_metrics_sql('u.')}
@@ -2473,7 +2549,7 @@ class UsageStore:
                     "employeeId": record["user_id"],
                     "employeeName": record["employee_name"] or record["user_id"],
                     "employeeEmail": record["employee_email"],
-                    "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱",
+                    "bindStatus": _record_bind_status(record),
                 }
             )
             rows.append(row)
@@ -2491,6 +2567,7 @@ class UsageStore:
                 SELECT employee_key, MIN(user_id) AS employee_id,
                        MAX(NULLIF(employee_email, '')) AS employee_email,
                        MAX(NULLIF(employee_name, '')) AS employee_name,
+                       MAX(NULLIF(email_source, '')) AS email_source,
                        -- 与 admin_rows 同理：相关子查询会按员工数重扫 filtered，
                        -- 这里在同一次分组里聚出 user_ids。
                        ARRAY_AGG(DISTINCT user_id ORDER BY user_id) AS user_ids,
@@ -2517,7 +2594,7 @@ class UsageStore:
                 "employeeId": record["employee_id"],
                 "employeeName": record["employee_name"] or record["employee_id"],
                 "employeeEmail": record["employee_email"] or "",
-                "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱",
+                "bindStatus": _record_bind_status(record),
                 "promptTokens": _as_int(record["prompt_tokens"]),
                 "completionTokens": _as_int(record["completion_tokens"]),
                 "totalTokens": _as_int(record["total_tokens"]),
@@ -2640,6 +2717,7 @@ class UsageStore:
             SELECT u.backend_id, u.usage_date, u.user_id,
                    MAX(u.employee_email) AS employee_email,
                    MAX(u.employee_name) AS employee_name,
+                   MAX(u.email_source) AS email_source,
                    u.source, {model_sql} AS model_name,
                    {self._aggregate_metrics_sql('u.')}
             FROM usage_daily u
@@ -2667,7 +2745,7 @@ class UsageStore:
                     "employeeId": record["user_id"],
                     "employeeName": record["employee_name"] or record["user_id"],
                     "employeeEmail": record["employee_email"] or "",
-                    "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱",
+                    "bindStatus": _record_bind_status(record),
                 }
             )
             rows.append(row)
@@ -2694,6 +2772,7 @@ class UsageStore:
                 SELECT employee_key, MIN(user_id) AS employee_id,
                        MAX(NULLIF(employee_email, '')) AS employee_email,
                        MAX(NULLIF(employee_name, '')) AS employee_name,
+                       MAX(NULLIF(email_source, '')) AS email_source,
                        MAX(team_role) AS team_role,
                        -- 同 admin_rows：避免按成员数重扫 filtered 的相关子查询。
                        ARRAY_AGG(DISTINCT user_id ORDER BY user_id) AS user_ids,
@@ -2718,7 +2797,7 @@ class UsageStore:
                 "employeeId": record["employee_id"],
                 "employeeName": record["employee_name"] or record["employee_id"],
                 "employeeEmail": record["employee_email"] or "",
-                "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱",
+                "bindStatus": _record_bind_status(record),
                 "promptTokens": _as_int(record["prompt_tokens"]),
                 "completionTokens": _as_int(record["completion_tokens"]),
                 "totalTokens": _as_int(record["total_tokens"]),
@@ -2783,7 +2862,7 @@ class UsageStore:
             item = (employee_by_user_id.get(f"email:{member_email}") if member_email else None) or employee_by_user_id.get(f"id:{backend_id}:{member['user_id']}") or employee_by_user_id.get(str(member["user_id"]))
             if item is None:
                 account_id = f"{backend_id}:{member['user_id']}"
-                item = {"employeeId": member["user_id"] if member_email else account_id, "employeeName": member["employee_name"] or member["user_id"], "employeeEmail": member["employee_email"] or "", "bindStatus": "已绑定邮箱" if member["employee_email"] else "未绑定邮箱", **empty_totals(), "primarySource": "其他", "userIds": [account_id], "teamRole": member["team_role"] or "user"}
+                item = {"employeeId": member["user_id"] if member_email else account_id, "employeeName": member["employee_name"] or member["user_id"], "employeeEmail": member["employee_email"] or "", "bindStatus": _record_bind_status(member), **empty_totals(), "primarySource": "其他", "userIds": [account_id], "teamRole": member["team_role"] or "user"}
             else:
                 item = dict(item)
                 item["teamRole"] = member["team_role"] or item.get("teamRole") or "user"
@@ -2831,6 +2910,7 @@ class UsageStore:
             SELECT u.backend_id, u.usage_date, u.user_id,
                    MAX(u.employee_email) AS employee_email,
                    MAX(u.employee_name) AS employee_name,
+                   MAX(u.email_source) AS email_source,
                    u.source, {model_sql} AS model_name,
                    {self._aggregate_metrics_sql('u.')}
             FROM usage_daily u
@@ -2853,14 +2933,14 @@ class UsageStore:
         rows = []
         for record in records:
             row = self._aggregated_usage_row(record)
-            row.update({"employeeId": record["user_id"], "employeeName": record["employee_name"] or record["user_id"], "employeeEmail": record["employee_email"] or "", "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱"})
+            row.update({"employeeId": record["user_id"], "employeeName": record["employee_name"] or record["user_id"], "employeeEmail": record["employee_email"] or "", "bindStatus": _record_bind_status(record)})
             rows.append({key: value for key, value in row.items() if not key.startswith("_")})
         selected_member = members[0]
         selected = {
             "employeeId": selected_user_ids[0],
             "employeeName": selected_member["employee_name"] or selected_user_ids[0],
             "employeeEmail": selected_member["employee_email"] or "",
-            "bindStatus": "已绑定邮箱" if selected_member["employee_email"] else "未绑定邮箱",
+            "bindStatus": _record_bind_status(selected_member),
             "userIds": selected_user_ids,
             "teamRole": selected_member["team_role"] or "user",
             **empty_totals(),
@@ -2911,13 +2991,13 @@ class UsageStore:
                        OR ($6='' AND ($5=lower(btrim(m.user_id)) OR $5=lower(btrim(m.employee_email)) OR $5=lower(btrim(m.employee_name)))))
                 ORDER BY m.backend_id, m.user_id, m.snapshot_date DESC
             )
-            SELECT 'member' AS kind, s.backend_id, s.team_id, s.team_name, s.user_id, s.employee_email, s.employee_name, s.team_role,
+            SELECT 'member' AS kind, s.backend_id, s.team_id, s.team_name, s.user_id, s.employee_email, s.employee_name, ''::text AS email_source, s.team_role,
                    NULL::date AS usage_date, NULL::text AS source, NULL::text AS model_name,
                    0::bigint AS prompt_tokens, 0::bigint AS completion_tokens, 0::bigint AS total_tokens,
                    0::bigint AS request_count, 0::bigint AS success_count, 0::bigint AS failure_count, 0::double precision AS spend
             FROM selected s
             UNION ALL
-            SELECT 'usage', MIN(u.backend_id), NULL, NULL, MIN(u.user_id), MAX(u.employee_email), MAX(u.employee_name), NULL,
+            SELECT 'usage', MIN(u.backend_id), NULL, NULL, MIN(u.user_id), MAX(u.employee_email), MAX(u.employee_name), MAX(u.email_source), NULL,
                    u.usage_date, u.source, {model_sql} AS model_name, {self._aggregate_metrics_sql('u.')}
             FROM usage_daily u
             WHERE u.backend_id=ANY($1::text[]) AND u.usage_date BETWEEN $3::date AND $4::date
@@ -2950,7 +3030,7 @@ class UsageStore:
                     "employeeId": record["user_id"],
                     "employeeName": record["employee_name"] or record["user_id"],
                     "employeeEmail": record["employee_email"] or "",
-                    "bindStatus": "已绑定邮箱" if record["employee_email"] else "未绑定邮箱",
+                    "bindStatus": _record_bind_status(record),
                 }
             )
             rows.append(self._public_rows([row])[0])
@@ -2961,7 +3041,7 @@ class UsageStore:
             "employeeId": first["user_id"] if first["employee_email"] else f"{first['backend_id']}:{first['user_id']}",
             "employeeName": first["employee_name"] or first["user_id"],
             "employeeEmail": first["employee_email"] or "",
-            "bindStatus": "已绑定邮箱" if first["employee_email"] else "未绑定邮箱",
+            "bindStatus": _record_bind_status(first),
             "userIds": user_ids,
             "teamRole": "admin" if any(item["team_role"] == "admin" for item in members) else first["team_role"] or "user",
             **empty_totals(),

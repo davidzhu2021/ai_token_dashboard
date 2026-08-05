@@ -90,7 +90,7 @@ def test_usage_record_persists_non_secret_event_attribution() -> None:
     )
 
     assert record[15:18] == ("org-upstream", "team-at-request-time", "hashed-key-id")
-    assert record[18:] == ("", "explicit", True)
+    assert record[18:] == ("", "explicit", True, "")
     assert record[6] == "gpt-5"
 
 
