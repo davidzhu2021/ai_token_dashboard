@@ -332,6 +332,43 @@ def test_empty_upstream_model_list_does_not_activate_local_signup(tmp_path, monk
     assert payload["entitlementStatus"] == "inactive"
 
 
+def test_customer_membership_activates_an_email_registered_account(tmp_path, monkeypatch) -> None:
+    """成员绑定的是邮箱注册账号时，权限也得跟着成员关系走。
+
+    这类账号有一个注册时建立的个人上游映射，但那个映射从来没有被授予模型，所以
+    只看它会一直判成"等待开通"，哪怕这个人在客户企业下早已有消费。
+    """
+
+    _client, store, upstream = auth_client(tmp_path, monkeypatch)
+    user = store.create_user("person@example.com", "梁海强", hash_auth_token("password"), email_verified=True)
+    store.set_provisioning_status(user["id"], "provisioned", "primary", f"local-{user['id']}")
+    upstream.user_models = []
+    monkeypatch.setattr(main, "organization_real_enabled", lambda: True)
+    monkeypatch.setattr(main, "require_real_organization_capability", lambda: None)
+
+    class MembershipStore:
+        async def resolve_members_by_auth_user_id(self, auth_user_id):
+            assert auth_user_id == str(user["id"])
+            return [
+                {
+                    "organizationId": "org-baic",
+                    "organization": {"id": "org-baic", "status": "active"},
+                    "member": {
+                        "id": "member-1",
+                        "status": "active",
+                        "upstreamUserId": "",
+                        "principalIds": ["principal-lianghaiqiang"],
+                    },
+                }
+            ]
+
+    monkeypatch.setattr(main, "organization_store", lambda: MembershipStore())
+
+    payload = asyncio.run(main.auth_user_payload(user, refresh_entitlement=True))
+
+    assert payload["entitlementStatus"] == "active"
+
+
 def test_password_identity_never_inherits_platform_admin_flags(tmp_path, monkeypatch) -> None:
     _client, store, _upstream = auth_client(tmp_path, monkeypatch)
     monkeypatch.setenv("ADMIN_EMAILS", "seller-admin@example.com")

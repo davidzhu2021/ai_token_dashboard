@@ -2846,10 +2846,11 @@ async def auth_user_payload(user: dict[str, Any], *, refresh_entitlement: bool =
                 # Entitlements are advisory UI state. A transient upstream lookup
                 # must not invalidate an otherwise valid dashboard login.
                 entitlement_status = "inactive"
-    elif account_type == "enterprise_managed":
-        entitlement_status = await managed_account_entitlement_status(
-            user, refresh=refresh_entitlement
-        )
+    if entitlement_status != "active":
+        # 客户企业成员的权限来自成员关系，不是个人注册时那个从未授予过模型的上游
+        # 账号。用户名账号根本没有个人映射，而邮箱注册的账号被平台管理员绑定到成员
+        # 之后同样如此，所以这里对两种账号类型一视同仁地兜底。
+        entitlement_status = await member_account_entitlement_status(user)
     contact_email = str(user.get("email") or user.get("contactEmail") or "").strip().lower()
     login_name = str(user.get("login_name") or user.get("loginName") or "").strip()
     display_identifier = contact_email or login_name
@@ -2910,10 +2911,12 @@ async def create_local_session(request: Request, user: dict[str, Any]) -> tuple[
     return await auth_user_payload(user), csrf_value
 
 
-async def managed_account_entitlement_status(
-    user: dict[str, Any], *, refresh: bool = False
-) -> str:
-    """Resolve a username account's upstream member without personal mapping."""
+async def member_account_entitlement_status(user: dict[str, Any]) -> str:
+    """Resolve entitlement from an active customer membership.
+
+    Membership is the grant: a member is entitled once the customer tenant is
+    adopted upstream and the account owns at least one usage identity there.
+    """
 
     user_id = str(user.get("id") or "")
     if not organization_real_enabled() or not user_id:
@@ -2930,7 +2933,8 @@ async def managed_account_entitlement_status(
             for item in _organization_membership_items(memberships)
             if item.get("status") == "active"
             and item.get("organizationStatus", "active") == "active"
-            and str(item.get("upstreamUserId") or "")
+            # 历史用量身份和建档时生成的上游 id 都算数：老成员可能只有前者。
+            and (str(item.get("upstreamUserId") or "") or list(item.get("principalIds") or []))
         ),
         None,
     )

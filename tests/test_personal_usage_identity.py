@@ -194,3 +194,89 @@ def test_member_usage_reports_provisioning_when_no_identity_exists(
     assert error.value.status_code == 409
     assert error.value.detail["code"] == "ORGANIZATION_MEMBER_PROVISIONING"
     assert store.calls == []
+
+
+class RecordingOrganizationStore:
+    """Answer membership lookups the way the real repository does."""
+
+    def __init__(self, memberships: list[dict[str, Any]]) -> None:
+        self.memberships = memberships
+
+    async def resolve_members_by_auth_user_id(self, auth_user_id: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "organizationId": item.get("organizationId"),
+                "organization": item.get("organization") or {"status": "active"},
+                "member": item,
+            }
+            for item in self.memberships
+        ]
+
+
+def entitlement_for(
+    monkeypatch: pytest.MonkeyPatch, memberships: list[dict[str, Any]]
+) -> str:
+    monkeypatch.setattr(main, "organization_real_enabled", lambda: True)
+    monkeypatch.setattr(main, "require_real_organization_capability", lambda: None)
+    monkeypatch.setattr(
+        main, "organization_store", lambda: RecordingOrganizationStore(memberships)
+    )
+    return asyncio.run(main.member_account_entitlement_status({"id": "auth-user-1"}))
+
+
+def member_record(**overrides: Any) -> dict[str, Any]:
+    base = {
+        "id": "member-1",
+        "status": "active",
+        "organizationId": "org-baic",
+        "organization": {"id": "org-baic", "status": "active"},
+        "upstreamUserId": "customer-member-1",
+        "principalIds": [],
+    }
+    base.update(overrides)
+    return base
+
+
+def test_entitlement_follows_an_active_membership(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert entitlement_for(monkeypatch, [member_record()]) == "active"
+
+
+def test_entitlement_accepts_a_member_carrying_only_usage_identities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """成员只挂着历史用量身份时也算已开通，否则界面会一直停在"等待开通"。"""
+
+    member = member_record(upstreamUserId="", principalIds=["principal-lianghaiqiang"])
+
+    assert entitlement_for(monkeypatch, [member]) == "active"
+
+
+def test_entitlement_stays_inactive_without_any_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    member = member_record(upstreamUserId="", principalIds=[])
+
+    assert entitlement_for(monkeypatch, [member]) == "inactive"
+
+
+def test_entitlement_ignores_an_invited_or_suspended_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert entitlement_for(monkeypatch, [member_record(status="invited")]) == "inactive"
+    assert entitlement_for(monkeypatch, [member_record(status="suspended")]) == "inactive"
+
+
+def test_entitlement_ignores_a_member_of_a_suspended_customer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    member = member_record(organization={"id": "org-baic", "status": "suspended"})
+
+    assert entitlement_for(monkeypatch, [member]) == "inactive"
+
+
+def test_entitlement_is_inactive_when_real_mode_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(main, "organization_real_enabled", lambda: False)
+
+    assert asyncio.run(main.member_account_entitlement_status({"id": "auth-user-1"})) == "inactive"
