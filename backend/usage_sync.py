@@ -98,6 +98,10 @@ class UsageSynchronizer:
         # 建号，同一个人的两个账号里往往只有一个带姓名。
         local_to_emails: dict[str, set[str]] = {}
         local_identity: dict[str, dict[str, str]] = {}
+        # 编号后缀 -> 身份。少数工具账号的邮箱前缀和编号后缀并不一致
+        # （如 `claude-code-t1v` 的邮箱是 `baiyu@`），只能按后缀配对。
+        suffix_to_names: dict[str, set[str]] = {}
+        suffix_identity: dict[str, dict[str, str]] = {}
 
         def remember_local(name: str, email: str, department: str = "") -> None:
             local = email.split("@", 1)[0] if email else ""
@@ -107,6 +111,17 @@ class UsageSynchronizer:
             current = local_identity.setdefault(local, {"name": "", "email": email, "department": ""})
             if name and not current["name"]:
                 current["name"] = name
+            if department and not current["department"]:
+                current["department"] = department
+
+        def remember_tool_suffix(user_id: str, name: str, email: str, department: str = "") -> None:
+            suffix = tool_account_email_prefix(user_id)
+            if not suffix or not name or name == user_id:
+                return
+            suffix_to_names.setdefault(suffix, set()).add(name)
+            current = suffix_identity.setdefault(suffix, {"name": name, "email": "", "department": ""})
+            if email and not current["email"]:
+                current["email"] = email
             if department and not current["department"]:
                 current["department"] = department
 
@@ -134,6 +149,12 @@ class UsageSynchronizer:
                         _email(profile.get("email")),
                         _text(profile.get("department")),
                     )
+                    remember_tool_suffix(
+                        _text(user_id),
+                        _text(profile.get("name")),
+                        _email(profile.get("email")),
+                        _text(profile.get("department")),
+                    )
                 continue
             try:
                 users = await self.client.users(backend)
@@ -146,6 +167,7 @@ class UsageSynchronizer:
                 if name and email:
                     name_to_email.setdefault(name, set()).add(email)
                 remember_local(name, email)
+                remember_tool_suffix(_text(user.get("user_id")), name, email)
         return {
             "byUserId": by_user_id,
             # 只保留唯一映射，同名对应多个邮箱时不做推断。
@@ -155,6 +177,14 @@ class UsageSynchronizer:
                 local: identity
                 for local, identity in local_identity.items()
                 if len(local_to_emails.get(local) or ()) == 1 and identity.get("name")
+            },
+            # 同一后缀对应多个姓名时同样不猜；后缀本身就是个有歧义的邮箱前缀
+            # （同名跨域）时，沿用 byEmailLocal 的保守判断。
+            "byToolSuffix": {
+                suffix: identity
+                for suffix, identity in suffix_identity.items()
+                if len(suffix_to_names.get(suffix) or ()) == 1
+                and len(local_to_emails.get(suffix) or ()) <= 1
             },
         }
 
@@ -186,6 +216,8 @@ class UsageSynchronizer:
             # 两个账号里通常只有一个带姓名，另一个只剩编号。
             prefix = tool_account_email_prefix(user_id)
             paired = (directory.get("byEmailLocal") or {}).get(prefix) if prefix else None
+            if not paired and prefix:
+                paired = (directory.get("byToolSuffix") or {}).get(prefix)
             if paired:
                 if not name or name == user_id:
                     name = _text(paired.get("name")) or name
@@ -696,19 +728,23 @@ class UsageSynchronizer:
             for raw_user_id, raw_rows in log_rows.items():
                 if raw_user_id in known_user_ids:
                     continue
-                # 全量扫描可能带出 /user/list 里没有的账号，跨后端目录仍可能认识它。
-                profile = (directory.get("byUserId") or {}).get(raw_user_id) or {}
-                fallback_name = _text(profile.get("name")) or (
-                    raw_user_id if raw_user_id != "unattributed" else "未归属请求"
-                )
+                # 全量扫描可能带出 /user/list 里没有的账号，跨后端目录与配对的工具账号仍可能认识它。
+                if raw_user_id == "unattributed":
+                    resolved = {"name": "未归属请求", "email": "", "emailSource": ""}
+                else:
+                    resolved = self._apply_identity_directory(
+                        backend, raw_user_id, {"name": "", "email": ""}, directory
+                    )
+                fallback_email = _email(resolved.get("email"))
+                fallback_name = _text(resolved.get("name")) or raw_user_id
                 for row in raw_rows:
                     rows.append(
                         {
                             **row,
                             "_userId": raw_user_id,
-                            "employeeEmail": _email(profile.get("email")),
+                            "employeeEmail": fallback_email,
                             "employeeName": fallback_name,
-                            "emailSource": _text(profile.get("emailSource")) if _email(profile.get("email")) else "",
+                            "emailSource": _text(resolved.get("emailSource")) if fallback_email else "",
                         }
                     )
         if token_mapping_index:

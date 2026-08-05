@@ -22,11 +22,13 @@ class FakeClient:
         users: dict[str, list[dict[str, Any]]],
         profiles: dict[str, dict[str, Any]] | None = None,
         teams: list[dict[str, Any]] | None = None,
+        log_rows: dict[str, list[dict[str, Any]]] | None = None,
     ) -> None:
         self.backends = [PRIMARY, HER]
         self._users = users
         self._profiles = profiles or {}
         self._teams = teams or []
+        self._log_rows = log_rows
 
     async def users(self, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
         return self._users.get(backend.id if backend else "primary", [])
@@ -62,14 +64,22 @@ class FakeClient:
     def _encode_account_id(self, backend: LiteLLMBackend, user_id: str) -> str:
         return user_id
 
+    async def sync_rows_from_logs(
+        self, start_date: str, end_date: str, backend: LiteLLMBackend
+    ) -> tuple[dict[str, list[dict[str, Any]]], bool]:
+        if self._log_rows is None:
+            raise RuntimeError("日志扫描未启用")
+        return {user_id: list(rows) for user_id, rows in self._log_rows.items()}, True
+
 
 def make_synchronizer(
     users: dict[str, list[dict[str, Any]]],
     profiles: dict[str, dict[str, Any]] | None = None,
     teams: list[dict[str, Any]] | None = None,
+    log_rows: dict[str, list[dict[str, Any]]] | None = None,
 ) -> UsageSynchronizer:
     synchronizer = object.__new__(UsageSynchronizer)
-    synchronizer.client = FakeClient(users, profiles, teams)
+    synchronizer.client = FakeClient(users, profiles, teams, log_rows)
     synchronizer.store = None
     synchronizer.organization_repository = None
 
@@ -216,3 +226,74 @@ def test_unassigned_members_are_filled_as_well() -> None:
     unassigned = {item["userId"]: item for item in memberships if item["teamId"] == "unassigned"}
     assert unassigned["claude-code-zhouzhian"]["employeeName"] == "周志安"
     assert unassigned["claude-code-zhouzhian"]["employeeEmail"] == "zhouzhian@auto-link.com.cn"
+
+
+def test_suffix_pairs_are_matched_when_email_prefix_differs() -> None:
+    """少数工具账号的邮箱前缀和编号后缀不一致，只能按编号后缀配对。"""
+
+    synchronizer = make_synchronizer(
+        users={
+            "primary": [
+                {"user_id": "claude-code-t1v", "user_alias": "白羽", "user_email": "baiyu@auto-link.com.cn"},
+                {"user_id": "cursor-t1v", "user_alias": None, "user_email": None},
+            ],
+            "her": [],
+        }
+    )
+
+    rows = {row["_userId"]: row for row in collect_rows(synchronizer, PRIMARY)}
+
+    assert rows["cursor-t1v"]["employeeName"] == "白羽"
+    assert rows["cursor-t1v"]["employeeEmail"] == "baiyu@auto-link.com.cn"
+    assert rows["cursor-t1v"]["emailSource"] == "paired_tool_account"
+
+
+def test_same_suffix_with_two_names_is_not_merged() -> None:
+    synchronizer = make_synchronizer(
+        users={
+            "primary": [
+                {"user_id": "claude-code-x9", "user_alias": "甲", "user_email": None},
+                {"user_id": "cursor-x9", "user_alias": "乙", "user_email": None},
+            ],
+            "her": [],
+        }
+    )
+    directory = asyncio.run(synchronizer._identity_directory())
+
+    assert "x9" not in (directory.get("byToolSuffix") or {})
+
+
+def test_accounts_only_present_in_request_logs_are_named_too() -> None:
+    """全员看板的行来自日志扫描，账号清单里没有的编号同样要补齐身份。"""
+
+    log_row = {
+        "date": "2026-08-01",
+        "source": "Codex",
+        "model": "gpt-5",
+        "promptTokens": 10,
+        "completionTokens": 5,
+        "totalTokens": 15,
+        "requestCount": 1,
+        "successCount": 1,
+        "failureCount": 0,
+        "spend": 0.01,
+    }
+    synchronizer = make_synchronizer(
+        users={
+            "primary": [
+                {"user_id": "claude-code-luoyun", "user_alias": "骆赟", "user_email": "luoyun@auto-link.com.cn"},
+            ],
+            "her": [],
+        },
+        # `cursor-luoyun` 在上游账号清单里不存在，只在请求日志里出现。
+        log_rows={"claude-code-luoyun": [log_row], "cursor-luoyun": [log_row], "unattributed": [log_row]},
+    )
+    synchronizer.collect_memberships = synchronizer._no_memberships  # type: ignore[assignment]
+    snapshot = asyncio.run(synchronizer.collect_backend(PRIMARY, "2026-08-01", "2026-08-01"))
+
+    rows = {row["_userId"]: row for row in snapshot.rows}
+    assert rows["cursor-luoyun"]["employeeName"] == "骆赟"
+    assert rows["cursor-luoyun"]["employeeEmail"] == "luoyun@auto-link.com.cn"
+    assert rows["cursor-luoyun"]["emailSource"] == "paired_tool_account"
+    assert rows["unattributed"]["employeeName"] == "未归属请求"
+    assert rows["unattributed"]["employeeEmail"] == ""
