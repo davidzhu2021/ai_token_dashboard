@@ -3315,13 +3315,40 @@ class LiteLLMClient:
 
     async def users(self, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
         backend = backend or self.backends[0]
+        # 上游默认按 created_at desc 排序，批量建号时这个字段大量相同，
+        # offset 分页因此会同时返回重复行和漏掉账号（实测 1212 条里 78 条重复、
+        # 等量账号缺失，导致姓名/邮箱补齐每轮同步都在抖动）。按主键 user_id
+        # 排序分页才稳定；老版本上游不认排序参数时退回原有请求方式。
+        sort_params: dict[str, Any] | None = {"sort_by": "user_id", "sort_order": "asc"}
         users: list[dict[str, Any]] = []
-        for page in range(1, 101):
-            payload = await self.request_backend(backend, "GET", "/user/list", params={"page": page, "page_size": 100})
-            users.extend(_records(payload))
+        seen_user_ids: set[str] = set()
+        page = 1
+        while page <= 100:
+            params: dict[str, Any] = {"page": page, "page_size": 100, **(sort_params or {})}
+            try:
+                payload = await self.request_backend(backend, "GET", "/user/list", params=params)
+            except Exception:
+                if sort_params is None:
+                    raise
+                logger.warning(
+                    "user list sorting unsupported on backend %s; retrying without sort", backend.id
+                )
+                sort_params = None
+                users = []
+                seen_user_ids = set()
+                page = 1
+                continue
+            for record in _records(payload):
+                user_id = _clean_text(record.get("user_id"))
+                if user_id:
+                    if user_id in seen_user_ids:
+                        continue
+                    seen_user_ids.add(user_id)
+                users.append(record)
             total_pages = _as_int(payload.get("total_pages")) if isinstance(payload, dict) else 0
             if total_pages and page >= total_pages:
                 break
+            page += 1
         return users
 
     async def sync_rows_from_logs(
