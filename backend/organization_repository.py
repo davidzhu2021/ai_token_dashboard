@@ -2706,8 +2706,11 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
                     if member is None:
                         raise OrganizationNotFoundError("member was not found")
                 await conn.execute(
-                    "UPDATE customer_principal SET member_id=$3, "
-                    "status=CASE WHEN $3 IS NULL THEN status "
+                    # $3 must be cast: it is both assigned to a column and tested
+                    # with IS NULL, and the planner cannot infer a type from the
+                    # second use alone (AmbiguousParameterError).
+                    "UPDATE customer_principal SET member_id=$3::text, "
+                    "status=CASE WHEN $3::text IS NULL THEN status "
                     "            WHEN status='pending' THEN 'active' ELSE status END, "
                     "updated_at=now() WHERE organization_id=$1 AND id=$2",
                     organization_id,

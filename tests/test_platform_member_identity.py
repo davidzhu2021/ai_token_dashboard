@@ -11,6 +11,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -784,6 +785,25 @@ def test_repository_binding_rejects_a_member_from_another_customer() -> None:
         asyncio.run(repository.set_principal_member(ORGANIZATION_ID, PRINCIPAL_ID, "member-x"))
 
     assert connection.executed == []
+
+
+def test_repository_binding_casts_every_parameter_it_tests_for_null() -> None:
+    """同一个参数既被赋值又被 IS NULL 判断时，Postgres 推不出类型直接拒绝准备语句。
+
+    这类 AmbiguousParameterError 只在真实连接上才会出现，假连接照样跑过，
+    所以直接盯住发出的语句本身。
+    """
+
+    connection = _PrincipalConnection(status="active", member_id=MEMBER_ID)
+    repository = principal_repository(connection)
+
+    asyncio.run(repository.set_principal_member(ORGANIZATION_ID, PRINCIPAL_ID, ""))
+
+    for query, _args in connection.executed:
+        # A cast turns "$3 IS NULL" into "$3::text IS NULL", so a bare parameter
+        # sitting right in front of IS NULL is exactly the unsafe shape.
+        uncast = re.findall(r"\$\d+ IS NULL", query)
+        assert not uncast, f"{uncast} 缺少显式类型转换：{query}"
 
 
 class _AccountConnection:
