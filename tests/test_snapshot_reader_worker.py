@@ -426,6 +426,53 @@ def _scheduling_worker(now: datetime) -> UsageSyncWorker:
     return UsageSyncWorker(client, object(), now=lambda: now)
 
 
+def test_worker_resumes_cycle_from_last_success_after_restart(monkeypatch) -> None:
+    """重启后跳过启动同步时，周期从上次成功时刻起算，而不是从重启时刻。"""
+
+    monkeypatch.setenv("USAGE_SYNC_INTERVAL_SECONDS", "1800")
+    monkeypatch.setenv("USAGE_SYNC_CALIBRATION_INTERVAL_SECONDS", "21600")
+    started_at = datetime(2026, 8, 5, 6, 4, tzinfo=timezone.utc)
+    last_success = started_at - timedelta(minutes=17)
+    synced: list[int] = []
+
+    class Store:
+        async def connect(self):
+            return None
+
+        async def has_complete_coverage(self, *_args):
+            return True
+
+        async def latest_success_at(self):
+            return last_success
+
+        async def heartbeat_worker(self, *_args, **_kwargs):
+            return None
+
+    client = type("Client", (), {"backends": [type("Backend", (), {"id": "primary"})()]})()
+    clock = {"now": started_at}
+    worker = UsageSyncWorker(client, Store(), now=lambda: clock["now"])
+
+    async def fake_sync(days: int) -> dict:
+        synced.append(days)
+        worker.stop_event.set()
+        return {"status": "ok"}
+
+    async def fake_wait(awaitable, timeout):
+        awaitable.close()
+        clock["now"] = clock["now"] + timedelta(seconds=timeout)
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(worker, "_run_sync", fake_sync)
+    monkeypatch.setattr(worker, "_heartbeat_loop", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(asyncio, "wait_for", fake_wait)
+
+    asyncio.run(worker.run())
+
+    # 距上次成功已过 17 分钟，只需再等 13 分钟，而不是重新等满 30 分钟。
+    assert synced == [2]
+    assert clock["now"] == started_at + timedelta(minutes=13)
+
+
 def test_worker_schedules_recent_refresh_every_interval(monkeypatch) -> None:
     monkeypatch.setenv("USAGE_SYNC_INTERVAL_SECONDS", "1800")
     monkeypatch.setenv("USAGE_SYNC_CALIBRATION_INTERVAL_SECONDS", "21600")

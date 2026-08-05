@@ -175,11 +175,13 @@ class UsageSyncWorker:
             startup_days = await self.startup_sync_days()
             if startup_days is not None:
                 await self._run_sync(startup_days)
+                last_refresh = self.now()
             else:
                 self._current_status = "idle"
                 await self.store.heartbeat_worker(self.worker_id, "idle")
-
-            last_refresh = self.now()
+                # 启动时快照仍新鲜，跳过了同步。周期必须从上一次成功时刻起算，
+                # 否则每次重启都把时钟推后一整个周期，快照年龄会超出新鲜度预算。
+                last_refresh = await self.store.latest_success_at() or self.now()
             last_calibration = self.now()
             while not self.stop_event.is_set():
                 wait_seconds = self.seconds_until_next_sync(
