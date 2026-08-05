@@ -1843,7 +1843,7 @@ function rangeLabel() {
 
 function selectedDepartmentInfo() {
   if (!selectedDepartment) return null;
-  const matched = departmentRankings.find((item) => item.departmentKey === selectedDepartment || item.departmentId === selectedDepartment || item.departmentName === selectedDepartment);
+  const matched = [...departmentRankings, ...departmentPickerOptions].find((item) => item.departmentKey === selectedDepartment || item.departmentId === selectedDepartment || item.departmentName === selectedDepartment);
   return {
     id: matched?.departmentId || selectedDepartment,
     name: matched?.departmentName || selectedDepartment,
@@ -2633,7 +2633,10 @@ function renderDepartmentPickerOptions() {
     const title = document.createElement("strong");
     title.textContent = departmentOptionName(item);
     const meta = document.createElement("span");
-    meta.textContent = `ID：${item.departmentId || "未绑定部门"} · Token：${formatTokens(item.totalTokens || 0)} · 活跃员工：${fmt.format(item.activeEmployees || 0)}`;
+    const hasUsage = Number(item.totalTokens || 0) > 0 || Number(item.requestCount || 0) > 0;
+    meta.textContent = hasUsage
+      ? `ID：${item.departmentId || "未绑定部门"} · Token：${formatTokens(item.totalTokens || 0)} · 活跃员工：${fmt.format(item.activeEmployees || 0)}`
+      : `ID：${item.departmentId || "未绑定部门"} · 当前范围暂无用量`;
 
     button.append(title, meta);
     button.addEventListener("click", () => selectDepartmentOption(item));
@@ -7473,7 +7476,7 @@ async function loadDepartmentData(forceRefresh = false) {
     departmentDataQuality = payload.dataQuality || null;
     departmentCoverage = payload.coverage || null;
     departmentUsageScopeKey = scopeKey;
-    if (!department) departmentPickerOptions = departmentRankings;
+    departmentPickerOptions = payload.departmentOptions || (department ? departmentPickerOptions : departmentRankings);
     lastDepartmentUsageCacheHit = Boolean(payload.cache?.hit);
     const rankingSubject = selectedDepartment ? "员工排行" : "部门排行";
     if (payload.truncated) {

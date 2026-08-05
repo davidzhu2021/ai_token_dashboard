@@ -80,6 +80,7 @@ from .billing_store import (
 from .litellm_client import (
     LiteLLMClient,
     default_date_range,
+    department_key,
     mask_key,
     model_display_name,
     normalize_model_display_name,
@@ -1808,12 +1809,44 @@ async def real_organization_department_usage_payload(
         )
     departments = list(stored.get("departments") or [])
     rows = list(stored.get("rows") or [])
+    local_departments = await organization_scoped_store_call(
+        organization_id, "list_departments", include_archived=False
+    )
+    usage_by_id = {
+        str(item.get("departmentId") or ""): item for item in departments
+    }
+    department_options = []
+    for item in local_departments:
+        upstream_team_id = str(item.get("upstreamTeamId") or "")
+        if not upstream_team_id:
+            continue
+        option = {
+            "departmentKey": department_key(upstream_team_id, str(item.get("name") or upstream_team_id)),
+            "departmentId": upstream_team_id,
+            "departmentName": str(item.get("name") or upstream_team_id),
+            "organizationId": upstream_organization_id,
+            "status": "active",
+            "promptTokens": 0,
+            "completionTokens": 0,
+            "totalTokens": 0,
+            "requestCount": 0,
+            "successCount": 0,
+            "failureCount": 0,
+            "spend": 0.0,
+            "primarySource": "",
+            "activeEmployees": 0,
+        }
+        option.update(usage_by_id.get(upstream_team_id, {}))
+        option["departmentName"] = str(item.get("name") or option["departmentName"])
+        option["departmentKey"] = department_key(upstream_team_id, option["departmentName"])
+        department_options.append(option)
+    matched_ids: set[str] = set()
     if department:
         matched_ids = {
-            str(item.get("departmentId") or "")
-            for item in departments
+            str(item.get("departmentId") or "") for item in department_options
             if department in {
                 str(item.get("departmentId") or ""),
+                str(item.get("departmentKey") or ""),
                 str(item.get("departmentName") or ""),
             }
         }
@@ -1825,12 +1858,16 @@ async def real_organization_department_usage_payload(
             item for item in rows
             if str(item.get("departmentId") or "") in matched_ids
         ]
+        if not matched_ids:
+            departments = []
+            rows = []
     last_synced = stored.get("lastSyncedAt")
     return {
         **stored,
         "rows": rows,
         "summaryRows": UsageStore._group_rows(rows, ("date", "source", "model")),
         "departments": departments,
+        "departmentOptions": department_options,
         "department": department,
         "totalRecords": len(rows),
         "dataFreshness": usage_data_freshness(

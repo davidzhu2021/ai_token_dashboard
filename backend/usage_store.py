@@ -102,6 +102,19 @@ CREATE TABLE IF NOT EXISTS usage_team_membership_daily (
     PRIMARY KEY (backend_id, snapshot_date, team_id, user_id)
 );
 
+CREATE TABLE IF NOT EXISTS usage_department_directory (
+    backend_id TEXT NOT NULL,
+    department_id TEXT NOT NULL,
+    department_name TEXT NOT NULL DEFAULT '',
+    organization_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    synced_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (backend_id, department_id)
+);
+
+CREATE INDEX IF NOT EXISTS usage_department_directory_org_idx
+    ON usage_department_directory (organization_id, status, department_name);
+
 CREATE INDEX IF NOT EXISTS usage_team_membership_lookup_idx
     ON usage_team_membership_daily (backend_id, team_id, snapshot_date);
 CREATE INDEX IF NOT EXISTS usage_team_membership_employee_idx
@@ -691,6 +704,7 @@ class UsageStore:
         memberships: list[dict[str, Any]],
         *,
         events: list[dict[str, Any]] | None = None,
+        departments: list[dict[str, Any]] | None = None,
     ) -> int:
         pool = self._require_pool()
         collected_at = datetime.now(timezone.utc)
@@ -721,6 +735,29 @@ class UsageStore:
                     _as_date(start_date),
                     _as_date(end_date),
                 )
+                if departments is not None:
+                    await connection.execute(
+                        "DELETE FROM usage_department_directory WHERE backend_id=$1",
+                        backend_id,
+                    )
+                    if departments:
+                        await connection.executemany(
+                            """
+                            INSERT INTO usage_department_directory
+                                (backend_id, department_id, department_name, organization_id, status, synced_at)
+                            VALUES ($1,$2,$3,$4,$5,$6)
+                            ON CONFLICT (backend_id, department_id) DO UPDATE SET
+                                department_name=EXCLUDED.department_name,
+                                organization_id=EXCLUDED.organization_id,
+                                status=EXCLUDED.status,
+                                synced_at=EXCLUDED.synced_at
+                            """,
+                            [
+                                (backend_id, str(item.get("departmentId") or ""), str(item.get("departmentName") or ""),
+                                 str(item.get("organizationId") or ""), str(item.get("status") or "active"), collected_at)
+                                for item in departments if str(item.get("departmentId") or "")
+                            ],
+                        )
                 await connection.execute(
                     "DELETE FROM usage_sync_coverage WHERE backend_id = $1 AND usage_date BETWEEN $2::date AND $3::date",
                     backend_id,
@@ -1041,6 +1078,30 @@ class UsageStore:
     async def has_complete_coverage(self, start_date: str, end_date: str, backend_ids: list[str]) -> bool:
         """Return whether every configured backend covers the complete date range."""
         return set(await self.covered_backend_ids(start_date, end_date, backend_ids)) == set(backend_ids)
+
+    async def department_directory(self, backend_ids: list[str], organization_id: str | None = None) -> list[dict[str, Any]]:
+        if not backend_ids:
+            return []
+        conditions = ["backend_id = ANY($1::text[])", "status = 'active'", "department_id <> ''"]
+        args: list[Any] = [backend_ids]
+        if organization_id:
+            args.append(organization_id)
+            conditions.append(f"organization_id = ${len(args)}")
+        rows = await self._require_pool().fetch(
+            "SELECT backend_id, department_id, department_name, organization_id, status "
+            "FROM usage_department_directory WHERE " + " AND ".join(conditions) +
+            " ORDER BY lower(department_name), department_id", *args
+        )
+        return [
+            {
+                "departmentKey": department_key(str(row["department_id"]), str(row["department_name"] or row["department_id"])),
+                "departmentId": str(row["department_id"]),
+                "departmentName": str(row["department_name"] or row["department_id"]),
+                "organizationId": str(row["organization_id"] or ""),
+                "status": str(row["status"] or "active"),
+            }
+            for row in rows
+        ]
 
     async def model_usage_counts(
         self,
@@ -1965,6 +2026,19 @@ class UsageStore:
             }
             for record in department_records
         ]
+        directory = await self.department_directory(covered)
+        usage_by_id = {str(item.get("departmentId")): item for item in departments}
+        for option in directory:
+            current = usage_by_id.get(str(option["departmentId"]))
+            if current:
+                option.update(current)
+                option["departmentKey"] = department_key(str(option["departmentId"]), str(option["departmentName"]))
+            else:
+                option.update({
+                    "promptTokens": 0, "completionTokens": 0, "totalTokens": 0,
+                    "requestCount": 0, "successCount": 0, "failureCount": 0,
+                    "spend": 0.0, "primarySource": "", "activeEmployees": 0,
+                })
         summary_records = await pool.fetch(
             f"""
             SELECT u.usage_date, u.source, {model_sql} AS model_name, {self._aggregate_metrics_sql('u.')}
@@ -1983,6 +2057,7 @@ class UsageStore:
             "rows": public_rows,
             "summaryRows": summary_rows,
             "departments": departments,
+            "departmentOptions": directory,
             "employees": employees,
             "pageLimit": 0,
             "pageSize": 0,

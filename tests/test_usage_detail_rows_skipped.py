@@ -95,6 +95,46 @@ def test_department_rows_uses_event_team_id_without_membership_join() -> None:
     assert any("u.team_id <> ''" in q and "LEFT JOIN" in q for q in department_queries)
 
 
+def test_department_rows_exposes_zero_usage_directory_options_without_ranking_them() -> None:
+    class Pool(_FakePool):
+        async def fetch(self, query: str, *args: Any) -> list[Any]:
+            self.queries.append(" ".join(query.split()))
+            if "FROM usage_department_directory" in query:
+                return [{
+                    "backend_id": "primary",
+                    "department_id": "team-baic",
+                    "department_name": "北汽集团",
+                    "organization_id": "org-baic",
+                    "status": "active",
+                }]
+            return []
+
+    payload = asyncio.run(
+        _store_with(Pool()).department_rows(
+            "2026-08-05", "2026-08-05", "all", None, ["primary"]
+        )
+    )
+
+    assert payload is not None
+    assert payload["departments"] == []
+    assert payload["departmentOptions"] == [{
+        "departmentKey": "team-baic::北汽集团",
+        "departmentId": "team-baic",
+        "departmentName": "北汽集团",
+        "organizationId": "org-baic",
+        "status": "active",
+        "promptTokens": 0,
+        "completionTokens": 0,
+        "totalTokens": 0,
+        "requestCount": 0,
+        "successCount": 0,
+        "failureCount": 0,
+        "spend": 0.0,
+        "primarySource": "",
+        "activeEmployees": 0,
+    }]
+
+
 def test_total_records_falls_back_to_summary_size() -> None:
     """未查明细时统计规模退回聚合行数，避免看板把范围显示成空。"""
     pool = _FakePool()

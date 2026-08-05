@@ -65,6 +65,7 @@ class BackendSnapshot:
     # None means raw event coverage was unavailable and existing event rows
     # must not be replaced by a daily-activity fallback.
     events: list[dict[str, Any]] | None = None
+    departments: list[dict[str, Any]] | None = None
 
 
 class UsageSynchronizer:
@@ -319,16 +320,26 @@ class UsageSynchronizer:
             for snapshot in snapshots:
                 replace_snapshot = self.store.replace_backend_snapshot
                 events = getattr(snapshot, "events", None)
+                departments = getattr(snapshot, "departments", None)
                 supports_events = True
+                supports_departments = False
                 try:
                     signature = inspect.signature(replace_snapshot)
                     supports_events = "events" in signature.parameters or any(
                         parameter.kind is inspect.Parameter.VAR_KEYWORD
                         for parameter in signature.parameters.values()
                     )
+                    supports_departments = "departments" in signature.parameters or any(
+                        parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in signature.parameters.values()
+                    )
                 except (TypeError, ValueError):
                     pass
-                kwargs = {"events": events} if supports_events and events is not None else {}
+                kwargs = {}
+                if supports_events and events is not None:
+                    kwargs["events"] = events
+                if supports_departments:
+                    kwargs["departments"] = departments
                 row_count += await replace_snapshot(
                     snapshot.backend_id,
                     start_date,
@@ -487,11 +498,31 @@ class UsageSynchronizer:
             end_date,
         )
         memberships = await self.collect_memberships(backend, users, start_date, end_date, account_index)
+        directory_teams = getattr(self, "_directory_teams", {}).get(backend.id)
+        if directory_teams is None:
+            try:
+                directory_teams = await self.client.teams(backend, include_details=False)
+            except TypeError:
+                directory_teams = await self.client.teams(backend)
+        departments = [
+            {
+                "departmentId": _text(team.get("team_id") or team.get("id")),
+                "departmentName": _text(team.get("team_alias") or team.get("alias") or team.get("name")) or _text(team.get("team_id") or team.get("id")),
+                "organizationId": _text(team.get("organization_id") or team.get("organizationId") or team.get("org_id") or team.get("orgId")),
+                "status": "blocked" if (
+                    team.get("blocked") is True
+                    or str(team.get("blocked") or "").strip().lower() in {"1", "true", "yes", "on"}
+                ) else "active",
+            }
+            for team in directory_teams
+            if _text(team.get("team_id") or team.get("id"))
+        ]
         return BackendSnapshot(
             backend.id,
             rows,
             memberships,
             event_rows if log_rows is not None else None,
+            departments,
         )
 
     async def collect_memberships(
@@ -503,6 +534,10 @@ class UsageSynchronizer:
         account_index: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         teams = await self.client.teams(backend)
+        directory_cache = getattr(self, "_directory_teams", None)
+        if directory_cache is None:
+            directory_cache = self._directory_teams = {}
+        directory_cache[backend.id] = teams
         user_map = self.client._admin_user_map(users)
         account_index = account_index or {}
         account_by_email: dict[str, list[str]] = {}

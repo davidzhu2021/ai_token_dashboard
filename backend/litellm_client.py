@@ -3785,8 +3785,28 @@ class LiteLLMClient:
         pages_read = 0
         total_pages = 0
         total_records = 0
+        department_options: dict[str, dict[str, Any]] = {}
 
         for backend in self.backends:
+            try:
+                for team in await self.teams(backend, include_details=False):
+                    team_id = str(_first(team, "team_id", "teamId", "id", default="") or "").strip()
+                    blocked = _first(team, "blocked", default=False)
+                    if isinstance(blocked, str):
+                        blocked = blocked.strip().lower() in {"1", "true", "yes", "on"}
+                    if not team_id or bool(blocked):
+                        continue
+                    team_name = str(_first(team, "team_alias", "teamAlias", "alias", "name", default="") or team_id).strip()
+                    logical_key = department_key(team_id, team_name)
+                    department_options.setdefault(logical_key, {
+                        "departmentKey": logical_key,
+                        "departmentId": team_id,
+                        "departmentName": team_name,
+                        "organizationId": str(_first(team, "organization_id", "organizationId", "org_id", "orgId", default="") or ""),
+                        "status": "active",
+                    })
+            except Exception:
+                logger.debug("failed to load department directory for backend %s", backend.id, exc_info=True)
             if backend.source and _source_filter_applies(source) and source != backend.source:
                 continue
             # Load the model directory with the other independent backend metadata.
@@ -3874,10 +3894,15 @@ class LiteLLMClient:
                     continue
 
         truncated = bool(total_pages and pages_read < total_pages)
+        department_summaries = self._department_summaries(rows, departments)
+        summaries_by_id = {str(item.get("departmentId") or ""): item for item in department_summaries}
+        for option in department_options.values():
+            option.update(summaries_by_id.get(str(option.get("departmentId") or ""), {}))
         return {
             "rows": rows,
             "summaryRows": summary_rows or rows,
-            "departments": self._department_summaries(rows, departments),
+            "departments": department_summaries,
+            "departmentOptions": sorted(department_options.values(), key=lambda item: (str(item["departmentName"]).casefold(), str(item["departmentId"]))),
             "employees": self._admin_employee_summaries(rows, employees),
             "pageLimit": max_pages,
             "pageSize": page_size,
