@@ -2659,7 +2659,7 @@ class LiteLLMClient:
                 status = "已过期"
             else:
                 status = "正常"
-            last_used = _first(item, "last_used_at", default=None)
+            last_used = _first(item, "last_active", "last_used_at", default=None)
             created_at = _first(item, "created_at", default=None)
             models = item.get("models") if isinstance(item.get("models"), list) else []
             rotation_fields = {

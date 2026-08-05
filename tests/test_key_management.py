@@ -44,7 +44,7 @@ def test_key_list_only_returns_mask_and_hash_identifier(monkeypatch) -> None:
                     "metadata": {"display_name": "我的 Codex", "purpose": "本机使用"},
                     "models": ["gpt-5"],
                     "created_at": "2026-07-01T01:02:03Z",
-                    "last_used_at": "2026-07-10T01:02:03Z",
+                    "last_active": "2026-07-10T01:02:03Z",
                     "expires": None,
                     "spend": 1.25,
                 }
@@ -59,9 +59,32 @@ def test_key_list_only_returns_mask_and_hash_identifier(monkeypatch) -> None:
     assert raw_key not in str(keys)
     assert keys[0]["name"] == "我的 Codex"
     assert keys[0]["models"] == ["gpt-5"]
+    assert keys[0]["lastUsed"] == "2026-07-10"
     assert keys[0]["_backendId"] == "primary"
     assert keys[0]["_userId"] == "user-1"
     assert keys[0]["_rotation"]["key_alias"] == "internal-alias"
+
+
+def test_key_list_accepts_legacy_last_used_at(monkeypatch) -> None:
+    client, backend = make_client()
+
+    async def fake_request_backend(
+        _backend: LiteLLMBackend, _method: str, _path: str, **_kwargs: Any
+    ) -> dict[str, Any]:
+        return {
+            "keys": [
+                {
+                    "token": "legacy-key-id",
+                    "metadata": {},
+                    "last_used_at": "2026-07-10T01:02:03Z",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+    keys = asyncio.run(client.keys_for_user("user-1", backend))
+
+    assert keys[0]["lastUsed"] == "2026-07-10"
 
 
 def test_key_list_does_not_fake_suffix_from_hash(monkeypatch) -> None:
