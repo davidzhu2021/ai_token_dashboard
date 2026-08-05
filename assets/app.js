@@ -5847,6 +5847,7 @@ function renderOrganizationMembers() {
     const role = String(member.role || "member");
     const status = String(member.status || "invited");
     const departmentName = organizationField(member, "departmentName", "department_name") || "未分配部门";
+    const isTeamLeader = String(organizationField(member, "teamRole", "team_role") || "member") === "leader";
     const joinedAt = organizationField(member, "createdAt", "created_at");
     const realMode = isRealOrganizationMode();
     // 已移除成员是只读墓碑：令牌与账号绑定都已撤销，没有可以就地恢复的操作，
@@ -5879,7 +5880,7 @@ function renderOrganizationMembers() {
             <div class="organization-member-identity"><strong>${escapeHtml(name)}</strong><span>${escapeHtml(email)}</span></div>
           </div>
         </td>
-        <td>${escapeHtml(departmentName)}</td>
+        <td>${escapeHtml(departmentName)}${isTeamLeader ? '<span class="organization-team-role">负责人</span>' : ""}</td>
         <td><span class="organization-role ${escapeHtml(role)}">${escapeHtml(organizationRoleLabel(role))}</span></td>
         <td><span class="organization-status ${escapeHtml(status)}">${escapeHtml(organizationStatusLabel(status))}</span></td>
         <td>${escapeHtml(organizationDate(joinedAt))}</td>
@@ -6941,6 +6942,8 @@ function openOrganizationMemberModal(memberId = "") {
   el("organizationMemberEmailInput").value = member?.email || "";
   el("organizationMemberEmailInput").disabled = isEditing;
   el("organizationMemberRoleInput").value = member?.role || "member";
+  el("organizationMemberTeamRoleInput").value =
+    String(organizationField(member || {}, "teamRole", "team_role") || "member") === "leader" ? "leader" : "member";
   el("organizationMemberStatusInput").value = member?.status || "invited";
   el("organizationMemberModal").classList.remove("hidden");
   window.setTimeout(() => el("organizationMemberNameInput").focus(), 0);
@@ -8401,6 +8404,7 @@ el("organizationMemberForm").addEventListener("submit", async (event) => {
   const email = el("organizationMemberEmailInput").value.trim();
   const departmentId = el("organizationMemberDepartmentInput").value;
   const role = el("organizationMemberRoleInput").value;
+  const teamRole = el("organizationMemberTeamRoleInput").value;
   const status = el("organizationMemberStatusInput").value;
   if (!name || !departmentId) {
     showToast("请填写姓名并选择部门");
@@ -8421,9 +8425,10 @@ el("organizationMemberForm").addEventListener("submit", async (event) => {
           name,
           departmentId,
           role,
+          teamRole,
           ...(!isRealOrganizationMode() ? { status } : {}),
         }
-      : { name, email, departmentId, role };
+      : { name, email, departmentId, role, teamRole };
     await api(
       isEditing
         ? organizationApiPath(`/members/${encodeURIComponent(editingOrganizationMemberId)}`)

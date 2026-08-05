@@ -3568,11 +3568,92 @@ async def department_usage_payload(admin: dict[str, Any], start_date: str, end_d
     return payload
 
 
+def empty_team_scope() -> dict[str, Any]:
+    return {"isTeamLeader": False, "teamBoardStatus": "none", "team": None, "leaderTeams": []}
+
+
+def public_team_scope(scope: dict[str, Any]) -> dict[str, Any]:
+    """Strip internal scope handles (upstream team ids) from a scope response."""
+
+    return {
+        "isTeamLeader": bool(scope.get("isTeamLeader")),
+        "teamBoardStatus": str(scope.get("teamBoardStatus") or "none"),
+        "team": public_team(scope.get("team")),
+        "leaderTeams": [team for team in (public_team(item) for item in scope.get("leaderTeams") or []) if team],
+    }
+
+
+async def real_customer_team_scope(app_user: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a real customer department leader's own team board scope.
+
+    The leader identity is derived only from the membership bound to this local
+    account id.  Matching by email would let an unrelated principal with the
+    same address inherit a customer's team scope, which is exactly what the
+    local-account early return in ``team_scope_for_user`` protects against.
+    """
+
+    if not organization_real_enabled():
+        return empty_team_scope()
+    try:
+        membership = await active_real_organization_membership(app_user)
+    except HTTPException:
+        # A recovering capability must not turn into a failed login; the board
+        # entry simply stays hidden until the directory is readable again.
+        logger.exception("failed to resolve real customer membership for team scope")
+        return empty_team_scope()
+    if not membership or str(membership.get("teamRole") or "") != "leader":
+        return empty_team_scope()
+    organization_id = organization_identifier(membership)
+    department_id = str(membership.get("departmentId") or "")
+    if not organization_id or not department_id:
+        return empty_team_scope()
+    try:
+        department = await organization_scoped_store_call(
+            organization_id, "get_department", department_id
+        )
+    except (HTTPException, OrganizationStoreError, AttributeError, TypeError):
+        logger.exception("failed to resolve department for real team scope")
+        return empty_team_scope()
+    if not isinstance(department, dict) or str(department.get("status") or "") != "active":
+        return empty_team_scope()
+    upstream_team_id = str(department.get("upstreamTeamId") or "")
+    if not upstream_team_id:
+        # The department has no upstream Team yet, so there is no usage scope to
+        # read.  The board appears on its own once provisioning completes.
+        return empty_team_scope()
+    department_name = str(department.get("name") or "")
+    backends = usage_backend_ids()
+    team = {
+        "id": department_id,
+        "name": department_name,
+        "teamRef": f"real-{organization_id}-{department_id}",
+        "departmentId": department_id,
+        "organizationId": organization_id,
+        "memberCount": int(department.get("activeMemberCount") or 0),
+        "backend": backends[0] if backends else "",
+        # The upstream Team id stays server-side: public_team() never exposes
+        # teamScopes, and select_authorized_team() matches on teamRef only.
+        "teamScopes": [
+            {"backend": backend, "id": upstream_team_id, "name": department_name}
+            for backend in backends
+        ],
+    }
+    return {
+        "isTeamLeader": True,
+        "teamBoardStatus": "single",
+        "team": team,
+        "leaderTeams": [team],
+    }
+
+
 async def team_scope_for_user(app_user: dict[str, Any], refresh: bool = False) -> dict[str, Any]:
     # Password and enterprise accounts are intentionally not merged by email.
-    # Local signups therefore never inherit a team-leader scope from SSO data.
+    # Local signups therefore never inherit a team-leader scope from SSO data;
+    # a real customer leader is resolved from its own bound membership instead.
     if app_user.get("id"):
-        return {"isTeamLeader": False, "teamBoardStatus": "none", "team": None, "leaderTeams": [], "cache": {"hit": True, "ttlSeconds": 0}}
+        scope = await real_customer_team_scope(app_user)
+        # 负责人是本地目录数据，改动应当立刻生效，因此这条路径不走权限缓存。
+        return {**scope, "cache": {"hit": True, "ttlSeconds": 0}}
     cache_key = team_auth_cache_key(app_user["email"], app_user.get("name"))
     if not refresh:
         hit, value, ttl_seconds = team_auth_cache.get(cache_key)
@@ -4095,6 +4176,9 @@ class OrganizationMemberCreateRequest(BaseModel):
     email: str = Field(min_length=3, max_length=254)
     departmentId: str = Field(min_length=1, max_length=128)
     role: Literal["admin", "member"] = "member"
+    # 部门职务与企业角色是两件事：负责人只看本部门的团队看板，企业角色才决定
+    # 能不能管理整个企业。默认普通成员，避免调用方漏填时静默放大权限。
+    teamRole: Literal["leader", "member"] = "member"
 
     @field_validator("name", "email", "departmentId")
     @classmethod
@@ -4110,6 +4194,7 @@ class OrganizationMemberUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
     departmentId: str | None = Field(default=None, min_length=1, max_length=128)
     role: Literal["admin", "member"] | None = None
+    teamRole: Literal["leader", "member"] | None = None
     # removed 只为给出清晰错误提示而接受：移除必须走 DELETE 路由，那里才会撤销令牌、
     # 作废邀请并解除登录账号绑定。这里放行到处理函数再拒绝，避免只给一个 422。
     status: Literal["invited", "pending", "active", "suspended", "removed"] | None = None
@@ -4698,6 +4783,10 @@ async def auth_me(request: Request) -> dict[str, Any]:
     user = await auth_user_payload(local_user, refresh_entitlement=True) if local_user else dict(require_user(request))
     if await is_demo_customer_user(user):
         user.update(await demo_team_scope_for_user(user))
+    elif organization_real_enabled() and local_user:
+        # 真实客户负责人只依赖本地目录，这里就能定论，团队看板入口不必等
+        # /api/auth/scope 回来。身份从登录账号本身解析，不看会话里的邮箱。
+        user.update(public_team_scope(await real_customer_team_scope(local_user)))
     else:
         user.update({"isTeamLeader": False, "teamBoardStatus": "loading", "team": None, "leaderTeams": []})
     user.update(await organization_access_fields_for_user(user))
@@ -4979,10 +5068,9 @@ async def auth_scope(request: Request) -> dict[str, Any]:
     await require_non_inactive_demo_identity(user)
     if user.get("id"):
         return {
-            "isTeamLeader": False,
-            "teamBoardStatus": "none",
-            "team": None,
-            "leaderTeams": [],
+            # A local account never inherits an SSO team scope, but a real
+            # customer department leader owns one through its own membership.
+            **public_team_scope(await real_customer_team_scope(user)),
             **(await organization_scope_fields_for_user(user)),
             "billingAvailable": self_service_billing_available(user),
         }
@@ -5545,6 +5633,7 @@ async def organization_create_member(data: OrganizationMemberCreateRequest, requ
             data.email,
             data.departmentId,
             data.role,
+            team_role=data.teamRole,
         )
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
@@ -5568,6 +5657,8 @@ async def organization_update_member(
         updates["department_id"] = data.departmentId
     if "role" in fields:
         updates["role"] = data.role
+    if "teamRole" in fields:
+        updates["team_role"] = data.teamRole
     if "status" in fields:
         reject_member_removal_via_update(data.status)
         reject_direct_real_member_activation(data.status)
@@ -6457,7 +6548,13 @@ async def platform_create_member(
     try:
         operation = "create_member_with_invitation" if organization_real_enabled() else "create_member"
         member = await organization_scoped_store_call(
-            organization_id, operation, data.name, data.email, data.departmentId, data.role
+            organization_id,
+            operation,
+            data.name,
+            data.email,
+            data.departmentId,
+            data.role,
+            team_role=data.teamRole,
         )
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
@@ -6486,6 +6583,8 @@ async def platform_update_member(
         updates["department_id"] = data.departmentId
     if "role" in fields:
         updates["role"] = data.role
+    if "teamRole" in fields:
+        updates["team_role"] = data.teamRole
     if "status" in fields:
         reject_member_removal_via_update(data.status)
         reject_direct_real_member_activation(data.status)
@@ -7918,8 +8017,10 @@ async def team_usage(
         )
         return {"leader": {"email": app_user["email"], "name": app_user["name"]}, "startDate": start_date, "endDate": end_date, "source": source, "teamRef": payload.get("teamRef") or team_ref or "", **payload}
     await require_non_inactive_demo_identity(app_user)
-    if app_user.get("id"):
-        # Password and enterprise SSO accounts remain separate identities.
+    if app_user.get("id") and not organization_real_enabled():
+        # Password and enterprise SSO accounts remain separate identities.  Only a
+        # real customer's own department-leader membership opens a team board; the
+        # leader check inside team_usage_payload still guards that path.
         raise auth_http_error(403, "当前账号还没有团队负责人权限", "AUTH_TEAM_SCOPE_UNAVAILABLE")
     if not start_date or not end_date:
         start_date, end_date = default_date_range()
@@ -7969,8 +8070,9 @@ async def team_member_usage(
         )
         return {"leader": {"email": app_user["email"], "name": app_user["name"]}, "startDate": start_date, "endDate": end_date, "source": source, "teamRef": payload.get("teamRef") or team_ref or "", **payload}
     await require_non_inactive_demo_identity(app_user)
-    if app_user.get("id"):
-        # Local accounts never inherit team scopes from a same-email SSO user.
+    if app_user.get("id") and not organization_real_enabled():
+        # Local accounts never inherit team scopes from a same-email SSO user; the
+        # real-mode leader scope comes from the membership bound to this account.
         raise auth_http_error(403, "当前账号还没有团队负责人权限", "AUTH_TEAM_SCOPE_UNAVAILABLE")
     if not start_date or not end_date:
         start_date, end_date = default_date_range()

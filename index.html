@@ -5544,6 +5544,21 @@
         background: rgba(104, 118, 138, 0.12);
       }
 
+      /* 部门职务不占独立列，跟在部门名后面做轻量标注。 */
+      .organization-team-role {
+        display: inline-flex;
+        align-items: center;
+        min-height: 20px;
+        margin-left: 6px;
+        padding: 0 7px;
+        border-radius: 999px;
+        color: #8a5b16;
+        background: var(--gold-soft);
+        font-size: 11px;
+        font-weight: 800;
+        white-space: nowrap;
+      }
+
       .organization-status.active {
         color: #157347;
         background: rgba(224, 245, 233, 0.9);
@@ -8407,6 +8422,14 @@
           </select>
           <p class="organization-modal-note">企业管理员可维护本企业部门、成员与企业范围权限。</p>
         </div>
+        <div class="field">
+          <label for="organizationMemberTeamRoleInput">部门职务</label>
+          <select id="organizationMemberTeamRoleInput" class="select" required>
+            <option value="member">普通成员</option>
+            <option value="leader">部门负责人</option>
+          </select>
+          <p class="organization-modal-note">部门负责人可查看本部门的团队看板，但看不到企业全员数据。</p>
+        </div>
         <div id="organizationMemberStatusField" class="field hidden">
           <label for="organizationMemberStatusInput">访问状态</label>
           <select id="organizationMemberStatusInput" class="select">
@@ -8626,6 +8649,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260805-fast-navigation"></script>
+    <script src="/assets/app.js?v=20260805-department-leader"></script>
   </body>
 </html>
