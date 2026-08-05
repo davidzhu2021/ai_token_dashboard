@@ -533,6 +533,24 @@ def usage_backend_ids() -> list[str]:
     return [backend.id for backend in client().backends]
 
 
+def resolve_usage_range(start_date: str | None, end_date: str | None) -> tuple[str, str]:
+    """Fall back to the default window and reject ranges that cannot be queried.
+
+    自定义时间筛选让起止日期变成用户可控入参，这里挡掉格式错误和首尾颠倒的组合，
+    否则非法值会一路传到 date.fromisoformat 或 SQL 才报 500。
+    """
+    if not start_date or not end_date:
+        return default_date_range()
+    try:
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="日期格式无效，请重新选择时间范围") from exc
+    if start > end:
+        raise HTTPException(status_code=400, detail="开始日期不能晚于结束日期")
+    return start.isoformat(), end.isoformat()
+
+
 def usage_data_freshness(last_synced: datetime | None, start_date: str, end_date: str) -> dict[str, Any]:
     """Mark only ranges containing today as stale when their snapshot is old."""
     max_age = max(60, env_int("USAGE_LIVE_REFRESH_MAX_AGE_SECONDS", 1800))
@@ -4744,8 +4762,7 @@ async def debug_me_usage_compare(
     if app_user.get("id"):
         raise auth_http_error(403, "本地密码账号不能使用调试接口", "AUTH_LOCAL_DEBUG_UNAVAILABLE")
     await require_non_inactive_demo_identity(app_user)
-    if not start_date or not end_date:
-        start_date, end_date = default_date_range()
+    start_date, end_date = resolve_usage_range(start_date, end_date)
     upstream, mapping_cache = await cached_resolve_user(app_user["email"], app_user.get("name"))
     user_ids = upstream_user_ids(upstream)
     litellm = client()
@@ -4778,8 +4795,7 @@ async def debug_admin_usage_compare(
     if not env_bool("DEBUG_MAPPING_ENABLED", False):
         raise HTTPException(status_code=404, detail="接口不存在")
     require_admin(request)
-    if not start_date or not end_date:
-        start_date, end_date = default_date_range()
+    start_date, end_date = resolve_usage_range(start_date, end_date)
     return await client().admin_usage_compare(start_date, end_date, source)
 
 
@@ -5682,8 +5698,7 @@ async def organization_current_usage(
     """Return persisted real usage or deterministic demo usage by mode."""
 
     user = await require_organization_usage_viewer(request)
-    if not start_date or not end_date:
-        start_date, end_date = default_date_range()
+    start_date, end_date = resolve_usage_range(start_date, end_date)
     organization_id = organization_identifier(organization_current_member(user))
     if organization_real_enabled():
         payload = await real_organization_usage_payload(
@@ -5721,8 +5736,7 @@ async def organization_current_department_usage(
     """Return Mock department usage scoped to the authenticated customer."""
 
     user = await require_organization_usage_viewer(request)
-    if not start_date or not end_date:
-        start_date, end_date = default_date_range()
+    start_date, end_date = resolve_usage_range(start_date, end_date)
     organization_id = organization_identifier(organization_current_member(user))
     if organization_real_enabled():
         payload = await real_organization_department_usage_payload(
@@ -8021,8 +8035,7 @@ async def platform_organization_usage(
     refresh: bool = Query(False),
 ) -> dict[str, Any]:
     await require_platform_organization(request, organization_id)
-    if not start_date or not end_date:
-        start_date, end_date = default_date_range()
+    start_date, end_date = resolve_usage_range(start_date, end_date)
     if organization_real_enabled():
         payload = await real_organization_usage_payload(
             organization_id, start_date=start_date, end_date=end_date, source=source,
@@ -8137,8 +8150,7 @@ async def platform_organization_department_usage(
     refresh: bool = Query(False),
 ) -> dict[str, Any]:
     await require_platform_organization(request, organization_id)
-    if not start_date or not end_date:
-        start_date, end_date = default_date_range()
+    start_date, end_date = resolve_usage_range(start_date, end_date)
     if organization_real_enabled():
         payload = await real_organization_department_usage_payload(
             organization_id, start_date=start_date, end_date=end_date, source=source,
@@ -8178,12 +8190,10 @@ async def my_usage(
 ) -> dict[str, Any]:
     app_user = require_user(request)
     if organization_real_enabled() and await active_real_organization_membership(app_user):
-        if not start_date or not end_date:
-            start_date, end_date = default_date_range()
+        start_date, end_date = resolve_usage_range(start_date, end_date)
         return await personal_usage_payload(app_user, start_date, end_date, source, refresh)
     if await is_demo_customer_user(app_user):
-        if not start_date or not end_date:
-            start_date, end_date = default_date_range()
+        start_date, end_date = resolve_usage_range(start_date, end_date)
         memberships = await organization_memberships_for_user(app_user)
         membership = next(
             item
@@ -8207,8 +8217,7 @@ async def my_usage(
             raise auth_http_error(401, "本地登录已失效，请重新登录", "AUTH_LOGIN_REQUIRED")
         app_user = await auth_user_payload(local_user, refresh_entitlement=True)
         require_active_local_entitlement(app_user)
-    if not start_date or not end_date:
-        start_date, end_date = default_date_range()
+    start_date, end_date = resolve_usage_range(start_date, end_date)
     return await personal_usage_payload(app_user, start_date, end_date, source, refresh)
 
 
@@ -8224,8 +8233,7 @@ async def team_usage(
 ) -> dict[str, Any]:
     app_user = require_user(request)
     if await is_demo_customer_user(app_user):
-        if not start_date or not end_date:
-            start_date, end_date = default_date_range()
+        start_date, end_date = resolve_usage_range(start_date, end_date)
         memberships = await organization_memberships_for_user(app_user)
         membership = next(
             item
@@ -8250,8 +8258,7 @@ async def team_usage(
         # real customer's own department-leader membership opens a team board; the
         # leader check inside team_usage_payload still guards that path.
         raise auth_http_error(403, "当前账号还没有团队负责人权限", "AUTH_TEAM_SCOPE_UNAVAILABLE")
-    if not start_date or not end_date:
-        start_date, end_date = default_date_range()
+    start_date, end_date = resolve_usage_range(start_date, end_date)
     payload = await team_usage_payload(app_user, start_date, end_date, source, refresh, team_ref, include_member_rankings)
     return {
         "leader": {"email": app_user["email"], "name": app_user["name"]},
@@ -8275,8 +8282,7 @@ async def team_member_usage(
 ) -> dict[str, Any]:
     app_user = require_user(request)
     if await is_demo_customer_user(app_user):
-        if not start_date or not end_date:
-            start_date, end_date = default_date_range()
+        start_date, end_date = resolve_usage_range(start_date, end_date)
         if not employee:
             raise HTTPException(status_code=400, detail="请选择要查看的团队成员")
         memberships = await organization_memberships_for_user(app_user)
@@ -8302,8 +8308,7 @@ async def team_member_usage(
         # Local accounts never inherit team scopes from a same-email SSO user; the
         # real-mode leader scope comes from the membership bound to this account.
         raise auth_http_error(403, "当前账号还没有团队负责人权限", "AUTH_TEAM_SCOPE_UNAVAILABLE")
-    if not start_date or not end_date:
-        start_date, end_date = default_date_range()
+    start_date, end_date = resolve_usage_range(start_date, end_date)
     if not employee:
         raise HTTPException(status_code=400, detail="请选择要查看的团队成员")
     payload = await team_member_usage_payload(app_user, start_date, end_date, source, employee, refresh, team_ref)
@@ -8328,8 +8333,7 @@ async def my_usage_logs(
 ) -> dict[str, Any]:
     app_user = require_user(request)
     if organization_real_enabled() and await active_real_organization_membership(app_user):
-        if not start_date or not end_date:
-            start_date, end_date = default_date_range()
+        start_date, end_date = resolve_usage_range(start_date, end_date)
         payload = await personal_usage_payload(app_user, start_date, end_date, source)
         rows = payload["rows"]
         start = (page - 1) * page_size
@@ -8342,8 +8346,7 @@ async def my_usage_logs(
             "cache": payload.get("cache", {"hit": False, "ttlSeconds": 0}),
         }
     if await is_demo_customer_user(app_user):
-        if not start_date or not end_date:
-            start_date, end_date = default_date_range()
+        start_date, end_date = resolve_usage_range(start_date, end_date)
         memberships = await organization_memberships_for_user(app_user)
         membership = next(
             item
@@ -8368,8 +8371,7 @@ async def my_usage_logs(
             raise auth_http_error(401, "本地登录已失效，请重新登录", "AUTH_LOGIN_REQUIRED")
         app_user = await auth_user_payload(local_user, refresh_entitlement=True)
         require_active_local_entitlement(app_user)
-    if not start_date or not end_date:
-        start_date, end_date = default_date_range()
+    start_date, end_date = resolve_usage_range(start_date, end_date)
     payload = await personal_usage_payload(app_user, start_date, end_date, source)
     rows = payload["rows"]
     start = (page - 1) * page_size
@@ -8394,8 +8396,7 @@ async def admin_usage(
     refresh: bool = Query(False),
 ) -> dict[str, Any]:
     admin = require_admin(request)
-    if not start_date or not end_date:
-        start_date, end_date = default_date_range()
+    start_date, end_date = resolve_usage_range(start_date, end_date)
     payload = await admin_usage_payload(admin, start_date, end_date, source, employee, refresh)
     return {
         "admin": {"email": admin["email"], "name": admin["name"]},
@@ -8417,8 +8418,7 @@ async def admin_users(
     refresh: bool = Query(False),
 ) -> dict[str, Any]:
     admin = require_admin(request)
-    if not start_date or not end_date:
-        start_date, end_date = default_date_range()
+    start_date, end_date = resolve_usage_range(start_date, end_date)
     payload = await admin_usage_payload(admin, start_date, end_date, source, q, refresh)
     return {"users": payload["employees"], "total": len(payload["employees"]), "startDate": start_date, "endDate": end_date, "source": source, "cache": payload.get("cache", {"hit": False, "ttlSeconds": 0})}
 
@@ -8433,8 +8433,7 @@ async def admin_departments_usage(
     refresh: bool = Query(False),
 ) -> dict[str, Any]:
     admin = require_admin(request)
-    if not start_date or not end_date:
-        start_date, end_date = default_date_range()
+    start_date, end_date = resolve_usage_range(start_date, end_date)
     payload = await department_usage_payload(admin, start_date, end_date, source, department, refresh)
     return {
         "admin": {"email": admin["email"], "name": admin["name"]},

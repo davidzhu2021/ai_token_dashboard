@@ -625,8 +625,39 @@ function localDate(date) {
   return new Date(date.getTime() - offset).toISOString().slice(0, 10);
 }
 
+// 自定义范围只允许落在后台回填窗口内，避免用户选到根本没有快照的区间。
+const CUSTOM_RANGE_MAX_DAYS = 90;
+let customDateRange = null;
+let lastPresetRangeValue = "1";
+
+function daysBetween(startDate, endDate) {
+  // 用 UTC 解析 YYYY-MM-DD 求含首尾天数，绕开本地时区与夏令时带来的偏移。
+  const toUtc = (value) => {
+    const [year, month, day] = String(value).split("-").map(Number);
+    return Date.UTC(year, (month || 1) - 1, day || 1);
+  };
+  const span = Math.round((toUtc(endDate) - toUtc(startDate)) / 86400000) + 1;
+  return span > 0 ? span : 1;
+}
+
+function customRangeBounds() {
+  const today = new Date();
+  const earliest = new Date(today);
+  earliest.setDate(today.getDate() - (CUSTOM_RANGE_MAX_DAYS - 1));
+  return { min: localDate(earliest), max: localDate(today) };
+}
+
+function isCustomRangeActive() {
+  return el("rangeSelect").value === "custom" && Boolean(customDateRange);
+}
+
 function selectedDateRange() {
-  const days = Number(el("rangeSelect").value || 30);
+  if (isCustomRangeActive()) {
+    const { startDate, endDate } = customDateRange;
+    return { startDate, endDate, days: daysBetween(startDate, endDate) };
+  }
+  // 弹层打开但尚未应用时仍按上一个预设取数，避免出现无意义的中间态。
+  const days = Number(el("rangeSelect").value) || Number(lastPresetRangeValue) || 30;
   const end = new Date();
   const start = new Date(end);
   start.setDate(end.getDate() - days + 1);
@@ -1846,7 +1877,8 @@ function displaySource(source) {
 }
 
 function rangeLabel() {
-  return `近 ${el("rangeSelect").value} 天`;
+  if (isCustomRangeActive()) return selectedDateRangeText();
+  return `近 ${el("rangeSelect").value === "custom" ? lastPresetRangeValue : el("rangeSelect").value} 天`;
 }
 
 function selectedDepartmentInfo() {
@@ -7562,6 +7594,7 @@ function switchView(view) {
   el("billingView").classList.toggle("hidden", view !== "billing");
   el("modelsView").classList.toggle("hidden", view !== "models");
   el("dashboardFilters").classList.toggle("hidden", view === "models" || view === "keys" || view === "billing" || view === "customers" || view === "organization" || view === "organization-tokens");
+  closeCustomRangePanel();
   renderOrganizationWorkspaceBar(view);
   const isCustomerDetailView = isViewingCustomerOrganization()
     && ["organization", "organization-tokens", "admin", "department", "billing"].includes(view);
@@ -8990,7 +9023,117 @@ async function reloadForFilterChange() {
   await loadCurrentViewData();
 }
 
-el("rangeSelect").addEventListener("change", reloadForFilterChange);
+function setCustomRangeHint(message, isError = false) {
+  const hint = el("customRangeHint");
+  if (!hint) return;
+  hint.textContent = message;
+  hint.classList.toggle("is-error", isError);
+}
+
+function resetCustomRangeValidation() {
+  el("customRangeStart").removeAttribute("aria-invalid");
+  el("customRangeEnd").removeAttribute("aria-invalid");
+  setCustomRangeHint(`最多可查询最近 ${CUSTOM_RANGE_MAX_DAYS} 天，且不能选择未来日期。`);
+}
+
+function openCustomRangePanel() {
+  const panel = el("customRangePanel");
+  if (!panel) return;
+  const bounds = customRangeBounds();
+  const current = customDateRange || selectedDateRange();
+  [el("customRangeStart"), el("customRangeEnd")].forEach((input) => {
+    input.min = bounds.min;
+    input.max = bounds.max;
+  });
+  el("customRangeStart").value = current.startDate;
+  el("customRangeEnd").value = current.endDate;
+  resetCustomRangeValidation();
+  panel.classList.remove("hidden");
+  el("customRangeStart").focus();
+}
+
+function closeCustomRangePanel(revert = false) {
+  const panel = el("customRangePanel");
+  if (!panel || panel.classList.contains("hidden")) return;
+  panel.classList.add("hidden");
+  // 只有在还没有生效的自定义区间时才回退下拉框，否则会丢掉已应用的选择。
+  if (revert && !customDateRange) el("rangeSelect").value = lastPresetRangeValue;
+}
+
+function applyPresetRange(value) {
+  customDateRange = null;
+  lastPresetRangeValue = value;
+  el("customRangeOption").textContent = "自定义…";
+  el("rangeSelect").value = value;
+  closeCustomRangePanel();
+}
+
+function customRangeError(startDate, endDate) {
+  if (!startDate || !endDate) return { message: "请选择完整的开始与结束日期。", field: startDate ? "end" : "start" };
+  const bounds = customRangeBounds();
+  if (startDate > endDate) return { message: "开始日期不能晚于结束日期。", field: "start" };
+  if (endDate > bounds.max) return { message: "结束日期不能晚于今天。", field: "end" };
+  if (startDate < bounds.min) return { message: `开始日期最早为 ${bounds.min}。`, field: "start" };
+  if (daysBetween(startDate, endDate) > CUSTOM_RANGE_MAX_DAYS) {
+    return { message: `查询跨度最多 ${CUSTOM_RANGE_MAX_DAYS} 天。`, field: "start" };
+  }
+  return null;
+}
+
+async function applyCustomRange() {
+  const startDate = el("customRangeStart").value;
+  const endDate = el("customRangeEnd").value;
+  const error = customRangeError(startDate, endDate);
+  resetCustomRangeValidation();
+  if (error) {
+    el(error.field === "end" ? "customRangeEnd" : "customRangeStart").setAttribute("aria-invalid", "true");
+    setCustomRangeHint(error.message, true);
+    showToast(error.message);
+    return;
+  }
+  customDateRange = { startDate, endDate };
+  el("rangeSelect").value = "custom";
+  el("customRangeOption").textContent = selectedDateRangeText();
+  closeCustomRangePanel();
+  await reloadForFilterChange();
+}
+
+el("rangeSelect").addEventListener("mousedown", (event) => {
+  // 已处于自定义态时直接弹面板，省去"再选一次自定义"这一步；键盘操作仍走原生列表。
+  if (el("rangeSelect").value !== "custom") return;
+  event.preventDefault();
+  const panel = el("customRangePanel");
+  if (panel.classList.contains("hidden")) openCustomRangePanel();
+  else closeCustomRangePanel();
+});
+
+el("rangeSelect").addEventListener("change", async () => {
+  if (el("rangeSelect").value === "custom") {
+    openCustomRangePanel();
+    return;
+  }
+  applyPresetRange(el("rangeSelect").value);
+  await reloadForFilterChange();
+});
+
+el("customRangeApply").addEventListener("click", applyCustomRange);
+
+el("customRangeCancel").addEventListener("click", () => closeCustomRangePanel(true));
+
+el("customRangePanel").querySelectorAll("[data-range-preset]").forEach((button) => {
+  button.addEventListener("click", async () => {
+    applyPresetRange(button.dataset.rangePreset);
+    await reloadForFilterChange();
+  });
+});
+
+// 用 mousedown 而不是 click 判定"点到外面"：原生下拉列表与日期日历都是浏览器控件，
+// 在它们上面的点击不会冒泡成 document 事件，避免刚打开就被自己的 click 关掉。
+document.addEventListener("mousedown", (event) => {
+  if (el("customRangePanel").classList.contains("hidden")) return;
+  if (event.target.closest("#customRangePanel") || event.target.closest("#rangeSelect")) return;
+  closeCustomRangePanel(true);
+});
 
 el("sourceSelect").addEventListener("change", reloadForFilterChange);
 
@@ -9433,6 +9576,10 @@ document.querySelectorAll(".modal-backdrop").forEach((backdrop) => {
 
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
+  if (!el("customRangePanel").classList.contains("hidden")) {
+    closeCustomRangePanel(true);
+    return;
+  }
   if (!el("newKeyModal").classList.contains("hidden")) clearPlainKey();
   else if (!el("deleteKeyModal").classList.contains("hidden")) closeDeleteKeyModal();
   else if (!el("regenerateKeyModal").classList.contains("hidden")) closeRegenerateKeyModal();

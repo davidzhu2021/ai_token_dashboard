@@ -1535,6 +1535,96 @@
         pointer-events: none;
       }
 
+      .range-picker {
+        position: relative;
+        min-width: 0;
+      }
+
+      .range-panel {
+        position: absolute;
+        top: calc(100% + 8px);
+        left: 0;
+        z-index: 60;
+        display: grid;
+        gap: 10px;
+        min-width: 260px;
+        padding: 14px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--panel-strong);
+        box-shadow: var(--shadow);
+        color: var(--ink);
+        text-align: left;
+      }
+
+      .range-panel.hidden {
+        display: none;
+      }
+
+      .range-panel-presets {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .range-preset {
+        min-height: 30px;
+        padding: 0 10px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: var(--paper);
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      .range-preset:hover {
+        border-color: var(--brand);
+        color: var(--brand);
+        background: var(--ice);
+      }
+
+      .range-panel-field {
+        display: grid;
+        gap: 6px;
+      }
+
+      .range-panel-field label {
+        font-size: 13px;
+        color: var(--muted);
+        font-weight: 700;
+      }
+
+      .range-panel-field .input {
+        min-height: 38px;
+        font-size: 14px;
+      }
+
+      .range-panel-hint {
+        margin: 0;
+        font-size: 12px;
+        line-height: 1.5;
+        color: var(--muted);
+      }
+
+      .range-panel-hint.is-error {
+        color: var(--rose);
+      }
+
+      .range-panel-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+      }
+
+      .range-panel-actions .ghost-btn,
+      .range-panel-actions .primary-btn {
+        min-height: 36px;
+        padding: 0 14px;
+        font-size: 14px;
+      }
+
       .user-pill {
         display: flex;
         align-items: center;
@@ -4649,6 +4739,12 @@
           font-size: inherit;
         }
 
+        .range-panel {
+          left: 0;
+          right: 0;
+          min-width: 0;
+        }
+
         .admin-toolbar,
         .admin-detail-head {
           align-items: stretch;
@@ -6670,12 +6766,36 @@
           <div class="top-controls">
             <div class="filter-zone">
               <div id="dashboardFilters" class="dashboard-filters">
-                <select id="rangeSelect" class="select" aria-label="日期范围">
-                  <option value="1" selected>近 1 天</option>
-                  <option value="7">近 7 天</option>
-                  <option value="14">近 14 天</option>
-                  <option value="30">近 30 天</option>
-                </select>
+                <div class="range-picker">
+                  <select id="rangeSelect" class="select" aria-label="日期范围">
+                    <option value="1" selected>近 1 天</option>
+                    <option value="7">近 7 天</option>
+                    <option value="14">近 14 天</option>
+                    <option value="30">近 30 天</option>
+                    <option id="customRangeOption" value="custom">自定义…</option>
+                  </select>
+                  <div id="customRangePanel" class="range-panel hidden" role="dialog" aria-label="自定义时间范围">
+                    <div class="range-panel-presets">
+                      <button class="range-preset" type="button" data-range-preset="1">近 1 天</button>
+                      <button class="range-preset" type="button" data-range-preset="7">近 7 天</button>
+                      <button class="range-preset" type="button" data-range-preset="14">近 14 天</button>
+                      <button class="range-preset" type="button" data-range-preset="30">近 30 天</button>
+                    </div>
+                    <div class="range-panel-field">
+                      <label for="customRangeStart">开始日期</label>
+                      <input id="customRangeStart" class="input" type="date" />
+                    </div>
+                    <div class="range-panel-field">
+                      <label for="customRangeEnd">结束日期</label>
+                      <input id="customRangeEnd" class="input" type="date" />
+                    </div>
+                    <p id="customRangeHint" class="range-panel-hint">最多可查询最近 90 天，且不能选择未来日期。</p>
+                    <div class="range-panel-actions">
+                      <button id="customRangeCancel" class="ghost-btn" type="button">取消</button>
+                      <button id="customRangeApply" class="primary-btn" type="button">应用</button>
+                    </div>
+                  </div>
+                </div>
                 <select id="sourceSelect" class="select" aria-label="来源筛选">
                   <option value="all">全部来源</option>
                   <option value="Cursor">Codex</option>
@@ -8744,6 +8864,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260805-team-member-keys"></script>
+    <script src="/assets/app.js?v=20260805-custom-range"></script>
   </body>
 </html>
