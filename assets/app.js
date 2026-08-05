@@ -668,12 +668,12 @@ function overviewContext(latestDate) {
 }
 
 function freshnessText(freshness) {
-  if (!freshness) return "数据更新时间：实时查询";
+  if (!freshness) return "数据更新时间：最近一次同步";
   if (!freshness.lastSyncedAt) return "数据更新时间：暂未同步";
   const parsed = new Date(freshness.lastSyncedAt);
   if (Number.isNaN(parsed.getTime())) return "数据更新时间：未知";
   const timeText = parsed.toLocaleString("zh-CN", { hour12: false });
-  return `${freshness.stale ? "数据更新时间（待刷新）" : "数据更新时间"}：${timeText}`;
+  return `${freshness.stale ? "数据更新时间（后台同步中）" : "数据更新时间"}：${timeText}`;
 }
 
 function usageStatusState(freshness = null, dataQuality = null, coverage = null) {
@@ -697,7 +697,7 @@ function usageStatusState(freshness = null, dataQuality = null, coverage = null)
     return {
       tone: "warning",
       title: "数据等待刷新",
-      description: "最近一次同步已超过当前数据时效，请刷新后再用于结算或经营判断。",
+      description: "当前仍展示最近一次已提交快照；同步完成后页面会读取到新版本。",
     };
   }
   return null;
@@ -7727,10 +7727,7 @@ async function showApp(user) {
     await scopePromise;
     return;
   }
-  // 模型目录不在首屏渲染路径上（仪表盘不读 modelCatalog），而它冷缓存时要打上游
-  // /models 与 /model/info，是引导期最慢的一段。改为后台预取：首屏只等用量与权限，
-  // 切到模型广场时若预取还没回来，switchView 会复用这个在途请求。
-  loadModels({ silent: true });
+  // 模型目录只在进入模型广场时加载，避免登录首屏产生无关的上游请求。
   await Promise.all([loadCurrentViewData(), scopePromise]);
 }
 
@@ -8723,27 +8720,27 @@ el("refreshButton").addEventListener("click", async () => {
     showToast("\u5df2\u5237\u65b0\u6a21\u578b\u5217\u8868");
   } else if (currentView === "admin") {
     await loadAdminData(true);
-    showToast("已刷新全员用量");
+    showToast("已读取最近一次同步数据");
   } else if (currentView === "team") {
     if (selectedTeamEmployee) {
       await Promise.all([
         loadTeamMemberData(selectedTeamEmployee, true, false),
         loadTeamRankingData(true),
       ]);
-      showToast("已刷新成员明细");
+      showToast("已读取最近一次同步数据");
     } else {
       await loadTeamData(true);
-      showToast("已刷新团队用量");
+      showToast("已读取最近一次同步数据");
     }
   } else if (currentView === "department") {
     await loadDepartmentData(true);
-    showToast("已刷新部门用量");
+    showToast("已读取最近一次同步数据");
   } else if (currentView === "organization") {
     await loadOrganizationData();
     showToast("已刷新企业组织");
   } else {
     await loadDashboardData(true);
-    showToast("已刷新个人用量");
+    showToast("已读取最近一次同步数据");
   }
 });
 

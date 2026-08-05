@@ -343,37 +343,51 @@ class UsageSynchronizer:
                     errors.append(f"{backend.id}: {exc.__class__.__name__}")
 
             row_count = 0
-            for snapshot in snapshots:
-                replace_snapshot = self.store.replace_backend_snapshot
-                events = getattr(snapshot, "events", None)
-                departments = getattr(snapshot, "departments", None)
-                supports_events = True
-                supports_departments = False
-                try:
-                    signature = inspect.signature(replace_snapshot)
-                    supports_events = "events" in signature.parameters or any(
-                        parameter.kind is inspect.Parameter.VAR_KEYWORD
-                        for parameter in signature.parameters.values()
-                    )
-                    supports_departments = "departments" in signature.parameters or any(
-                        parameter.kind is inspect.Parameter.VAR_KEYWORD
-                        for parameter in signature.parameters.values()
-                    )
-                except (TypeError, ValueError):
-                    pass
-                kwargs = {}
-                if supports_events and events is not None:
-                    kwargs["events"] = events
-                if supports_departments:
-                    kwargs["departments"] = departments
-                row_count += await replace_snapshot(
-                    snapshot.backend_id,
-                    start_date,
-                    end_date,
-                    snapshot.rows,
-                    snapshot.memberships,
-                    **kwargs,
+            snapshot_revision: str | None = None
+            expected_backend_count = len(self.client.backends)
+            publish_snapshots = getattr(self.store, "publish_snapshots", None)
+            if not errors and len(snapshots) == expected_backend_count and callable(publish_snapshots):
+                published = await publish_snapshots(start_date, end_date, snapshots)
+                row_count = int(published.get("rowCount") or 0)
+                snapshot_revision = _text(published.get("snapshotRevision")) or None
+            elif errors:
+                logger.warning(
+                    "usage snapshot publish skipped because collection was incomplete backends=%s/%s",
+                    len(snapshots),
+                    expected_backend_count,
                 )
+            else:
+                for snapshot in snapshots:
+                    replace_snapshot = self.store.replace_backend_snapshot
+                    events = getattr(snapshot, "events", None)
+                    departments = getattr(snapshot, "departments", None)
+                    supports_events = True
+                    supports_departments = False
+                    try:
+                        signature = inspect.signature(replace_snapshot)
+                        supports_events = "events" in signature.parameters or any(
+                            parameter.kind is inspect.Parameter.VAR_KEYWORD
+                            for parameter in signature.parameters.values()
+                        )
+                        supports_departments = "departments" in signature.parameters or any(
+                            parameter.kind is inspect.Parameter.VAR_KEYWORD
+                            for parameter in signature.parameters.values()
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                    kwargs = {}
+                    if supports_events and events is not None:
+                        kwargs["events"] = events
+                    if supports_departments:
+                        kwargs["departments"] = departments
+                    row_count += await replace_snapshot(
+                        snapshot.backend_id,
+                        start_date,
+                        end_date,
+                        snapshot.rows,
+                        snapshot.memberships,
+                        **kwargs,
+                    )
             status = "partial" if errors and snapshots else "failed" if errors else "ok"
             await self.store.finish_sync_run(run_id, status, len(snapshots), row_count, "; ".join(errors))
             return {
@@ -381,6 +395,7 @@ class UsageSynchronizer:
                 "rowCount": row_count,
                 "backendCount": len(snapshots),
                 "errors": errors,
+                "snapshotRevision": snapshot_revision,
             }
         except Exception as exc:
             await self.store.finish_sync_run(run_id, "failed", len(snapshots), 0, exc.__class__.__name__)
@@ -698,6 +713,9 @@ async def run_sync_with_recent_refresh(
         )
     output = dict(result)
     output["recentRefresh"] = {"days": recent_days, **recent_result}
+    output["snapshotRevision"] = (
+        recent_result.get("snapshotRevision") or result.get("snapshotRevision")
+    )
     if recent_result.get("status") != "ok":
         output["status"] = "partial"
         output["errors"] = [

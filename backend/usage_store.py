@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import uuid
 from collections import defaultdict
 from datetime import date, datetime, timezone
 from typing import Any
@@ -12,7 +13,12 @@ try:
 except ImportError:  # pragma: no cover - optional for local development
     asyncpg = None  # type: ignore[assignment]
 
-from .litellm_client import department_key, normalize_model_display_name, normalize_team_text
+from .litellm_client import (
+    department_key,
+    normalize_model_display_name,
+    normalize_team_text,
+    team_identity_key,
+)
 
 
 USAGE_SCHEMA = """
@@ -138,6 +144,32 @@ CREATE TABLE IF NOT EXISTS usage_sync_runs (
 
 CREATE INDEX IF NOT EXISTS usage_sync_runs_dates_idx
     ON usage_sync_runs (start_date, end_date, status, finished_at DESC);
+
+CREATE TABLE IF NOT EXISTS usage_snapshot_state (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    revision TEXT NOT NULL DEFAULT '',
+    published_at TIMESTAMPTZ,
+    start_date DATE,
+    end_date DATE,
+    backend_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[]
+);
+
+CREATE TABLE IF NOT EXISTS usage_sync_state (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    worker_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'starting',
+    heartbeat_at TIMESTAMPTZ,
+    last_started_at TIMESTAMPTZ,
+    last_finished_at TIMESTAMPTZ,
+    last_success_at TIMESTAMPTZ,
+    last_error TEXT NOT NULL DEFAULT '',
+    snapshot_revision TEXT NOT NULL DEFAULT ''
+);
+
+INSERT INTO usage_snapshot_state (singleton) VALUES (TRUE)
+ON CONFLICT (singleton) DO NOTHING;
+INSERT INTO usage_sync_state (singleton) VALUES (TRUE)
+ON CONFLICT (singleton) DO NOTHING;
 
 -- Non-content request metadata used for historical attribution and intraday
 -- billing cutoffs. Prompts, responses, and plaintext credentials are omitted.
@@ -358,7 +390,15 @@ class UsageStore:
         enabled = os.getenv("USAGE_SYNC_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
         if not enabled or not dsn:
             return None
-        return cls(dsn)
+        try:
+            min_size = max(1, int(os.getenv("USAGE_DB_POOL_MIN_SIZE", "1")))
+        except ValueError:
+            min_size = 1
+        try:
+            max_size = max(min_size, int(os.getenv("USAGE_DB_POOL_MAX_SIZE", "5")))
+        except ValueError:
+            max_size = max(5, min_size)
+        return cls(dsn, min_size=min_size, max_size=max_size)
 
     async def connect(self) -> None:
         if self.pool is not None:
@@ -437,6 +477,121 @@ class UsageStore:
             row_count,
             error_message[:2000],
             run_id,
+        )
+
+    async def update_worker_state(
+        self,
+        *,
+        worker_id: str,
+        status: str,
+        heartbeat_at: datetime | None = None,
+        last_started_at: datetime | None = None,
+        last_finished_at: datetime | None = None,
+        last_success_at: datetime | None = None,
+        last_error: str | None = None,
+        snapshot_revision: str | None = None,
+    ) -> None:
+        await self._require_pool().execute(
+            """
+            INSERT INTO usage_sync_state (
+                singleton, worker_id, status, heartbeat_at, last_started_at,
+                last_finished_at, last_success_at, last_error, snapshot_revision
+            ) VALUES (TRUE, $1, $2, $3, $4, $5, $6, COALESCE($7, ''), COALESCE($8, ''))
+            ON CONFLICT (singleton) DO UPDATE SET
+                worker_id=EXCLUDED.worker_id,
+                status=EXCLUDED.status,
+                heartbeat_at=COALESCE(EXCLUDED.heartbeat_at, usage_sync_state.heartbeat_at),
+                last_started_at=COALESCE(EXCLUDED.last_started_at, usage_sync_state.last_started_at),
+                last_finished_at=COALESCE(EXCLUDED.last_finished_at, usage_sync_state.last_finished_at),
+                last_success_at=COALESCE(EXCLUDED.last_success_at, usage_sync_state.last_success_at),
+                last_error=CASE WHEN $7 IS NULL THEN usage_sync_state.last_error ELSE EXCLUDED.last_error END,
+                snapshot_revision=CASE WHEN $8 IS NULL THEN usage_sync_state.snapshot_revision ELSE EXCLUDED.snapshot_revision END
+            """,
+            worker_id,
+            status,
+            heartbeat_at,
+            last_started_at,
+            last_finished_at,
+            last_success_at,
+            last_error,
+            snapshot_revision,
+        )
+
+    async def heartbeat_worker(self, worker_id: str, status: str = "idle") -> None:
+        await self.update_worker_state(
+            worker_id=worker_id,
+            status=status,
+            heartbeat_at=datetime.now(timezone.utc),
+        )
+
+    async def snapshot_revision(
+        self,
+        start_date: str,
+        end_date: str,
+        backend_ids: list[str],
+    ) -> str | None:
+        if not backend_ids:
+            return None
+        return await self._require_pool().fetchval(
+            """
+            SELECT MIN(synced_at)::text
+            FROM usage_sync_coverage
+            WHERE usage_date=$1::date AND backend_id=ANY($2::text[])
+            HAVING COUNT(DISTINCT backend_id)=cardinality($2::text[])
+            """,
+            _as_date(end_date),
+            sorted(set(backend_ids)),
+        )
+
+    async def sync_state(self) -> dict[str, Any]:
+        row = await self._require_pool().fetchrow(
+            """
+            SELECT s.worker_id, s.status, s.heartbeat_at, s.last_started_at,
+                   s.last_finished_at, s.last_success_at, s.last_error,
+                   COALESCE(NULLIF(s.snapshot_revision, ''), p.revision) AS snapshot_revision,
+                   p.published_at, p.start_date, p.end_date, p.backend_ids
+            FROM usage_sync_state s
+            CROSS JOIN usage_snapshot_state p
+            WHERE s.singleton=TRUE AND p.singleton=TRUE
+            """
+        )
+        if row is None:
+            return {"status": "missing"}
+        return {
+            "workerId": str(row["worker_id"] or ""),
+            "status": str(row["status"] or "unknown"),
+            "heartbeatAt": row["heartbeat_at"],
+            "lastStartedAt": row["last_started_at"],
+            "lastFinishedAt": row["last_finished_at"],
+            "lastSuccessAt": row["last_success_at"],
+            "lastError": str(row["last_error"] or ""),
+            "snapshotRevision": str(row["snapshot_revision"] or ""),
+            "publishedAt": row["published_at"],
+            "startDate": row["start_date"].isoformat() if row["start_date"] else None,
+            "endDate": row["end_date"].isoformat() if row["end_date"] else None,
+            "backendIds": list(row["backend_ids"] or []),
+        }
+
+    async def snapshot_state(self) -> dict[str, Any]:
+        row = await self._require_pool().fetchrow(
+            """
+            SELECT revision, published_at, start_date, end_date, backend_ids
+            FROM usage_snapshot_state WHERE singleton=TRUE
+            """
+        )
+        if row is None:
+            return {"revision": "", "publishedAt": None}
+        return {
+            "revision": str(row["revision"] or ""),
+            "publishedAt": row["published_at"],
+            "startDate": row["start_date"].isoformat() if row["start_date"] else None,
+            "endDate": row["end_date"].isoformat() if row["end_date"] else None,
+            "backendIds": list(row["backend_ids"] or []),
+        }
+
+    async def latest_success_at(self) -> datetime | None:
+        return await self._require_pool().fetchval(
+            "SELECT last_success_at FROM usage_sync_state WHERE singleton=TRUE"
         )
 
     async def team_rows(self, team_scopes: list[dict[str, Any]], start_date: str, end_date: str, source: str) -> dict[str, Any] | None:
@@ -872,6 +1027,216 @@ class UsageStore:
                     collected_at,
                 )
         return len(usage_records)
+
+    async def publish_snapshots(
+        self,
+        start_date: str,
+        end_date: str,
+        snapshots: list[Any],
+    ) -> dict[str, Any]:
+        """COPY a complete multi-backend snapshot, then publish it atomically."""
+
+        if not snapshots:
+            return {"rowCount": 0, "snapshotRevision": None}
+        pool = self._require_pool()
+        collected_at = datetime.now(timezone.utc)
+        backend_ids = sorted({str(snapshot.backend_id) for snapshot in snapshots})
+        usage_records = [
+            self._usage_record(str(snapshot.backend_id), row, collected_at)
+            for snapshot in snapshots
+            for row in self._coalesce_usage_rows(list(snapshot.rows or []))
+            if row.get("date")
+        ]
+        membership_records_by_key: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+        for snapshot in snapshots:
+            for row in list(snapshot.memberships or []):
+                if not row.get("snapshotDate") or not row.get("teamId"):
+                    continue
+                record = self._membership_record(str(snapshot.backend_id), row)
+                membership_records_by_key[(record[0], record[1], record[2], record[4])] = record
+        membership_records = list(membership_records_by_key.values())
+        event_records_by_key: dict[tuple[str, str], tuple[Any, ...]] = {}
+        for snapshot in snapshots:
+            for row in list(getattr(snapshot, "events", None) or []):
+                record = self._event_record(str(snapshot.backend_id), row, collected_at)
+                if record is not None:
+                    event_records_by_key[(str(record[0]), str(record[1]))] = record
+        event_records = list(event_records_by_key.values())
+        department_records_by_key: dict[tuple[str, str], tuple[Any, ...]] = {}
+        for snapshot in snapshots:
+            for item in list(getattr(snapshot, "departments", None) or []):
+                department_id = _clean_text(item.get("departmentId"))
+                if not department_id:
+                    continue
+                record = (
+                    str(snapshot.backend_id),
+                    department_id,
+                    _clean_text(item.get("departmentName")),
+                    _clean_text(item.get("organizationId")),
+                    _clean_text(item.get("status")) or "active",
+                    collected_at,
+                )
+                department_records_by_key[(record[0], record[1])] = record
+        department_records = list(department_records_by_key.values())
+        event_backends = sorted(
+            str(snapshot.backend_id)
+            for snapshot in snapshots
+            if getattr(snapshot, "events", None) is not None
+        )
+        department_backends = sorted(
+            str(snapshot.backend_id)
+            for snapshot in snapshots
+            if getattr(snapshot, "departments", None) is not None
+        )
+        suffix = uuid.uuid4().hex
+        usage_stage = f"usage_daily_stage_{suffix}"
+        membership_stage = f"usage_membership_stage_{suffix}"
+        event_stage = f"usage_event_stage_{suffix}"
+        department_stage = f"usage_department_stage_{suffix}"
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    f"CREATE TEMP TABLE {usage_stage} (LIKE usage_daily INCLUDING DEFAULTS) ON COMMIT DROP"
+                )
+                await connection.execute(
+                    f"CREATE TEMP TABLE {membership_stage} (LIKE usage_team_membership_daily INCLUDING DEFAULTS) ON COMMIT DROP"
+                )
+                await connection.execute(
+                    f"CREATE TEMP TABLE {event_stage} (LIKE usage_event_attribution INCLUDING DEFAULTS) ON COMMIT DROP"
+                )
+                await connection.execute(
+                    f"CREATE TEMP TABLE {department_stage} (LIKE usage_department_directory INCLUDING DEFAULTS) ON COMMIT DROP"
+                )
+                if usage_records:
+                    await connection.copy_records_to_table(
+                        usage_stage,
+                        records=usage_records,
+                        columns=(
+                            "backend_id", "usage_date", "user_id", "employee_email",
+                            "employee_name", "source", "model", "prompt_tokens",
+                            "completion_tokens", "total_tokens", "request_count",
+                            "success_count", "failure_count", "spend", "collected_at",
+                            "organization_id", "team_id", "key_id", "principal_id",
+                            "attribution_source", "billing_eligible",
+                        ),
+                    )
+                if membership_records:
+                    await connection.copy_records_to_table(
+                        membership_stage,
+                        records=membership_records,
+                        columns=(
+                            "backend_id", "snapshot_date", "team_id", "team_name",
+                            "user_id", "employee_email", "employee_name", "team_role",
+                        ),
+                    )
+                if event_records:
+                    await connection.copy_records_to_table(
+                        event_stage,
+                        records=event_records,
+                        columns=(
+                            "backend_id", "request_id", "event_time", "usage_date",
+                            "raw_user_id", "organization_id", "team_id", "key_id",
+                            "principal_id", "source", "model", "prompt_tokens",
+                            "completion_tokens", "total_tokens", "request_count",
+                            "success_count", "failure_count", "spend",
+                            "attribution_source", "billing_eligible", "collected_at",
+                        ),
+                    )
+                if department_records:
+                    await connection.copy_records_to_table(
+                        department_stage,
+                        records=department_records,
+                        columns=(
+                            "backend_id", "department_id", "department_name",
+                            "organization_id", "status", "synced_at",
+                        ),
+                    )
+                await connection.execute(
+                    "DELETE FROM usage_daily WHERE backend_id=ANY($1::text[]) "
+                    "AND usage_date BETWEEN $2::date AND $3::date "
+                    "AND attribution_source <> 'legacy_report_only'",
+                    backend_ids,
+                    _as_date(start_date),
+                    _as_date(end_date),
+                )
+                await connection.execute(
+                    "DELETE FROM usage_team_membership_daily WHERE backend_id=ANY($1::text[]) "
+                    "AND snapshot_date BETWEEN $2::date AND $3::date",
+                    backend_ids,
+                    _as_date(start_date),
+                    _as_date(end_date),
+                )
+                await connection.execute(
+                    "DELETE FROM usage_sync_coverage WHERE backend_id=ANY($1::text[]) "
+                    "AND usage_date BETWEEN $2::date AND $3::date",
+                    backend_ids,
+                    _as_date(start_date),
+                    _as_date(end_date),
+                )
+                if event_backends:
+                    await connection.execute(
+                        "DELETE FROM usage_event_attribution WHERE backend_id=ANY($1::text[]) "
+                        "AND usage_date BETWEEN $2::date AND $3::date "
+                        "AND attribution_source <> 'legacy_report_only'",
+                        event_backends,
+                        _as_date(start_date),
+                        _as_date(end_date),
+                    )
+                if department_backends:
+                    await connection.execute(
+                        "DELETE FROM usage_department_directory WHERE backend_id=ANY($1::text[])",
+                        department_backends,
+                    )
+                await connection.execute(f"INSERT INTO usage_daily SELECT * FROM {usage_stage}")
+                await connection.execute(
+                    f"INSERT INTO usage_team_membership_daily SELECT * FROM {membership_stage}"
+                )
+                await connection.execute(
+                    f"INSERT INTO usage_event_attribution SELECT * FROM {event_stage}"
+                )
+                await connection.execute(
+                    f"INSERT INTO usage_department_directory SELECT * FROM {department_stage}"
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO usage_sync_coverage (backend_id, usage_date, synced_at)
+                    SELECT backend_id, day::date, $4
+                    FROM unnest($1::text[]) AS backend_id
+                    CROSS JOIN generate_series($2::date, $3::date, interval '1 day') AS day
+                    """,
+                    backend_ids,
+                    _as_date(start_date),
+                    _as_date(end_date),
+                    collected_at,
+                )
+                revision = await connection.fetchval(
+                    """
+                    SELECT MIN(synced_at)::text
+                    FROM usage_sync_coverage
+                    WHERE usage_date=$1::date AND backend_id=ANY($2::text[])
+                    HAVING COUNT(DISTINCT backend_id)=cardinality($2::text[])
+                    """,
+                    _as_date(end_date),
+                    backend_ids,
+                )
+                await connection.execute(
+                    """
+                    UPDATE usage_snapshot_state
+                    SET revision=$1, published_at=$2, start_date=$3::date,
+                        end_date=$4::date, backend_ids=$5::text[]
+                    WHERE singleton=TRUE
+                    """,
+                    str(revision or ""),
+                    collected_at,
+                    _as_date(start_date),
+                    _as_date(end_date),
+                    backend_ids,
+                )
+        return {
+            "rowCount": len(usage_records),
+            "snapshotRevision": str(revision or ""),
+            "publishedAt": collected_at,
+        }
 
     async def upsert_attributed_usage(
         self,
@@ -1442,6 +1807,134 @@ class UsageStore:
             for record in records
         ]
         return {"rows": self._group_rows(rows, ("date", "source", "model")), "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered)}
+
+    async def personal_rows_by_user_ids(
+        self,
+        user_ids: list[str],
+        start_date: str,
+        end_date: str,
+        source: str,
+        backend_ids: list[str],
+    ) -> dict[str, Any] | None:
+        covered = await self.covered_backend_ids(start_date, end_date, backend_ids)
+        if set(covered) != set(backend_ids):
+            return None
+        normalized = sorted({str(item).strip() for item in user_ids if str(item).strip()})
+        records = await self._require_pool().fetch(
+            """
+            SELECT usage_date, source, model,
+                   SUM(prompt_tokens) AS prompt_tokens,
+                   SUM(completion_tokens) AS completion_tokens,
+                   SUM(total_tokens) AS total_tokens,
+                   SUM(request_count) AS request_count,
+                   SUM(success_count) AS success_count,
+                   SUM(failure_count) AS failure_count,
+                   SUM(spend) AS spend
+            FROM usage_daily
+            WHERE usage_date BETWEEN $1::date AND $2::date
+              AND user_id=ANY($3::text[])
+              AND backend_id=ANY($4::text[])
+              AND ($5='all' OR source=$5)
+            GROUP BY usage_date, source, model
+            ORDER BY usage_date, source, model
+            """,
+            _as_date(start_date),
+            _as_date(end_date),
+            normalized,
+            covered,
+            source or "all",
+        )
+        rows = [self._aggregated_usage_row(record, include_identity=False) for record in records]
+        return {
+            "rows": self._public_rows(rows),
+            "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered),
+        }
+
+    async def team_leader_scope(
+        self,
+        email: str,
+        user_ids: list[str],
+        backend_ids: list[str],
+    ) -> dict[str, Any]:
+        """Resolve leader scope from the committed membership snapshot.
+
+        Mirrors the upstream rule: leadership is anchored on the primary backend
+        and other backends only contribute scopes for the same logical team.
+        """
+
+        empty = {"isTeamLeader": False, "teamBoardStatus": "none", "team": None, "leaderTeams": []}
+        if not backend_ids:
+            return empty
+        normalized_email = email.strip().lower()
+        normalized_ids = sorted({str(item).strip() for item in user_ids if str(item).strip()})
+        records = await self._require_pool().fetch(
+            """
+            WITH latest AS (
+                SELECT DISTINCT ON (backend_id, team_id, user_id)
+                       backend_id, team_id, team_name, user_id,
+                       employee_email, team_role, snapshot_date
+                FROM usage_team_membership_daily
+                WHERE backend_id=ANY($1::text[])
+                ORDER BY backend_id, team_id, user_id, snapshot_date DESC
+            )
+            SELECT backend_id, team_id,
+                   (array_agg(team_name ORDER BY snapshot_date DESC))[1] AS team_name,
+                   COUNT(*) AS member_count,
+                   bool_or(
+                       lower(COALESCE(team_role, ''))='admin'
+                       AND (
+                           user_id=ANY($2::text[])
+                           OR ($3<>'' AND lower(btrim(COALESCE(employee_email, '')))=$3)
+                       )
+                   ) AS is_leader
+            FROM latest
+            GROUP BY backend_id, team_id
+            """,
+            backend_ids,
+            normalized_ids,
+            normalized_email,
+        )
+        primary_backend = str(backend_ids[0])
+        summaries_by_identity: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        anchors: list[dict[str, Any]] = []
+        for row in records:
+            team_id = str(row["team_id"] or "").strip()
+            if not team_id:
+                continue
+            team_name = str(row["team_name"] or "").strip() or team_id
+            summary = {
+                "id": team_id,
+                "name": team_name,
+                "memberCount": int(row["member_count"] or 0),
+                "backend": str(row["backend_id"]),
+            }
+            summaries_by_identity[team_identity_key(team_id, team_name)].append(summary)
+            if summary["backend"] == primary_backend and row["is_leader"]:
+                anchors.append(summary)
+        leader_teams: list[dict[str, Any]] = []
+        for anchor in sorted(anchors, key=lambda item: (normalize_team_text(item["name"]), item["id"])):
+            identity = team_identity_key(anchor["id"], anchor["name"])
+            scopes = [anchor]
+            for backend_id in backend_ids[1:]:
+                match = next(
+                    (
+                        item
+                        for item in summaries_by_identity.get(identity, [])
+                        if item["backend"] == str(backend_id)
+                    ),
+                    None,
+                )
+                if match is not None:
+                    scopes.append(match)
+            leader_teams.append({**anchor, "teamScopes": scopes})
+        if not leader_teams:
+            return empty
+        return {
+            "isTeamLeader": True,
+            "teamBoardStatus": "single" if len(leader_teams) == 1 else "multiple",
+            "team": leader_teams[0] if len(leader_teams) == 1 else None,
+            "leaderTeams": leader_teams,
+        }
 
     async def organization_identity_rows(
         self,

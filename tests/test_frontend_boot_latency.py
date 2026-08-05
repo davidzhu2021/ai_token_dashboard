@@ -31,12 +31,10 @@ def test_boot_does_not_await_model_catalog() -> None:
     assert "scopePromise" in final_await
 
 
-def test_boot_still_prefetches_model_catalog_in_background() -> None:
+def test_boot_does_not_prefetch_model_catalog() -> None:
     body = show_app_body()
 
-    # 预取要保留，否则第一次打开模型广场反而变慢；且必须静默，避免弹出
-    # 用户没有触发过的错误提示。
-    assert "loadModels({ silent: true })" in body
+    assert "loadModels(" not in body
 
 
 def test_model_catalog_requests_are_deduplicated() -> None:

@@ -19,7 +19,7 @@ def test_manual_refresh_skips_upstream_sync(monkeypatch) -> None:
     assert called is False
 
 
-def test_normal_usage_refresh_stays_background(monkeypatch) -> None:
+def test_normal_usage_refresh_does_not_trigger_background_sync(monkeypatch) -> None:
     calls: list[tuple[str, str, bool]] = []
 
     def record_refresh(start_date: str, end_date: str, force: bool = False) -> None:
@@ -29,7 +29,7 @@ def test_normal_usage_refresh_stays_background(monkeypatch) -> None:
 
     asyncio.run(main.prepare_usage_refresh("2026-07-01", "2026-07-23", force=False))
 
-    assert calls == [("2026-07-01", "2026-07-23", False)]
+    assert calls == []
 
 
 def test_manual_refresh_database_unavailable_is_not_upstream_fallback() -> None:

@@ -216,6 +216,8 @@ department_usage_cache = TTLCache()
 team_auth_cache = TTLCache()
 team_usage_cache = TTLCache()
 team_member_usage_cache = TTLCache()
+_usage_singleflight: dict[str, asyncio.Task[Any]] = {}
+_usage_singleflight_lock = asyncio.Lock()
 # Generated customer-demo boards are isolated from the production board
 # caches. Their keys are derived from the server-resolved organization scope.
 organization_usage_cache = TTLCache()
@@ -243,6 +245,15 @@ _usage_sync_stop: asyncio.Event | None = None
 _organization_outbox_task: asyncio.Task[Any] | None = None
 _organization_outbox_stop: asyncio.Event | None = None
 _usage_sync_status: dict[str, Any] = {"status": "disabled", "lastRun": None}
+
+
+def usage_sync_role() -> str:
+    role = os.getenv("USAGE_SYNC_ROLE", "combined").strip().lower()
+    return role if role in {"reader", "worker", "combined"} else "combined"
+
+
+def snapshot_reader_configured() -> bool:
+    return usage_store() is not None
 
 
 def validate_runtime_auth_config() -> None:
@@ -533,7 +544,61 @@ def usage_data_freshness(last_synced: datetime | None, start_date: str, end_date
         "source": "database",
         "lastSyncedAt": last_synced.isoformat() if last_synced else None,
         "stale": stale,
+        "maxAgeSeconds": max_age,
     }
+
+
+async def snapshot_revision(start_date: str, end_date: str) -> str:
+    store = usage_store()
+    if store is None:
+        return "development-upstream"
+    try:
+        await store.connect()
+        revision_loader = getattr(store, "snapshot_revision", None)
+        if callable(revision_loader):
+            revision = await revision_loader(start_date, end_date, usage_backend_ids())
+        else:
+            revision = "legacy-test-snapshot"
+    except Exception as exc:
+        logger.exception("usage snapshot revision query failed")
+        raise manual_refresh_database_unavailable() from exc
+    if not revision:
+        raise HTTPException(
+            status_code=503,
+            detail="所选日期范围的用量快照尚未就绪，请等待后台同步完成",
+        )
+    return revision
+
+
+def attach_snapshot_freshness(
+    payload: dict[str, Any],
+    last_synced: datetime | None,
+    start_date: str,
+    end_date: str,
+    revision: str,
+) -> dict[str, Any]:
+    freshness = usage_data_freshness(last_synced, start_date, end_date)
+    freshness["snapshotRevision"] = revision
+    payload["dataFreshness"] = freshness
+    return payload
+
+
+async def usage_singleflight(key: str, factory: Any) -> Any:
+    """Collapse concurrent cold reads of one cache key into a single SQL query."""
+
+    async with _usage_singleflight_lock:
+        task = _usage_singleflight.get(key)
+        if task is None:
+            task = asyncio.create_task(factory())
+            _usage_singleflight[key] = task
+            # 请求方可能在等待期间断开，靠 finally 出队会把已完成的任务永久留在表里，
+            # 后续请求就会一直读到这份旧结果。改由任务自身在完成时出队。
+            task.add_done_callback(
+                lambda finished, cache_key=key: _usage_singleflight.pop(cache_key, None)
+                if _usage_singleflight.get(cache_key) is finished
+                else None
+            )
+    return await asyncio.shield(task)
 
 
 async def run_usage_sync(days: int) -> dict[str, Any]:
@@ -639,15 +704,12 @@ async def schedule_usage_refresh(start_date: str, end_date: str, force: bool = F
 
 
 async def prepare_usage_refresh(start_date: str, end_date: str, force: bool = False) -> None:
-    # 手动刷新只重读 SQL 快照，避免把一次页面刷新升级成全量上游同步。
-    if force:
-        logger.info(
-            "manual refresh skips upstream usage sync start=%s end=%s",
-            start_date,
-            end_date,
-        )
-        return
-    trigger_usage_refresh(start_date, end_date)
+    logger.info(
+        "usage request reads committed snapshot only start=%s end=%s refresh=%s",
+        start_date,
+        end_date,
+        force,
+    )
 
 
 def manual_refresh_database_unavailable() -> HTTPException:
@@ -670,7 +732,11 @@ def trigger_usage_refresh(start_date: str, end_date: str, force: bool = False) -
 
 async def start_usage_sync() -> None:
     global _usage_sync_task, _usage_sync_stop
-    if usage_store() is None:
+    store = usage_store()
+    if store is None:
+        return
+    await store.connect()
+    if usage_sync_role() == "reader":
         return
     if _usage_sync_task is not None and not _usage_sync_task.done():
         return
@@ -1323,7 +1389,11 @@ async def organization_memberships_for_user(user: dict[str, Any]) -> list[dict[s
             local_user_id = str(user.get("id") or "").strip()
             if not local_user_id:
                 return []
-            result = await organization_store_call("resolve_members_by_auth_user_id", local_user_id)
+            result = await organization_store_call(
+                "resolve_members_by_auth_user_id",
+                local_user_id,
+                _require_capability=False,
+            )
         else:
             email = str(user.get("email") or "")
             # V2 store: a user may have at most one effective Mock customer.
@@ -1722,13 +1792,15 @@ async def real_organization_usage_payload(
     if not upstream_id or str((organization or {}).get("upstreamStatus") or "") != "active":
         raise auth_http_error(409, "企业账号仍在开通中，请稍后重试", "ORGANIZATION_PROVISIONING_PENDING")
     store = usage_store()
-    if store is None or store.pool is None:
+    if store is None:
         raise auth_http_error(
             503,
             "企业用量快照暂不可用，请等待同步完成后重试",
             "ORGANIZATION_USAGE_SNAPSHOT_UNAVAILABLE",
         )
     try:
+        await store.connect()
+        revision = await snapshot_revision(start_date, end_date)
         stored = await store.organization_rows(
             upstream_id,
             start_date,
@@ -1756,10 +1828,11 @@ async def real_organization_usage_payload(
         )
     last_synced = stored.get("lastSyncedAt")
     stored["organization"] = organization
-    stored["dataFreshness"] = usage_data_freshness(
+    attach_snapshot_freshness(stored,
         last_synced if isinstance(last_synced, datetime) else None,
         start_date,
         end_date,
+        revision,
     )
     stored["cache"] = {"hit": False, "ttlSeconds": 0}
     return stored
@@ -1780,13 +1853,15 @@ async def real_organization_department_usage_payload(
     if not organization or str(organization.get("upstreamStatus") or "") != "active":
         raise auth_http_error(409, "企业账号仍在开通中，请稍后重试", "ORGANIZATION_PROVISIONING_PENDING")
     store = usage_store()
-    if store is None or store.pool is None:
+    if store is None:
         raise auth_http_error(
             503,
             "部门用量快照暂不可用，请等待同步完成后重试",
             "ORGANIZATION_USAGE_SNAPSHOT_UNAVAILABLE",
         )
     try:
+        await store.connect()
+        revision = await snapshot_revision(start_date, end_date)
         stored = await store.organization_rows(
             upstream_organization_id,
             start_date,
@@ -1811,10 +1886,20 @@ async def real_organization_department_usage_payload(
             "部门用量仍在同步中，请稍后重试",
             "ORGANIZATION_USAGE_SNAPSHOT_UNAVAILABLE",
         )
+    last_synced = stored.get("lastSyncedAt")
+    attach_snapshot_freshness(
+        stored,
+        last_synced if isinstance(last_synced, datetime) else None,
+        start_date,
+        end_date,
+        revision,
+    )
     departments = list(stored.get("departments") or [])
     rows = list(stored.get("rows") or [])
     local_departments = await organization_scoped_store_call(
-        organization_id, "list_departments", include_archived=False
+        organization_id,
+        "list_departments",
+        include_archived=False,
     )
     usage_by_id = {
         str(item.get("departmentId") or ""): item for item in departments
@@ -1874,11 +1959,7 @@ async def real_organization_department_usage_payload(
         "departmentOptions": department_options,
         "department": department,
         "totalRecords": len(rows),
-        "dataFreshness": usage_data_freshness(
-            last_synced if isinstance(last_synced, datetime) else None,
-            start_date,
-            end_date,
-        ),
+        "dataFreshness": stored["dataFreshness"],
         "cache": {"hit": False, "ttlSeconds": 0},
     }
 
@@ -3015,24 +3096,24 @@ async def cached_resolve_user(email: str, name: str | None = None, refresh: bool
     return upstream, {"hit": False, "ttlSeconds": 0}
 
 
-def personal_usage_cache_key(email: str, start_date: str, end_date: str, source: str) -> str:
-    return f"usage:v7:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
+def personal_usage_cache_key(email: str, start_date: str, end_date: str, source: str, revision: str = "") -> str:
+    return f"usage:v8:{revision}:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
 
 
-def local_personal_usage_cache_key(user_id: str, start_date: str, end_date: str, source: str) -> str:
-    return f"usage:local:v2:{user_id}:{start_date}:{end_date}:{source or 'all'}"
+def local_personal_usage_cache_key(user_id: str, start_date: str, end_date: str, source: str, revision: str = "") -> str:
+    return f"usage:local:v3:{revision}:{user_id}:{start_date}:{end_date}:{source or 'all'}"
 
 
-def admin_usage_cache_key(email: str, start_date: str, end_date: str, source: str, employee: str | None) -> str:
-    return f"admin-usage:v5:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(employee or '').strip().lower()}"
+def admin_usage_cache_key(email: str, start_date: str, end_date: str, source: str, employee: str | None, revision: str = "") -> str:
+    return f"admin-usage:v6:{revision}:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(employee or '').strip().lower()}"
 
 
-def department_usage_cache_key(email: str, start_date: str, end_date: str, source: str, department: str | None) -> str:
-    return f"department-usage:v6:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(department or '').strip().lower()}"
+def department_usage_cache_key(email: str, start_date: str, end_date: str, source: str, department: str | None, revision: str = "") -> str:
+    return f"department-usage:v7:{revision}:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(department or '').strip().lower()}"
 
 
-def team_auth_cache_key(email: str, name: str | None) -> str:
-    return f"team-auth:v3:{email.strip().lower()}:{str(name or '').strip()}"
+def team_auth_cache_key(email: str, name: str | None, revision: str = "") -> str:
+    return f"team-auth:v4:{revision}:{email.strip().lower()}:{str(name or '').strip()}"
 
 
 def team_scope_items(team: dict[str, Any]) -> list[dict[str, Any]]:
@@ -3051,12 +3132,12 @@ def team_scope_fingerprint(team: dict[str, Any]) -> str:
     )
 
 
-def team_usage_cache_key(email: str, team: dict[str, Any], start_date: str, end_date: str, source: str) -> str:
-    return f"team-usage:v9:{email.strip().lower()}:{team_scope_fingerprint(team)}:{start_date}:{end_date}:{source or 'all'}"
+def team_usage_cache_key(email: str, team: dict[str, Any], start_date: str, end_date: str, source: str, revision: str = "") -> str:
+    return f"team-usage:v10:{revision}:{email.strip().lower()}:{team_scope_fingerprint(team)}:{start_date}:{end_date}:{source or 'all'}"
 
 
-def team_member_usage_cache_key(email: str, team: dict[str, Any], employee: str, start_date: str, end_date: str, source: str) -> str:
-    return f"team-member-usage:v8:{email.strip().lower()}:{team_scope_fingerprint(team)}:{employee.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
+def team_member_usage_cache_key(email: str, team: dict[str, Any], employee: str, start_date: str, end_date: str, source: str, revision: str = "") -> str:
+    return f"team-member-usage:v9:{revision}:{email.strip().lower()}:{team_scope_fingerprint(team)}:{employee.strip().lower()}:{start_date}:{end_date}:{source or 'all'}"
 
 
 def team_ref(team: dict[str, Any]) -> str:
@@ -3255,7 +3336,10 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
     if app_user.get("id"):
         return await local_personal_usage_payload(app_user, start_date, end_date, source, refresh)
     request_started = asyncio.get_running_loop().time()
-    cache_key = personal_usage_cache_key(app_user["email"], start_date, end_date, source)
+    revision = "development-upstream"
+    if usage_store() is not None:
+        revision = await snapshot_revision(start_date, end_date)
+    cache_key = personal_usage_cache_key(app_user["email"], start_date, end_date, source, revision)
     hit, value, ttl_seconds = personal_usage_cache.get(cache_key)
     if hit and not refresh:
         payload = dict(value)
@@ -3268,13 +3352,12 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
             db_started = asyncio.get_running_loop().time()
             await store.connect()
             connected_at = asyncio.get_running_loop().time()
-            await prepare_usage_refresh(start_date, end_date, refresh)
             stored = await store.personal_rows(app_user["email"], start_date, end_date, source, usage_backend_ids())
             queried_at = asyncio.get_running_loop().time()
             logger.info("personal usage sql refresh=%s connect_ms=%.0f query_ms=%.0f total_ms=%.0f", refresh, (connected_at - db_started) * 1000, (queried_at - connected_at) * 1000, (queried_at - request_started) * 1000)
             if stored is not None:
                 rows = stored["rows"]
-                payload = {
+                payload = attach_snapshot_freshness({
                     "user": app_user,
                     "startDate": start_date,
                     "endDate": end_date,
@@ -3282,13 +3365,22 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
                     "rows": rows,
                     "summary": usage_summary(rows),
                     "mappingCache": {"hit": True, "ttlSeconds": 0},
-                    "dataFreshness": usage_data_freshness(stored.get("lastSyncedAt"), start_date, end_date),
-                }
+                }, stored.get("lastSyncedAt"), start_date, end_date, revision)
                 personal_usage_cache.set(cache_key, payload, env_int("PERSONAL_USAGE_CACHE_TTL_SECONDS", 300))
                 payload["cache"] = {"hit": False, "ttlSeconds": 0}
                 return payload
-        except Exception:
-            logger.exception("local personal usage query failed; falling back to upstream")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("local personal usage query failed")
+            if snapshot_reader_configured():
+                raise manual_refresh_database_unavailable() from exc
+
+        if snapshot_reader_configured():
+            raise HTTPException(
+                status_code=503,
+                detail="个人用量快照尚未就绪，请等待后台同步完成",
+            )
 
     if refresh:
         raise manual_refresh_database_unavailable()
@@ -3357,7 +3449,7 @@ async def real_organization_member_usage_payload(
         )
     try:
         await store.connect()
-        await prepare_usage_refresh(start_date, end_date, refresh)
+        revision = await snapshot_revision(start_date, end_date)
         stored = await store.organization_identity_rows(
             upstream_organization_id,
             upstream_user_ids,
@@ -3395,9 +3487,12 @@ async def real_organization_member_usage_payload(
         "rows": rows,
         "summary": usage_summary(rows),
         "mappingCache": {"hit": True, "ttlSeconds": 0},
-        "dataFreshness": usage_data_freshness(
+        "dataFreshness": {
+            **usage_data_freshness(
             stored.get("lastSyncedAt"), start_date, end_date
-        ),
+            ),
+            "snapshotRevision": revision,
+        },
         "dataQuality": {
             "summarySource": "database",
             "organizationScoped": True,
@@ -3416,7 +3511,10 @@ async def local_personal_usage_payload(
 ) -> dict[str, Any]:
     """Read password-account usage only from its provisioned upstream identity."""
     local_user_id = str(app_user["id"])
-    cache_key = local_personal_usage_cache_key(local_user_id, start_date, end_date, source)
+    revision = "development-upstream"
+    if usage_store() is not None:
+        revision = await snapshot_revision(start_date, end_date)
+    cache_key = local_personal_usage_cache_key(local_user_id, start_date, end_date, source, revision)
     if not refresh:
         hit, value, ttl_seconds = personal_usage_cache.get(cache_key)
         if hit:
@@ -3427,9 +3525,21 @@ async def local_personal_usage_payload(
     upstream_user_id = str((account or {}).get("upstream_user_id") or "")
     if not account or account.get("status") != "provisioned" or not upstream_user_id:
         raise auth_http_error(409, "账号仍在开通中，请稍后重试", "AUTH_PROVISIONING_PENDING")
-    if refresh:
-        raise manual_refresh_database_unavailable()
-    rows = await client().usage_rows_for_user_ids([upstream_user_id], start_date, end_date, source)
+    store = usage_store()
+    if store is None:
+        if refresh:
+            raise manual_refresh_database_unavailable()
+        rows = await client().usage_rows_for_user_ids([upstream_user_id], start_date, end_date, source)
+        last_synced = None
+    else:
+        await store.connect()
+        stored = await store.personal_rows_by_user_ids(
+            [upstream_user_id], start_date, end_date, source, usage_backend_ids()
+        )
+        if stored is None:
+            raise HTTPException(status_code=503, detail="个人用量快照尚未就绪，请等待后台同步完成")
+        rows = stored["rows"]
+        last_synced = stored.get("lastSyncedAt")
     payload = {
         "user": app_user,
         "startDate": start_date,
@@ -3439,6 +3549,8 @@ async def local_personal_usage_payload(
         "summary": usage_summary(rows),
         "mappingCache": {"hit": True, "ttlSeconds": 0},
     }
+    if store is not None:
+        attach_snapshot_freshness(payload, last_synced, start_date, end_date, revision)
     personal_usage_cache.set(cache_key, payload, env_int("PERSONAL_USAGE_CACHE_TTL_SECONDS", 300))
     payload = dict(payload)
     payload["cache"] = {"hit": False, "ttlSeconds": 0}
@@ -3460,8 +3572,14 @@ async def batched_person_usage_rows(
         stored = await store.rows_by_employee_emails(emails, start_date, end_date, source, usage_backend_ids())
         if stored is not None:
             return stored
-    except Exception:
-        logger.exception("batched employee usage SQL query failed; falling back to upstream")
+        if snapshot_reader_configured():
+            raise HTTPException(status_code=503, detail="用量快照尚未就绪，请等待后台同步完成")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("batched employee usage SQL query failed")
+        if snapshot_reader_configured():
+            raise manual_refresh_database_unavailable() from exc
     return None
 
 
@@ -3486,7 +3604,10 @@ async def person_usage_rows(email: str, name: str | None, start_date: str, end_d
 
 async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: str, source: str, employee: str | None, refresh: bool = False) -> dict[str, Any]:
     request_started = asyncio.get_running_loop().time()
-    cache_key = admin_usage_cache_key(admin["email"], start_date, end_date, source, employee)
+    revision = "development-upstream"
+    if usage_store() is not None:
+        revision = await snapshot_revision(start_date, end_date)
+    cache_key = admin_usage_cache_key(admin["email"], start_date, end_date, source, employee, revision)
     if not refresh:
         hit, value, ttl_seconds = admin_usage_cache.get(cache_key)
         if hit:
@@ -3494,37 +3615,49 @@ async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: 
             payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
             logger.info("admin usage cache hit records=%s", len(payload.get("rows") or []))
             return payload
-    store = usage_store()
-    if store is not None:
+
+    async def load() -> dict[str, Any]:
+        if not refresh:
+            hit, value, ttl_seconds = admin_usage_cache.get(cache_key)
+            if hit:
+                payload = dict(value)
+                payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+                return payload
+        store = usage_store()
+        if store is None:
+            payload = await client().admin_usage_rows(start_date, end_date, source, employee)
+            admin_usage_cache.set(cache_key, payload, env_int("ADMIN_USAGE_CACHE_TTL_SECONDS", 300))
+            payload = dict(payload)
+            payload["cache"] = {"hit": False, "ttlSeconds": 0}
+            return payload
         try:
             db_started = asyncio.get_running_loop().time()
             await store.connect()
             connected_at = asyncio.get_running_loop().time()
-            await prepare_usage_refresh(start_date, end_date, refresh)
             stored = await store.admin_rows(start_date, end_date, source, employee, usage_backend_ids())
             queried_at = asyncio.get_running_loop().time()
             logger.info("admin usage sql refresh=%s connect_ms=%.0f query_ms=%.0f total_ms=%.0f", refresh, (connected_at - db_started) * 1000, (queried_at - connected_at) * 1000, (queried_at - request_started) * 1000)
             if stored is not None:
                 stored = dict(stored)
                 last_synced = stored.pop("lastSyncedAt", None)
-                stored["dataFreshness"] = usage_data_freshness(last_synced, start_date, end_date)
+                attach_snapshot_freshness(stored, last_synced, start_date, end_date, revision)
                 admin_usage_cache.set(cache_key, stored, env_int("ADMIN_USAGE_CACHE_TTL_SECONDS", 300))
                 stored["cache"] = {"hit": False, "ttlSeconds": 0}
                 return stored
-        except Exception:
-            logger.exception("local admin usage query failed; falling back to upstream")
-    if refresh:
-        raise manual_refresh_database_unavailable()
-    payload = await client().admin_usage_rows(start_date, end_date, source, employee)
-    admin_usage_cache.set(cache_key, payload, env_int("ADMIN_USAGE_CACHE_TTL_SECONDS", 300))
-    payload = dict(payload)
-    payload["cache"] = {"hit": False, "ttlSeconds": 0}
-    return payload
+        except Exception as exc:
+            logger.exception("local admin usage query failed")
+            raise manual_refresh_database_unavailable() from exc
+        raise HTTPException(status_code=503, detail="全员用量快照尚未就绪，请等待后台同步完成")
+
+    return await usage_singleflight(cache_key, load)
 
 
 async def department_usage_payload(admin: dict[str, Any], start_date: str, end_date: str, source: str, department: str | None, refresh: bool = False) -> dict[str, Any]:
     request_started = asyncio.get_running_loop().time()
-    cache_key = department_usage_cache_key(admin["email"], start_date, end_date, source, department)
+    revision = "development-upstream"
+    if usage_store() is not None:
+        revision = await snapshot_revision(start_date, end_date)
+    cache_key = department_usage_cache_key(admin["email"], start_date, end_date, source, department, revision)
     if not refresh:
         hit, value, ttl_seconds = department_usage_cache.get(cache_key)
         if hit:
@@ -3532,13 +3665,25 @@ async def department_usage_payload(admin: dict[str, Any], start_date: str, end_d
             payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
             logger.info("department usage cache hit records=%s", len(payload.get("rows") or []))
             return payload
-    store = usage_store()
-    if store is not None:
+
+    async def load() -> dict[str, Any]:
+        if not refresh:
+            hit, value, ttl_seconds = department_usage_cache.get(cache_key)
+            if hit:
+                payload = dict(value)
+                payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+                return payload
+        store = usage_store()
+        if store is None:
+            payload = await client().admin_department_usage_rows(start_date, end_date, source, department)
+            department_usage_cache.set(cache_key, payload, env_int("DEPARTMENT_USAGE_CACHE_TTL_SECONDS", 300))
+            payload = dict(payload)
+            payload["cache"] = {"hit": False, "ttlSeconds": 0}
+            return payload
         try:
             db_started = asyncio.get_running_loop().time()
             await store.connect()
             connected_at = asyncio.get_running_loop().time()
-            await prepare_usage_refresh(start_date, end_date, refresh)
             stored = await store.department_rows(start_date, end_date, source, department, usage_backend_ids())
             queried_at = asyncio.get_running_loop().time()
             logger.info(
@@ -3553,19 +3698,16 @@ async def department_usage_payload(admin: dict[str, Any], start_date: str, end_d
             if stored is not None:
                 stored = dict(stored)
                 last_synced = stored.pop("lastSyncedAt", None)
-                stored["dataFreshness"] = usage_data_freshness(last_synced, start_date, end_date)
+                attach_snapshot_freshness(stored, last_synced, start_date, end_date, revision)
                 department_usage_cache.set(cache_key, stored, env_int("DEPARTMENT_USAGE_CACHE_TTL_SECONDS", 300))
                 stored["cache"] = {"hit": False, "ttlSeconds": 0}
                 return stored
-        except Exception:
-            logger.exception("local department usage query failed; falling back to upstream")
-    if refresh:
-        raise manual_refresh_database_unavailable()
-    payload = await client().admin_department_usage_rows(start_date, end_date, source, department)
-    department_usage_cache.set(cache_key, payload, env_int("DEPARTMENT_USAGE_CACHE_TTL_SECONDS", 300))
-    payload = dict(payload)
-    payload["cache"] = {"hit": False, "ttlSeconds": 0}
-    return payload
+        except Exception as exc:
+            logger.exception("local department usage query failed")
+            raise manual_refresh_database_unavailable() from exc
+        raise HTTPException(status_code=503, detail="部门用量快照尚未就绪，请等待后台同步完成")
+
+    return await usage_singleflight(cache_key, load)
 
 
 def empty_team_scope() -> dict[str, Any]:
@@ -3654,7 +3796,19 @@ async def team_scope_for_user(app_user: dict[str, Any], refresh: bool = False) -
         scope = await real_customer_team_scope(app_user)
         # 负责人是本地目录数据，改动应当立刻生效，因此这条路径不走权限缓存。
         return {**scope, "cache": {"hit": True, "ttlSeconds": 0}}
-    cache_key = team_auth_cache_key(app_user["email"], app_user.get("name"))
+    store = usage_store()
+    revision = "development-upstream"
+    if store is not None:
+        await store.connect()
+        state_loader = getattr(store, "snapshot_state", None)
+        if callable(state_loader):
+            state = await state_loader()
+            revision = str(state.get("revision") or "")
+        else:
+            revision = "legacy-test-snapshot"
+        if not revision:
+            raise HTTPException(status_code=503, detail="团队权限快照尚未就绪，请等待后台同步完成")
+    cache_key = team_auth_cache_key(app_user["email"], app_user.get("name"), revision)
     if not refresh:
         hit, value, ttl_seconds = team_auth_cache.get(cache_key)
         if hit:
@@ -3666,14 +3820,20 @@ async def team_scope_for_user(app_user: dict[str, Any], refresh: bool = False) -
                 sum(len(team_scope_items(team)) for team in scope.get("leaderTeams") or [] if isinstance(team, dict)),
             )
             return scope
-    try:
-        upstream_user, _ = await cached_resolve_user(app_user["email"], app_user.get("name"), refresh)
-        scope = await client().team_leader_scope(upstream_user)
-    except HTTPException as exc:
-        if exc.status_code == 404:
-            scope = {"isTeamLeader": False, "teamBoardStatus": "none", "team": None, "leaderTeams": []}
-        else:
-            raise
+    scope_loader = getattr(store, "team_leader_scope", None) if store is not None else None
+    if callable(scope_loader):
+        # 这条分支只服务 SSO 账号（本地账号已在函数开头返回），团队成员快照里的
+        # employee_email 就是可用的身份键，无需再向上游解析用户。
+        scope = await scope_loader(app_user["email"], [], usage_backend_ids())
+    else:
+        try:
+            upstream_user, _ = await cached_resolve_user(app_user["email"], app_user.get("name"), refresh)
+            scope = await client().team_leader_scope(upstream_user)
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                scope = {"isTeamLeader": False, "teamBoardStatus": "none", "team": None, "leaderTeams": []}
+            else:
+                raise
     team_auth_cache.set(cache_key, scope, env_int("TEAM_AUTH_CACHE_TTL_SECONDS", 300))
     scope = dict(scope)
     scope["cache"] = {"hit": False, "ttlSeconds": 0}
@@ -3711,7 +3871,10 @@ async def team_usage_payload(
     if not scope.get("isTeamLeader"):
         raise HTTPException(status_code=403, detail="当前账号还没有团队负责人权限")
     team = select_authorized_team(scope, team_ref_value)
-    cache_key = team_usage_cache_key(app_user["email"], team, start_date, end_date, source)
+    revision = "development-upstream"
+    if usage_store() is not None:
+        revision = await snapshot_revision(start_date, end_date)
+    cache_key = team_usage_cache_key(app_user["email"], team, start_date, end_date, source, revision)
     if enrich_member_rankings and not refresh:
         hit, value, ttl_seconds = team_usage_cache.get(cache_key)
         if hit:
@@ -3724,55 +3887,65 @@ async def team_usage_payload(
                 len(payload.get("rows") or []),
             )
             return payload
-    store = usage_store()
-    payload = None
-    if store is not None:
-        try:
-            db_started = asyncio.get_running_loop().time()
-            await store.connect()
-            connected_at = asyncio.get_running_loop().time()
-            await prepare_usage_refresh(start_date, end_date, refresh)
-            payload = await store.team_rows(team_scope_items(team), start_date, end_date, source)
-            queried_at = asyncio.get_running_loop().time()
-            logger.info(
-                "team usage sql refresh=%s connect_ms=%.0f query_ms=%.0f total_ms=%.0f backends=%s scopes=%s records=%s",
-                refresh,
-                (connected_at - db_started) * 1000,
-                (queried_at - connected_at) * 1000,
-                (queried_at - request_started) * 1000,
-                len({item.get("backend") for item in team_scope_items(team)}),
-                len(team_scope_items(team)),
-                len(payload.get("rows") or []) if payload else 0,
-            )
-            if payload is not None:
-                payload = dict(payload)
-                last_synced = payload.pop("lastSyncedAt", None)
-                payload["dataFreshness"] = usage_data_freshness(last_synced, start_date, end_date)
-                payload.setdefault("dataQuality", {})["backends"] = [item.get("backend") for item in team_scope_items(team)]
-        except Exception:
-            logger.exception("local team usage query failed; falling back to upstream")
-            payload = None
-    if payload is None:
-        if refresh:
-            raise manual_refresh_database_unavailable()
-        try:
-            payload = dict(await client().team_usage_rows(team_scope_items(team), start_date, end_date, source))
-        except TypeError:
-            # Keep test doubles and older clients compatible with the legacy signature.
-            payload = dict(await client().team_usage_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source))
-    if enrich_member_rankings:
-        # team_rows/team_usage_rows already aggregate through team membership. Do not
-        # replace that scoped result with an email-wide personal usage query.
-        payload["employees"] = payload.get("employees") or []
-        payload.setdefault("dataQuality", {})["rankingSource"] = "team_membership_database" if store is not None and payload.get("dataQuality", {}).get("summarySource") == "database" else "team_membership_upstream"
-        payload["dataQuality"]["rankingScope"] = "selected_team"
-        payload["dataQuality"]["memberIdentityMatch"] = "user_id_or_email"
-    payload["team"] = public_team_from_payload(team, payload.get("team"))
-    # 摘要和排行来自同一批结果；首个请求即写缓存，后续排行请求不重复查库。
-    team_usage_cache.set(cache_key, payload, env_int("TEAM_USAGE_CACHE_TTL_SECONDS", 300))
-    payload = dict(payload)
-    payload["cache"] = {"hit": False, "ttlSeconds": 0}
-    return payload
+    async def load() -> dict[str, Any]:
+        if enrich_member_rankings and not refresh:
+            hit, value, ttl_seconds = team_usage_cache.get(cache_key)
+            if hit:
+                payload = dict(value)
+                payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+                return payload
+        store = usage_store()
+        payload = None
+        if store is not None:
+            try:
+                db_started = asyncio.get_running_loop().time()
+                await store.connect()
+                connected_at = asyncio.get_running_loop().time()
+                payload = await store.team_rows(team_scope_items(team), start_date, end_date, source)
+                queried_at = asyncio.get_running_loop().time()
+                logger.info(
+                    "team usage sql refresh=%s connect_ms=%.0f query_ms=%.0f total_ms=%.0f backends=%s scopes=%s records=%s",
+                    refresh,
+                    (connected_at - db_started) * 1000,
+                    (queried_at - connected_at) * 1000,
+                    (queried_at - request_started) * 1000,
+                    len({item.get("backend") for item in team_scope_items(team)}),
+                    len(team_scope_items(team)),
+                    len(payload.get("rows") or []) if payload else 0,
+                )
+                if payload is not None:
+                    payload = dict(payload)
+                    last_synced = payload.pop("lastSyncedAt", None)
+                    attach_snapshot_freshness(payload, last_synced, start_date, end_date, revision)
+                    payload.setdefault("dataQuality", {})["backends"] = [item.get("backend") for item in team_scope_items(team)]
+            except Exception as exc:
+                logger.exception("local team usage query failed")
+                raise manual_refresh_database_unavailable() from exc
+        if payload is None:
+            if store is not None:
+                raise HTTPException(status_code=503, detail="团队用量快照尚未就绪，请等待后台同步完成")
+            if refresh:
+                raise manual_refresh_database_unavailable()
+            try:
+                payload = dict(await client().team_usage_rows(team_scope_items(team), start_date, end_date, source))
+            except TypeError:
+                # Keep test doubles and older clients compatible with the legacy signature.
+                payload = dict(await client().team_usage_rows(str(team["backend"]), str(team["id"]), start_date, end_date, source))
+        if enrich_member_rankings:
+            # team_rows/team_usage_rows already aggregate through team membership. Do not
+            # replace that scoped result with an email-wide personal usage query.
+            payload["employees"] = payload.get("employees") or []
+            payload.setdefault("dataQuality", {})["rankingSource"] = "team_membership_database" if store is not None and payload.get("dataQuality", {}).get("summarySource") == "database" else "team_membership_upstream"
+            payload["dataQuality"]["rankingScope"] = "selected_team"
+            payload["dataQuality"]["memberIdentityMatch"] = "user_id_or_email"
+        payload["team"] = public_team_from_payload(team, payload.get("team"))
+        # 摘要和排行来自同一批结果；首个请求即写缓存，后续排行请求不重复查库。
+        team_usage_cache.set(cache_key, payload, env_int("TEAM_USAGE_CACHE_TTL_SECONDS", 300))
+        payload = dict(payload)
+        payload["cache"] = {"hit": False, "ttlSeconds": 0}
+        return payload
+
+    return await usage_singleflight(cache_key, load)
 
 
 def clean_identifier(value: Any) -> str:
@@ -3854,7 +4027,10 @@ async def team_member_usage_payload(
         raise HTTPException(status_code=403, detail="当前账号还没有团队负责人权限")
 
     team = select_authorized_team(scope, team_ref_value)
-    cache_key = team_member_usage_cache_key(app_user["email"], team, employee, start_date, end_date, source)
+    revision = "development-upstream"
+    if usage_store() is not None:
+        revision = await snapshot_revision(start_date, end_date)
+    cache_key = team_member_usage_cache_key(app_user["email"], team, employee, start_date, end_date, source, revision)
     if not refresh:
         hit, value, ttl_seconds = team_member_usage_cache.get(cache_key)
         if hit:
@@ -3875,7 +4051,6 @@ async def team_member_usage_payload(
             db_started = asyncio.get_running_loop().time()
             await store.connect()
             connected_at = asyncio.get_running_loop().time()
-            await prepare_usage_refresh(start_date, end_date, refresh)
             stored_payload = await store.team_member_rows(team_scope_items(team), employee, start_date, end_date, source)
             queried_at = asyncio.get_running_loop().time()
             logger.info(
@@ -3888,8 +4063,9 @@ async def team_member_usage_payload(
                 len(team_scope_items(team)),
                 len(stored_payload.get("rows") or []) if stored_payload else 0,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("local team member usage query failed")
+            raise manual_refresh_database_unavailable() from exc
     if stored_payload is not None:
         rows = stored_payload.get("rows") or []
         selected_employee = stored_payload.get("employee") or {}
@@ -3897,6 +4073,8 @@ async def team_member_usage_payload(
             raise HTTPException(status_code=404, detail="未找到该团队成员")
         team_payload = {"team": stored_payload.get("team") or {}, "dataQuality": stored_payload.get("dataQuality") or {}}
     else:
+        if store is not None:
+            raise HTTPException(status_code=503, detail="团队成员用量快照尚未就绪，请等待后台同步完成")
         if refresh:
             raise manual_refresh_database_unavailable()
         team_payload = await team_usage_payload(app_user, start_date, end_date, source, False, team_ref_value, enrich_member_rankings=False)
@@ -3924,7 +4102,13 @@ async def team_member_usage_payload(
         "dataQuality": stored_payload.get("dataQuality") if stored_payload is not None else team_payload.get("dataQuality", {}),
     }
     if stored_payload is not None:
-        payload["dataFreshness"] = usage_data_freshness(stored_payload.get("lastSyncedAt"), start_date, end_date)
+        attach_snapshot_freshness(
+            payload,
+            stored_payload.get("lastSyncedAt"),
+            start_date,
+            end_date,
+            revision,
+        )
     elif team_payload.get("dataFreshness"):
         payload["dataFreshness"] = team_payload["dataFreshness"]
     team_member_usage_cache.set(cache_key, payload, env_int("TEAM_MEMBER_USAGE_CACHE_TTL_SECONDS", 300))
@@ -4589,7 +4773,7 @@ async def debug_admin_usage_compare(
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    result: dict[str, Any] = {"status": "ok", "usageSync": dict(_usage_sync_status)}
+    result: dict[str, Any] = {"status": "ok", "usageSync": {"status": "disabled"}}
     if organization_real_enabled() and (
         not _organization_capability_status.get("available")
         or organization_capability_probe_due()
@@ -4659,22 +4843,54 @@ async def health() -> dict[str, Any]:
         result["usageDatabase"] = await store.health()
         if result["usageDatabase"].get("status") in {"error", "disconnected"}:
             result["status"] = "degraded"
+        else:
+            state_loader = getattr(store, "sync_state", None)
+            if not callable(state_loader):
+                # 未接入共享同步状态的旧 store（含测试替身）沿用进程内状态。
+                result["usageSync"] = dict(_usage_sync_status)
+                if result["usageSync"].get("status") in {"error", "failed", "partial"}:
+                    result["status"] = "degraded"
+                state = {}
+            else:
+                state = await state_loader() or {}
+            if state:
+                now = datetime.now(timezone.utc)
+                heartbeat = state.get("heartbeatAt")
+                last_success = state.get("lastSuccessAt")
+                heartbeat_lag = (
+                    max(0, int((now - heartbeat).total_seconds()))
+                    if isinstance(heartbeat, datetime)
+                    else None
+                )
+                snapshot_lag = (
+                    max(0, int((now - last_success).total_seconds()))
+                    if isinstance(last_success, datetime)
+                    else None
+                )
+                result["usageSync"] = {
+                    "role": usage_sync_role(),
+                    "status": state.get("status", "unknown"),
+                    "workerId": state.get("workerId"),
+                    "heartbeatAt": heartbeat.isoformat() if isinstance(heartbeat, datetime) else None,
+                    "heartbeatLagSeconds": heartbeat_lag,
+                    "lastStartedAt": state["lastStartedAt"].isoformat() if isinstance(state.get("lastStartedAt"), datetime) else None,
+                    "lastFinishedAt": state["lastFinishedAt"].isoformat() if isinstance(state.get("lastFinishedAt"), datetime) else None,
+                    "lastSuccessAt": last_success.isoformat() if isinstance(last_success, datetime) else None,
+                    "snapshotLagSeconds": snapshot_lag,
+                    "snapshotRevision": state.get("snapshotRevision"),
+                    "lastError": state.get("lastError"),
+                }
+                if (
+                    heartbeat_lag is None
+                    or heartbeat_lag > max(30, env_int("USAGE_SYNC_HEARTBEAT_MAX_AGE_SECONDS", 120))
+                    or snapshot_lag is None
+                    or snapshot_lag > max(60, env_int("USAGE_SYNC_SUCCESS_MAX_AGE_SECONDS", 3600))
+                    or state.get("status") in {"failed", "error", "partial"}
+                ):
+                    result["usageSync"]["status"] = "degraded"
+                    result["status"] = "degraded"
     else:
         result["usageDatabase"] = {"enabled": False, "connected": False, "status": "disabled"}
-    if result["usageSync"].get("status") in {"error", "failed", "partial"}:
-        result["status"] = "degraded"
-    last_run = str(result["usageSync"].get("lastRun") or "")
-    if last_run:
-        try:
-            parsed_last_run = datetime.fromisoformat(last_run.replace("Z", "+00:00"))
-            if parsed_last_run.tzinfo is None:
-                parsed_last_run = parsed_last_run.replace(tzinfo=timezone.utc)
-            lag_seconds = max(0, int((datetime.now(timezone.utc) - parsed_last_run).total_seconds()))
-            result["usageSync"]["lagSeconds"] = lag_seconds
-            if lag_seconds > max(60, env_int("USAGE_SYNC_HEALTH_MAX_LAG_SECONDS", 7200)):
-                result["status"] = "degraded"
-        except ValueError:
-            result["usageSync"]["lagSeconds"] = None
     billing_ledger = billing_store()
     if billing_ledger is None:
         result["billing"] = {"enabled": False, "status": "disabled"}
