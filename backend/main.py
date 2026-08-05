@@ -2846,15 +2846,19 @@ async def auth_user_payload(user: dict[str, Any], *, refresh_entitlement: bool =
                 # Entitlements are advisory UI state. A transient upstream lookup
                 # must not invalidate an otherwise valid dashboard login.
                 entitlement_status = "inactive"
-    if entitlement_status != "active":
-        # 客户企业成员的权限来自成员关系，不是个人注册时那个从未授予过模型的上游
-        # 账号。用户名账号根本没有个人映射，而邮箱注册的账号被平台管理员绑定到成员
-        # 之后同样如此，所以这里对两种账号类型一视同仁地兜底。
-        entitlement_status = await member_account_entitlement_status(user)
+    # 客户企业成员的权限和资料都来自成员关系，不是个人注册时那个从未授予过模型的
+    # 上游账号。用户名账号根本没有个人映射，而邮箱注册的账号被平台管理员绑定到成员
+    # 之后同样如此，所以这里对两种账号类型一视同仁。
+    member = await provisioned_member_for_account(user)
+    if member is not None:
+        entitlement_status = "active"
     contact_email = str(user.get("email") or user.get("contactEmail") or "").strip().lower()
     login_name = str(user.get("login_name") or user.get("loginName") or "").strip()
     display_identifier = contact_email or login_name
-    normalized = normalize_user(display_identifier, str(user.get("name") or ""))
+    # 成员花名册由企业管理员维护，比注册时自己填的名字更权威；换绑登录账号后也不
+    # 该继续顶着上一个账号的名字。
+    member_name = str((member or {}).get("name") or "").strip()
+    normalized = normalize_user(display_identifier, member_name or str(user.get("name") or ""))
     # Username-only managed accounts must not leak a fabricated email into
     # auth/me or downstream authorization checks.
     normalized["email"] = contact_email or None
@@ -2911,23 +2915,25 @@ async def create_local_session(request: Request, user: dict[str, Any]) -> tuple[
     return await auth_user_payload(user), csrf_value
 
 
-async def member_account_entitlement_status(user: dict[str, Any]) -> str:
-    """Resolve entitlement from an active customer membership.
+async def provisioned_member_for_account(user: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the active customer membership that provisions this account.
 
-    Membership is the grant: a member is entitled once the customer tenant is
-    adopted upstream and the account owns at least one usage identity there.
+    Membership is the grant: a member counts as provisioned once the customer
+    tenant is adopted upstream and the account owns at least one usage identity
+    there.  It is also the authoritative profile — a customer administrator
+    maintains the member roster, not the name typed at signup.
     """
 
     user_id = str(user.get("id") or "")
     if not organization_real_enabled() or not user_id:
-        return "inactive"
+        return None
     try:
         memberships = await organization_store_call(
             "resolve_members_by_auth_user_id", user_id, _require_capability=False
         )
     except Exception:
-        return "inactive"
-    active = next(
+        return None
+    return next(
         (
             item
             for item in _organization_membership_items(memberships)
@@ -2938,7 +2944,6 @@ async def member_account_entitlement_status(user: dict[str, Any]) -> str:
         ),
         None,
     )
-    return "active" if active else "inactive"
 
 
 async def provision_local_user(user: dict[str, Any]) -> dict[str, Any]:

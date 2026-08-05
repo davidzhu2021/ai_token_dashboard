@@ -221,7 +221,8 @@ def entitlement_for(
     monkeypatch.setattr(
         main, "organization_store", lambda: RecordingOrganizationStore(memberships)
     )
-    return asyncio.run(main.member_account_entitlement_status({"id": "auth-user-1"}))
+    member = asyncio.run(main.provisioned_member_for_account({"id": "auth-user-1"}))
+    return "active" if member is not None else "inactive"
 
 
 def member_record(**overrides: Any) -> dict[str, Any]:
@@ -279,4 +280,4 @@ def test_entitlement_is_inactive_when_real_mode_is_off(
 ) -> None:
     monkeypatch.setattr(main, "organization_real_enabled", lambda: False)
 
-    assert asyncio.run(main.member_account_entitlement_status({"id": "auth-user-1"})) == "inactive"
+    assert asyncio.run(main.provisioned_member_for_account({"id": "auth-user-1"})) is None
