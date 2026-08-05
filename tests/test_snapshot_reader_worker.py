@@ -242,6 +242,55 @@ def test_publish_snapshots_uses_copy_before_atomic_replace() -> None:
     assert result["snapshotRevision"]
 
 
+def test_snapshot_state_falls_back_to_coverage_before_first_publish() -> None:
+    """升级后发布状态表为空，但历史快照仍可用，权限读取不应整体失败。"""
+
+    class Pool:
+        async def fetchrow(self, query, *_args):
+            if "FROM usage_snapshot_state" in query:
+                return {
+                    "revision": "",
+                    "published_at": None,
+                    "start_date": None,
+                    "end_date": None,
+                    "backend_ids": None,
+                }
+            assert "FROM usage_sync_coverage" in query
+            return {
+                "revision": "2026-08-05 05:00:00+00",
+                "published_at": datetime(2026, 8, 5, 5, tzinfo=timezone.utc),
+                "start_date": datetime(2026, 5, 7, tzinfo=timezone.utc).date(),
+                "end_date": datetime(2026, 8, 5, tzinfo=timezone.utc).date(),
+                "backend_ids": ["primary", "her"],
+            }
+
+    store = UsageStore("postgresql://unused")
+    store.pool = Pool()
+    state = asyncio.run(store.snapshot_state())
+
+    assert state["revision"] == "2026-08-05 05:00:00+00"
+    assert state["backendIds"] == ["primary", "her"]
+
+
+def test_snapshot_state_stays_empty_without_any_coverage() -> None:
+    class Pool:
+        async def fetchrow(self, query, *_args):
+            if "FROM usage_snapshot_state" in query:
+                return None
+            return {
+                "revision": None,
+                "published_at": None,
+                "start_date": None,
+                "end_date": None,
+                "backend_ids": None,
+            }
+
+    store = UsageStore("postgresql://unused")
+    store.pool = Pool()
+
+    assert asyncio.run(store.snapshot_state())["revision"] == ""
+
+
 def test_worker_startup_uses_recent_refresh_when_snapshot_is_old(monkeypatch) -> None:
     now = datetime(2026, 8, 5, 8, tzinfo=timezone.utc)
 

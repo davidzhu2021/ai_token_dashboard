@@ -579,10 +579,32 @@ class UsageStore:
             FROM usage_snapshot_state WHERE singleton=TRUE
             """
         )
-        if row is None:
-            return {"revision": "", "publishedAt": None}
+        if row is None or not row["revision"]:
+            # 发布状态表是随本次改动新建的，首次发布前为空；已同步过的历史快照仍在
+            # usage_sync_coverage 里，用它的最新同步时间兜底，避免升级后到首次发布
+            # 之间把权限读取整体拒掉。
+            return await self._snapshot_state_from_coverage()
         return {
             "revision": str(row["revision"] or ""),
+            "publishedAt": row["published_at"],
+            "startDate": row["start_date"].isoformat() if row["start_date"] else None,
+            "endDate": row["end_date"].isoformat() if row["end_date"] else None,
+            "backendIds": list(row["backend_ids"] or []),
+        }
+
+    async def _snapshot_state_from_coverage(self) -> dict[str, Any]:
+        row = await self._require_pool().fetchrow(
+            """
+            SELECT MAX(synced_at)::text AS revision, MAX(synced_at) AS published_at,
+                   MIN(usage_date) AS start_date, MAX(usage_date) AS end_date,
+                   array_agg(DISTINCT backend_id) AS backend_ids
+            FROM usage_sync_coverage
+            """
+        )
+        if row is None or not row["revision"]:
+            return {"revision": "", "publishedAt": None}
+        return {
+            "revision": str(row["revision"]),
             "publishedAt": row["published_at"],
             "startDate": row["start_date"].isoformat() if row["start_date"] else None,
             "endDate": row["end_date"].isoformat() if row["end_date"] else None,
