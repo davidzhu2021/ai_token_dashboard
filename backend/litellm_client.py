@@ -323,6 +323,21 @@ def tool_account_aliases(email_prefix: str) -> list[str]:
     return [alias for alias in aliases if alias]
 
 
+# `tool_account_aliases` 的反向操作：工具账号编号里的后缀就是员工邮箱前缀，
+# 同一个人的 cursor / claude-code 两个账号里往往只有一个带姓名和邮箱。
+_TOOL_ACCOUNT_PREFIXES = ("claude-code-", "cursor-")
+
+
+def tool_account_email_prefix(user_id: Any) -> str:
+    """从工具账号编号里取出邮箱前缀，不是工具账号时返回空串。"""
+
+    text = _clean_text(user_id).lower()
+    for prefix in _TOOL_ACCOUNT_PREFIXES:
+        if text.startswith(prefix):
+            return text[len(prefix) :]
+    return ""
+
+
 def _tool_alias_matches(alias: str, candidate: Any) -> bool:
     text = _clean_text(candidate)
     return text == alias or text.startswith(f"{alias}-")

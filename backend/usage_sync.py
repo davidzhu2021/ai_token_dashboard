@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from .litellm_client import LiteLLMBackend, LiteLLMClient, usage_today
+from .litellm_client import LiteLLMBackend, LiteLLMClient, tool_account_email_prefix, usage_today
 from .usage_store import UsageStore
 
 
@@ -94,6 +94,22 @@ class UsageSynchronizer:
 
         by_user_id: dict[str, dict[str, str]] = {}
         name_to_email: dict[str, set[str]] = {}
+        # 邮箱前缀 -> 身份。工具账号按 `cursor-<邮箱前缀>` / `claude-code-<邮箱前缀>`
+        # 建号，同一个人的两个账号里往往只有一个带姓名。
+        local_to_emails: dict[str, set[str]] = {}
+        local_identity: dict[str, dict[str, str]] = {}
+
+        def remember_local(name: str, email: str, department: str = "") -> None:
+            local = email.split("@", 1)[0] if email else ""
+            if not local:
+                return
+            local_to_emails.setdefault(local, set()).add(email)
+            current = local_identity.setdefault(local, {"name": "", "email": email, "department": ""})
+            if name and not current["name"]:
+                current["name"] = name
+            if department and not current["department"]:
+                current["department"] = department
+
         for backend in getattr(self.client, "backends", None) or []:
             if getattr(backend, "source", ""):
                 loader = getattr(self.client, "her_account_index", None)
@@ -113,6 +129,11 @@ class UsageSynchronizer:
                         "department": _text(profile.get("department")),
                         "emailSource": _text(profile.get("emailSource")) or ("upstream" if _email(profile.get("email")) else ""),
                     }
+                    remember_local(
+                        _text(profile.get("name")),
+                        _email(profile.get("email")),
+                        _text(profile.get("department")),
+                    )
                 continue
             try:
                 users = await self.client.users(backend)
@@ -124,10 +145,17 @@ class UsageSynchronizer:
                 email = _email(user.get("user_email") or user.get("sso_user_id"))
                 if name and email:
                     name_to_email.setdefault(name, set()).add(email)
+                remember_local(name, email)
         return {
             "byUserId": by_user_id,
             # 只保留唯一映射，同名对应多个邮箱时不做推断。
             "nameToEmail": {name: next(iter(emails)) for name, emails in name_to_email.items() if len(emails) == 1},
+            # 同一前缀落在两个不同邮箱上时（跨域同名）不做归并。
+            "byEmailLocal": {
+                local: identity
+                for local, identity in local_identity.items()
+                if len(local_to_emails.get(local) or ()) == 1 and identity.get("name")
+            },
         }
 
     def _apply_identity_directory(
@@ -151,6 +179,18 @@ class UsageSynchronizer:
                     email = _email(profile.get("email"))
                     email_source = _text(profile.get("emailSource")) if email else ""
                 department = department or _text(profile.get("department"))
+        if not name or name == user_id or not email:
+            # 工具账号编号的后缀就是邮箱前缀，同一个人的 cursor / claude-code
+            # 两个账号里通常只有一个带姓名，另一个只剩编号。
+            prefix = tool_account_email_prefix(user_id)
+            paired = (directory.get("byEmailLocal") or {}).get(prefix) if prefix else None
+            if paired:
+                if not name or name == user_id:
+                    name = _text(paired.get("name")) or name
+                if not email:
+                    email = _email(paired.get("email"))
+                    email_source = "paired_tool_account" if email else email_source
+                department = department or _text(paired.get("department"))
         if not email:
             # 上游没有邮箱时，用另一侧目录的「姓名 -> 邮箱」唯一映射推断，
             # 仅用于展示与归并，不参与 resolve_user 的邮箱匹配。
@@ -165,6 +205,29 @@ class UsageSynchronizer:
             "department": department,
             "emailSource": email_source,
         }
+
+    def _member_identity(
+        self,
+        backend: LiteLLMBackend,
+        user_id: str,
+        name: str,
+        email: str,
+        directory: dict[str, Any] | None,
+    ) -> tuple[str, str]:
+        """团队成员的姓名/邮箱同样走跨后端目录。
+
+        团队看板读的是成员表而不是用量表，上游的成员清单里 ``user_alias`` 时有时无，
+        缺失时看板上就只剩一个账号编号。
+        """
+
+        name = _text(name)
+        email = _email(email)
+        if name and name != user_id and email:
+            return name, email
+        resolved = self._apply_identity_directory(
+            backend, user_id, {"name": name, "email": email}, directory or {}
+        )
+        return _text(resolved.get("name")) or name, _email(resolved.get("email")) or email
 
     @staticmethod
     def _department_records(teams: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -657,7 +720,7 @@ class UsageSynchronizer:
             start_date,
             end_date,
         )
-        memberships = await self.collect_memberships(backend, users, start_date, end_date, account_index)
+        memberships = await self.collect_memberships(backend, users, start_date, end_date, account_index, directory)
         directory_teams = getattr(self, "_directory_teams", {}).get(backend.id)
         if directory_teams is None:
             try:
@@ -690,6 +753,7 @@ class UsageSynchronizer:
         start_date: str,
         end_date: str,
         account_index: dict[str, Any] | None = None,
+        directory: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         teams = await self.client.teams(backend)
         directory_cache = getattr(self, "_directory_teams", None)
@@ -754,6 +818,9 @@ class UsageSynchronizer:
                 role = _text(member.get("role") or member.get("user_role") or member.get("team_role")) or "user"
                 for candidate_user_id in candidate_ids:
                     assigned_user_ids.add(candidate_user_id)
+                    member_name, member_email = self._member_identity(
+                        backend, candidate_user_id, name, email, directory
+                    )
                     for snapshot_date in dates:
                         memberships.append(
                             {
@@ -761,8 +828,8 @@ class UsageSynchronizer:
                                 "teamId": team_id,
                                 "teamName": team_name,
                                 "userId": candidate_user_id,
-                                "employeeEmail": email,
-                                "employeeName": name,
+                                "employeeEmail": member_email,
+                                "employeeName": member_name,
                                 "teamRole": role,
                             }
                         )
@@ -773,6 +840,9 @@ class UsageSynchronizer:
         }
         for user_id in sorted(account_user_ids - assigned_user_ids):
             info = user_map.get(user_id.lower(), {})
+            member_name, member_email = self._member_identity(
+                backend, user_id, _text(info.get("name")), _email(info.get("email")), directory
+            )
             for snapshot_date in dates:
                 memberships.append(
                     {
@@ -780,8 +850,8 @@ class UsageSynchronizer:
                         "teamId": "unassigned",
                         "teamName": "未分配部门",
                         "userId": user_id,
-                        "employeeEmail": _email(info.get("email")),
-                        "employeeName": _text(info.get("name")) or user_id,
+                        "employeeEmail": member_email,
+                        "employeeName": member_name or user_id,
                         "teamRole": "user",
                     }
                 )

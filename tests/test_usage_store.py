@@ -1257,7 +1257,7 @@ def test_usage_sync_passes_backend_account_index_to_membership_snapshot() -> Non
     synchronizer = UsageSynchronizer(client, object())
     captured = {}
 
-    async def capture(_backend, _users, _start, _end, account_index=None):
+    async def capture(_backend, _users, _start, _end, account_index=None, directory=None):
         captured["account_index"] = account_index
         return []
 
