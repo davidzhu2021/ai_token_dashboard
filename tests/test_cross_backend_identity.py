@@ -18,10 +18,16 @@ HER = LiteLLMBackend(id="her", label="Her", base_url="https://her.test", admin_k
 
 
 class FakeClient:
-    def __init__(self, users: dict[str, list[dict[str, Any]]], profiles: dict[str, dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        users: dict[str, list[dict[str, Any]]],
+        profiles: dict[str, dict[str, Any]],
+        teams: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.backends = [PRIMARY, HER]
         self._users = users
         self._profiles = profiles
+        self._teams = teams or []
 
     async def users(self, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
         return self._users.get(backend.id if backend else "primary", [])
@@ -46,7 +52,7 @@ class FakeClient:
         ]
 
     async def teams(self, backend: LiteLLMBackend | None = None, include_details: bool = True) -> list[dict[str, Any]]:
-        return []
+        return self._teams if (backend is None or backend.id == "her") else []
 
     def _admin_user_map(self, users: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         return {}
@@ -58,9 +64,13 @@ class FakeClient:
         return user_id
 
 
-def make_synchronizer(users: dict[str, list[dict[str, Any]]], profiles: dict[str, dict[str, Any]]) -> UsageSynchronizer:
+def make_synchronizer(
+    users: dict[str, list[dict[str, Any]]],
+    profiles: dict[str, dict[str, Any]],
+    teams: list[dict[str, Any]] | None = None,
+) -> UsageSynchronizer:
     synchronizer = object.__new__(UsageSynchronizer)
-    synchronizer.client = FakeClient(users, profiles)
+    synchronizer.client = FakeClient(users, profiles, teams)
     synchronizer.store = None
     synchronizer.organization_repository = None
 
@@ -180,3 +190,44 @@ def test_snapshot_carries_identities_for_historical_refresh() -> None:
             "emailSource": "upstream",
         }
     ]
+
+
+def test_team_membership_fills_names_from_the_shared_directory() -> None:
+    """成员清单里只有账号编号时，团队看板也要用档案补出姓名。
+
+    用量表在 ``collect_backend`` 里另外合并过一次账号档案，成员表没有这一步，
+    补齐逻辑必须对两套后端都生效，否则团队看板上会继续只剩编号。
+    """
+
+    profiles = {
+        "carher-224": {"email": "", "name": "潘晓", "department": "AI技术院", "emailSource": ""},
+        "carher-236": {
+            "email": "liuguoxian@auto-link.com.cn",
+            "name": "刘国现",
+            "department": "AI Infra部",
+            "emailSource": "enterprise_email",
+        },
+    }
+    teams = [
+        {
+            "team_id": "team-ai",
+            "team_alias": "AI技术院",
+            "members_with_roles": [
+                {"user_id": "carher-224", "role": "user"},
+                {"user_id": "carher-236", "role": "user"},
+            ],
+        }
+    ]
+    synchronizer = object.__new__(UsageSynchronizer)
+    synchronizer.client = FakeClient({"primary": [], "her": []}, profiles, teams)
+    directory = asyncio.run(synchronizer._identity_directory())
+
+    memberships = asyncio.run(
+        synchronizer.collect_memberships(HER, [], "2026-08-01", "2026-08-01", {}, directory)
+    )
+
+    by_user_id = {item["userId"]: item for item in memberships}
+    assert by_user_id["carher-224"]["employeeName"] == "潘晓"
+    assert by_user_id["carher-224"]["employeeEmail"] == ""
+    assert by_user_id["carher-236"]["employeeName"] == "刘国现"
+    assert by_user_id["carher-236"]["employeeEmail"] == "liuguoxian@auto-link.com.cn"

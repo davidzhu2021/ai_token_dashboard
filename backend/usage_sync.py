@@ -171,14 +171,16 @@ class UsageSynchronizer:
         email = _email(info.get("email"))
         department = _text(info.get("department"))
         email_source = "upstream" if email else ""
-        if not getattr(backend, "source", ""):
-            profile = (directory.get("byUserId") or {}).get(user_id) or {}
-            if profile and (not name or name == user_id or not email):
-                name = name if name and name != user_id else _text(profile.get("name")) or name
-                if not email:
-                    email = _email(profile.get("email"))
-                    email_source = _text(profile.get("emailSource")) if email else ""
-                department = department or _text(profile.get("department"))
+        # 两套后端共用一个账号编号命名空间，这份 `byUserId` 就是员工档案，对本侧
+        # 账号同样适用：用量表在 collect_backend 里另外合并过一次档案，成员表没有，
+        # 只按后端过滤会让团队看板上的本侧账号继续只剩编号。
+        profile = (directory.get("byUserId") or {}).get(user_id) or {}
+        if profile and (not name or name == user_id or not email):
+            name = name if name and name != user_id else _text(profile.get("name")) or name
+            if not email:
+                email = _email(profile.get("email"))
+                email_source = _text(profile.get("emailSource")) if email else ""
+            department = department or _text(profile.get("department"))
         if not name or name == user_id or not email:
             # 工具账号编号的后缀就是邮箱前缀，同一个人的 cursor / claude-code
             # 两个账号里通常只有一个带姓名，另一个只剩编号。
