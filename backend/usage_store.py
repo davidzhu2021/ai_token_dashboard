@@ -1103,6 +1103,35 @@ class UsageStore:
             for row in rows
         ]
 
+    async def replace_department_directory(self, backend_id: str, departments: list[dict[str, Any]]) -> int:
+        pool = self._require_pool()
+        synced_at = datetime.now(timezone.utc)
+        records = [
+            (
+                backend_id,
+                str(item.get("departmentId") or ""),
+                str(item.get("departmentName") or ""),
+                str(item.get("organizationId") or ""),
+                str(item.get("status") or "active"),
+                synced_at,
+            )
+            for item in departments
+            if str(item.get("departmentId") or "")
+        ]
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "DELETE FROM usage_department_directory WHERE backend_id=$1", backend_id
+                )
+                if records:
+                    await connection.executemany(
+                        "INSERT INTO usage_department_directory "
+                        "(backend_id,department_id,department_name,organization_id,status,synced_at) "
+                        "VALUES ($1,$2,$3,$4,$5,$6)",
+                        records,
+                    )
+        return len(records)
+
     async def model_usage_counts(
         self,
         start_date: str,

@@ -1348,3 +1348,32 @@ def test_health_reports_degraded_when_one_backend_sync_fails(monkeypatch) -> Non
     monkeypatch.setattr(main, "_usage_sync_status", {"status": "partial", "lastRun": "2026-07-22T00:00:00+00:00"})
     payload = asyncio.run(main.health())
     assert payload["status"] == "degraded"
+
+
+def test_department_directory_sync_does_not_collect_usage_or_team_details() -> None:
+    class Client:
+        backends = [type("Backend", (), {"id": "primary"})()]
+
+        async def teams(self, _backend, include_details=True):
+            assert include_details is False
+            return [{
+                "team_id": "team-baic",
+                "team_alias": "北汽集团",
+                "organization_id": "org-baic",
+                "members_with_roles": [],
+            }]
+
+    class Store:
+        async def replace_department_directory(self, backend_id, departments):
+            assert backend_id == "primary"
+            assert departments[0]["departmentId"] == "team-baic"
+            assert departments[0]["departmentName"] == "北汽集团"
+            return len(departments)
+
+    result = asyncio.run(UsageSynchronizer(Client(), Store()).sync_department_directories())
+
+    assert result == {
+        "status": "ok",
+        "backends": {"primary": 1},
+        "departmentCount": 1,
+    }

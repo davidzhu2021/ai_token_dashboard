@@ -607,6 +607,10 @@ async def usage_sync_loop() -> None:
         if not has_history:
             await run_usage_sync(initial_days)
         else:
+            synchronizer = UsageSynchronizer(
+                client(), store, await organization_repository_for_usage_sync()
+            )
+            await synchronizer.sync_department_directories()
             _usage_sync_status.update({"status": "ready", "lastRun": None, "initialBackfill": "complete"})
     except Exception:
         logger.exception("initial usage coverage check failed")

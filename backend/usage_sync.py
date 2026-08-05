@@ -82,6 +82,32 @@ class UsageSynchronizer:
         # mapping used when SpendLogs omit organization/team identifiers.
         self.organization_repository = organization_repository
 
+    @staticmethod
+    def _department_records(teams: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "departmentId": _text(team.get("team_id") or team.get("id")),
+                "departmentName": _text(team.get("team_alias") or team.get("alias") or team.get("name")) or _text(team.get("team_id") or team.get("id")),
+                "organizationId": _text(team.get("organization_id") or team.get("organizationId") or team.get("org_id") or team.get("orgId")),
+                "status": "blocked" if (
+                    team.get("blocked") is True
+                    or str(team.get("blocked") or "").strip().lower() in {"1", "true", "yes", "on"}
+                ) else "active",
+            }
+            for team in teams
+            if _text(team.get("team_id") or team.get("id"))
+        ]
+
+    async def sync_department_directories(self) -> dict[str, Any]:
+        counts: dict[str, int] = {}
+        for backend in self.client.backends:
+            teams = await self.client.teams(backend, include_details=False)
+            departments = self._department_records(teams)
+            counts[backend.id] = await self.store.replace_department_directory(
+                backend.id, departments
+            )
+        return {"status": "ok", "backends": counts, "departmentCount": sum(counts.values())}
+
     async def _token_attribution_map(
         self, backend_id: str
     ) -> dict[tuple[str, str], list[dict[str, Any]]]:
@@ -504,19 +530,7 @@ class UsageSynchronizer:
                 directory_teams = await self.client.teams(backend, include_details=False)
             except TypeError:
                 directory_teams = await self.client.teams(backend)
-        departments = [
-            {
-                "departmentId": _text(team.get("team_id") or team.get("id")),
-                "departmentName": _text(team.get("team_alias") or team.get("alias") or team.get("name")) or _text(team.get("team_id") or team.get("id")),
-                "organizationId": _text(team.get("organization_id") or team.get("organizationId") or team.get("org_id") or team.get("orgId")),
-                "status": "blocked" if (
-                    team.get("blocked") is True
-                    or str(team.get("blocked") or "").strip().lower() in {"1", "true", "yes", "on"}
-                ) else "active",
-            }
-            for team in directory_teams
-            if _text(team.get("team_id") or team.get("id"))
-        ]
+        departments = self._department_records(directory_teams)
         return BackendSnapshot(
             backend.id,
             rows,
