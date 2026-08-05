@@ -27,6 +27,7 @@ from .organization_validation import (
     DEFAULT_TOKEN_DAILY_BUDGET_USD,
     DuplicateMemberEmailError,
     MAX_TOKENS_PER_ORGANIZATION,
+    MEMBER_REMOVABLE_STATUSES,
     MEMBER_REMOVED_STATUS,
     OrganizationConflictError,
     OrganizationNotFoundError,
@@ -1781,12 +1782,13 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
         return await self._member_payload_with_department(row, organization_id=organization_id)
 
     async def remove_member(self, member_id: str, *, organization_id: str) -> dict[str, Any]:
-        """Move one suspended member out of the customer for good.
+        """Move one invited or suspended member out of the customer for good.
 
         The row survives as a tombstone because usage history, issued tokens and
         invitations all reference it, and the department/company boards read the
-        member row to label historical usage. Only a suspended member may be
-        removed so access is already cut before the tombstone hides the row.
+        member row to label historical usage. An active member must be suspended
+        first so access is already cut before the tombstone hides the row; an
+        invited one never gained access, so cancelling it outright is safe.
         """
 
         pool = self._require_pool()
@@ -1803,8 +1805,10 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
                 previous_status = str(previous["status"] or "")
                 if previous_status == MEMBER_REMOVED_STATUS:
                     raise OrganizationConflictError("member was already removed")
-                if previous_status != "suspended":
-                    raise OrganizationConflictError("only a suspended member can be removed")
+                if previous_status not in MEMBER_REMOVABLE_STATUSES:
+                    raise OrganizationConflictError(
+                        "only an invited or suspended member can be removed"
+                    )
                 row = await conn.fetchrow(
                     # 姓名、邮箱与部门都留下：历史用量按成员行显示归属，管理员也要能回查移除了谁。
                     # auth_user_id 必须清空，否则对方的登录账号仍然解析得到这个企业。

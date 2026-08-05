@@ -5861,9 +5861,12 @@ function renderOrganizationMembers() {
     if (isRemoved) {
       statusActions = "";
     } else if (status === "invited" && realMode) {
+      // 还没接受邀请的成员手上没有任何访问能力，可以直接删除；撤销邀请只作废链接，
+      // 人还留在名册里等重发，两个动作解决的不是同一件事。
       statusActions = `
             <button class="ghost-btn" type="button" data-organization-member-invitation-resend="${escapeHtml(id)}" ${canManage ? "" : "disabled"}>重发邀请</button>
             <button class="danger-outline-btn" type="button" data-organization-member-invitation-revoke="${escapeHtml(id)}" ${canManage ? "" : "disabled"}>撤销邀请</button>
+            ${removeButton}
           `;
     } else if (status === "suspended") {
       statusActions = realMode
@@ -7242,11 +7245,12 @@ async function removeOrganizationMember(memberId) {
   if (!organizationCanManage()) return;
   const member = organizationMembers.find((item) => organizationMemberId(item) === String(memberId));
   const label = member?.name || member?.email || "该成员";
-  if (
-    !window.confirm(
-      `删除成员“${label}”？删除后该成员将移出企业，其访问令牌立即失效、登录账号解除绑定，此操作不可撤销。历史用量仍会保留在报表中。`,
-    )
-  ) {
+  // 待邀请成员还没有令牌、也没有绑定登录账号，照抄已暂停成员那套"令牌立即失效"的
+  // 警告会把人吓住，只说清"邀请作废、要重新邀请"就够了。
+  const question = String(member?.status || "") === "invited"
+    ? `删除成员“${label}”？该成员尚未接受邀请，删除后邀请链接立即失效，日后加入需要重新邀请。此操作不可撤销。`
+    : `删除成员“${label}”？删除后该成员将移出企业，其访问令牌立即失效、登录账号解除绑定，此操作不可撤销。历史用量仍会保留在报表中。`;
+  if (!window.confirm(question)) {
     return;
   }
   try {

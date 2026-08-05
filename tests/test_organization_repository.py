@@ -1723,10 +1723,28 @@ def test_member_removal_revokes_access_and_projects_the_tombstone_upstream() -> 
     assert outbox_kinds == ["organization.member.sync", "organization.token.revoke"]
 
 
-def test_only_a_suspended_member_can_be_removed_in_real_mode() -> None:
+def test_an_invited_member_can_be_removed_without_being_suspended_first() -> None:
+    """邀请没成功的人手上没有访问能力，删除时该顺带作废掉那张还没消费的邀请。"""
+
+    connection = _RemovalConnection(status="invited")
+    repository = PostgreSQLOrganizationRepository("postgresql://unused")
+    repository.pool = _RemovalPool(connection)
+
+    member = asyncio.run(repository.remove_member("member-1", organization_id="org-1"))
+
+    assert member["status"] == "removed"
+    assert member["removedAt"]
+    invitation_revocations = [
+        query for query, _ in connection.executed
+        if query.startswith("UPDATE customer_invitation SET revoked_at=now()")
+    ]
+    assert len(invitation_revocations) == 1
+    assert "consumed_at IS NULL AND revoked_at IS NULL" in invitation_revocations[0]
+
+
+def test_an_active_member_must_be_suspended_before_removal_in_real_mode() -> None:
     for status, message in (
-        ("active", "only a suspended member"),
-        ("invited", "only a suspended member"),
+        ("active", "only an invited or suspended member"),
         ("removed", "already removed"),
     ):
         connection = _RemovalConnection(status=status)

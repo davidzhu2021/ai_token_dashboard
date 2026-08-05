@@ -226,29 +226,42 @@ def test_suspended_member_removal_hides_the_row_and_frees_the_email() -> None:
     assert rehired["id"] != invited["id"]
 
 
-def test_only_suspended_members_can_be_removed_and_tombstones_stay_read_only() -> None:
+def test_active_members_cannot_be_removed_and_tombstones_stay_read_only() -> None:
     store = InMemoryOrganizationStore()
-    invited = store.create_member("Casey Active", "casey.active@example.com", "dept-product")
+    member = store.create_member("Casey Active", "casey.active@example.com", "dept-product")
 
-    with pytest.raises(OrganizationConflictError, match="only a suspended member"):
-        store.remove_member(invited["id"])
-    store.update_member(invited["id"], status="active")
-    with pytest.raises(OrganizationConflictError, match="only a suspended member"):
-        store.remove_member(invited["id"])
+    store.update_member(member["id"], status="active")
+    with pytest.raises(OrganizationConflictError, match="only an invited or suspended member"):
+        store.remove_member(member["id"])
     with pytest.raises(OrganizationNotFoundError):
         store.remove_member("missing-member")
 
-    store.update_member(invited["id"], status="suspended")
-    store.remove_member(invited["id"])
+    store.update_member(member["id"], status="suspended")
+    store.remove_member(member["id"])
 
     with pytest.raises(OrganizationConflictError, match="already removed"):
-        store.remove_member(invited["id"])
+        store.remove_member(member["id"])
     # 令牌与账号绑定都撤销过了，改回可用状态只会得到一个没有访问能力的成员。
     with pytest.raises(OrganizationConflictError, match="was removed"):
-        store.update_member(invited["id"], status="active")
+        store.update_member(member["id"], status="active")
     # 移除状态不是可写状态，普通编辑接口不能绕过删除流程。
     with pytest.raises(OrganizationValidationError):
         store.update_member("member-001", status="removed")
+
+
+def test_an_invited_member_can_be_removed_without_being_suspended_first() -> None:
+    """邀请没成功就想撤掉这个人时，不该逼管理员先走一遍「暂停」。"""
+
+    store = InMemoryOrganizationStore()
+    invited = store.create_member("Robin Pending", "robin.pending@example.com", "dept-product")
+    assert invited["status"] == "invited"
+
+    removed = store.remove_member(invited["id"])
+
+    assert removed["status"] == "removed"
+    assert removed["removedAt"]
+    default_ids = {item["id"] for item in store.list_members(page_size=50)["items"]}
+    assert invited["id"] not in default_ids
 
 
 def test_member_removal_revokes_the_tokens_bound_to_that_member() -> None:

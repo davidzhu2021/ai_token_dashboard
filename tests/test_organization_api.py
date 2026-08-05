@@ -327,7 +327,7 @@ def test_platform_cross_customer_member_id_is_not_found(monkeypatch) -> None:
 
 
 def test_customer_admin_removes_a_suspended_member(monkeypatch) -> None:
-    """删除只对已暂停成员开放，成功后默认名册看不到、可按已移除筛选回查。"""
+    """删除对已启用成员关闭，成功后默认名册看不到、可按已移除筛选回查。"""
 
     client = organization_client(monkeypatch, email="admin@demo.example")
 
@@ -349,7 +349,7 @@ def test_customer_admin_removes_a_suspended_member(monkeypatch) -> None:
     removed_list = client.get("/api/organization/current/members?status=removed&pageSize=50")
 
     assert active_removal.status_code == 409
-    assert error_code(active_removal) == "ORGANIZATION_MEMBER_REMOVE_NOT_SUSPENDED"
+    assert error_code(active_removal) == "ORGANIZATION_MEMBER_REMOVE_NOT_ALLOWED"
     assert suspended.status_code == 200
     assert removed.status_code == 200
     assert removed.json()["member"]["status"] == "removed"
@@ -358,6 +358,33 @@ def test_customer_admin_removes_a_suspended_member(monkeypatch) -> None:
     assert error_code(repeat) == "ORGANIZATION_MEMBER_ALREADY_REMOVED"
     assert "member-001" not in {item["id"] for item in default_list.json()["items"]}
     assert [item["id"] for item in removed_list.json()["items"]] == ["member-001"]
+
+
+def test_customer_admin_deletes_a_member_whose_invitation_never_succeeded(monkeypatch) -> None:
+    """邀请没被接受的成员可以直接删除，不用先暂停。"""
+
+    client = organization_client(monkeypatch, email="admin@demo.example")
+
+    created = client.post(
+        "/api/organization/current/members",
+        json={
+            "name": "Robin Pending",
+            "email": "robin.pending@demo.example",
+            "departmentId": "dept-product",
+        },
+        headers=write_headers(),
+    )
+    member_id = created.json()["member"]["id"]
+    assert created.json()["member"]["status"] == "invited"
+
+    removed = client.delete(
+        f"/api/organization/current/members/{member_id}", headers=write_headers()
+    )
+    default_list = client.get("/api/organization/current/members?pageSize=50")
+
+    assert removed.status_code == 200
+    assert removed.json()["member"]["status"] == "removed"
+    assert member_id not in {item["id"] for item in default_list.json()["items"]}
 
 
 def test_member_removal_requires_csrf_and_management_rights(monkeypatch) -> None:

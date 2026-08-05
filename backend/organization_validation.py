@@ -25,6 +25,9 @@ MEMBER_STATUSES = frozenset({"invited", "active", "suspended"})
 # 离职成员被移出企业后的终态。故意不放进 MEMBER_STATUSES：删除必须走专用接口，
 # 那里才会撤销令牌、作废邀请并解除登录账号绑定，普通成员编辑接口不能绕过这些收尾。
 MEMBER_REMOVED_STATUS = "removed"
+# 可以直接删除的状态：待邀请成员还没接受邀请、手上没有任何访问能力；已暂停成员的访问
+# 能力也已经断开。已启用成员必须先暂停再删除，好让断权和移出是两个独立可核查的动作。
+MEMBER_REMOVABLE_STATUSES = frozenset({"invited", "suspended"})
 # 列表筛选允许回查已移除成员，因此比可写状态多一个终态。
 MEMBER_FILTER_STATUSES = MEMBER_STATUSES | {MEMBER_REMOVED_STATUS}
 ORGANIZATION_STATUSES = frozenset({"active", "suspended", "archived"})

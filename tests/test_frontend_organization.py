@@ -165,7 +165,7 @@ def test_real_member_rows_expose_invitation_lifecycle_without_direct_activation(
 
 
 def test_suspended_member_rows_offer_removal_and_removed_rows_are_read_only() -> None:
-    """删除入口只出现在已暂停成员行；已移除成员整行只读，避免误以为可以恢复。"""
+    """删除入口不出现在已启用成员行；已移除成员整行只读，避免误以为可以恢复。"""
 
     markup = INDEX_HTML.read_text(encoding="utf-8")
     source = APP_JS.read_text(encoding="utf-8")
@@ -178,10 +178,14 @@ def test_suspended_member_rows_offer_removal_and_removed_rows_are_read_only() ->
         : source.index("function switchView(")
     ]
 
-    # 删除按钮只在 suspended 分支拼进操作列，两种模式都给。
+    # 删除按钮只拼进 invited / suspended 两个分支，已启用成员那条分支只有「暂停」。
     assert 'data-organization-member-remove="${escapeHtml(id)}"' in renderer
     assert 'const isRemoved = status === "removed";' in renderer
     assert "${removeButton}" in renderer
+    active_branch = renderer[
+        renderer.index('} else {', renderer.index('} else if (status === "suspended") {')) :
+    ]
+    assert "removeButton" not in active_branch[: active_branch.index("return `")]
     assert 'isRemoved ? "" : `<button class="ghost-btn" type="button" data-organization-member-edit=' in renderer
     assert "!isRemoved && canBindIdentity" in renderer
     # 二次确认必须说明后果不可撤销，并说明历史用量仍然保留。
@@ -199,6 +203,32 @@ def test_suspended_member_rows_offer_removal_and_removed_rows_are_read_only() ->
         : markup.index('<div class="modal-actions">', markup.index('<select id="organizationMemberStatusInput"'))
     ]
     assert "removed" not in edit_modal
+
+
+def test_invited_member_rows_offer_deletion_with_invitation_specific_copy() -> None:
+    """邀请没成功的成员要能直接删除，而且确认文案不能照抄「令牌立即失效」那套。"""
+
+    source = APP_JS.read_text(encoding="utf-8")
+    renderer = source[
+        source.index("function renderOrganizationMembers()")
+        : source.index("function renderCustomerOrganizations()")
+    ]
+    invited_branch = renderer[
+        renderer.index('} else if (status === "invited" && realMode) {')
+        : renderer.index('} else if (status === "suspended") {')
+    ]
+    remover = source[
+        source.index("async function removeOrganizationMember(memberId)")
+        : source.index("function switchView(")
+    ]
+
+    # 撤销邀请只作废链接、人还留在名册里，所以删除是另一个按钮而不是它的替代。
+    assert "data-organization-member-invitation-revoke=" in invited_branch
+    assert "${removeButton}" in invited_branch
+    # 待邀请成员没有令牌、也没有绑定登录账号，别用那套警告吓管理员。
+    assert 'String(member?.status || "") === "invited"' in remover
+    assert "尚未接受邀请" in remover
+    assert "重新邀请" in remover
 
 
 def test_employee_ranking_does_not_invent_a_mock_identity() -> None:

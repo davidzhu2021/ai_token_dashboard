@@ -5639,7 +5639,7 @@ async def organization_revoke_member_invitation(
 
 
 async def remove_organization_member(organization_id: str, member_id: str) -> dict[str, Any]:
-    """把一名已暂停成员移出企业，并收尾其残留访问能力。
+    """把一名待邀请或已暂停成员移出企业，并收尾其残留访问能力。
 
     store 负责撤销令牌、作废邀请并解除登录账号绑定；这里补上会话撤销，否则对方
     已登录的浏览器还能继续读这家企业的数据。
@@ -5656,11 +5656,11 @@ async def remove_organization_member(organization_id: str, member_id: str) -> di
             raise auth_http_error(
                 409, "该成员已被移除", "ORGANIZATION_MEMBER_ALREADY_REMOVED"
             ) from exc
-        if "suspended" in detail:
+        if "can be removed" in detail:
             raise auth_http_error(
                 409,
-                "只能删除已暂停的成员，请先暂停该成员",
-                "ORGANIZATION_MEMBER_REMOVE_NOT_SUSPENDED",
+                "只能删除待邀请或已暂停的成员，请先暂停该成员",
+                "ORGANIZATION_MEMBER_REMOVE_NOT_ALLOWED",
             ) from exc
         raise organization_store_error(exc) from exc
     except OrganizationStoreError as exc:
@@ -5676,7 +5676,7 @@ async def remove_organization_member(organization_id: str, member_id: str) -> di
 
 @app.delete("/api/organization/current/members/{member_id}")
 async def organization_remove_member(member_id: str, request: Request) -> dict[str, Any]:
-    """Let a customer administrator move a suspended member out of the company."""
+    """Let a customer administrator move an invited or suspended member out of the company."""
 
     await enforce_csrf(request)
     user = await require_organization_demo_manager(request)
@@ -6474,7 +6474,7 @@ async def platform_remove_member(
     member_id: str,
     request: Request,
 ) -> dict[str, Any]:
-    """Let seller operations move a suspended member out of a customer company."""
+    """Let seller operations move an invited or suspended member out of a customer company."""
 
     if organization_real_enabled():
         require_real_organization_capability()

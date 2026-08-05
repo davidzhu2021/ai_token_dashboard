@@ -30,6 +30,7 @@ from .organization_validation import (
     MAX_SIMULATED_TOPUP_USD,
     MAX_TOKEN_DAILY_BUDGET_USD,
     MAX_TOKENS_PER_ORGANIZATION,
+    MEMBER_REMOVABLE_STATUSES,
     MEMBER_REMOVED_STATUS,
     MEMBER_STATUSES,
     MIN_SIMULATED_TOPUP_USD,
@@ -1798,10 +1799,11 @@ class InMemoryOrganizationStore(OrganizationValidationMixin):
             return self._member_payload(state, member)
 
     def remove_member(self, member_id: str, *, organization_id: str | None = None) -> dict[str, Any]:
-        """把一名已暂停成员移出企业。
+        """把一名待邀请或已暂停成员移出企业。
 
-        记录保留成墓碑：历史用量按成员行显示归属，管理员也要能回查移除了谁。只有
-        已暂停成员可以移除，所以访问权限在墓碑隐藏这一行之前就已经断开。
+        记录保留成墓碑：历史用量按成员行显示归属，管理员也要能回查移除了谁。已启用成员
+        必须先暂停再删除，访问权限才会在墓碑隐藏这一行之前断开；待邀请成员从没拿到过访问
+        能力，可以直接移除。
         """
 
         with self._lock:
@@ -1811,8 +1813,8 @@ class InMemoryOrganizationStore(OrganizationValidationMixin):
             member = self._member_or_raise(state, member_id)
             if member.status == MEMBER_REMOVED_STATUS:
                 raise OrganizationConflictError("member was already removed")
-            if member.status != "suspended":
-                raise OrganizationConflictError("only a suspended member can be removed")
+            if member.status not in MEMBER_REMOVABLE_STATUSES:
+                raise OrganizationConflictError("only an invited or suspended member can be removed")
             now = self._now()
             member.status = MEMBER_REMOVED_STATUS
             member.removed_at = now
