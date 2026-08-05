@@ -221,6 +221,8 @@ class OrganizationStore(Protocol):
 
     def revoke_token(self, organization_id: str, token_id: str) -> dict[str, Any]: ...
 
+    def delete_token(self, organization_id: str, token_id: str) -> dict[str, Any]: ...
+
     def reset(self, organization_id: str | None = None) -> dict[str, Any]: ...
 
 
@@ -291,6 +293,9 @@ class _AccessToken:
     updated_at: str
     expires_at: str = ""
     revoked_at: str = ""
+    # A deleted token is only hidden from the list; the record survives so the
+    # usage it produced keeps its owner, mirroring the persistent store.
+    deleted_at: str = ""
 
 
 @dataclass
@@ -829,6 +834,16 @@ class InMemoryOrganizationStore(OrganizationValidationMixin):
             return "expired"
         return token.status
 
+    @staticmethod
+    def _visible_tokens(state: _OrganizationState) -> list[_AccessToken]:
+        """Tokens the customer still sees: everything that was not deleted.
+
+        Deleted records stay in ``state.tokens`` so usage attribution keeps
+        working, so every list, count and quota check goes through here.
+        """
+
+        return [token for token in state.tokens.values() if not token.deleted_at]
+
     @classmethod
     def _token_model_catalog(cls, available_models: Any = None) -> tuple[str, ...]:
         """解析可选模型目录。
@@ -918,13 +933,15 @@ class InMemoryOrganizationStore(OrganizationValidationMixin):
             "updatedAt": token.updated_at,
             "expiresAt": token.expires_at or None,
             "revokedAt": token.revoked_at or None,
+            "deletedAt": token.deleted_at or None,
         }
 
     def _token_stats_payload(self, state: _OrganizationState) -> dict[str, Any]:
-        statuses = [self._effective_token_status(token) for token in state.tokens.values()]
+        visible = self._visible_tokens(state)
+        statuses = [self._effective_token_status(token) for token in visible]
         bound_members = {
             token.member_id
-            for token in state.tokens.values()
+            for token in visible
             if token.member_id and self._effective_token_status(token) == "active"
         }
         return {
@@ -1322,7 +1339,7 @@ class InMemoryOrganizationStore(OrganizationValidationMixin):
             if target_member_id and target_member_id not in state.members:
                 raise OrganizationNotFoundError("member was not found")
             tokens = sorted(
-                state.tokens.values(),
+                self._visible_tokens(state),
                 key=lambda item: (item.created_at, item.identifier),
                 reverse=True,
             )
@@ -1378,7 +1395,7 @@ class InMemoryOrganizationStore(OrganizationValidationMixin):
             state = self._organization_or_raise(organization_id)
             if state.organization.get("status") != "active":
                 raise OrganizationConflictError("tokens cannot be created for an inactive organization")
-            if len(state.tokens) >= MAX_TOKENS_PER_ORGANIZATION:
+            if len(self._visible_tokens(state)) >= MAX_TOKENS_PER_ORGANIZATION:
                 raise OrganizationConflictError(
                     f"an organization may hold at most {MAX_TOKENS_PER_ORGANIZATION} tokens"
                 )
@@ -1422,6 +1439,28 @@ class InMemoryOrganizationStore(OrganizationValidationMixin):
             now = self._now()
             token.status = "revoked"
             token.revoked_at = now
+            token.updated_at = now
+            return self._token_payload(state, token)
+
+    def delete_token(self, organization_id: str, token_id: str) -> dict[str, Any]:
+        """Hide one already revoked token from the customer's list.
+
+        The record is kept rather than dropped so the usage this token produced
+        keeps its member and department attribution; only a revoked token can be
+        deleted, so its upstream key is already gone.
+        """
+
+        with self._lock:
+            state = self._organization_or_raise(organization_id)
+            if state.organization.get("status") != "active":
+                raise OrganizationConflictError("tokens cannot be changed for an inactive organization")
+            token = self._token_or_raise(state, token_id)
+            if token.deleted_at:
+                raise OrganizationConflictError("this token has already been deleted")
+            if self._effective_token_status(token) != "revoked":
+                raise OrganizationConflictError("only a revoked token can be deleted")
+            now = self._now()
+            token.deleted_at = now
             token.updated_at = now
             return self._token_payload(state, token)
 
@@ -2540,6 +2579,9 @@ class OrganizationScope:
 
     def revoke_token(self, token_id: str) -> dict[str, Any]:
         return self._store.revoke_token(self.organization_id, token_id)
+
+    def delete_token(self, token_id: str) -> dict[str, Any]:
+        return self._store.delete_token(self.organization_id, token_id)
 
     def mock_organization_usage(self, **kwargs: Any) -> dict[str, Any]:
         return self._store.mock_organization_usage(self.organization_id, **kwargs)

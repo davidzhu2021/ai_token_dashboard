@@ -217,6 +217,9 @@ CREATE INDEX IF NOT EXISTS customer_token_org_idx ON customer_access_token(organ
 ALTER TABLE customer_access_token ADD COLUMN IF NOT EXISTS department_id TEXT REFERENCES customer_department(id);
 ALTER TABLE customer_access_token ADD COLUMN IF NOT EXISTS upstream_team_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE customer_access_token ADD COLUMN IF NOT EXISTS principal_id TEXT REFERENCES customer_principal(id);
+-- A deleted token is only hidden from the customer's list. The row stays so the
+-- spend logs it produced keep their member and department attribution.
+ALTER TABLE customer_access_token ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 
 -- Composite tenant keys let PostgreSQL enforce that a member or department
 -- referenced by a mapping belongs to the same organization.
@@ -4309,6 +4312,7 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
             "updatedAt": _iso(_row_value(row, "updated_at")),
             "expiresAt": _iso(_row_value(row, "expires_at")),
             "revokedAt": _iso(_row_value(row, "revoked_at")),
+            "deletedAt": _iso(_row_value(row, "deleted_at")),
         }
         if secret: result["token"] = secret
         return result
@@ -4434,6 +4438,10 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
         versions may emit the stable key id or alias.  Keep all three lookup
         values so the synchronizer can apply the documented precedence without
         inferring a tenant from an email address.
+
+        Revoked and deleted tokens stay in this map on purpose: a deleted token
+        is only hidden from the customer's list, and the usage it produced while
+        it was active must keep its member and department attribution.
         """
 
         rows = await self._require_pool().fetch(
@@ -4539,7 +4547,7 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
             )
             if not member_exists:
                 raise OrganizationNotFoundError("member was not found")
-        clauses, args = ["t.organization_id=$1"], [organization_id]
+        clauses, args = ["t.organization_id=$1", "t.deleted_at IS NULL"], [organization_id]
         if status:
             args.append(status)
             clauses.append(
@@ -4584,7 +4592,7 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
             "count(*) FILTER (WHERE status='provisioning') AS provisioning_count, "
             "count(DISTINCT member_id) FILTER (WHERE status='active' AND "
             "    (expires_at IS NULL OR expires_at > now()) AND member_id IS NOT NULL) AS bound_member_count "
-            "FROM customer_access_token WHERE organization_id=$1",
+            "FROM customer_access_token WHERE organization_id=$1 AND deleted_at IS NULL",
             organization_id,
         )
         bindable_rows = await pool.fetch(
@@ -4736,6 +4744,33 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
         """Compatibility alias for callers that do not coordinate upstream revocation."""
 
         return await self.mark_token_revoked(organization_id, token_id)
+
+    async def delete_token(self, organization_id: str, token_id: str) -> dict[str, Any]:
+        """Hide one already revoked token from the customer's list.
+
+        The row is kept on purpose: ``usage_token_attribution_map`` reads every
+        token regardless of status so the spend logs this token produced keep
+        their member and department attribution.  Deleting the row would move
+        that historical usage into the unattributed bucket and change the
+        department board retroactively.  Only a revoked token qualifies, so the
+        upstream key is already gone by the time this runs.
+        """
+
+        row = await self._require_pool().fetchrow(
+            "UPDATE customer_access_token SET deleted_at=now(), updated_at=now() "
+            "WHERE id=$1 AND organization_id=$2 AND status='revoked' AND deleted_at IS NULL "
+            "RETURNING *",
+            token_id,
+            organization_id,
+        )
+        if row is None:
+            existing = await self.get_token(organization_id, token_id)
+            if existing is None:
+                raise OrganizationNotFoundError("access token was not found")
+            if existing.get("deletedAt"):
+                raise OrganizationConflictError("this token has already been deleted")
+            raise OrganizationConflictError("only a revoked token can be deleted")
+        return self._token_payload(row, secret=None)
 
     async def billing_payload(self, organization_id: str, *, page: int = 1, page_size: int = 20) -> dict[str, Any]:
         page, page_size = self._page_value(page, "page", 100000), self._page_value(page_size, "page_size", 100)

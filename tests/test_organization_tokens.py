@@ -202,6 +202,62 @@ def test_reset_restores_seeded_tokens_for_one_customer_only() -> None:
     assert store.list_tokens("org-aurora")["total"] == 4
 
 
+def test_deleting_a_revoked_token_hides_it_from_the_list_and_the_counters() -> None:
+    store = InMemoryOrganizationStore()
+    before = store.list_tokens("org-demo")["stats"]
+    store.revoke_token("org-demo", "token-demo-001")
+
+    deleted = store.delete_token("org-demo", "token-demo-001")
+    after = store.list_tokens("org-demo")
+
+    assert deleted["deletedAt"]
+    assert "token-demo-001" not in {item["id"] for item in after["items"]}
+    assert after["total"] == before["total"] - 1
+    # The seeded token was active before this test revoked it, so the revoked
+    # count returns to its original value once the record is hidden.
+    assert after["stats"]["revokedCount"] == before["revokedCount"]
+    assert after["stats"]["activeCount"] == before["activeCount"] - 1
+    # A hidden record cannot be surfaced through the status filter either.
+    assert "token-demo-001" not in {
+        item["id"] for item in store.list_tokens("org-demo", status="revoked")["items"]
+    }
+
+
+def test_only_a_revoked_token_can_be_deleted_and_only_once() -> None:
+    store = InMemoryOrganizationStore()
+
+    # token-demo-001 is seeded active, token-demo-003 is seeded revoked.
+    with pytest.raises(OrganizationConflictError):
+        store.delete_token("org-demo", "token-demo-001")
+
+    store.delete_token("org-demo", "token-demo-003")
+    with pytest.raises(OrganizationConflictError):
+        store.delete_token("org-demo", "token-demo-003")
+
+
+def test_delete_token_is_customer_scoped() -> None:
+    store = InMemoryOrganizationStore()
+    neighbour_total = store.list_tokens("org-aurora")["total"]
+
+    with pytest.raises(OrganizationNotFoundError):
+        store.delete_token("org-demo", "token-aurora-001")
+    assert store.list_tokens("org-aurora")["total"] == neighbour_total
+
+
+def test_a_deleted_token_frees_up_its_quota_slot() -> None:
+    store = InMemoryOrganizationStore()
+    existing = store.list_tokens("org-demo")["total"]
+    for index in range(MAX_TOKENS_PER_ORGANIZATION - existing):
+        store.create_token("org-demo", f"占位令牌-{index}", ["gpt-5.2"])
+    with pytest.raises(OrganizationConflictError):
+        store.create_token("org-demo", "超额令牌", ["gpt-5.2"])
+
+    store.revoke_token("org-demo", "token-demo-001")
+    store.delete_token("org-demo", "token-demo-001")
+
+    assert store.create_token("org-demo", "腾出名额后的令牌", ["gpt-5.2"])["token"]["id"]
+
+
 class _CatalogOnlyClient:
     """只提供模型目录的假上游：任何写操作都视为契约破坏。
 
@@ -278,9 +334,11 @@ def test_token_writes_require_csrf(monkeypatch) -> None:
         json={"name": "缺少 CSRF", "models": ["gpt-5.2"]},
     )
     revoked = client.post("/api/organization/current/tokens/token-demo-001/revoke")
+    deleted = client.post("/api/organization/current/tokens/token-demo-003/delete")
 
     assert created.status_code == 403
     assert revoked.status_code == 403
+    assert deleted.status_code == 403
 
 
 def test_regular_member_cannot_read_or_create_customer_tokens(monkeypatch) -> None:
@@ -292,8 +350,11 @@ def test_regular_member_cannot_read_or_create_customer_tokens(monkeypatch) -> No
         json={"name": "成员越权令牌", "models": ["gpt-5.2"]},
         headers=csrf_headers(),
     )
+    deleted = client.post(
+        "/api/organization/current/tokens/token-demo-003/delete", headers=csrf_headers()
+    )
 
-    for response in (listed, created):
+    for response in (listed, created, deleted):
         assert response.status_code == 403
         assert error_code(response) == "ORGANIZATION_MANAGE_FORBIDDEN"
 
@@ -309,10 +370,49 @@ def test_customer_admin_cannot_bind_or_revoke_another_customers_records(monkeypa
     revoked = client.post(
         "/api/organization/current/tokens/token-aurora-001/revoke", headers=csrf_headers()
     )
+    deleted = client.post(
+        "/api/organization/current/tokens/token-aurora-003/delete", headers=csrf_headers()
+    )
 
-    for response in (created, revoked):
+    for response in (created, revoked, deleted):
         assert response.status_code == 404
         assert error_code(response) == "ORGANIZATION_TOKEN_NOT_FOUND"
+
+
+def test_customer_admin_can_delete_a_revoked_token_from_the_list(monkeypatch) -> None:
+    client = demo_client(monkeypatch, "owner@demo.example")
+    fake = _CatalogOnlyClient(list(ORGANIZATION_TOKEN_MODELS))
+    monkeypatch.setattr(main, "client", lambda: fake)
+
+    created = client.post(
+        "/api/organization/current/tokens",
+        json={"name": "待删除令牌", "models": ["gpt-5.2"]},
+        headers=csrf_headers(),
+    )
+    token_id = created.json()["token"]["id"]
+
+    # An active token has no delete path: it must be revoked first.
+    too_early = client.post(
+        f"/api/organization/current/tokens/{token_id}/delete", headers=csrf_headers()
+    )
+    assert too_early.status_code == 409
+    assert error_code(too_early) == "ORGANIZATION_TOKEN_CONFLICT"
+
+    client.post(f"/api/organization/current/tokens/{token_id}/revoke", headers=csrf_headers())
+    deleted = client.post(
+        f"/api/organization/current/tokens/{token_id}/delete", headers=csrf_headers()
+    )
+
+    assert deleted.status_code == 200
+    assert deleted.json() == {"ok": True, "tokenId": token_id}
+    listed = client.get("/api/organization/current/tokens")
+    assert token_id not in {item["id"] for item in listed.json()["items"]}
+
+    again = client.post(
+        f"/api/organization/current/tokens/{token_id}/delete", headers=csrf_headers()
+    )
+    assert again.status_code == 409
+    assert error_code(again) == "ORGANIZATION_TOKEN_CONFLICT"
 
 
 def test_invalid_token_payloads_are_rejected_before_the_store(monkeypatch) -> None:
@@ -357,6 +457,10 @@ def test_platform_admin_token_access_is_read_only_and_customer_scoped(monkeypatc
         "/api/platform/organizations/org-aurora/tokens/token-aurora-001/revoke",
         headers=csrf_headers(),
     )
+    deleted = client.post(
+        "/api/platform/organizations/org-aurora/tokens/token-aurora-003/delete",
+        headers=csrf_headers(),
+    )
 
     assert listed.status_code == 200
     assert [item["id"] for item in listed.json()["items"]] == [
@@ -367,10 +471,11 @@ def test_platform_admin_token_access_is_read_only_and_customer_scoped(monkeypatc
     assert all("secret" not in item for item in listed.json()["items"])
     assert unknown.status_code == 404
     assert error_code(unknown) == "ORGANIZATION_NOT_FOUND"
-    # No seller-side write route exists, so both attempts must miss routing
+    # No seller-side write route exists, so every attempt must miss routing
     # instead of reaching a store mutation.
     assert created.status_code == 405
     assert revoked.status_code == 405
+    assert deleted.status_code == 405
     assert client.get("/api/platform/organizations/org-aurora/tokens").json()["stats"][
         "activeCount"
     ] == 2

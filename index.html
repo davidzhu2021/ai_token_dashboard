@@ -8553,6 +8553,24 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260804-member-removal"></script>
+    <div id="organizationTokenDeleteModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="organizationTokenDeleteTitle">
+      <div class="modal">
+        <h3 id="organizationTokenDeleteTitle">删除令牌</h3>
+        <div class="warning-box">
+          <span class="app-icon"><svg><use href="#icon-warning"></use></svg></span>
+          <span>该令牌已撤销并失效，删除只是把它从列表中移除，且无法恢复。它产生过的历史用量记录会保留，不影响用量看板。</span>
+        </div>
+        <div class="delete-key-summary">
+          <div><span>令牌名称</span><strong id="organizationTokenDeleteName">-</strong></div>
+          <div><span>令牌</span><code id="organizationTokenDeleteMasked">sk-...----</code></div>
+        </div>
+        <div class="modal-actions">
+          <button id="cancelOrganizationTokenDeleteButton" class="ghost-btn" type="button">取消</button>
+          <button id="confirmOrganizationTokenDeleteButton" class="danger-btn" type="button">确认删除</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/assets/app.js?v=20260805-token-delete"></script>
   </body>
 </html>

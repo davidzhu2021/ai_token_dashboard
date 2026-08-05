@@ -78,8 +78,8 @@ def test_reveal_has_a_timeout_fallback_for_cold_upstream_lookups() -> None:
     source = APP_JS.read_text(encoding="utf-8")
 
     # 上游查不到账号的邮箱（新入职、拼错地址）会让 team_scope_for_user 翻完整个
-    # 用户列表，实测 24-32 秒。已开通员工是 10ms 量级，远快于这个时限，所以兜底
-    # 对他们不生效——但没有它，那类用户会看到侧边栏空白半分钟。
+    # 用户列表，实测 24-32 秒。兜底必须晚于这个窗口，否则会先揭示「我的用量」，
+    # 等权限回来后再补出团队看板；35 秒后仍未返回时再降级，避免永久卡在骨架态。
     assert "const NAVIGATION_REVEAL_TIMEOUT_MS = 35000;" in source
     assert "function scheduleNavigationRevealFallback() {" in source
     assert "if (!isNavigationRevealed) revealNavigation();" in source

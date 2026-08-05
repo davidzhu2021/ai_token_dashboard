@@ -156,11 +156,8 @@ let billingAvailable = false;
 // 侧边栏导航整栏一次性揭示的闸门：为 false 时 syncNavigationVisibility() 不动 DOM。
 let isNavigationRevealed = false;
 let navigationRevealTimer = null;
-// 权限探测的兜底时限。已开通员工的 /api/auth/scope 是 10ms 量级，永远赶得上；
-// 但上游查不到账号的邮箱（新入职、拼错地址）要翻完整个用户列表，实测 24-32 秒
-// ——那种情况下先揭示已知项，别让整栏空着。
-// Keep the navigation grouped: the known cold team-scope lookup takes 24-32 seconds.
-// Fall back only after that window so personal usage and the team board reveal together.
+// 权限请求正常返回时一次性揭示整栏，避免「我的用量」先出现、团队看板稍后补入。
+// 只有权限解析异常缓慢时才降级揭示已知项；正常的 24-32 秒冷查询仍有机会完整返回。
 const NAVIGATION_REVEAL_TIMEOUT_MS = 35000;
 let selectedTopupAmount = 0;
 let pendingTopupTradeNo = "";
@@ -191,12 +188,14 @@ let organizationTokenBindableMembers = [];
 let isOrganizationTokenLoading = false;
 let isOrganizationTokenSaving = false;
 let isOrganizationTokenRevoking = false;
+let isOrganizationTokenDeleting = false;
 let organizationTokenLoadError = "";
 let organizationTokenLoadErrorCode = "";
 let organizationTokenScopeKey = "";
 let organizationTokenRequestId = 0;
 let organizationTokenSearchTimer = null;
 let revokingOrganizationTokenId = "";
+let deletingOrganizationTokenId = "";
 let authConfig = {
   devLoginEnabled: false,
   oidcConfigured: false,
@@ -6359,10 +6358,12 @@ function resetOrganizationTokenData() {
   isOrganizationTokenLoading = false;
   isOrganizationTokenSaving = false;
   isOrganizationTokenRevoking = false;
+  isOrganizationTokenDeleting = false;
   organizationTokenLoadError = "";
   organizationTokenLoadErrorCode = "";
   organizationTokenScopeKey = "";
   revokingOrganizationTokenId = "";
+  deletingOrganizationTokenId = "";
   window.clearTimeout(organizationTokenSearchTimer);
   organizationTokenSearchTimer = null;
   const search = el("organizationTokenSearch");
@@ -6372,6 +6373,7 @@ function resetOrganizationTokenData() {
   el("organizationTokenModal")?.classList.add("hidden");
   el("organizationTokenSecretModal")?.classList.add("hidden");
   el("organizationTokenRevokeModal")?.classList.add("hidden");
+  el("organizationTokenDeleteModal")?.classList.add("hidden");
 }
 
 function renderOrganizationTokenFilters() {
@@ -6486,8 +6488,14 @@ function renderOrganizationTokens() {
         )}</span></div>`
       : '<span class="chip blue">企业共享</span>';
     const canRevoke = canManage && status === "active" && !reportOnly;
+    // 已撤销的令牌上游 key 在撤销时就删掉了，剩下的只是列表里的死记录，所以这里换成
+    // 删除入口：它只把记录从列表隐藏，历史用量归属仍然保留。历史资产不给删除入口。
+    const canDelete = canManage && status === "revoked" && !reportOnly;
     const statusLabel = reportOnly ? "历史资产、只读" : organizationTokenStatusLabel(status);
     const statusTone = reportOnly ? "invited" : organizationTokenStatusTone(status);
+    const actionButton = canDelete
+      ? `<button class="danger-outline-btn" type="button" data-organization-token-delete="${escapeHtml(id)}">删除</button>`
+      : `<button class="danger-outline-btn" type="button" data-organization-token-revoke="${escapeHtml(id)}" ${canRevoke ? "" : "disabled"}>${reportOnly ? "不可撤销" : "撤销"}</button>`;
     return `
       <tr>
         <td>
@@ -6501,7 +6509,7 @@ function renderOrganizationTokens() {
         <td>${escapeHtml(expiresAt ? organizationDate(expiresAt) : "永不过期")}</td>
         <td>
           <div class="organization-member-actions">
-            <button class="danger-outline-btn" type="button" data-organization-token-revoke="${escapeHtml(id)}" ${canRevoke ? "" : "disabled"}>${reportOnly ? "不可撤销" : "撤销"}</button>
+            ${actionButton}
           </div>
         </td>
       </tr>
@@ -6739,6 +6747,47 @@ async function confirmOrganizationTokenRevoke() {
   } finally {
     isOrganizationTokenRevoking = false;
     setButtonLoading("confirmOrganizationTokenRevokeButton", false);
+  }
+}
+
+function closeOrganizationTokenDeleteModal(options = {}) {
+  if (isOrganizationTokenDeleting && !options.force) return;
+  deletingOrganizationTokenId = "";
+  el("organizationTokenDeleteModal")?.classList.add("hidden");
+}
+
+function openOrganizationTokenDeleteModal(tokenId) {
+  if (!organizationTokenCanManage() || !tokenId) return;
+  const token = organizationTokens.find(
+    (item) => String(organizationField(item, "id", "token_id") || "") === String(tokenId),
+  );
+  if (!token) return;
+  deletingOrganizationTokenId = String(tokenId);
+  setText("organizationTokenDeleteName", organizationField(token, "name", "name") || "未命名令牌");
+  setText("organizationTokenDeleteMasked", organizationField(token, "masked", "masked") || "sk-...----");
+  el("organizationTokenDeleteModal")?.classList.remove("hidden");
+}
+
+async function confirmOrganizationTokenDelete() {
+  if (!organizationTokenCanManage() || !deletingOrganizationTokenId || isOrganizationTokenDeleting) return;
+  const tokenId = deletingOrganizationTokenId;
+  isOrganizationTokenDeleting = true;
+  setButtonLoading("confirmOrganizationTokenDeleteButton", true, "删除中");
+  try {
+    await ensureCsrfToken();
+    await api(`/api/organization/current/tokens/${encodeURIComponent(tokenId)}/delete`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    isOrganizationTokenDeleting = false;
+    closeOrganizationTokenDeleteModal({ force: true });
+    await loadOrganizationTokens();
+    showToast("令牌已从列表移除。");
+  } catch (error) {
+    showToast(error.message || "令牌删除失败，请稍后重试。");
+  } finally {
+    isOrganizationTokenDeleting = false;
+    setButtonLoading("confirmOrganizationTokenDeleteButton", false);
   }
 }
 
@@ -8515,10 +8564,17 @@ el("copyOrganizationTokenSecret").addEventListener("click", () => {
 });
 el("cancelOrganizationTokenRevokeButton").addEventListener("click", () => closeOrganizationTokenRevokeModal());
 el("confirmOrganizationTokenRevokeButton").addEventListener("click", confirmOrganizationTokenRevoke);
+el("cancelOrganizationTokenDeleteButton").addEventListener("click", () => closeOrganizationTokenDeleteModal());
+el("confirmOrganizationTokenDeleteButton").addEventListener("click", confirmOrganizationTokenDelete);
 
 el("organizationTokenTable").addEventListener("click", (event) => {
   const revokeButton = event.target.closest("[data-organization-token-revoke]");
-  if (revokeButton) openOrganizationTokenRevokeModal(revokeButton.dataset.organizationTokenRevoke);
+  if (revokeButton) {
+    openOrganizationTokenRevokeModal(revokeButton.dataset.organizationTokenRevoke);
+    return;
+  }
+  const deleteButton = event.target.closest("[data-organization-token-delete]");
+  if (deleteButton) openOrganizationTokenDeleteModal(deleteButton.dataset.organizationTokenDelete);
 });
 
 el("organizationTokenSearch").addEventListener("input", () => {

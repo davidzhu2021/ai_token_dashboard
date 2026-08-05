@@ -178,7 +178,7 @@ def test_list_organizations_includes_directory_card_stats() -> None:
     class Pool:
         async def fetchval(self, query, *args):
             assert "FROM customer_organization o" in query
-            assert args == ("%baic%", "active")
+            assert args == ("%北汽%", "active")
             return 1
 
         async def fetch(self, query, *args):
@@ -187,28 +187,43 @@ def test_list_organizations_includes_directory_card_stats() -> None:
             assert "d.status='active'" in query
             assert "o.name ILIKE $1" in query
             assert "o.status = $2" in query
-            assert args == ("%baic%", "active", 12, 12)
+            assert args == ("%北汽%", "active", 12, 12)
             return [{
-                "id": "org-1", "name": "BAIC", "status": "active",
-                "billing_status": "active", "billing_balance_usd": Decimal("100.00"),
-                "billing_effective_at": None, "upstream_organization_id": "upstream-org-1",
-                "upstream_status": "active", "created_at": now, "updated_at": now,
-                "archived_at": None, "department_count": 2, "member_count": 4,
-                "active_member_count": 3, "invited_member_count": 1,
-                "suspended_member_count": 0, "active_admin_count": 1,
+                "id": "org-1",
+                "name": "北汽集团",
+                "status": "active",
+                "billing_status": "active",
+                "billing_balance_usd": Decimal("100.00"),
+                "billing_effective_at": None,
+                "upstream_organization_id": "upstream-org-1",
+                "upstream_status": "active",
+                "created_at": now,
+                "updated_at": now,
+                "archived_at": None,
+                "department_count": 2,
+                "member_count": 4,
+                "active_member_count": 3,
+                "invited_member_count": 1,
+                "suspended_member_count": 0,
+                "active_admin_count": 1,
             }]
 
     repository = PostgreSQLOrganizationRepository("postgresql://unused")
     repository.pool = Pool()
+
     result = asyncio.run(repository.list_organizations(
-        keyword="baic", status="active", page=2, page_size=12
+        keyword="北汽", status="active", page=2, page_size=12
     ))
 
     assert result["total"] == 1
     assert result["page"] == 2
     assert result["items"][0]["stats"] == {
-        "departmentCount": 2, "memberCount": 4, "activeMemberCount": 3,
-        "invitedMemberCount": 1, "suspendedMemberCount": 0, "activeAdminCount": 1,
+        "departmentCount": 2,
+        "memberCount": 4,
+        "activeMemberCount": 3,
+        "invitedMemberCount": 1,
+        "suspendedMemberCount": 0,
+        "activeAdminCount": 1,
     }
 
 
@@ -1468,6 +1483,93 @@ def test_stale_usage_backfill_worker_cannot_finish_a_reclaimed_lease() -> None:
         )
     )
     assert result["status"] == "complete"
+
+
+def test_schema_keeps_deleted_tokens_for_usage_attribution() -> None:
+    assert (
+        "ALTER TABLE customer_access_token ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ"
+        in ORGANIZATION_SCHEMA
+    )
+
+
+def test_deleting_a_token_hides_it_but_keeps_its_usage_attribution() -> None:
+    """A deleted token must disappear from the list and stay in the attribution map.
+
+    Dropping the row instead would move every spend log this token produced into
+    the unattributed bucket and rewrite the department board retroactively, so
+    the mapping query deliberately has no deleted_at filter.
+    """
+
+    class Pool:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        async def fetchrow(self, query, *args):
+            self.queries.append(query)
+            if query.startswith("UPDATE customer_access_token SET deleted_at"):
+                assert "status='revoked'" in query
+                assert "deleted_at IS NULL" in query
+                return {
+                    "id": args[0],
+                    "organization_id": args[1],
+                    "name": "已撤销令牌",
+                    "status": "revoked",
+                    "daily_budget_usd": Decimal("100"),
+                    "deleted_at": datetime(2026, 8, 4, tzinfo=timezone.utc),
+                }
+            raise AssertionError(f"unexpected fetchrow: {query}")
+
+        async def fetch(self, query, *_args):
+            self.queries.append(query)
+            return []
+
+    repository = PostgreSQLOrganizationRepository("postgresql://unused")
+    pool = Pool()
+    repository.pool = pool
+
+    deleted = asyncio.run(repository.delete_token("org-local", "token-1"))
+    asyncio.run(repository.usage_token_attribution_map())
+
+    assert deleted["deletedAt"] is not None
+    attribution_query = next(
+        query for query in pool.queries if "FROM customer_access_token t" in query
+    )
+    assert "deleted_at" not in attribution_query
+
+
+def test_a_token_that_is_not_revoked_cannot_be_deleted() -> None:
+    class Pool:
+        async def fetchrow(self, query, *args):
+            if query.startswith("UPDATE customer_access_token SET deleted_at"):
+                return None
+            if query.startswith("SELECT * FROM customer_access_token"):
+                return {
+                    "id": args[0],
+                    "organization_id": args[1],
+                    "name": "生效中的令牌",
+                    "status": "active",
+                    "daily_budget_usd": Decimal("100"),
+                    "deleted_at": None,
+                }
+            raise AssertionError(f"unexpected fetchrow: {query}")
+
+    repository = PostgreSQLOrganizationRepository("postgresql://unused")
+    repository.pool = Pool()
+
+    with pytest.raises(OrganizationConflictError):
+        asyncio.run(repository.delete_token("org-local", "token-1"))
+
+
+def test_deleting_an_unknown_token_is_reported_as_missing() -> None:
+    class Pool:
+        async def fetchrow(self, query, *_args):
+            return None
+
+    repository = PostgreSQLOrganizationRepository("postgresql://unused")
+    repository.pool = Pool()
+
+    with pytest.raises(OrganizationNotFoundError):
+        asyncio.run(repository.delete_token("org-local", "token-missing"))
 
 
 def test_schema_keeps_removed_members_but_frees_their_email_and_login_name() -> None:

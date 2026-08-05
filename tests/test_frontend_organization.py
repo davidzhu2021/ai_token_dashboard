@@ -725,6 +725,37 @@ def test_token_table_escapes_every_rendered_value() -> None:
     assert "${label}" not in tokens_render
 
 
+def test_only_a_revoked_token_offers_the_delete_action() -> None:
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    tokens_render = source[
+        source.index("function renderOrganizationTokens()") : source.index("async function loadOrganizationTokens()")
+    ]
+    # 删除只是列表清理：撤销时上游 key 已经删除，所以入口只对已撤销的自有令牌开放，
+    # 历史资产（只读）继续走原来的禁用态。
+    assert 'const canDelete = canManage && status === "revoked" && !reportOnly;' in tokens_render
+    assert 'data-organization-token-delete="${escapeHtml(id)}"' in tokens_render
+    assert 'const canRevoke = canManage && status === "active" && !reportOnly;' in tokens_render
+
+    # 弹窗、事件委托与请求三件套齐备，且删除走独立的 loading 状态。
+    assert 'id="organizationTokenDeleteModal"' in markup
+    assert 'id="confirmOrganizationTokenDeleteButton" class="danger-btn"' in markup
+    assert "该令牌已撤销并失效，删除只是把它从列表中移除" in markup
+    assert "它产生过的历史用量记录会保留，不影响用量看板。" in markup
+    assert '[data-organization-token-delete]' in source
+    assert "openOrganizationTokenDeleteModal(deleteButton.dataset.organizationTokenDelete)" in source
+    delete_flow = source[
+        source.index("async function confirmOrganizationTokenDelete()") : source.index(
+            "function closeCustomerOrganizationModal("
+        )
+    ]
+    assert "await ensureCsrfToken();" in delete_flow
+    assert "/delete`" in delete_flow
+    assert "await loadOrganizationTokens();" in delete_flow
+    assert '"令牌已从列表移除。"' in delete_flow
+
+
 def test_token_copy_does_not_expose_backend_provider_terms() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
     source = APP_JS.read_text(encoding="utf-8")

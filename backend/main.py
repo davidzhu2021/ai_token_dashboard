@@ -1544,6 +1544,7 @@ async def organization_scoped_store_call(
         "billing_payload",
         "list_tokens",
         "revoke_token",
+        "delete_token",
     }
     if isinstance(store, PostgreSQLOrganizationRepository) and method in positional_scope_methods:
         if inspect.iscoroutinefunction(function):
@@ -5780,6 +5781,52 @@ async def organization_revoke_token(
         except OrganizationStoreError as exc:
             raise organization_token_store_error(exc) from exc
     return {"ok": True, "token": token}
+
+
+@app.post("/api/organization/current/tokens/{token_id}/delete")
+async def organization_delete_token(
+    token_id: str,
+    request: Request,
+    _data: OrganizationEmptyRequest | None = None,
+) -> dict[str, Any]:
+    """Hide one already revoked token from the authenticated customer's list.
+
+    Deletion is list cleanup only: the stored record survives so the usage this
+    token produced keeps its member and department attribution, and the upstream
+    key was already removed when the token was revoked.
+    """
+
+    await enforce_csrf(request)
+    user = await require_organization_demo_manager(request)
+    organization_id = organization_identifier(organization_current_member(user))
+    if organization_real_enabled():
+        store = organization_store()
+        if not isinstance(store, PostgreSQLOrganizationRepository):
+            raise auth_http_error(
+                503, "企业 Token 持久化能力暂不可用", "ORGANIZATION_TOKEN_STORE_UNAVAILABLE"
+            )
+        try:
+            token = await store.delete_token(organization_id, token_id)
+        except OrganizationStoreError as exc:
+            raise organization_token_store_error(exc) from exc
+        await store.record_audit(
+            organization_id,
+            "organization.token.delete",
+            actor=str(user.get("email") or ""),
+            target_type="token",
+            target_id=token_id,
+            details={"name": str(token.get("name") or "")},
+        )
+    else:
+        try:
+            token = await organization_scoped_store_call(
+                organization_id,
+                "delete_token",
+                token_id,
+            )
+        except OrganizationStoreError as exc:
+            raise organization_token_store_error(exc) from exc
+    return {"ok": True, "tokenId": token_id}
 
 
 def internal_upstream_organization_ids() -> set[str]:
