@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import uuid
 from collections import defaultdict
@@ -19,6 +20,9 @@ from .litellm_client import (
     normalize_team_text,
     team_identity_key,
 )
+
+
+logger = logging.getLogger("ai-token-dashboard.usage-store")
 
 
 USAGE_SCHEMA = """

@@ -426,6 +426,43 @@ def _scheduling_worker(now: datetime) -> UsageSyncWorker:
     return UsageSyncWorker(client, object(), now=lambda: now)
 
 
+def test_refresh_account_identity_updates_history_rows() -> None:
+    """身份回填的失败会被同步的 except 吞掉，这里直接跑通整条语句路径。"""
+
+    executed: list[tuple[str, list]] = []
+
+    class Connection:
+        async def executemany(self, query, args):
+            executed.append((query, list(args)))
+
+    class Acquire:
+        async def __aenter__(self):
+            return Connection()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Pool:
+        def acquire(self):
+            return Acquire()
+
+    store = UsageStore("postgresql://unused")
+    store.pool = Pool()
+    updated = asyncio.run(
+        store.refresh_account_identity(
+            "primary",
+            [
+                {"userId": "user-1", "name": "张三", "email": "zhangsan@example.com"},
+                {"userId": "", "name": "无账号"},
+            ],
+        )
+    )
+
+    assert updated == 1
+    assert "UPDATE usage_daily" in executed[0][0]
+    assert executed[0][1] == [("primary", "张三", "zhangsan@example.com", "", "user-1")]
+
+
 def test_worker_resumes_cycle_from_last_success_after_restart(monkeypatch) -> None:
     """重启后跳过启动同步时，周期从上次成功时刻起算，而不是从重启时刻。"""
 
