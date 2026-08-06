@@ -6,9 +6,12 @@
 """
 
 import asyncio
+from copy import deepcopy
 from typing import Any
 
-from backend.litellm_client import LiteLLMBackend
+import pytest
+
+from backend.litellm_client import LiteLLMBackend, UsageLogRows
 from backend.usage_store import bind_status
 from backend.usage_sync import UsageSynchronizer
 
@@ -112,6 +115,103 @@ def test_primary_account_borrows_name_and_department_from_the_other_directory() 
     assert rows[0]["employeeName"] == "王芳"
     assert rows[0]["employeeEmail"] == "wangfang@carher.net"
     assert rows[0]["emailSource"] == "upstream"
+
+
+def test_primary_other_rows_and_events_for_confirmed_her_account_are_reclassified() -> None:
+    synchronizer = make_synchronizer(
+        users={"primary": [{"user_id": "carher-75"}], "her": []},
+        profiles={
+            "carher-75": {
+                "email": "linsen@auto-link.com.cn",
+                "name": "林森",
+                "department": "AI技术院",
+                "emailSource": "enterprise_email",
+            }
+        },
+    )
+    directory = asyncio.run(synchronizer._identity_directory())
+    metrics = {
+        "promptTokens": 12,
+        "completionTokens": 8,
+        "totalTokens": 20,
+        "requestCount": 2,
+        "successCount": 1,
+        "failureCount": 1,
+        "spend": 0.25,
+    }
+    aggregate = {"_userId": "carher-75", "source": "其他", "model": "gpt-5.6-luna", **metrics}
+    event = {
+        "_userId": "carher-75",
+        "requestId": "request-1",
+        "eventTime": "2026-08-06T01:00:00Z",
+        "source": "其他",
+        "model": "gpt-5.6-luna",
+        **metrics,
+    }
+    aggregate_before = deepcopy(aggregate)
+    event_before = deepcopy(event)
+
+    async def sync_rows_from_logs(*_args: Any, **_kwargs: Any) -> tuple[UsageLogRows, bool]:
+        return UsageLogRows({"carher-75": [aggregate]}, events=[event]), True
+
+    synchronizer.client.sync_rows_from_logs = sync_rows_from_logs  # type: ignore[attr-defined]
+
+    snapshot = asyncio.run(
+        synchronizer.collect_backend(PRIMARY, "2026-08-06", "2026-08-06", directory)
+    )
+
+    assert snapshot.rows == [
+        {
+            **aggregate_before,
+            "source": "Her",
+            "employeeEmail": "linsen@auto-link.com.cn",
+            "employeeName": "林森",
+            "emailSource": "enterprise_email",
+            "userOrganizationId": "",
+            "userTeamId": "",
+        }
+    ]
+    assert snapshot.events == [{**event_before, "source": "Her"}]
+
+
+def test_primary_other_row_accepts_a_confirmed_her_name_without_email() -> None:
+    synchronizer = make_synchronizer(
+        users={"primary": [], "her": []},
+        profiles={"carher-75": {"email": "", "name": "林森"}},
+    )
+    directory = asyncio.run(synchronizer._identity_directory())
+    row = {"_userId": "carher-75", "source": "其他"}
+
+    assert synchronizer._reclassify_primary_her_usage(PRIMARY, [row], directory) == 1
+    assert row["source"] == "Her"
+
+
+@pytest.mark.parametrize(
+    ("backend", "profile", "row"),
+    [
+        (PRIMARY, None, {"_userId": "carher-75", "source": "其他"}),
+        (PRIMARY, {"email": "", "name": "carher-75"}, {"_userId": "carher-75", "source": "其他"}),
+        (PRIMARY, {"email": "", "name": "unknown"}, {"_userId": "carher-75", "source": "其他"}),
+        (PRIMARY, {"email": "", "name": "林森"}, {"_userId": "ordinary-75", "source": "其他"}),
+        (PRIMARY, {"email": "", "name": "林森"}, {"_userId": "carher-75", "source": "Cursor"}),
+        (PRIMARY, {"email": "", "name": "林森"}, {"_userId": "carher-75", "source": "Claude Code"}),
+        (HER, {"email": "", "name": "林森"}, {"_userId": "carher-75", "source": "其他"}),
+    ],
+)
+def test_primary_her_reclassification_requires_an_explicit_matching_other_account(
+    backend: LiteLLMBackend,
+    profile: dict[str, str] | None,
+    row: dict[str, str],
+) -> None:
+    synchronizer = make_synchronizer(
+        users={"primary": [], "her": []},
+        profiles={"carher-75": profile} if profile else {},
+    )
+    directory = asyncio.run(synchronizer._identity_directory())
+    original = dict(row)
+
+    assert synchronizer._reclassify_primary_her_usage(backend, [row], directory) == 0
+    assert row == original
 
 
 def test_missing_email_is_inferred_from_the_primary_directory_and_flagged() -> None:

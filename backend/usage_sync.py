@@ -17,6 +17,23 @@ from .usage_store import UsageStore
 
 logger = logging.getLogger("ai-token-dashboard.usage-sync")
 
+_GENERIC_HER_PROFILE_NAMES = {
+    "admin",
+    "administrator",
+    "default",
+    "default_user_id",
+    "guest",
+    "n/a",
+    "na",
+    "none",
+    "null",
+    "root",
+    "system",
+    "test",
+    "unknown",
+    "user",
+}
+
 
 def _env_int(name: str, default: int) -> int:
     import os
@@ -102,6 +119,7 @@ class UsageSynchronizer:
         # （如 `claude-code-t1v` 的邮箱是 `baiyu@`），只能按后缀配对。
         suffix_to_names: dict[str, set[str]] = {}
         suffix_identity: dict[str, dict[str, str]] = {}
+        confirmed_her_user_ids: set[str] = set()
 
         def remember_local(name: str, email: str, department: str = "") -> None:
             local = email.split("@", 1)[0] if email else ""
@@ -136,23 +154,39 @@ class UsageSynchronizer:
                     logger.exception("failed to load account directory for backend %s", backend.id)
                     continue
                 for user_id, profile in (index.get("profiles") or {}).items():
-                    if not _text(user_id):
+                    user_id_text = _text(user_id)
+                    if not user_id_text:
                         continue
-                    by_user_id[_text(user_id)] = {
-                        "name": _text(profile.get("name")),
-                        "email": _email(profile.get("email")),
+                    profile_name = _text(profile.get("name"))
+                    profile_email = _email(profile.get("email"))
+                    by_user_id[user_id_text] = {
+                        "name": profile_name,
+                        "email": profile_email,
                         "department": _text(profile.get("department")),
-                        "emailSource": _text(profile.get("emailSource")) or ("upstream" if _email(profile.get("email")) else ""),
+                        "emailSource": _text(profile.get("emailSource")) or ("upstream" if profile_email else ""),
                     }
+                    if (
+                        backend.id == "her"
+                        and user_id_text.casefold().startswith("carher-")
+                        and (
+                            profile_email
+                            or (
+                                profile_name
+                                and profile_name.casefold() != user_id_text.casefold()
+                                and profile_name.casefold() not in _GENERIC_HER_PROFILE_NAMES
+                            )
+                        )
+                    ):
+                        confirmed_her_user_ids.add(user_id_text.casefold())
                     remember_local(
-                        _text(profile.get("name")),
-                        _email(profile.get("email")),
+                        profile_name,
+                        profile_email,
                         _text(profile.get("department")),
                     )
                     remember_tool_suffix(
-                        _text(user_id),
-                        _text(profile.get("name")),
-                        _email(profile.get("email")),
+                        user_id_text,
+                        profile_name,
+                        profile_email,
                         _text(profile.get("department")),
                     )
                 continue
@@ -186,7 +220,43 @@ class UsageSynchronizer:
                 if len(suffix_to_names.get(suffix) or ()) == 1
                 and len(local_to_emails.get(suffix) or ()) <= 1
             },
+            "confirmedHerUserIds": confirmed_her_user_ids,
         }
+
+    @staticmethod
+    def _reclassify_primary_her_usage(
+        backend: LiteLLMBackend,
+        rows: list[dict[str, Any]],
+        directory: dict[str, Any],
+    ) -> int:
+        """Classify only explicitly identified Primary ``carher-*`` traffic as Her."""
+
+        if backend.id != "primary" or backend.source:
+            return 0
+        confirmed_ids = {
+            _text(user_id).casefold()
+            for user_id in directory.get("confirmedHerUserIds") or set()
+            if _text(user_id)
+        }
+        if not confirmed_ids:
+            return 0
+
+        updated = 0
+        for row in rows:
+            user_id = _text(
+                row.get("_userId")
+                or row.get("userId")
+                or row.get("user_id")
+                or row.get("user")
+            ).casefold()
+            if (
+                _text(row.get("source")) == "其他"
+                and user_id.startswith("carher-")
+                and user_id in confirmed_ids
+            ):
+                row["source"] = "Her"
+                updated += 1
+        return updated
 
     def _apply_identity_directory(
         self,
@@ -747,16 +817,20 @@ class UsageSynchronizer:
                             "emailSource": _text(resolved.get("emailSource")) if fallback_email else "",
                         }
                     )
+        reclassified_rows = self._reclassify_primary_her_usage(backend, rows, directory)
+        reclassified_events = self._reclassify_primary_her_usage(backend, event_rows, directory)
         if token_mapping_index:
             self._apply_token_attribution(rows, token_mapping_index)
             self._apply_token_attribution(event_rows, token_mapping_index)
         logger.info(
-            "usage snapshot collected backend=%s users=%s rows=%s start=%s end=%s",
+            "usage snapshot collected backend=%s users=%s rows=%s start=%s end=%s her_rows=%s her_events=%s",
             backend.id,
             len(account_users),
             len(rows),
             start_date,
             end_date,
+            reclassified_rows,
+            reclassified_events,
         )
         memberships = await self.collect_memberships(backend, users, start_date, end_date, account_index, directory)
         directory_teams = getattr(self, "_directory_teams", {}).get(backend.id)
