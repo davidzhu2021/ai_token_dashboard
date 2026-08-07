@@ -18,6 +18,8 @@ def make_client() -> tuple[LiteLLMClient, LiteLLMBackend]:
     client.backends = [backend]
     client._backend_map = {backend.id: backend}
     client._key_cache = TTLCache()
+    client._key_cache_versions = {}
+    client._key_list_inflight = {}
     # 真实构造函数总会建这个缓存；模型目录查询要用它。
     client._model_cache = TTLCache()
     return client, backend
@@ -645,6 +647,168 @@ def test_keys_endpoint_merges_pending_rotation_state(monkeypatch) -> None:
     assert key["recoveryRequired"] is False
     assert key["oldKeyId"] == "old-hash"
     assert key["replacementKeyId"] == "new-hash"
+    assert response.json()["availableModels"] == ["gpt-5"]
+    assert response.json()["unrestrictedModels"] is False
+
+
+def test_keys_endpoint_can_skip_model_scope_lookup(monkeypatch) -> None:
+    class FakeClient:
+        async def available_key_models(self, _user_id):
+            raise AssertionError("include_models=0 must not load model permissions")
+
+        async def keys_for_user_ids(self, user_ids, refresh=False):
+            assert user_ids == ["user-1"]
+            assert refresh is True
+            return [{"_backendId": "primary", "_userId": "user-1", "id": "hash-1", "masked": "sk-...ABCD"}]
+
+    class FakeVault:
+        def has(self, *_args):
+            return False
+
+        def pending_rotations(self, *_args):
+            return []
+
+    async def fake_current_upstream_user(_request):
+        return {"email": "employee@example.com"}, {"matched_user_ids": ["user-1"]}
+
+    monkeypatch.setattr(main, "client", lambda: FakeClient())
+    monkeypatch.setattr(main, "key_vault", lambda: FakeVault())
+    monkeypatch.setattr(main, "current_upstream_user", fake_current_upstream_user)
+
+    with TestClient(main.app) as app_client:
+        response = app_client.get("/api/me/keys?include_models=0&refresh=1")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "keys": [{"id": "hash-1", "masked": "sk-...ABCD", "revealable": False}],
+        "availableModels": [],
+        "unrestrictedModels": False,
+    }
+
+
+def test_key_list_concurrent_cold_reads_share_one_upstream_request(monkeypatch) -> None:
+    client, backend = make_client()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def fake_request_backend(_backend, _method, _path, **_kwargs):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return {"keys": [{"token": "hash-1", "key_name": "sk-...ABCD", "metadata": {}}]}
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    async def run() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        first = asyncio.create_task(client.keys_for_user("user-1", backend))
+        await started.wait()
+        second = asyncio.create_task(client.keys_for_user("user-1", backend))
+        await asyncio.sleep(0)
+        release.set()
+        return await asyncio.gather(first, second)
+
+    first, second = asyncio.run(run())
+
+    assert calls == 1
+    assert first == second
+    assert first[0]["id"] == "hash-1"
+
+
+def test_key_list_cache_hit_skips_upstream_request(monkeypatch) -> None:
+    client, backend = make_client()
+    cached = [{"id": "cached-hash"}]
+    client._key_cache.set("keys:primary:user-1", cached, 300)
+
+    async def fake_request_backend(*_args, **_kwargs):
+        raise AssertionError("cache hit must not call the upstream key list")
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    assert asyncio.run(client.keys_for_user("user-1", backend)) == cached
+
+
+def test_key_list_concurrent_refreshes_share_one_fresh_request(monkeypatch) -> None:
+    client, backend = make_client()
+    client._key_cache.set("keys:primary:user-1", [{"id": "stale"}], 300)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def fake_request_backend(_backend, _method, _path, **_kwargs):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return {"keys": [{"token": "fresh", "metadata": {}}]}
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    async def run() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        first = asyncio.create_task(client.keys_for_user("user-1", backend, refresh=True))
+        await started.wait()
+        second = asyncio.create_task(client.keys_for_user("user-1", backend, refresh=True))
+        await asyncio.sleep(0)
+        release.set()
+        return await asyncio.gather(first, second)
+
+    first, second = asyncio.run(run())
+
+    assert calls == 1
+    assert first == second
+    assert first[0]["id"] == "fresh"
+
+
+def test_key_list_inflight_is_scoped_by_backend_and_user(monkeypatch) -> None:
+    client, primary = make_client()
+    secondary = LiteLLMBackend(id="secondary", label="Secondary", base_url="https://secondary.test", admin_key="test-key")
+    calls: list[tuple[str, str]] = []
+
+    async def fake_request_backend(backend, _method, _path, **kwargs):
+        user_id = kwargs["params"]["user_id"]
+        calls.append((backend.id, user_id))
+        await asyncio.sleep(0)
+        return {"keys": [{"token": f"{backend.id}-{user_id}", "metadata": {}}]}
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    async def run() -> list[list[dict[str, Any]]]:
+        return await asyncio.gather(
+            client.keys_for_user("user-1", primary),
+            client.keys_for_user("user-2", primary),
+            client.keys_for_user("user-1", secondary),
+        )
+
+    results = asyncio.run(run())
+
+    assert sorted(calls) == [("primary", "user-1"), ("primary", "user-2"), ("secondary", "user-1")]
+    assert [batch[0]["id"] for batch in results] == ["primary-user-1", "primary-user-2", "secondary-user-1"]
+
+
+def test_key_cache_invalidation_during_request_prevents_stale_repopulation(monkeypatch) -> None:
+    client, backend = make_client()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_request_backend(_backend, _method, _path, **_kwargs):
+        started.set()
+        await release.wait()
+        return {"keys": [{"token": "stale-result", "metadata": {}}]}
+
+    monkeypatch.setattr(client, "request_backend", fake_request_backend)
+
+    async def run() -> list[dict[str, Any]]:
+        request = asyncio.create_task(client.keys_for_user("user-1", backend))
+        await started.wait()
+        client.invalidate_key_cache("user-1", backend)
+        release.set()
+        return await request
+
+    result = asyncio.run(run())
+
+    assert result[0]["id"] == "stale-result"
+    assert client._key_cache.get("keys:primary:user-1")[0] is False
 
 
 def test_key_audit_never_writes_plain_key(monkeypatch, tmp_path) -> None:

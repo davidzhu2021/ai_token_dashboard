@@ -75,8 +75,34 @@ let modelViewMode = "card";
 let personalKeys = [];
 let availableKeyModels = [];
 let unrestrictedKeyModels = false;
+const PERSONAL_KEY_CACHE_TTL_MS = 30_000;
+const PERSONAL_KEY_CACHE_PREFIX = "tongqu:personal-keys:v1:";
+const CACHEABLE_PERSONAL_KEY_FIELDS = [
+  "id",
+  "keyType",
+  "name",
+  "purpose",
+  "masked",
+  "models",
+  "createdAt",
+  "lastUsed",
+  "expiresAt",
+  "monthTokens",
+  "spend",
+  "status",
+  "revealable",
+  "cleanupRequired",
+  "recoveryRequired",
+  "oldKeyId",
+  "replacementKeyId",
+];
+let hasLoadedPersonalKeys = false;
+let personalKeysLoadedAt = 0;
 let isKeysLoading = false;
 let keyLoadError = "";
+let keyRefreshError = "";
+let keyListRequest = null;
+let keyRefreshRequest = null;
 let pendingRegenerateKeyId = "";
 let pendingDeleteKeyId = "";
 let pendingDeleteKeyName = "";
@@ -3606,11 +3632,11 @@ async function toggleKeyReveal(keyId) {
 
 function renderKeys() {
   const countText = `${fmt.format(personalKeys.length)} 个密钥`;
-  setText("keyCount", isKeysLoading ? "加载中" : countText);
+  setText("keyCount", isKeysLoading ? (hasLoadedPersonalKeys ? "更新中" : "加载中") : countText);
   const tableBody = el("keyTableBody");
   const cardList = el("keyCardList");
 
-  if (isKeysLoading) {
+  if (isKeysLoading && !hasLoadedPersonalKeys) {
     tableBody.innerHTML = `<tr><td colspan="8" class="key-loading">正在加载个人密钥...</td></tr>`;
     cardList.innerHTML = `<article class="panel key-loading">正在加载个人密钥...</article>`;
     return;
@@ -3622,7 +3648,11 @@ function renderKeys() {
     return;
   }
   if (!personalKeys.length) {
-    const emptyMessage = "还没有个人密钥，点击“添加密钥”创建第一个。";
+    const emptyMessage = escapeHtml(
+      keyRefreshError
+        ? `暂时无法更新密钥列表：${keyRefreshError}`
+        : "还没有个人密钥，点击“添加密钥”创建第一个。",
+    );
     tableBody.innerHTML = `<tr><td colspan="8" class="key-empty">${emptyMessage}</td></tr>`;
     cardList.innerHTML = `<article class="panel key-empty">${emptyMessage}</article>`;
     return;
@@ -3696,6 +3726,15 @@ function renderKeys() {
     `;
     })
     .join("");
+
+  if (keyRefreshError) {
+    const warning = `<tr><td colspan="8" class="key-empty">列表暂未更新：${escapeHtml(keyRefreshError)}</td></tr>`;
+    tableBody.insertAdjacentHTML("afterbegin", warning);
+    cardList.insertAdjacentHTML(
+      "afterbegin",
+      `<article class="panel key-empty">列表暂未更新：${escapeHtml(keyRefreshError)}</article>`,
+    );
+  }
 }
 
 function renderKeyModelChoices() {
@@ -3802,27 +3841,156 @@ function clearPlainKey() {
   el("newKeyModal").classList.add("hidden");
 }
 
-async function loadKeys(forceRefresh = false) {
-  if (!currentUser || isKeysLoading) return;
+function personalKeyCacheIdentity(user = currentUser) {
+  if (!user) return "";
+  return String(user.id || authContactEmail(user) || authDisplayIdentifier(user) || "")
+    .trim()
+    .toLowerCase();
+}
+
+function personalKeyCacheStorageKey(user = currentUser) {
+  const identity = personalKeyCacheIdentity(user);
+  return identity ? `${PERSONAL_KEY_CACHE_PREFIX}${encodeURIComponent(identity)}` : "";
+}
+
+function cacheablePersonalKey(key) {
+  if (!key || typeof key !== "object") return null;
+  return Object.fromEntries(
+    CACHEABLE_PERSONAL_KEY_FIELDS
+      .filter((field) => Object.hasOwn(key, field))
+      .map((field) => [field, key[field]]),
+  );
+}
+
+function clearPersonalKeyCache(user = currentUser) {
+  const storageKey = personalKeyCacheStorageKey(user);
+  if (!storageKey) return;
+  try {
+    window.sessionStorage.removeItem(storageKey);
+  } catch {}
+}
+
+function restorePersonalKeyCache() {
+  if (hasLoadedPersonalKeys) return false;
+  const storageKey = personalKeyCacheStorageKey();
+  if (!storageKey) return false;
+  try {
+    const cached = JSON.parse(window.sessionStorage.getItem(storageKey) || "null");
+    const cachedAt = Number(cached?.cachedAt || 0);
+    if (!Array.isArray(cached?.keys) || !cachedAt || Date.now() - cachedAt > PERSONAL_KEY_CACHE_TTL_MS) {
+      window.sessionStorage.removeItem(storageKey);
+      return false;
+    }
+    personalKeys = cached.keys.map(cacheablePersonalKey).filter(Boolean);
+    availableKeyModels = [];
+    unrestrictedKeyModels = false;
+    hasLoadedPersonalKeys = true;
+    personalKeysLoadedAt = cachedAt;
+    keyLoadError = "";
+    keyRefreshError = "";
+    renderKeys();
+    return true;
+  } catch {
+    try {
+      window.sessionStorage.removeItem(storageKey);
+    } catch {}
+    return false;
+  }
+}
+
+function storePersonalKeyCache(keys) {
+  const storageKey = personalKeyCacheStorageKey();
+  if (!storageKey) return;
+  try {
+    window.sessionStorage.setItem(storageKey, JSON.stringify({
+      cachedAt: Date.now(),
+      keys: keys.map(cacheablePersonalKey).filter(Boolean),
+    }));
+  } catch {}
+}
+
+async function fetchPersonalKeys(forceRefresh = false, options = {}) {
+  const requestIdentity = personalKeyCacheIdentity();
+  const requestGeneration = authSessionGeneration;
+  const hadLoadedData = hasLoadedPersonalKeys;
   if (revealedKeys.size || revealTimers.size || revealingKeyIds.size) clearRevealedKeys();
   isKeysLoading = true;
   keyLoadError = "";
+  keyRefreshError = "";
   renderKeys();
   try {
-    const payload = await api(`/api/me/keys${forceRefresh ? "?refresh=1" : ""}`);
+    const params = new URLSearchParams({ include_models: "0" });
+    if (forceRefresh) params.set("refresh", "1");
+    const payload = await api(`/api/me/keys?${params}`);
+    if (requestGeneration !== authSessionGeneration || requestIdentity !== personalKeyCacheIdentity()) return null;
     personalKeys = Array.isArray(payload.keys) ? payload.keys : [];
-    availableKeyModels = Array.isArray(payload.availableModels) ? payload.availableModels : [];
-    unrestrictedKeyModels = Boolean(payload.unrestrictedModels);
-  } catch (error) {
-    personalKeys = [];
     availableKeyModels = [];
     unrestrictedKeyModels = false;
-    keyLoadError = error.message || "个人密钥加载失败，请稍后重试。";
-    showToast(keyLoadError);
+    hasLoadedPersonalKeys = true;
+    personalKeysLoadedAt = Date.now();
+    storePersonalKeyCache(personalKeys);
+    return payload;
+  } catch (error) {
+    if (requestGeneration !== authSessionGeneration || requestIdentity !== personalKeyCacheIdentity()) return null;
+    const message = error.message || "个人密钥加载失败，请稍后重试。";
+    if (hadLoadedData || hasLoadedPersonalKeys) keyRefreshError = message;
+    else {
+      personalKeys = [];
+      availableKeyModels = [];
+      unrestrictedKeyModels = false;
+      keyLoadError = message;
+    }
+    if (!options.silent) showToast(message);
+    return null;
   } finally {
-    isKeysLoading = false;
-    renderKeys();
+    if (requestGeneration === authSessionGeneration && requestIdentity === personalKeyCacheIdentity()) {
+      isKeysLoading = false;
+      renderKeys();
+    }
   }
+}
+
+function loadKeys(forceRefresh = false, options = {}) {
+  if (!currentUser) return Promise.resolve(null);
+  if (!forceRefresh) {
+    restorePersonalKeyCache();
+    if (keyRefreshRequest) return keyRefreshRequest;
+    if (keyListRequest) return keyListRequest;
+    let request;
+    request = fetchPersonalKeys(false, options).finally(() => {
+      if (keyListRequest === request) keyListRequest = null;
+    });
+    keyListRequest = request;
+    return request;
+  }
+
+  clearPersonalKeyCache();
+  if (keyRefreshRequest) return keyRefreshRequest;
+  const pendingListRequest = keyListRequest;
+  let request;
+  request = (async () => {
+    if (pendingListRequest) {
+      try {
+        await pendingListRequest;
+      } catch {}
+    }
+    return fetchPersonalKeys(true, options);
+  })().finally(() => {
+    if (keyRefreshRequest === request) keyRefreshRequest = null;
+  });
+  keyRefreshRequest = request;
+  return request;
+}
+
+function personalKeysAreFresh() {
+  return hasLoadedPersonalKeys
+    && personalKeysLoadedAt > 0
+    && Date.now() - personalKeysLoadedAt <= PERSONAL_KEY_CACHE_TTL_MS;
+}
+
+function prefetchPersonalKeys() {
+  if (!currentUser || isOrganizationCustomerIdentity() || accountAccessCopy(currentUser)) return;
+  loadKeys(false, { silent: true });
 }
 
 // ---- 团队成员密钥（团队负责人） ----
@@ -7628,7 +7796,7 @@ function switchView(view) {
   if (view === "keys") {
     renderKeys();
     renderTeamKeys();
-    if (!personalKeys.length && !isKeysLoading) loadKeys();
+    if (!personalKeysAreFresh() && !isKeysLoading) loadKeys(false, { silent: hasLoadedPersonalKeys });
     if (canManageTeamKeys() && !teamMemberKeys.length && !isTeamKeysLoading) loadTeamKeys();
   }
   if (view === "billing") {
@@ -7663,7 +7831,7 @@ async function loadCurrentViewData(forceRefresh = false) {
   if (currentView === "keys") {
     // 团队成员密钥独立加载，负责人身份不满足时会自己收起面板。
     loadTeamKeys();
-    return loadKeys();
+    return loadKeys(forceRefresh);
   }
   if (currentView === "billing") return isOrganizationBillingView() ? loadOrganizationBillingData() : loadBillingData();
   if (currentView === "models") return loadModels();
@@ -8003,8 +8171,28 @@ async function loadModels({ silent = false } = {}) {
 }
 
 async function showApp(user) {
+  const previousUser = currentUser;
+  const nextUser = normalizeAuthUser(user);
+  const previousKeyIdentity = personalKeyCacheIdentity(previousUser);
+  const nextKeyIdentity = personalKeyCacheIdentity(nextUser);
+  if (previousKeyIdentity && previousKeyIdentity !== nextKeyIdentity) {
+    clearPersonalKeyCache(previousUser);
+    authSessionGeneration += 1;
+    personalKeys = [];
+    availableKeyModels = [];
+    unrestrictedKeyModels = false;
+    hasLoadedPersonalKeys = false;
+    personalKeysLoadedAt = 0;
+    isKeysLoading = false;
+    keyLoadError = "";
+    keyRefreshError = "";
+    keyListRequest = null;
+    keyRefreshRequest = null;
+    clearRevealedKeys();
+    clearPlainKey();
+  }
   clearResetPasswordToken();
-  currentUser = normalizeAuthUser(user);
+  currentUser = nextUser;
   syncOrganizationDemoChrome();
   if (user?.csrfToken) authCsrfToken = user.csrfToken;
   if (currentUser?.csrfToken) authCsrfToken = currentUser.csrfToken;
@@ -8052,6 +8240,7 @@ async function showApp(user) {
   }
   // 模型目录只在进入模型广场时加载，避免登录首屏产生无关的上游请求。
   await Promise.all([loadCurrentViewData(), scopePromise]);
+  prefetchPersonalKeys();
 }
 
 async function loadAuthScope() {
@@ -8084,6 +8273,8 @@ async function loadAuthScope() {
 }
 
 function showLogin() {
+  const previousUser = currentUser;
+  clearPersonalKeyCache(previousUser);
   currentUser = null;
   authSessionGeneration += 1;
   authCsrfToken = "";
@@ -8195,7 +8386,13 @@ function showLogin() {
   personalKeys = [];
   availableKeyModels = [];
   unrestrictedKeyModels = false;
+  hasLoadedPersonalKeys = false;
+  personalKeysLoadedAt = 0;
+  isKeysLoading = false;
   keyLoadError = "";
+  keyRefreshError = "";
+  keyListRequest = null;
+  keyRefreshRequest = null;
   pendingRegenerateKeyId = "";
   pendingDeleteKeyId = "";
   pendingDeleteKeyName = "";
@@ -9149,7 +9346,7 @@ el("refreshButton").addEventListener("click", async () => {
   if (currentView === "keys") {
     await loadKeys(true);
     await loadTeamKeys(true);
-    showToast(keyLoadError ? "密钥列表刷新失败" : "已刷新密钥列表");
+    showToast(keyLoadError || keyRefreshError ? "密钥列表刷新失败" : "已刷新密钥列表");
   } else if (currentView === "models") {
     await loadModels();
     showToast("\u5df2\u5237\u65b0\u6a21\u578b\u5217\u8868");
@@ -9340,7 +9537,6 @@ el("createKeyForm").addEventListener("submit", async (event) => {
     el("createKeyModal").classList.add("hidden");
     el("createKeyForm").reset();
     updateKeyModelMode();
-    personalKeys = [];
     await loadKeys(true);
     showPlainKey(payload.key, payload.expiresAt || "", payload);
   } catch (error) {
@@ -9503,7 +9699,6 @@ el("deleteKeyForm").addEventListener("submit", async (event) => {
     pendingDeleteKeyName = "";
     el("deleteKeyModal").classList.add("hidden");
     el("deleteKeyConfirmInput").value = "";
-    personalKeys = [];
     await loadKeys(true);
     showToast(payload.warning || "密钥已删除并立即失效");
   } catch (error) {
@@ -9532,7 +9727,6 @@ el("confirmRegenerateKey").addEventListener("click", async () => {
     });
     pendingRegenerateKeyId = "";
     el("regenerateKeyModal").classList.add("hidden");
-    personalKeys = [];
     await loadKeys(true);
     showPlainKey(payload.key, payload.expiresAt || "", {
       ...payload,

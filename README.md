@@ -428,7 +428,7 @@ GET /api/auth/sso/start
 
 - `GET /api/me/usage`：返回我的用量汇总、趋势、来源拆分、模型排行和明细。
 - `GET /api/me/usage/logs`：返回我的用量明细分页。
-- `GET /api/me/keys`：返回本人访问密钥列表，密钥只展示掩码。
+- `GET /api/me/keys`：返回本人访问密钥列表，密钥只展示掩码；列表页可传 `include_models=0` 跳过与列表展示无关的模型权限查询，`refresh=1` 强制刷新上游数据。
 - `POST /api/me/keys/{key_id}/regenerate`：再生成本人访问密钥，新密钥只在本次响应中返回。
 - `GET /api/models`：返回当前账号可用模型列表。
 

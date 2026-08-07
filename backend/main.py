@@ -8446,18 +8446,26 @@ async def admin_departments_usage(
 
 
 @app.get("/api/me/keys")
-async def my_keys(request: Request, refresh: bool = Query(False)) -> dict[str, Any]:
+async def my_keys(
+    request: Request,
+    refresh: bool = Query(False),
+    include_models: bool = Query(True),
+) -> dict[str, Any]:
     app_user, upstream_user = await current_upstream_user(request)
     require_active_local_entitlement(app_user)
     user_ids = upstream_user_ids(upstream_user)
     if not user_ids:
         raise HTTPException(status_code=502, detail="上游员工记录缺少 user_id")
-    primary_user_id = primary_upstream_user_id(upstream_user)
-    # 两个上游调用相互独立，并行执行
-    (available_models, unrestricted), keys = await asyncio.gather(
-        client().available_key_models(primary_user_id),
-        client().keys_for_user_ids(user_ids, refresh),
-    )
+    if include_models:
+        primary_user_id = primary_upstream_user_id(upstream_user)
+        # 模型权限与密钥列表相互独立，保留兼容调用方的并行加载。
+        (available_models, unrestricted), keys = await asyncio.gather(
+            client().available_key_models(primary_user_id),
+            client().keys_for_user_ids(user_ids, refresh),
+        )
+    else:
+        available_models, unrestricted = [], False
+        keys = await client().keys_for_user_ids(user_ids, refresh)
     return {
         "keys": add_revealability(keys),
         "availableModels": [model for model in available_models if model not in {"no-default-models", "all-proxy-models"}],

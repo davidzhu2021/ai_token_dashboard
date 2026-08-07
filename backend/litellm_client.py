@@ -598,6 +598,8 @@ class LiteLLMClient:
         self.http_client = httpx.AsyncClient(timeout=self.timeout)
         self._semaphore = asyncio.Semaphore(max(1, _env_int("LITELLM_MAX_CONCURRENCY", 4)))
         self._key_cache = TTLCache()
+        self._key_cache_versions: dict[str, int] = {}
+        self._key_list_inflight: dict[tuple[str, int], asyncio.Task[list[dict[str, Any]]]] = {}
         self._model_cache = TTLCache()
         self._deployment_model_maps: dict[str, dict[str, str]] = {}
         self._model_usage_cache = TTLCache()
@@ -2647,13 +2649,13 @@ class LiteLLMClient:
             rows.extend(self._rows_from_daily_activity_item(item, source_override or "其他", backend))
         return rows
 
-    async def keys_for_user(self, user_id: str, backend: LiteLLMBackend | None = None, refresh: bool = False) -> list[dict[str, Any]]:
-        backend = backend or self.backends[0]
-        cache_key = f"keys:{backend.id}:{user_id}"
-        if not refresh:
-            hit, value, _ = self._key_cache.get(cache_key)
-            if hit:
-                return value
+    async def _load_keys_for_user(
+        self,
+        user_id: str,
+        backend: LiteLLMBackend,
+        cache_key: str,
+        cache_version: int,
+    ) -> list[dict[str, Any]]:
         payload = await self.request_backend(
             backend,
             "GET",
@@ -2746,12 +2748,45 @@ class LiteLLMClient:
                     },
                 }
             )
-        self._key_cache.set(cache_key, keys, _env_int("KEY_LIST_CACHE_TTL_SECONDS", 300))
+        if self._key_cache_versions.get(cache_key, 0) == cache_version:
+            self._key_cache.set(cache_key, keys, _env_int("KEY_LIST_CACHE_TTL_SECONDS", 300))
         return keys
+
+    async def keys_for_user(self, user_id: str, backend: LiteLLMBackend | None = None, refresh: bool = False) -> list[dict[str, Any]]:
+        backend = backend or self.backends[0]
+        cache_key = f"keys:{backend.id}:{user_id}"
+        if not refresh:
+            hit, value, _ = self._key_cache.get(cache_key)
+            if hit:
+                return value
+
+        inflight_tasks = getattr(self, "_key_list_inflight", None)
+        if inflight_tasks is None:
+            inflight_tasks = self._key_list_inflight = {}
+        cache_versions = getattr(self, "_key_cache_versions", None)
+        if cache_versions is None:
+            cache_versions = self._key_cache_versions = {}
+        cache_version = cache_versions.get(cache_key, 0)
+        inflight_key = (cache_key, cache_version)
+        task = inflight_tasks.get(inflight_key)
+        if task is None:
+            task = asyncio.create_task(self._load_keys_for_user(user_id, backend, cache_key, cache_version))
+            inflight_tasks[inflight_key] = task
+            task.add_done_callback(
+                lambda finished, key=inflight_key: inflight_tasks.pop(key, None)
+                if inflight_tasks.get(key) is finished
+                else None
+            )
+        return await asyncio.shield(task)
 
     def invalidate_key_cache(self, user_id: str, backend: LiteLLMBackend | None = None) -> None:
         backend = backend or self.backends[0]
-        self._key_cache.delete(f"keys:{backend.id}:{user_id}")
+        cache_key = f"keys:{backend.id}:{user_id}"
+        cache_versions = getattr(self, "_key_cache_versions", None)
+        if cache_versions is None:
+            cache_versions = self._key_cache_versions = {}
+        cache_versions[cache_key] = cache_versions.get(cache_key, 0) + 1
+        self._key_cache.delete(cache_key)
 
     async def key_user_info(self, user_id: str, backend: LiteLLMBackend | None = None) -> dict[str, Any]:
         backend = backend or self.backends[0]
