@@ -7556,7 +7556,7 @@
                 <h3 id="departmentDetailTitle">员工详情</h3>
                 <p id="departmentDetailSubtitle">点击部门排行中的一行查看部门明细。</p>
               </div>
-              <button id="departmentClearEmployee" class="ghost-btn drilldown-back-btn" type="button"><span class="app-icon" aria-hidden="true"><svg><use href="#icon-arrow-left"></use></svg></span><span>返回全部部门</span></button>
+              <button id="departmentClearEmployee" class="ghost-btn drilldown-back-btn" type="button"><span class="app-icon" aria-hidden="true"><svg><use href="#icon-arrow-left"></use></svg></span><span id="departmentDetailBackLabel">返回全部部门</span></button>
             </div>
           </section>
 
@@ -7607,6 +7607,10 @@
               <div class="daily-mini accent">
                 <span id="departmentActiveLabel" class="daily-label">活跃部门</span>
                 <strong id="departmentActiveUsers">0</strong>
+                <div id="departmentAvgSpendWrap" class="daily-average-money hidden">
+                  <span class="daily-average-label">日均金额</span>
+                  <strong id="departmentAvgSpend">$0.00</strong>
+                </div>
                 <span id="departmentActiveUsersSub" class="daily-sub">当前筛选范围</span>
               </div>
               <div class="daily-mini">
@@ -7702,6 +7706,57 @@
                   </tr>
                 </thead>
                 <tbody id="departmentUserTable"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section id="departmentEmployeeDetailCard" class="panel table-panel hidden">
+            <div class="panel-header">
+              <div class="panel-heading">
+                <span class="panel-icon"><svg><use href="#icon-table"></use></svg></span>
+                <div>
+                  <h3 class="panel-title">员工用量明细</h3>
+                  <p class="panel-desc">按当前日期范围与来源筛选展示所选员工的每日模型用量。</p>
+                </div>
+              </div>
+              <span id="departmentEmployeeTableCount" class="chip blue">0 条</span>
+            </div>
+            <div class="usage-detail-toolbar" aria-label="员工用量明细筛选">
+              <div class="usage-detail-field">
+                <label for="departmentEmployeeUsageDetailDateFilter">日期</label>
+                <select id="departmentEmployeeUsageDetailDateFilter" class="select" aria-label="按日期筛选员工用量明细"></select>
+              </div>
+              <div class="usage-detail-field">
+                <label for="departmentEmployeeUsageDetailModelFilter">模型</label>
+                <select id="departmentEmployeeUsageDetailModelFilter" class="select" aria-label="按模型筛选员工用量明细"></select>
+              </div>
+              <div class="usage-detail-field">
+                <label for="departmentEmployeeUsageDetailStatusFilter">状态</label>
+                <select id="departmentEmployeeUsageDetailStatusFilter" class="select" aria-label="按状态筛选员工用量明细"></select>
+              </div>
+              <div class="usage-detail-field usage-detail-search">
+                <label for="departmentEmployeeUsageDetailSearch">搜索</label>
+                <input id="departmentEmployeeUsageDetailSearch" class="input" type="search" placeholder="搜索模型或来源" aria-label="搜索员工用量明细" />
+              </div>
+              <div class="usage-detail-actions">
+                <button id="departmentEmployeeUsageDetailReset" class="ghost-btn" type="button">重置</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>日期</th>
+                    <th>来源</th>
+                    <th>模型</th>
+                    <th class="num">请求数</th>
+                    <th class="num">Prompt</th>
+                    <th class="num">Completion</th>
+                    <th class="num">总 Token</th>
+                    <th>状态</th>
+                  </tr>
+                </thead>
+                <tbody id="departmentEmployeeUsageTable"></tbody>
               </table>
             </div>
           </section>
