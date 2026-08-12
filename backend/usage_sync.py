@@ -88,6 +88,38 @@ class BackendSnapshot:
     event_start_date: str | None = None
     event_end_date: str | None = None
     events_complete: bool | None = None
+    event_replace_start_date: str | None = None
+    event_replace_end_date: str | None = None
+    event_window_complete: bool | None = None
+
+
+def _stability_scan_plan(
+    desired_start: date,
+    desired_end: date,
+    state: dict[str, Any] | None,
+) -> tuple[date, date, date, date]:
+    """Return scan and resulting contiguous coverage windows."""
+
+    state = state or {}
+    current_start = state.get("window_start")
+    current_end = state.get("window_end")
+    if isinstance(current_start, str):
+        current_start = date.fromisoformat(current_start[:10])
+    if isinstance(current_end, str):
+        current_end = date.fromisoformat(current_end[:10])
+
+    if not isinstance(current_start, date) or not isinstance(current_end, date):
+        return desired_end, desired_end, desired_end, desired_end
+    if bool(state.get("partial")):
+        retry_day = min(desired_end, max(desired_start, current_start))
+        return retry_day, retry_day, current_start, current_end
+    if current_end < desired_end:
+        scan_start = min(desired_end, current_end + timedelta(days=1))
+        return scan_start, scan_start, current_start, scan_start
+    if current_start > desired_start:
+        scan_start = max(desired_start, current_start - timedelta(days=1))
+        return scan_start, scan_start, scan_start, current_end
+    return desired_end, desired_end, desired_start, desired_end
 
 
 class UsageSynchronizer:
@@ -590,6 +622,19 @@ class UsageSynchronizer:
         errors: list[str] = []
         try:
             directory = await self._identity_directory()
+            states_loader = getattr(self.store, "stability_sync_states", None)
+            states = await states_loader() if callable(states_loader) else []
+            self._stability_state_map = {
+                str(item.get("backend_id")): item for item in states if isinstance(item, dict)
+            }
+            publish_stability = getattr(self.store, "publish_stability_events", None)
+            if _env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False) and callable(publish_stability):
+                for backend in self.client.backends:
+                    try:
+                        await self._sync_stability_backend(backend, publish_stability)
+                    except Exception:
+                        logger.exception("standalone stability sync failed for backend %s", backend.id)
+                self._stability_collected_separately = True
             for backend in self.client.backends:
                 try:
                     snapshots.append(await self.collect_backend(backend, start_date, end_date, directory))
@@ -679,6 +724,35 @@ class UsageSynchronizer:
             except Exception:
                 logger.exception("usage identity refresh failed for backend %s", snapshot.backend_id)
 
+    async def _sync_stability_backend(self, backend: LiteLLMBackend, publish: Any) -> None:
+        stability_days = max(1, _env_int("STABILITY_SYNC_WINDOW_DAYS", 7))
+        desired_end = usage_today()
+        desired_start = desired_end - timedelta(days=stability_days - 1)
+        scan_start, scan_end, merged_start, merged_end = _stability_scan_plan(
+            desired_start,
+            desired_end,
+            getattr(self, "_stability_state_map", {}).get(backend.id),
+        )
+        rows, complete = await self.client.stability_rows_from_logs(
+            scan_start.isoformat(), scan_end.isoformat(), backend
+        )
+        events = list(getattr(rows, "events", None) or rows.pop("__events__", []))
+        await publish(
+            backend.id,
+            scan_start.isoformat(),
+            scan_end.isoformat(),
+            events,
+            merged_start.isoformat(),
+            merged_end.isoformat(),
+            complete,
+        )
+        self._stability_state_map[backend.id] = {
+            "backend_id": backend.id,
+            "window_start": merged_start,
+            "window_end": merged_end,
+            "partial": not complete,
+        }
+
     async def collect_backend(
         self,
         backend: LiteLLMBackend,
@@ -727,6 +801,9 @@ class UsageSynchronizer:
         event_start_date: str | None = None
         event_end_date: str | None = None
         events_complete: bool | None = None
+        event_replace_start_date: str | None = None
+        event_replace_end_date: str | None = None
+        event_window_complete: bool | None = None
         token_mapping_index = await self._token_attribution_map(backend.id)
         window_days = (date.fromisoformat(end_date) - date.fromisoformat(start_date)).days + 1
         max_window = max(1, _env_int("USAGE_SYNC_LOG_MAX_WINDOW_DAYS", 3))
@@ -758,34 +835,40 @@ class UsageSynchronizer:
 
         # Stability requires a bounded recent raw-log window even when the
         # regular 90-day aggregate sync intentionally avoids request scans.
-        if _env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False):
+        if _env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False) and not getattr(
+            self, "_stability_collected_separately", False
+        ):
             stability_days = max(1, _env_int("STABILITY_SYNC_WINDOW_DAYS", 7))
             stability_end = min(date.fromisoformat(end_date), usage_today())
             # Keep the dashboard snapshot window independent from the shorter
             # recent usage refresh window, so a 2-day billing refresh cannot
             # silently shrink the 7-day stability coverage.
-            stability_start = stability_end - timedelta(days=stability_days - 1)
-            stability_start_text, stability_end_text = stability_start.isoformat(), stability_end.isoformat()
+            desired_start = stability_end - timedelta(days=stability_days - 1)
+            stability_start, stability_scan_end, merged_start, merged_end = _stability_scan_plan(
+                desired_start,
+                stability_end,
+                getattr(self, "_stability_state_map", {}).get(backend.id),
+            )
+            stability_start_text, stability_end_text = stability_start.isoformat(), stability_scan_end.isoformat()
             try:
                 stability_rows, stability_complete = await self.client.stability_rows_from_logs(
                     stability_start_text, stability_end_text, backend
                 )
                 stability_events = list(getattr(stability_rows, "events", None) or stability_rows.pop("__events__", []))
-                if stability_complete:
-                    event_rows = stability_events
-                    event_start_date, event_end_date, events_complete = stability_start_text, stability_end_text, True
-                else:
-                    logger.warning(
-                        "stability log scan incomplete for backend %s; preserving last complete snapshot",
-                        backend.id,
-                    )
-                    event_rows, event_start_date, event_end_date, events_complete = [], None, None, None
+                event_rows = stability_events
+                event_replace_start_date, event_replace_end_date = stability_start_text, stability_end_text
+                events_complete = stability_complete
+                event_start_date = merged_start.isoformat()
+                event_end_date = merged_end.isoformat()
+                event_window_complete = stability_complete
             except Exception:
                 logger.exception("stability log scan failed for backend %s", backend.id)
                 # Preserve the last good raw-event snapshot when the upstream
                 # scan is unavailable; an empty partial response would erase
                 # useful dashboard data.
-                event_rows, event_start_date, event_end_date, events_complete = [], None, None, None
+                if event_start_date is None:
+                    event_rows, event_start_date, event_end_date, events_complete = [], None, None, None
+                    event_window_complete = None
 
         semaphore = asyncio.Semaphore(max(1, _env_int("USAGE_SYNC_USER_CONCURRENCY", 4)))
 
@@ -897,6 +980,9 @@ class UsageSynchronizer:
             event_start_date,
             event_end_date,
             events_complete,
+            event_replace_start_date,
+            event_replace_end_date,
+            event_window_complete,
         )
 
     async def collect_memberships(

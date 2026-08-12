@@ -3415,6 +3415,8 @@ class LiteLLMClient:
         page_size_override: int | None = None,
         max_pages_override: int | None = None,
         concurrency_override: int | None = None,
+        page_retries_override: int | None = None,
+        allow_partial: bool = False,
     ) -> tuple[dict[str, list[dict[str, Any]]], bool]:
         """按北京时间日界扫描全量日志，返回 {user_id: usage rows} 与是否完整覆盖。
 
@@ -3434,6 +3436,12 @@ class LiteLLMClient:
         # snapshot when pages are fetched concurrently. Keep historical
         # imports deterministic; global scans retain the faster parallel path.
         concurrency = 1 if api_key else max(1, concurrency_override or _env_int("USAGE_SYNC_LOG_CONCURRENCY", 8))
+        page_retries = max(
+            0,
+            page_retries_override
+            if page_retries_override is not None
+            else _env_int("USAGE_SYNC_LOG_PAGE_RETRIES", 2),
+        )
 
         async def fetch_page(page: int) -> tuple[list[dict[str, Any]], int]:
             params: dict[str, Any] = {
@@ -3446,16 +3454,32 @@ class LiteLLMClient:
             }
             if api_key:
                 params["api_key"] = safe_key_id(api_key)
-            payload = await self.request_backend(
-                backend,
-                "GET",
-                "/spend/logs/v2",
-                params=params,
-            )
+            last_error: Exception | None = None
+            for attempt in range(page_retries + 1):
+                try:
+                    payload = await self.request_backend(
+                        backend,
+                        "GET",
+                        "/spend/logs/v2",
+                        params=params,
+                    )
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if attempt >= page_retries:
+                        raise
+                    await asyncio.sleep(min(2.0, 0.25 * (2**attempt)))
+            else:  # pragma: no cover - loop either breaks or raises
+                raise last_error or RuntimeError("spend log page failed")
             total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=0)) if isinstance(payload, dict) else 0
             return _records(payload), total_pages
 
-        first_logs, total_pages = await fetch_page(1)
+        page_failed = False
+        try:
+            first_logs, total_pages = await fetch_page(1)
+        except Exception:
+            logger.exception("usage log first page failed backend=%s", backend.id)
+            raise
         pages_to_fetch = min(total_pages or 1, max_pages)
         truncated = bool(total_pages and total_pages > max_pages)
 
@@ -3563,17 +3587,24 @@ class LiteLLMClient:
             semaphore = asyncio.Semaphore(concurrency)
 
             async def load(page: int) -> list[dict[str, Any]]:
+                nonlocal page_failed
                 async with semaphore:
                     try:
                         logs, _ = await fetch_page(page)
                         return logs
-                    except HTTPException:
+                    except Exception:
                         logger.exception("usage log page %s failed backend=%s", page, backend.id)
+                        if allow_partial:
+                            page_failed = True
+                            return []
                         raise
 
-            batches = await asyncio.gather(*(load(page) for page in range(2, pages_to_fetch + 1)))
-            for batch in batches:
-                absorb(batch)
+            batch_size = max(concurrency, _env_int("USAGE_SYNC_LOG_BATCH_PAGES", 50))
+            for batch_start in range(2, pages_to_fetch + 1, batch_size):
+                batch_end = min(pages_to_fetch + 1, batch_start + batch_size)
+                batches = await asyncio.gather(*(load(page) for page in range(batch_start, batch_end)))
+                for batch in batches:
+                    absorb(batch)
 
         logger.info(
             "usage log scan backend=%s pages=%s/%s users=%s start=%s end=%s truncated=%s",
@@ -3597,7 +3628,7 @@ class LiteLLMClient:
             user_id: sorted(bucket.values(), key=lambda item: (item["date"], item["source"], item["model"]))
             for user_id, bucket in grouped.items()
         }, events=event_rows)
-        return result, not truncated
+        return result, not truncated and not page_failed
 
     async def stability_rows_from_logs(
         self,
@@ -3611,7 +3642,9 @@ class LiteLLMClient:
             backend,
             page_size_override=_env_int("STABILITY_SYNC_PAGE_SIZE", 100),
             max_pages_override=_env_int("STABILITY_SYNC_MAX_PAGES", 5000),
-            concurrency_override=_env_int("STABILITY_SYNC_CONCURRENCY", 4),
+            concurrency_override=_env_int("STABILITY_SYNC_CONCURRENCY", 2),
+            page_retries_override=_env_int("STABILITY_SYNC_PAGE_RETRIES", 3),
+            allow_partial=True,
         )
 
     async def admin_daily_activity_rows(self, start_date: str, end_date: str, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:

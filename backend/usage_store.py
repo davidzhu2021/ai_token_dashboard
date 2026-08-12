@@ -1213,6 +1213,108 @@ class UsageStore:
                 )
         return len(usage_records)
 
+    async def publish_stability_events(
+        self,
+        backend_id: str,
+        replace_start_date: str,
+        replace_end_date: str,
+        events: list[dict[str, Any]],
+        window_start: str,
+        window_end: str,
+        complete: bool,
+    ) -> int:
+        """Publish one bounded stability slice without waiting for usage aggregation."""
+
+        pool = self._require_pool()
+        collected_at = datetime.now(timezone.utc)
+        records = [
+            record
+            for row in events
+            if (record := self._event_record(backend_id, row, collected_at)) is not None
+        ]
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "DELETE FROM usage_event_attribution WHERE backend_id=$1 "
+                    "AND usage_date BETWEEN $2::date AND $3::date "
+                    "AND attribution_source <> 'legacy_report_only'",
+                    backend_id,
+                    _as_date(replace_start_date),
+                    _as_date(replace_end_date),
+                )
+                if records:
+                    await connection.executemany(
+                        """
+                        INSERT INTO usage_event_attribution (
+                            backend_id, request_id, event_time, usage_date, raw_user_id,
+                            organization_id, team_id, key_id, principal_id, source, model,
+                            prompt_tokens, completion_tokens, total_tokens, request_count,
+                            success_count, failure_count, spend, attribution_source,
+                            billing_eligible, provider, model_group, model_id, api_base,
+                            status, error_code, error_class, error_message, scenario,
+                            request_duration_ms, ttft_ms, attempted_retries, max_retries,
+                            trace_id, user_visible_failure, collected_at
+                        ) VALUES (
+                            $1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+                            $17,$18::numeric,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
+                            $31,$32,$33,$34,$35,$36
+                        )
+                        ON CONFLICT (backend_id, request_id) DO UPDATE SET
+                            event_time=EXCLUDED.event_time, usage_date=EXCLUDED.usage_date,
+                            raw_user_id=EXCLUDED.raw_user_id, organization_id=EXCLUDED.organization_id,
+                            team_id=EXCLUDED.team_id, key_id=EXCLUDED.key_id,
+                            principal_id=EXCLUDED.principal_id, source=EXCLUDED.source,
+                            model=EXCLUDED.model, prompt_tokens=EXCLUDED.prompt_tokens,
+                            completion_tokens=EXCLUDED.completion_tokens,
+                            total_tokens=EXCLUDED.total_tokens, request_count=EXCLUDED.request_count,
+                            success_count=EXCLUDED.success_count, failure_count=EXCLUDED.failure_count,
+                            spend=EXCLUDED.spend, attribution_source=EXCLUDED.attribution_source,
+                            billing_eligible=EXCLUDED.billing_eligible, provider=EXCLUDED.provider,
+                            model_group=EXCLUDED.model_group, model_id=EXCLUDED.model_id,
+                            api_base=EXCLUDED.api_base, status=EXCLUDED.status,
+                            error_code=EXCLUDED.error_code, error_class=EXCLUDED.error_class,
+                            error_message=EXCLUDED.error_message, scenario=EXCLUDED.scenario,
+                            request_duration_ms=EXCLUDED.request_duration_ms,
+                            ttft_ms=EXCLUDED.ttft_ms, attempted_retries=EXCLUDED.attempted_retries,
+                            max_retries=EXCLUDED.max_retries, trace_id=EXCLUDED.trace_id,
+                            user_visible_failure=EXCLUDED.user_visible_failure,
+                            collected_at=EXCLUDED.collected_at
+                        """,
+                        records,
+                    )
+                event_count = int(
+                    await connection.fetchval(
+                        "SELECT COUNT(*) FROM usage_event_attribution WHERE backend_id=$1 "
+                        "AND usage_date BETWEEN $2::date AND $3::date",
+                        backend_id,
+                        _as_date(window_start),
+                        _as_date(window_end),
+                    )
+                    or 0
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO stability_sync_state (
+                        backend_id, window_start, window_end, status, partial,
+                        event_count, synced_at, error_message
+                    ) VALUES ($1,$2::date,$3::date,$4,$5,$6,$7,$8)
+                    ON CONFLICT (backend_id) DO UPDATE SET
+                        window_start=EXCLUDED.window_start, window_end=EXCLUDED.window_end,
+                        status=EXCLUDED.status, partial=EXCLUDED.partial,
+                        event_count=EXCLUDED.event_count, synced_at=EXCLUDED.synced_at,
+                        error_message=EXCLUDED.error_message
+                    """,
+                    backend_id,
+                    _as_date(window_start),
+                    _as_date(window_end),
+                    "complete" if complete else "partial",
+                    not complete,
+                    event_count,
+                    collected_at,
+                    "" if complete else "page limit or upstream scan incomplete",
+                )
+        return len(records)
+
     async def publish_snapshots(
         self,
         start_date: str,
@@ -1249,8 +1351,8 @@ class UsageStore:
         event_records = list(event_records_by_key.values())
         event_windows = {
             str(snapshot.backend_id): (
-                str(getattr(snapshot, "event_start_date", None) or start_date),
-                str(getattr(snapshot, "event_end_date", None) or end_date),
+                str(getattr(snapshot, "event_replace_start_date", None) or getattr(snapshot, "event_start_date", None) or start_date),
+                str(getattr(snapshot, "event_replace_end_date", None) or getattr(snapshot, "event_end_date", None) or end_date),
             )
             for snapshot in snapshots
             if getattr(snapshot, "events", None) is not None
@@ -1398,6 +1500,23 @@ class UsageStore:
                 for snapshot in snapshots:
                     if getattr(snapshot, "events_complete", None) is None:
                         continue
+                    state_complete = bool(
+                        getattr(snapshot, "event_window_complete", None)
+                        if getattr(snapshot, "event_window_complete", None) is not None
+                        else getattr(snapshot, "events_complete", False)
+                    )
+                    state_start = getattr(snapshot, "event_start_date", None) or start_date
+                    state_end = getattr(snapshot, "event_end_date", None) or end_date
+                    event_count = int(
+                        await connection.fetchval(
+                            "SELECT COUNT(*) FROM usage_event_attribution "
+                            "WHERE backend_id=$1 AND usage_date BETWEEN $2::date AND $3::date",
+                            str(snapshot.backend_id),
+                            _as_date(state_start),
+                            _as_date(state_end),
+                        )
+                        or 0
+                    )
                     await connection.execute(
                         """
                         INSERT INTO stability_sync_state (
@@ -1416,11 +1535,11 @@ class UsageStore:
                         str(snapshot.backend_id),
                         getattr(snapshot, "event_start_date", None) or start_date,
                         getattr(snapshot, "event_end_date", None) or end_date,
-                        "complete" if getattr(snapshot, "events_complete", False) else "partial",
-                        not bool(getattr(snapshot, "events_complete", False)),
-                        len(list(getattr(snapshot, "events", None) or [])),
+                        "complete" if state_complete else "partial",
+                        not state_complete,
+                        event_count,
                         collected_at,
-                        "" if getattr(snapshot, "events_complete", False) else "page limit or upstream scan incomplete",
+                        "" if state_complete else "page limit or upstream scan incomplete",
                     )
                 await connection.execute(
                     """
