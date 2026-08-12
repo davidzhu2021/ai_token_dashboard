@@ -2503,6 +2503,7 @@ function renderModelBarsTo(containerId, data) {
     .filter((row) => row.value > 0)
     .sort((a, b) => b.value - a.value);
   const max = Math.max(1, ...rows.map((row) => row.value));
+  container.classList.toggle("is-compact", rows.length > 0 && rows.length <= 4);
   container.innerHTML = rows.length
     ? rows
         .map((row) => `<div class="bar-row"><strong>${escapeHtml(displayModelName(row.model))}</strong><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3, (row.value / max) * 100)}%"></div></div><span class="num">${formatTokens(row.value)}</span></div>`)
@@ -2517,6 +2518,7 @@ function renderDepartmentBarsTo(containerId, departments) {
     .filter((d) => d.totalTokens > 0)
     .sort((a, b) => b.totalTokens - a.totalTokens);
   const max = Math.max(1, ...sorted.map((d) => d.totalTokens));
+  container.classList.toggle("is-compact", sorted.length > 0 && sorted.length <= 4);
   container.innerHTML = sorted.length
     ? sorted
         .map((dept) => `<div class="bar-row"><strong>${escapeHtml(dept.departmentName)}</strong><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3, (dept.totalTokens / max) * 100)}%"></div></div><span class="num">${formatTokens(dept.totalTokens)}</span></div>`)
@@ -8177,7 +8179,9 @@ function renderStabilityOverview() {
     const failures = item.userVisibleFailureCount;
     return `<div class="observability-bar" title="${escapeHtml(item.date)} · 上游异常 ${upstream ?? "暂无数据"} · 用户最终失败 ${failures ?? "暂无数据"}"><span class="observability-bar-segment" style="height:${upstream == null ? 3 : Math.max(3, Number(upstream) / max * 150)}px"></span><span class="observability-bar-segment secondary" style="height:${failures == null ? 3 : Math.max(3, Number(failures) / max * 150)}px"></span><small>${escapeHtml(String(item.date).slice(5))}</small></div>`;
   }).join("") : `<p class="empty">暂无可用稳定性事件</p>`;
-  el("stabilityRanking").innerHTML = (data.modelRankings || []).map((item, index) => `<div class="observability-rank-row"><strong>${index + 1}</strong><div><b>${escapeHtml(item.model)}</b><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Math.max(3, 100 - Math.min(100, Number(item.userVisibleFailureRate || 0) * 1000))}%"></div></div></div><span class="chip ${item.state === "稳定" ? "green" : item.state === "观察" ? "gold" : "red"}">${escapeHtml(item.state)}</span></div>`).join("") || `<p class="empty">暂无模型样本</p>`;
+  const stabilityRankings = data.modelRankings || [];
+  el("stabilityRanking").classList.toggle("is-compact", stabilityRankings.length > 0 && stabilityRankings.length <= 4);
+  el("stabilityRanking").innerHTML = stabilityRankings.map((item, index) => `<div class="observability-rank-row"><strong>${index + 1}</strong><div><b>${escapeHtml(item.model)}</b><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Math.max(3, 100 - Math.min(100, Number(item.userVisibleFailureRate || 0) * 1000))}%"></div></div></div><span class="chip ${item.state === "稳定" ? "green" : item.state === "观察" ? "gold" : "red"}">${escapeHtml(item.state)}</span></div>`).join("") || `<p class="empty">暂无模型样本</p>`;
   el("stabilityScenarioBody").innerHTML = (data.topScenarios || []).map((item) => {
     const sample = (item.sampleRequests || [])[0] || { requestId: (item.sampleRequestIds || [])[0], backendId: "" };
     return `<tr><td>${escapeHtml(item.scenario)}</td><td>${escapeHtml(item.model || "-")}</td><td>${escapeHtml(item.errorCode || "-")}</td><td>${item.count}</td><td>${escapeHtml(observabilityPercent(item.userVisibleFailureRate))}</td><td>${sample.requestId ? `<button class="ghost-btn" type="button" data-stability-request="${escapeHtml(sample.requestId)}" data-stability-backend="${escapeHtml(sample.backendId || "")}">查看样本</button>` : "-"}</td></tr>`;
@@ -8237,6 +8241,7 @@ function renderCostOverview() {
   el("savingsActionList").innerHTML = (data.savingsActions || []).map((item) => `<article class="observability-action"><div><strong>${escapeHtml(item.name)}</strong><p class="hint">${escapeHtml(item.owner || "未指定负责人")} · ${escapeHtml(item.status)}</p></div><div class="observability-table-actions"><span>${item.status === "verified" ? `${observabilityMoney(Math.max(0, Number(item.baselineDailyCost) - Number(item.verifiedDailyCost || 0)))}/日` : "尚未计入节省"}</span><button class="ghost-btn" type="button" data-edit-savings-action="${escapeHtml(item.id)}">编辑</button></div></article>`).join("") || `<p class="empty">暂无降本动作</p>`;
   const split = data.modelSplit || [];
   const maxModelSpend = Math.max(1, ...split.map((item) => Number(item.spend || 0)));
+  el("costModelSplit").classList.toggle("is-compact", split.length > 0 && split.length <= 4);
   el("costModelSplit").innerHTML = split.map((item) => `<div class="observability-model-row"><strong>${escapeHtml(item.model)}</strong><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Math.max(3, Number(item.spend || 0) / maxModelSpend * 100)}%"></div></div><span>${observabilityMoney(item.spend)}</span></div>`).join("") || `<p class="empty">暂无模型成本</p>`;
   const targetMonth = String(data.month || el("costMonth")?.value || "").slice(0, 7);
   const budget = costBudgets.find((item) => String(item.month).slice(0, 7) === targetMonth);

@@ -2153,6 +2153,7 @@
       .metrics {
         display: grid;
         grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-auto-rows: 404px;
         gap: 14px;
         margin-bottom: 20px;
         align-items: stretch;
@@ -2264,8 +2265,8 @@
       }
 
       .model-rank-group {
-        min-height: 320px;
-        height: auto;
+        min-height: 0;
+        height: 100%;
         display: flex;
         flex-direction: column;
         overflow: hidden;
@@ -2286,6 +2287,11 @@
         line-height: 1.35;
         overflow-wrap: anywhere;
         white-space: normal;
+      }
+
+      .model-rank-group > div.bars.is-compact,
+      .ranking-list-panel > div.bars.is-compact {
+        align-content: center;
       }
 
       .chip {
@@ -2606,7 +2612,8 @@
       .ranking-list-panel {
         display: flex;
         flex-direction: column;
-        max-height: 420px;
+        height: 420px;
+        min-height: 420px;
       }
 
       .ranking-list-panel > .panel-header {
@@ -2614,7 +2621,9 @@
       }
 
       .ranking-list-panel > .bars {
+        flex: 1 1 auto;
         min-height: 0;
+        align-content: start;
         overflow-x: hidden;
         overflow-y: auto;
         padding-right: 8px;
@@ -3094,6 +3103,8 @@
       .observability-ranking-panel { height:360px; min-height:360px; display:flex; flex-direction:column; overflow:hidden; }
       .observability-ranking-panel > .panel-header { flex:0 0 auto; }
       .observability-ranking-panel > .observability-model-list { flex:1 1 auto; min-height:0; align-content:start; overflow-x:hidden; overflow-y:auto; padding-right:8px; scrollbar-gutter:stable; overscroll-behavior:contain; }
+      .observability-stability-grid > .panel > div.observability-ranking.is-compact,
+      .observability-ranking-panel > div.observability-model-list.is-compact { align-content:center; }
       .observability-model-row { display:grid; grid-template-columns:minmax(120px,1fr) 2fr auto; gap:12px; align-items:center; }
       .observability-model-row > strong { min-width:0; overflow-wrap:anywhere; }
       .observability-drawer-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:18px; }
@@ -3104,7 +3115,7 @@
       .observability-drawer-row dd { margin:0; word-break:break-word; }
       .observability-drawer { position:fixed; top:0; right:0; width:min(440px,100vw); height:100vh; background:#fff; box-shadow:-12px 0 30px rgba(20,36,58,.16); padding:24px; z-index:20; overflow:auto; }
       @media (max-width: 900px) { .observability-metric-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .observability-grid { grid-template-columns:1fr; } .observability-stability-grid { grid-template-columns:1fr; } .observability-stability-grid > .panel { height:320px; min-height:320px; } .observability-ranking-panel { height:320px; min-height:320px; } .observability-head { grid-template-columns:1fr; align-items:start; gap:16px; } .observability-filter-bar { justify-content:flex-start; } .observability-filter-fields { grid-template-columns:repeat(2,minmax(180px,1fr)); } .observability-budget-strip { grid-template-columns:repeat(2,minmax(0,1fr)); } }
-      @media (max-width: 560px) { .observability-metric-grid { grid-template-columns:1fr; } .observability-composition-row { grid-template-columns:80px 1fr 64px; } .observability-stability-grid > .panel { height:300px; min-height:300px; } .observability-ranking-panel { height:300px; min-height:300px; } .model-rank-group { height:300px; min-height:300px; } .ranking-list-panel { max-height:360px; } .ranking-table-panel > .table-wrap { max-height:360px; } .observability-filter-bar { display:grid; grid-template-columns:minmax(0,1fr) auto auto; width:100%; } .observability-primary-filter { width:100%; min-width:0; } .observability-filter-button { padding:0 11px; } .observability-filter-fields,.observability-filter-fields.single { grid-template-columns:1fr; } .observability-filter-panel.is-open { max-height:420px; } }
+      @media (max-width: 560px) { .observability-metric-grid { grid-template-columns:1fr; } .observability-composition-row { grid-template-columns:80px 1fr 64px; } .observability-stability-grid > .panel { height:300px; min-height:300px; } .observability-ranking-panel { height:300px; min-height:300px; } .model-rank-group { height:100%; min-height:0; } .ranking-list-panel { height:360px; min-height:360px; } .ranking-table-panel > .table-wrap { max-height:360px; } .observability-filter-bar { display:grid; grid-template-columns:minmax(0,1fr) auto auto; width:100%; } .observability-primary-filter { width:100%; min-width:0; } .observability-filter-button { padding:0 11px; } .observability-filter-fields,.observability-filter-fields.single { grid-template-columns:1fr; } .observability-filter-panel.is-open { max-height:420px; } }
       @media (prefers-reduced-motion: reduce) { .observability-filter-button,.observability-filter-panel { transition:none; } }
 
       .key-type-label {
@@ -9158,6 +9169,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260812-ranking-scroll"></script>
+    <script src="/assets/app.js?v=20260812-ranking-scroll-center"></script>
   </body>
 </html>

@@ -53,13 +53,24 @@ def test_ranking_tables_keep_headers_visible_and_mobile_heights_bounded() -> Non
 
     assert ".ranking-table-panel > .table-wrap thead th" in markup
     assert "position: sticky" in markup
-    assert "max-height: 420px" in markup
+    assert ".ranking-list-panel {" in markup
+    assert "height: 420px" in markup
     assert ".observability-ranking-panel { height:360px; min-height:360px;" in markup
     assert ".metrics {" in markup and "align-items: stretch;" in markup
     model_group_start = markup.index(".model-rank-group {")
     model_group_rule = markup[model_group_start : markup.index("}", model_group_start)]
-    assert "min-height: 320px" in model_group_rule
-    assert "\n        height: 320px" not in model_group_rule
+    assert "min-height: 0" in model_group_rule
+    assert "height: 100%" in model_group_rule
+    assert "grid-auto-rows: 404px" in markup
+    assert ".bars.is-compact" in markup
+    assert "div.observability-ranking.is-compact" in markup
+    assert "div.observability-model-list.is-compact" in markup
+    assert markup.index("div.observability-ranking.is-compact") > markup.index(".observability-stability-grid .observability-ranking {")
+    assert markup.index("div.observability-model-list.is-compact") > markup.index(".observability-ranking-panel > .observability-model-list {")
+    assert 'container.classList.toggle("is-compact", rows.length > 0 && rows.length <= 4);' in source
+    assert 'container.classList.toggle("is-compact", sorted.length > 0 && sorted.length <= 4);' in source
+    assert 'el("stabilityRanking").classList.toggle("is-compact", stabilityRankings.length > 0 && stabilityRankings.length <= 4);' in source
+    assert 'el("costModelSplit").classList.toggle("is-compact", split.length > 0 && split.length <= 4);' in source
     assert '.filter((row) => row.value > 0)' in source
     model_renderer_start = source.index("function renderModelBarsTo")
     model_renderer_end = source.index("function renderDepartmentBarsTo", model_renderer_start)
@@ -69,4 +80,5 @@ def test_ranking_tables_keep_headers_visible_and_mobile_heights_bounded() -> Non
     assert ".slice(0, 5)" not in model_renderer
     assert ".slice(0, 10)" not in department_renderer
     assert "前 10 个部门" not in markup
+    assert ".ranking-list-panel { height:360px; min-height:360px; }" in markup
     assert ".ranking-table-panel > .table-wrap { max-height:360px; }" in markup

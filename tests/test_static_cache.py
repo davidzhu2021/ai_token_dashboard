@@ -17,7 +17,7 @@ def test_index_uses_fresh_app_asset_and_disables_html_cache() -> None:
     assert "Cache-Control" in response.headers
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["Referrer-Policy"] == "no-referrer"
-    assert "/assets/app.js?v=20260812-ranking-scroll" in response.text
+    assert "/assets/app.js?v=20260812-ranking-scroll-center" in response.text
     assert "20260807-personal-key-speed" not in response.text
     assert "20260805-team-member-keys" not in response.text
     assert "20260805-owner-identity" not in response.text
