@@ -130,6 +130,13 @@ class UsageSyncWorker:
         recent_days = max(1, _env_int("USAGE_SYNC_RECENT_DAYS", 2))
         calibration_days = max(recent_days, _env_int("USAGE_SYNC_CALIBRATION_DAYS", 3))
         refresh_interval = max(60, _env_int("USAGE_SYNC_INTERVAL_SECONDS", 1800))
+        if os.getenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
+            # Stability snapshots have their own cadence; the worker still
+            # publishes the same atomic snapshot so dashboard reads stay cheap.
+            refresh_interval = min(
+                refresh_interval,
+                max(60, _env_int("STABILITY_SYNC_INTERVAL_SECONDS", refresh_interval)),
+            )
         calibration_interval = max(
             refresh_interval,
             _env_int("USAGE_SYNC_CALIBRATION_INTERVAL_SECONDS", 21600),

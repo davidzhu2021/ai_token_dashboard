@@ -13,10 +13,11 @@ import socket
 import ssl
 import uuid
 from contextlib import asynccontextmanager
+from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from base64 import urlsafe_b64encode
-from email.message import EmailMessage
+from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
 from html import unescape
 from pathlib import Path
@@ -86,6 +87,7 @@ from .litellm_client import (
     normalize_model_display_name,
     usage_today,
 )
+from .observability import monthly_forecast, model_state, stability_metrics, verified_savings
 from .key_vault import KeyVault, KeyVaultError
 from .organization_store import (
     DEFAULT_TOKEN_DAILY_BUDGET_USD,
@@ -1211,6 +1213,13 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
 def request_ip(request: Request) -> str:
     peer = str(request.client.host if request.client else "").strip()
     if not _trusted_proxy_ip(peer):
@@ -1298,6 +1307,10 @@ def organization_access_fields(
         # advertise demo controls.
         "organizationDemoEnabled": organization_demo_enabled(),
         "isPlatformAdmin": bool(user.get("isPlatformAdmin")),
+        "observabilityDashboardsEnabled": bool(
+            user.get("isPlatformAdmin")
+            and env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False)
+        ),
         "organizationId": organization_id,
         # The customer name is safe display context for scoped boards. It lets
         # a customer admin identify their tenant without exposing the seller's
@@ -2865,14 +2878,13 @@ def send_auth_email_sync(recipient: str, subject: str, body: str) -> None:
         raise RuntimeError("SMTP_SSL 和 SMTP_STARTTLS 不能同时启用")
     if (username or password) and not (smtp_ssl or smtp_starttls):
         raise RuntimeError("SMTP 凭据必须通过 TLS 连接发送")
-    message = EmailMessage()
+    message = MIMEText(body, "plain", "utf-8")
     message["From"] = sender
     message["To"] = recipient
     message["Subject"] = subject
     message["Date"] = formatdate(localtime=False, usegmt=True)
-    message_id_domain = sender.rsplit("@", 1)[1] if "@" in sender else None
+    message_id_domain = os.getenv("SMTP_MESSAGE_ID_DOMAIN", "example.com").strip() or "example.com"
     message["Message-ID"] = make_msgid(domain=message_id_domain)
-    message.set_content(body)
     if smtp_ssl:
         connection: smtplib.SMTP = smtplib.SMTP_SSL(host, port, timeout=15, context=ssl.create_default_context())
     else:
@@ -4636,6 +4648,41 @@ class OrganizationTokenCreateRequest(BaseModel):
         if value < MIN_TOKEN_DAILY_BUDGET_USD or value > MAX_TOKEN_DAILY_BUDGET_USD:
             raise ValueError("dailyBudgetUsd must be between 1.00 and 5000.00")
         return value.quantize(Decimal("0.01"))
+
+
+class CostItemRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    category: str = Field(min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=160)
+    vendor: str = Field(default="", max_length=160)
+    model: str = Field(default="", max_length=256)
+    businessScope: str = Field(default="", max_length=160)
+    amount: Decimal = Field(gt=0)
+    currency: Literal["USD", "CNY"] = "USD"
+    exchangeRate: Decimal = Field(default=Decimal("1"), gt=0)
+    serviceStartDate: date
+    serviceEndDate: date
+    financeBucket: str = Field(default="", max_length=160)
+    notes: str = Field(default="", max_length=1000)
+    enabled: bool = True
+
+
+class CostBudgetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    budgetUsd: Decimal = Field(ge=0)
+    dailyTargetUsd: Decimal = Field(ge=0)
+
+
+class SavingsActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=160)
+    baselineDailyCost: Decimal = Field(ge=0)
+    implementedDate: date
+    verifiedDate: date | None = None
+    verifiedDailyCost: Decimal | None = Field(default=None, ge=0)
+    owner: str = Field(default="", max_length=160)
+    status: Literal["planned", "implemented", "verified"] = "planned"
+    notes: str = Field(default="", max_length=1000)
 
 
 def write_key_audit(event: str, email: str, key_id: str, request: Request, result: str) -> None:
@@ -8443,6 +8490,414 @@ async def admin_departments_usage(
         "department": department or "",
         **payload,
     }
+
+
+def _admin_observability_store() -> UsageStore:
+    if not env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False):
+        raise HTTPException(status_code=404, detail="看板尚未开放")
+    require = usage_store()
+    if require is None:
+        raise HTTPException(status_code=503, detail="看板数据暂不可用")
+    return require
+
+
+def _observability_envelope(data: Any, *, freshness: dict[str, Any] | None = None, coverage: dict[str, Any] | None = None, source: str = "usage snapshot") -> dict[str, Any]:
+    return {
+        "data": data,
+        "freshness": freshness or {"status": "unknown"},
+        "coverage": coverage or {"partial": False, "incomplete": False},
+        "source": source,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def _admin_stability_events(start_date: str, end_date: str, model: str = "") -> list[dict[str, Any]]:
+    rows = await _admin_observability_store().stability_events(start_date, end_date, model)
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        status = item.get("status")
+        item.update({
+            "status": status or "unknown",
+            "scenario": item.get("scenario") or "unknown",
+            "userVisibleFailure": item.get("user_visible_failure"),
+            "attemptedRetries": item.get("attempted_retries"),
+            "ttftMs": item.get("ttft_ms"),
+        })
+        output.append(item)
+    return output
+
+
+@app.get("/api/admin/stability/overview")
+async def admin_stability_overview(
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    model: str = "",
+) -> dict[str, Any]:
+    require_platform_admin(request)
+    if not env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False):
+        raise HTTPException(status_code=404, detail="看板尚未开放")
+    start_date, end_date = resolve_usage_range(start_date, end_date)
+    events = await _admin_stability_events(start_date, end_date, model)
+    sync_states = await _admin_observability_store().stability_sync_states()
+    overview = stability_metrics(events)
+    by_day: dict[str, list[dict[str, Any]]] = {}
+    by_model: dict[str, list[dict[str, Any]]] = {}
+    by_scenario: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        day = str(event.get("usage_date") or event.get("event_time") or "")[:10]
+        by_day.setdefault(day, []).append(event)
+        by_model.setdefault(str(event.get("model") or "unknown"), []).append(event)
+        attempted_retries = event.get("attemptedRetries")
+        is_exception_sample = bool(
+            event.get("userVisibleFailure")
+            or (attempted_retries is not None and int(attempted_retries) > 0)
+            or event.get("error_code")
+            or event.get("error_class")
+        )
+        scenario_name = str(event.get("scenario") or "unknown")
+        if is_exception_sample or scenario_name != "unknown":
+            by_scenario.setdefault(scenario_name, []).append(event)
+    daily = [{"date": day, **stability_metrics(items)} for day, items in sorted(by_day.items())]
+    rankings = []
+    for name, items in by_model.items():
+        metrics = stability_metrics(items)
+        rankings.append({
+            "model": name,
+            **metrics,
+            "state": model_state(
+                metrics["userVisibleFailureRate"],
+                metrics["ttftP95Ms"],
+                env_float("STABILITY_FAILURE_STABLE_THRESHOLD", 0.01),
+                env_float("STABILITY_FAILURE_OBSERVE_THRESHOLD", 0.03),
+                env_float("STABILITY_TTFT_STABLE_MS", 2000),
+                env_float("STABILITY_TTFT_OBSERVE_MS", 4000),
+            ),
+        })
+    scenarios = []
+    for name, items in sorted(by_scenario.items(), key=lambda pair: len(pair[1]), reverse=True)[:10]:
+        model_counts: dict[str, int] = defaultdict(int)
+        error_counts: dict[str, int] = defaultdict(int)
+        for item in items:
+            model_counts[str(item.get("model") or "unknown")] += 1
+            if item.get("error_code"):
+                error_counts[str(item["error_code"])] += 1
+        scenarios.append({
+            "scenario": name,
+            "count": len(items),
+            "model": max(model_counts, key=model_counts.get),
+            "errorCode": max(error_counts, key=error_counts.get) if error_counts else None,
+            "sampleRequestIds": [item.get("request_id") for item in items[:5]],
+            "sampleRequests": [
+                {"requestId": item.get("request_id"), "backendId": item.get("backend_id")}
+                for item in items[:5]
+            ],
+            **stability_metrics(items),
+        })
+    partial = any(bool(item.get("partial")) for item in sync_states)
+    state_windows = [
+        (str(item.get("window_start") or ""), str(item.get("window_end") or ""))
+        for item in sync_states
+    ]
+    window_covered = bool(state_windows) and all(
+        window_start <= start_date and window_end >= end_date
+        for window_start, window_end in state_windows
+    )
+    expected_backends = {str(item.get("backend_id") or "") for item in sync_states if item.get("backend_id")}
+    configured_backends = set(usage_backend_ids())
+    if configured_backends and expected_backends != configured_backends:
+        window_covered = False
+    covered = {
+        "partial": partial,
+        "incomplete": not window_covered or partial,
+        "eventCount": len(events),
+        "window": {"startDate": start_date, "endDate": end_date},
+        "syncStates": sync_states,
+    }
+    freshness = {"status": "available" if events else "empty", "latestCollectedAt": max((str(item.get("collected_at") or "") for item in events), default=None)}
+    return _observability_envelope({"overview": overview, "daily": daily, "modelRankings": sorted(rankings, key=lambda item: (item.get("userVisibleFailureRate") is None, item.get("userVisibleFailureRate") or 0)), "topScenarios": scenarios}, freshness=freshness, coverage=covered, source="稳定性事件快照") | {"startDate": start_date, "endDate": end_date, "model": model}
+
+
+@app.get("/api/admin/stability/scenarios")
+async def admin_stability_scenarios(request: Request, start_date: str | None = None, end_date: str | None = None, model: str = "", scenario: str = "", error_code: str = "", page: int = 1, page_size: int = 20) -> dict[str, Any]:
+    require_platform_admin(request)
+    if not env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False):
+        raise HTTPException(status_code=404, detail="看板尚未开放")
+    start_date, end_date = resolve_usage_range(start_date, end_date)
+    page = max(1, page)
+    page_size = max(1, min(100, page_size))
+    store = _admin_observability_store()
+    query = getattr(store, "stability_scenario_samples", None)
+    if callable(query):
+        result = await query(start_date, end_date, model=model, scenario=scenario, error_code=error_code, page=page, page_size=page_size)
+        raw_items, total = result.get("items", []), int(result.get("total") or 0)
+    else:
+        events = await _admin_stability_events(start_date, end_date, model)
+        filtered = [item for item in events if (not scenario or item.get("scenario") == scenario) and (not error_code or item.get("error_code") == error_code)]
+        start = (page - 1) * page_size
+        raw_items, total = filtered[start:start + page_size], len(filtered)
+    samples = [{
+        "requestId": item.get("request_id"),
+        "backendId": item.get("backend_id"),
+        "eventTime": item.get("event_time"),
+        "model": item.get("model"),
+        "scenario": item.get("scenario") or "unknown",
+        "errorCode": item.get("error_code"),
+        "status": item.get("status") or "unknown",
+        "userVisibleFailure": item.get("user_visible_failure"),
+        "attemptedRetries": item.get("attempted_retries"),
+        "ttftMs": item.get("ttft_ms"),
+    } for item in raw_items]
+    sync_states = await store.stability_sync_states()
+    partial = any(bool(item.get("partial")) for item in sync_states)
+    return _observability_envelope(
+        {"items": samples, "total": total, "page": page, "pageSize": page_size},
+        coverage={"partial": partial, "incomplete": partial, "syncStates": sync_states},
+        source="稳定性事件快照",
+    )
+
+
+@app.get("/api/admin/stability/requests/{request_id}")
+async def admin_stability_request(request: Request, request_id: str, backend_id: str = "") -> dict[str, Any]:
+    require_platform_admin(request)
+    if not env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False):
+        raise HTTPException(status_code=404, detail="看板尚未开放")
+    store = _admin_observability_store()
+    try:
+        record = await store.stability_request(request_id, backend_id)
+    except TypeError:
+        record = await store.stability_request(request_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="请求样本不存在")
+    safe_fields = {key: record.get(key) for key in ("backend_id", "request_id", "event_time", "model", "provider", "model_group", "model_id", "source", "status", "error_code", "error_class", "error_message", "scenario", "request_duration_ms", "ttft_ms", "prompt_tokens", "completion_tokens", "total_tokens", "attempted_retries", "max_retries", "trace_id", "user_visible_failure", "organization_id", "team_id", "principal_id", "collected_at")}
+    return _observability_envelope(safe_fields, coverage={"partial": False, "incomplete": False}, source="稳定性事件快照")
+
+
+def _cost_item_payload(item: dict[str, Any]) -> dict[str, Any]:
+    return {"id": str(item.get("id")), "category": item.get("category"), "name": item.get("name"), "vendor": item.get("vendor"), "model": item.get("model"), "businessScope": item.get("business_scope"), "amount": float(item.get("amount") or 0), "currency": item.get("currency"), "exchangeRate": float(item.get("exchange_rate") or 1), "amountUsd": float(item.get("amount_usd") or 0), "serviceStartDate": str(item.get("service_start_date")), "serviceEndDate": str(item.get("service_end_date")), "financeBucket": item.get("finance_bucket"), "notes": item.get("notes"), "enabled": bool(item.get("enabled"))}
+
+
+def _cost_item_overlap_usd(item: dict[str, Any], start: date, end: date) -> float:
+    if not bool(item.get("enabled")):
+        return 0.0
+    service_start = item["service_start_date"] if isinstance(item["service_start_date"], date) else date.fromisoformat(str(item["service_start_date"]))
+    service_end = item["service_end_date"] if isinstance(item["service_end_date"], date) else date.fromisoformat(str(item["service_end_date"]))
+    overlap_start = max(start, service_start)
+    overlap_end = min(end, service_end)
+    if overlap_end < overlap_start:
+        return 0.0
+    service_days = max(1, (service_end - service_start).days + 1)
+    overlap_days = (overlap_end - overlap_start).days + 1
+    return float(item.get("amount_usd") or 0) / service_days * overlap_days
+
+
+@app.get("/api/admin/costs/items")
+async def admin_cost_items(request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    return _observability_envelope([_cost_item_payload(item) for item in await _admin_observability_store().list_cost_items()], source="费用控制账本")
+
+
+def _cost_item_input(data: CostItemRequest, item_id: str | None = None) -> dict[str, Any]:
+    if data.serviceEndDate < data.serviceStartDate:
+        raise HTTPException(status_code=400, detail="服务结束日期不能早于开始日期")
+    rate = data.exchangeRate if data.currency == "CNY" else Decimal("1")
+    return {"id": item_id or uuid.uuid4().hex, "category": data.category.strip(), "name": data.name.strip(), "vendor": data.vendor.strip(), "model": data.model.strip(), "businessScope": data.businessScope.strip(), "amount": data.amount, "currency": data.currency, "exchangeRate": rate, "amountUsd": data.amount / rate, "serviceStartDate": data.serviceStartDate.isoformat(), "serviceEndDate": data.serviceEndDate.isoformat(), "financeBucket": data.financeBucket.strip(), "notes": data.notes.strip(), "enabled": data.enabled}
+
+
+@app.post("/api/admin/costs/items")
+async def admin_create_cost_item(data: CostItemRequest, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    await enforce_csrf(request)
+    return _observability_envelope(_cost_item_payload(await _admin_observability_store().create_cost_item(_cost_item_input(data))), source="费用控制账本")
+
+
+@app.patch("/api/admin/costs/items/{item_id}")
+async def admin_update_cost_item(item_id: str, data: CostItemRequest, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    await enforce_csrf(request)
+    record = await _admin_observability_store().update_cost_item(item_id, _cost_item_input(data, item_id))
+    if not record:
+        raise HTTPException(status_code=404, detail="成本项不存在")
+    return _observability_envelope(_cost_item_payload(record), source="费用控制账本")
+
+
+@app.delete("/api/admin/costs/items/{item_id}")
+async def admin_delete_cost_item(item_id: str, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    await enforce_csrf(request)
+    if not await _admin_observability_store().delete_cost_item(item_id):
+        raise HTTPException(status_code=404, detail="成本项不存在")
+    return _observability_envelope({"deleted": True}, source="费用控制账本")
+
+
+@app.get("/api/admin/costs/budgets")
+async def admin_cost_budgets(request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    return _observability_envelope([{ "month": str(item.get("month")), "budgetUsd": float(item.get("budget_usd") or 0), "dailyTargetUsd": float(item.get("daily_target_usd") or 0)} for item in await _admin_observability_store().list_cost_budgets()], source="费用控制账本")
+
+
+@app.put("/api/admin/costs/budgets/{month}")
+async def admin_update_cost_budget(month: str, data: CostBudgetRequest, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    await enforce_csrf(request)
+    try:
+        date.fromisoformat(f"{month}-01")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="月份格式应为 YYYY-MM") from exc
+    item = await _admin_observability_store().upsert_cost_budget(month, float(data.budgetUsd), float(data.dailyTargetUsd))
+    return _observability_envelope({"month": str(item.get("month")), "budgetUsd": float(item.get("budget_usd") or 0), "dailyTargetUsd": float(item.get("daily_target_usd") or 0)}, source="费用控制账本")
+
+
+def _savings_payload(item: dict[str, Any]) -> dict[str, Any]:
+    return {"id": str(item.get("id")), "name": item.get("name"), "baselineDailyCost": float(item.get("baseline_daily_cost") or 0), "implementedDate": str(item.get("implemented_date")), "verifiedDate": str(item.get("verified_date")) if item.get("verified_date") else None, "verifiedDailyCost": float(item.get("verified_daily_cost")) if item.get("verified_daily_cost") is not None else None, "owner": item.get("owner"), "status": item.get("status"), "notes": item.get("notes")}
+
+
+@app.get("/api/admin/costs/savings-actions")
+async def admin_savings_actions(request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    return _observability_envelope([_savings_payload(item) for item in await _admin_observability_store().list_savings_actions()], source="费用控制账本")
+
+
+def _savings_input(data: SavingsActionRequest, action_id: str | None = None) -> dict[str, Any]:
+    if data.verifiedDate and data.verifiedDate < data.implementedDate:
+        raise HTTPException(status_code=400, detail="验证日期不能早于实施日期")
+    if data.status == "verified" and (data.verifiedDate is None or data.verifiedDailyCost is None):
+        raise HTTPException(status_code=400, detail="已验证动作必须填写验证日期和验证后日均成本")
+    return {"id": action_id or uuid.uuid4().hex, "name": data.name.strip(), "baselineDailyCost": data.baselineDailyCost, "implementedDate": data.implementedDate.isoformat(), "verifiedDate": data.verifiedDate.isoformat() if data.verifiedDate else None, "verifiedDailyCost": data.verifiedDailyCost, "owner": data.owner.strip(), "status": data.status, "notes": data.notes.strip()}
+
+
+@app.post("/api/admin/costs/savings-actions")
+async def admin_create_savings_action(data: SavingsActionRequest, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    await enforce_csrf(request)
+    return _observability_envelope(_savings_payload(await _admin_observability_store().create_savings_action(_savings_input(data))), source="费用控制账本")
+
+
+@app.patch("/api/admin/costs/savings-actions/{action_id}")
+async def admin_update_savings_action(action_id: str, data: SavingsActionRequest, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    await enforce_csrf(request)
+    item = await _admin_observability_store().update_savings_action(action_id, _savings_input(data, action_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="降本动作不存在")
+    return _observability_envelope(_savings_payload(item), source="费用控制账本")
+
+
+@app.get("/api/admin/costs/overview")
+async def admin_costs_overview(request: Request, month: str | None = None, category: str = "", model: str = "", vendor: str = "") -> dict[str, Any]:
+    require_platform_admin(request)
+    target = month or date.today().strftime("%Y-%m")
+    try:
+        start = date.fromisoformat(f"{target}-01")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="月份格式应为 YYYY-MM") from exc
+    next_month = date(start.year + 1, 1, 1) if start.month == 12 else date(start.year, start.month + 1, 1)
+    end = next_month - timedelta(days=1)
+    today = min(date.today(), end)
+    store = _admin_observability_store()
+    api_rows = await store.api_cost_rows(start.isoformat(), today.isoformat())
+    items = [item for item in await store.list_cost_items() if bool(item.get("enabled"))]
+    has_api_costs = bool(api_rows)
+    has_manual_costs = bool(items)
+    available_models = sorted({str(item.get("model") or "") for item in api_rows + items if item.get("model")})
+    available_vendors = sorted(
+        {str(item.get("source") or "") for item in api_rows if item.get("source")}
+        | {str(item.get("vendor") or "") for item in items if item.get("vendor")}
+    )
+    available_categories = sorted(
+        ({"API Token"} if api_rows else set())
+        | {str(item.get("category") or "") for item in items if item.get("category")}
+    )
+    if category:
+        if category == "API Token":
+            items = []
+        else:
+            api_rows = []
+            items = [item for item in items if item.get("category") == category]
+    if model:
+        api_rows = [item for item in api_rows if item.get("model") == model]
+        items = [item for item in items if item.get("model") == model]
+    if vendor:
+        items = [item for item in items if item.get("vendor") == vendor]
+        api_rows = [item for item in api_rows if item.get("source") == vendor]
+    daily_non_api: dict[str, float] = defaultdict(float)
+    for item in items:
+        original_start = item["service_start_date"] if isinstance(item["service_start_date"], date) else date.fromisoformat(str(item["service_start_date"]))
+        original_end = item["service_end_date"] if isinstance(item["service_end_date"], date) else date.fromisoformat(str(item["service_end_date"]))
+        service_start = max(start, original_start)
+        service_end = min(today, original_end)
+        if service_end < service_start:
+            continue
+        per_day = float(item.get("amount_usd") or 0) / max(1, (original_end - original_start).days + 1)
+        cursor = service_start
+        while cursor <= service_end:
+            daily_non_api[cursor.isoformat()] += per_day
+            cursor += timedelta(days=1)
+    daily: dict[str, dict[str, float]] = defaultdict(lambda: {"api": 0.0, "nonApi": 0.0})
+    for row in api_rows:
+        daily[str(row["usage_date"])] ["api"] += float(row.get("spend") or 0)
+    for day, value in daily_non_api.items():
+        daily[day]["nonApi"] += value
+    actual = sum(sum(value.values()) for value in daily.values())
+    budgets = await store.list_cost_budgets()
+    budget_record = next((item for item in budgets if str(item.get("month"))[:7] == target), None)
+    budget = (
+        float(budget_record.get("budget_usd") or 0)
+        if budget_record
+        else env_float("COST_DEFAULT_MONTHLY_BUDGET_USD", 60000)
+    )
+    daily_target = (
+        float(budget_record.get("daily_target_usd") or 0)
+        if budget_record
+        else env_float("COST_DEFAULT_DAILY_TARGET_USD", 2000)
+    )
+    actions = [_savings_payload(item) for item in await store.list_savings_actions()]
+    forecast = monthly_forecast(actual, start, today, budget)
+    model_split: dict[str, float] = defaultdict(float)
+    for row in api_rows:
+        model_split[str(row.get("model") or "unknown")] += float(row.get("spend") or 0)
+    trend_end = end if target != date.today().strftime("%Y-%m") else today
+    all_days = [start + timedelta(days=offset) for offset in range((trend_end - start).days + 1)]
+    month_days = (end - start).days + 1
+    budget_daily = budget / month_days if budget is not None else None
+    elapsed_days = max(1, (today - start).days + 1)
+    projected_daily = actual / elapsed_days if elapsed_days else 0.0
+    return _observability_envelope(
+        {
+            "month": target,
+            "metrics": {
+                **forecast,
+                "dailyTarget": daily_target,
+                "verifiedSavings": verified_savings(actions, today),
+            },
+            "trend": [
+                {
+                    "date": day.isoformat(),
+                    "actual": sum(value.values()),
+                    "forecast": sum(value.values()) if day <= today else projected_daily,
+                    "budget": budget_daily,
+                    "api": value["api"],
+                    "nonApi": value["nonApi"],
+                }
+                for day in all_days
+                for value in [daily.get(day.isoformat(), {"api": 0.0, "nonApi": 0.0})]
+            ],
+            "modelSplit": [
+                {"model": key, "spend": value}
+                for key, value in sorted(model_split.items(), key=lambda item: item[1], reverse=True)
+            ],
+            "costItems": [_cost_item_payload(item) for item in items],
+            "savingsActions": actions,
+            "filters": {
+                "categories": available_categories,
+                "models": available_models,
+                "vendors": available_vendors,
+            },
+        },
+        coverage={"partial": False, "incomplete": not has_api_costs or not has_manual_costs},
+        source="费用控制账本",
+    )
 
 
 @app.get("/api/me/keys")

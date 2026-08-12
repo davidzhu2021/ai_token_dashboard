@@ -18,6 +18,8 @@ SIDEBAR_TABS = (
     "keysTab",
     "organizationTokensTab",
     "billingTab",
+    "stabilityTab",
+    "costControlTab",
 )
 
 

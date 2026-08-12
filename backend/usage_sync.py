@@ -85,6 +85,9 @@ class BackendSnapshot:
     departments: list[dict[str, Any]] | None = None
     # 本次识别出的账号身份，用于把姓名/邮箱回填到同步窗口之外的历史行。
     identities: list[dict[str, Any]] | None = None
+    event_start_date: str | None = None
+    event_end_date: str | None = None
+    events_complete: bool | None = None
 
 
 class UsageSynchronizer:
@@ -721,6 +724,9 @@ class UsageSynchronizer:
         # 短窗口启用；初始回填这类长窗口仍走 daily activity，避免一次同步跑上数小时。
         log_rows: dict[str, list[dict[str, Any]]] | None = None
         event_rows: list[dict[str, Any]] = []
+        event_start_date: str | None = None
+        event_end_date: str | None = None
+        events_complete: bool | None = None
         token_mapping_index = await self._token_attribution_map(backend.id)
         window_days = (date.fromisoformat(end_date) - date.fromisoformat(start_date)).days + 1
         max_window = max(1, _env_int("USAGE_SYNC_LOG_MAX_WINDOW_DAYS", 3))
@@ -741,6 +747,7 @@ class UsageSynchronizer:
                             getattr(log_rows, "events", None)
                             or log_rows.pop("__events__", [])
                         )
+                        event_start_date, event_end_date, events_complete = start_date, end_date, True
                     else:
                         logger.warning(
                             "usage log scan incomplete for backend %s; falling back to daily activity",
@@ -748,6 +755,37 @@ class UsageSynchronizer:
                         )
                 except Exception:
                     logger.exception("usage log scan failed for backend %s; falling back to daily activity", backend.id)
+
+        # Stability requires a bounded recent raw-log window even when the
+        # regular 90-day aggregate sync intentionally avoids request scans.
+        if _env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False):
+            stability_days = max(1, _env_int("STABILITY_SYNC_WINDOW_DAYS", 7))
+            stability_end = min(date.fromisoformat(end_date), usage_today())
+            # Keep the dashboard snapshot window independent from the shorter
+            # recent usage refresh window, so a 2-day billing refresh cannot
+            # silently shrink the 7-day stability coverage.
+            stability_start = stability_end - timedelta(days=stability_days - 1)
+            stability_start_text, stability_end_text = stability_start.isoformat(), stability_end.isoformat()
+            try:
+                stability_rows, stability_complete = await self.client.stability_rows_from_logs(
+                    stability_start_text, stability_end_text, backend
+                )
+                stability_events = list(getattr(stability_rows, "events", None) or stability_rows.pop("__events__", []))
+                if stability_complete:
+                    event_rows = stability_events
+                    event_start_date, event_end_date, events_complete = stability_start_text, stability_end_text, True
+                else:
+                    logger.warning(
+                        "stability log scan incomplete for backend %s; preserving last complete snapshot",
+                        backend.id,
+                    )
+                    event_rows, event_start_date, event_end_date, events_complete = [], None, None, None
+            except Exception:
+                logger.exception("stability log scan failed for backend %s", backend.id)
+                # Preserve the last good raw-event snapshot when the upstream
+                # scan is unavailable; an empty partial response would erase
+                # useful dashboard data.
+                event_rows, event_start_date, event_end_date, events_complete = [], None, None, None
 
         semaphore = asyncio.Semaphore(max(1, _env_int("USAGE_SYNC_USER_CONCURRENCY", 4)))
 
@@ -853,9 +891,12 @@ class UsageSynchronizer:
             backend.id,
             rows,
             memberships,
-            event_rows if log_rows is not None else None,
+            event_rows if event_start_date is not None else None,
             departments,
             identities,
+            event_start_date,
+            event_end_date,
+            events_complete,
         )
 
     async def collect_memberships(

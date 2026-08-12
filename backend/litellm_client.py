@@ -10,6 +10,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
+
+from .observability import normalize_event
 from urllib.parse import quote
 
 import httpx
@@ -3410,6 +3412,9 @@ class LiteLLMClient:
         backend: LiteLLMBackend | None = None,
         *,
         api_key: str | None = None,
+        page_size_override: int | None = None,
+        max_pages_override: int | None = None,
+        concurrency_override: int | None = None,
     ) -> tuple[dict[str, list[dict[str, Any]]], bool]:
         """按北京时间日界扫描全量日志，返回 {user_id: usage rows} 与是否完整覆盖。
 
@@ -3423,12 +3428,12 @@ class LiteLLMClient:
         await self._ensure_deployment_model_map(backend)
         utc_start, utc_end = _local_date_window_as_utc_text(start_date, end_date)
         # 上游 /spend/logs/v2 限制 page_size <= 100，单日约 800+ 页，需并发拉取。
-        page_size = max(1, min(100, _env_int("USAGE_SYNC_LOG_PAGE_SIZE", 100)))
-        max_pages = max(1, _env_int("USAGE_SYNC_LOG_MAX_PAGES", 5000))
+        page_size = max(1, min(100, page_size_override or _env_int("USAGE_SYNC_LOG_PAGE_SIZE", 100)))
+        max_pages = max(1, max_pages_override or _env_int("USAGE_SYNC_LOG_MAX_PAGES", 5000))
         # LiteLLM's key-scoped spend-log pagination can expose a moving
         # snapshot when pages are fetched concurrently. Keep historical
         # imports deterministic; global scans retain the faster parallel path.
-        concurrency = 1 if api_key else max(1, _env_int("USAGE_SYNC_LOG_CONCURRENCY", 8))
+        concurrency = 1 if api_key else max(1, concurrency_override or _env_int("USAGE_SYNC_LOG_CONCURRENCY", 8))
 
         async def fetch_page(page: int) -> tuple[list[dict[str, Any]], int]:
             params: dict[str, Any] = {
@@ -3459,6 +3464,10 @@ class LiteLLMClient:
 
         def absorb(logs: list[dict[str, Any]]) -> None:
             for log in logs:
+                normalized_log = dict(log)
+                normalized_metadata = _metadata_dict(log.get("metadata"))
+                if normalized_metadata:
+                    normalized_log["metadata"] = normalized_metadata
                 user_id = self._log_raw_user(log) or "unattributed"
                 day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
                 # 并发分页取回的记录可能落在窗口外，按本地日界二次校验。
@@ -3492,6 +3501,7 @@ class LiteLLMClient:
                     request_id = hashlib.sha256(
                         json.dumps(
                             {
+                                "backend": backend.id,
                                 "eventTime": event_time,
                                 "userId": user_id,
                                 "source": source,
@@ -3499,6 +3509,7 @@ class LiteLLMClient:
                                 "keyId": attribution["keyId"],
                                 "spend": _first(log, "spend", "cost", "total_spend"),
                                 "tokens": _first(log, "total_tokens", "totalTokens"),
+                                "rawLog": log,
                             },
                             sort_keys=True,
                             separators=(",", ":"),
@@ -3512,8 +3523,15 @@ class LiteLLMClient:
                         "requestId": request_id,
                         "eventTime": event_time,
                         "_userId": user_id,
+                        "provider": _clean_text(_first(log, "custom_llm_provider", "provider", "llm_provider", default="")),
+                        "modelGroup": _clean_text(_first(log, "model_group", "modelGroup", default="")),
+                        "modelId": _clean_text(_first(log, "model_id", "modelId", default="")),
+                        "apiBase": _clean_text(_first(log, "api_base", "apiBase", default="")),
+                        "startTime": _first(log, "startTime", "start_time", default=None),
+                        "endTime": _first(log, "endTime", "end_time", default=None),
                     }
                 )
+                event_row.update(normalize_event(normalized_log))
                 self._add_log_to_row(event_row, log)
                 event_rows.append(event_row)
                 key = (
@@ -3580,6 +3598,21 @@ class LiteLLMClient:
             for user_id, bucket in grouped.items()
         }, events=event_rows)
         return result, not truncated
+
+    async def stability_rows_from_logs(
+        self,
+        start_date: str,
+        end_date: str,
+        backend: LiteLLMBackend | None = None,
+    ) -> tuple[dict[str, list[dict[str, Any]]], bool]:
+        return await self.sync_rows_from_logs(
+            start_date,
+            end_date,
+            backend,
+            page_size_override=_env_int("STABILITY_SYNC_PAGE_SIZE", 100),
+            max_pages_override=_env_int("STABILITY_SYNC_MAX_PAGES", 5000),
+            concurrency_override=_env_int("STABILITY_SYNC_CONCURRENCY", 4),
+        )
 
     async def admin_daily_activity_rows(self, start_date: str, end_date: str, backend: LiteLLMBackend | None = None) -> list[dict[str, Any]]:
         backend = backend or self.backends[0]
