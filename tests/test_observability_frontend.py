@@ -87,3 +87,16 @@ def test_frontend_copy_does_not_expose_backend_branding() -> None:
     assert "LiteLLM" not in dashboard_copy
     assert "Virtual Key" not in dashboard_copy
     assert "master key" not in dashboard_copy.lower()
+
+
+def test_stability_middle_panels_have_equal_layout_and_scrollable_ranking() -> None:
+    markup = (ROOT / "index.html").read_text(encoding="utf-8")
+    assert 'class="observability-grid observability-stability-grid"' in markup
+    assert ".observability-stability-grid { grid-template-columns:repeat(2,minmax(0,1fr));" in markup
+    assert ".observability-stability-grid > .panel { height:360px; min-height:360px;" in markup
+    assert ".observability-stability-grid .observability-ranking { flex:1 1 auto; min-height:0;" in markup
+    assert "overflow-y:auto" in markup
+    assert "scrollbar-gutter:stable" in markup
+    assert "overscroll-behavior:contain" in markup
+    assert "@media (max-width: 900px)" in markup and ".observability-stability-grid { grid-template-columns:1fr; }" in markup
+    assert "@media (max-width: 560px)" in markup and ".observability-stability-grid > .panel { height:300px; min-height:300px; }" in markup

@@ -3000,7 +3000,11 @@
       .observability-metric span { display:block; color:var(--muted-text,#68758a); font-size:13px; }
       .observability-metric strong { display:block; margin-top:8px; font-size:28px; color:var(--ink,#14243a); }
       .observability-grid { display:grid; grid-template-columns:minmax(0,1.35fr) minmax(320px,.9fr); gap:16px; margin-bottom:16px; }
+      .observability-stability-grid { grid-template-columns:repeat(2,minmax(0,1fr)); align-items:stretch; }
+      .observability-stability-grid > .panel { height:360px; min-height:360px; min-width:0; display:flex; flex-direction:column; overflow:hidden; }
+      .observability-stability-grid > .panel .panel-header { flex:0 0 auto; min-height:64px; margin-bottom:14px; }
       .observability-bars { display:flex; align-items:flex-end; gap:8px; min-height:180px; padding:16px 4px 8px; overflow-x:auto; }
+      .observability-stability-grid .observability-bars { flex:1 1 auto; min-height:0; height:auto; overflow-x:auto; overflow-y:hidden; }
       .observability-bar { flex:1; min-width:20px; height:150px; display:flex; align-items:flex-end; justify-content:center; gap:2px; position:relative; }
       .observability-bar-segment { width:min(12px,42%); min-height:3px; border-radius:6px 6px 2px 2px; background:#1f5fd0; }
       .observability-bar-segment.secondary { background:#e2783d; }
@@ -3012,7 +3016,10 @@
       .observability-legend .forecast { background:#dce6f5; border:1px dashed #87a5ca; }
       .observability-legend .budget { height:2px; border-radius:0; background:#c23b45; }
       .observability-ranking { display:grid; gap:12px; padding:4px 0; }
+      .observability-stability-grid .observability-ranking { flex:1 1 auto; min-height:0; align-content:start; overflow-x:hidden; overflow-y:auto; padding:4px 8px 4px 0; scrollbar-gutter:stable; overscroll-behavior:contain; }
       .observability-rank-row { display:grid; grid-template-columns:26px 1fr auto; gap:10px; align-items:center; }
+      .observability-rank-row > div { min-width:0; }
+      .observability-rank-row b { display:block; overflow-wrap:anywhere; }
       .observability-rank-track { height:7px; margin-top:6px; background:#e8edf4; border-radius:10px; overflow:hidden; }
       .observability-rank-fill { height:100%; background:#2f7df4; border-radius:10px; }
       .observability-composition { display:grid; gap:12px; padding:10px 0; }
@@ -3032,8 +3039,8 @@
       .observability-drawer-row dt { color:var(--muted-text,#68758a); }
       .observability-drawer-row dd { margin:0; word-break:break-word; }
       .observability-drawer { position:fixed; top:0; right:0; width:min(440px,100vw); height:100vh; background:#fff; box-shadow:-12px 0 30px rgba(20,36,58,.16); padding:24px; z-index:20; overflow:auto; }
-      @media (max-width: 900px) { .observability-metric-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .observability-grid { grid-template-columns:1fr; } .observability-head { grid-template-columns:1fr; align-items:start; gap:16px; } .observability-filter-bar { justify-content:flex-start; } .observability-filter-fields { grid-template-columns:repeat(2,minmax(180px,1fr)); } .observability-budget-strip { grid-template-columns:repeat(2,minmax(0,1fr)); } }
-      @media (max-width: 560px) { .observability-metric-grid { grid-template-columns:1fr; } .observability-composition-row { grid-template-columns:80px 1fr 64px; } .observability-filter-bar { display:grid; grid-template-columns:minmax(0,1fr) auto auto; width:100%; } .observability-primary-filter { width:100%; min-width:0; } .observability-filter-button { padding:0 11px; } .observability-filter-fields,.observability-filter-fields.single { grid-template-columns:1fr; } .observability-filter-panel.is-open { max-height:420px; } }
+      @media (max-width: 900px) { .observability-metric-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .observability-grid { grid-template-columns:1fr; } .observability-stability-grid { grid-template-columns:1fr; } .observability-stability-grid > .panel { height:320px; min-height:320px; } .observability-head { grid-template-columns:1fr; align-items:start; gap:16px; } .observability-filter-bar { justify-content:flex-start; } .observability-filter-fields { grid-template-columns:repeat(2,minmax(180px,1fr)); } .observability-budget-strip { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+      @media (max-width: 560px) { .observability-metric-grid { grid-template-columns:1fr; } .observability-composition-row { grid-template-columns:80px 1fr 64px; } .observability-stability-grid > .panel { height:300px; min-height:300px; } .observability-filter-bar { display:grid; grid-template-columns:minmax(0,1fr) auto auto; width:100%; } .observability-primary-filter { width:100%; min-width:0; } .observability-filter-button { padding:0 11px; } .observability-filter-fields,.observability-filter-fields.single { grid-template-columns:1fr; } .observability-filter-panel.is-open { max-height:420px; } }
       @media (prefers-reduced-motion: reduce) { .observability-filter-button,.observability-filter-panel { transition:none; } }
 
       .key-type-label {
@@ -8561,7 +8568,7 @@
           <div id="stabilityFilterPanel" class="observability-filter-panel" aria-hidden="true" inert><div class="observability-filter-fields single"><div class="observability-filter-field"><label for="stabilityModel">模型</label><select id="stabilityModel" class="select"><option value="">全部模型</option></select></div></div></div>
           <div id="stabilityQuality" class="operational-status hidden"></div>
           <div id="stabilityMetrics" class="observability-metric-grid"></div>
-          <div class="observability-grid"><section class="panel"><div class="panel-header"><div><h3 class="panel-title">异常趋势</h3><p class="panel-desc">用户最终失败与上游异常按日变化</p></div></div><div id="stabilityTrend" class="observability-bars"></div><div class="observability-legend"><span><i></i>上游异常</span><span><i class="secondary"></i>用户最终失败</span></div></section><section class="panel"><div class="panel-header"><div><h3 class="panel-title">模型稳定性排名</h3><p class="panel-desc">失败率与 TTFT P95 共同判断状态</p></div></div><div id="stabilityRanking" class="observability-ranking"></div></section></div>
+          <div class="observability-grid observability-stability-grid"><section class="panel"><div class="panel-header"><div><h3 class="panel-title">异常趋势</h3><p class="panel-desc">用户最终失败与上游异常按日变化</p></div></div><div id="stabilityTrend" class="observability-bars"></div><div class="observability-legend"><span><i></i>上游异常</span><span><i class="secondary"></i>用户最终失败</span></div></section><section class="panel"><div class="panel-header"><div><h3 class="panel-title">模型稳定性排名</h3><p class="panel-desc">失败率与 TTFT P95 共同判断状态</p></div></div><div id="stabilityRanking" class="observability-ranking"></div></section></div>
           <section class="panel"><div class="panel-header"><div><h3 class="panel-title">Top 异常场景</h3><p class="panel-desc">点击场景查看样本请求，再下钻非内容元数据；不展示提示词和响应正文。</p></div></div><div class="table-wrap"><table><thead><tr><th>场景</th><th>模型</th><th>错误码</th><th>次数</th><th>失败率</th><th>样本</th></tr></thead><tbody id="stabilityScenarioBody"></tbody></table></div></section>
           <aside id="stabilityDrawer" class="observability-drawer hidden" aria-live="polite"><div class="observability-drawer-head"><h3 id="stabilityDrawerTitle">请求元数据</h3><button id="stabilityDrawerClose" class="ghost-btn" type="button">关闭</button></div><div id="stabilityRequestList"></div><dl id="stabilityRequestDetail" class="observability-drawer-list"></dl></aside>
         </section>
