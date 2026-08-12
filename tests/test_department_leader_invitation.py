@@ -446,7 +446,7 @@ def test_member_modal_and_roster_expose_the_department_role() -> None:
 def test_static_asset_version_is_refreshed_for_the_new_control() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
 
-    assert "/assets/app.js?v=20260812-observability-filters" in markup
+    assert "/assets/app.js?v=20260812-ranking-scroll" in markup
     assert "20260805-team-member-keys" not in markup
     assert "20260805-owner-identity" not in markup
     assert "20260805-department-leader" not in markup

@@ -49,10 +49,24 @@ def test_ranking_panels_are_marked_without_affecting_regular_tables() -> None:
 
 def test_ranking_tables_keep_headers_visible_and_mobile_heights_bounded() -> None:
     markup = (ROOT / "index.html").read_text(encoding="utf-8")
+    source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
 
     assert ".ranking-table-panel > .table-wrap thead th" in markup
     assert "position: sticky" in markup
     assert "max-height: 420px" in markup
     assert ".observability-ranking-panel { height:360px; min-height:360px;" in markup
-    assert ".model-rank-group {" in markup and "height: 320px" in markup
+    assert ".metrics {" in markup and "align-items: stretch;" in markup
+    model_group_start = markup.index(".model-rank-group {")
+    model_group_rule = markup[model_group_start : markup.index("}", model_group_start)]
+    assert "min-height: 320px" in model_group_rule
+    assert "\n        height: 320px" not in model_group_rule
+    assert '.filter((row) => row.value > 0)' in source
+    model_renderer_start = source.index("function renderModelBarsTo")
+    model_renderer_end = source.index("function renderDepartmentBarsTo", model_renderer_start)
+    model_renderer = source[model_renderer_start:model_renderer_end]
+    department_renderer_end = source.index("function uniqueSorted", model_renderer_end)
+    department_renderer = source[model_renderer_end:department_renderer_end]
+    assert ".slice(0, 5)" not in model_renderer
+    assert ".slice(0, 10)" not in department_renderer
+    assert "前 10 个部门" not in markup
     assert ".ranking-table-panel > .table-wrap { max-height:360px; }" in markup

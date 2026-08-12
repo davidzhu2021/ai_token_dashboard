@@ -2155,6 +2155,7 @@
         grid-template-columns: repeat(3, minmax(0, 1fr));
         gap: 14px;
         margin-bottom: 20px;
+        align-items: stretch;
       }
 
       .metric-card,
@@ -2173,6 +2174,7 @@
         display: grid;
         gap: 12px;
         min-width: 0;
+        height: 100%;
       }
 
       .metric-group-head h3 {
@@ -2262,8 +2264,8 @@
       }
 
       .model-rank-group {
-        height: 320px;
         min-height: 320px;
+        height: auto;
         display: flex;
         flex-direction: column;
         overflow: hidden;
@@ -7802,7 +7804,7 @@
                 <span class="panel-icon"><svg><use href="#icon-table"></use></svg></span>
                 <div>
                   <h3 class="panel-title">部门用量对比</h3>
-                  <p class="panel-desc">各部门总 Token 横向对比，显示用量最高的前 10 个部门。</p>
+                  <p class="panel-desc">各部门总 Token 横向对比，显示当前范围内所有有用量部门。</p>
                 </div>
               </div>
               <span id="departmentBarsCount" class="chip">0 个部门</span>
@@ -9156,6 +9158,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260812-observability-filters"></script>
+    <script src="/assets/app.js?v=20260812-ranking-scroll"></script>
   </body>
 </html>

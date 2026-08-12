@@ -2500,8 +2500,8 @@ function renderModelBarsTo(containerId, data) {
   });
   const rows = Object.keys(grouped)
     .map((model) => ({ model, value: sum(grouped[model], "totalTokens") }))
-    .sort((a, b) => b.value - a.value)
-    .slice(0, 5);
+    .filter((row) => row.value > 0)
+    .sort((a, b) => b.value - a.value);
   const max = Math.max(1, ...rows.map((row) => row.value));
   container.innerHTML = rows.length
     ? rows
@@ -2515,8 +2515,7 @@ function renderDepartmentBarsTo(containerId, departments) {
   if (!container) return;
   const sorted = departments
     .filter((d) => d.totalTokens > 0)
-    .sort((a, b) => b.totalTokens - a.totalTokens)
-    .slice(0, 10);
+    .sort((a, b) => b.totalTokens - a.totalTokens);
   const max = Math.max(1, ...sorted.map((d) => d.totalTokens));
   container.innerHTML = sorted.length
     ? sorted
