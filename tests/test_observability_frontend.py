@@ -38,6 +38,46 @@ def test_cost_control_forms_and_write_handlers_exist() -> None:
     assert 'method: "DELETE"' in source
 
 
+def test_observability_filters_use_expandable_toolbars() -> None:
+    markup = (ROOT / "index.html").read_text(encoding="utf-8")
+    source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
+    for element_id in (
+        "stabilityFiltersButton",
+        "stabilityResetFiltersButton",
+        "stabilityFilterPanel",
+        "stabilityFilterCount",
+        "stabilityActiveFilters",
+        "costFiltersButton",
+        "costResetFiltersButton",
+        "costFilterPanel",
+        "costFilterCount",
+        "costActiveFilters",
+    ):
+        assert f'id="{element_id}"' in markup
+    assert 'aria-controls="stabilityFilterPanel"' in markup
+    assert 'aria-controls="costFilterPanel"' in markup
+    assert markup.count('aria-expanded="false"') >= 2
+    assert 'data-observability-clear=' in source
+    assert 'setObservabilityFilterPanel("stability"' in source
+    assert 'setObservabilityFilterPanel("cost"' in source
+
+
+def test_observability_filter_controls_and_reset_scope() -> None:
+    markup = (ROOT / "index.html").read_text(encoding="utf-8")
+    source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
+    for element_id in ("stabilityRange", "stabilityModel", "costMonth", "costCategory", "costModel", "costVendor"):
+        assert f'id="{element_id}"' in markup
+    reset_start = source.index("function resetObservabilityFilters")
+    reset_end = source.index("function clearObservabilityFilter", reset_start)
+    reset_source = source[reset_start:reset_end]
+    assert 'id: "stabilityModel"' not in reset_source
+    assert 'stabilityRange' not in reset_source
+    assert 'costMonth' not in reset_source
+    assert 'observabilityFilterConfig(scope).filters' in reset_source
+    assert "start_date=${day(start)}&end_date=${day(end)}&model=${encodeURIComponent(model)}" in source
+    assert "category=${encodeURIComponent(category)}&model=${encodeURIComponent(model)}&vendor=${encodeURIComponent(vendor)}" in source
+
+
 def test_frontend_copy_does_not_expose_backend_branding() -> None:
     markup = (ROOT / "index.html").read_text(encoding="utf-8")
     start = markup.index('id="stabilityView"')

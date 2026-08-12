@@ -199,6 +199,8 @@ let costOverview = null;
 let costBudgets = [];
 let isStabilityLoading = false;
 let isCostOverviewLoading = false;
+let stabilityFiltersOpen = false;
+let costFiltersOpen = false;
 // 登录身份落地后立即揭示已知入口；异步权限结果随后只补充团队/企业入口。
 let isNavigationRevealed = false;
 let selectedTopupAmount = 0;
@@ -8073,6 +8075,91 @@ function observabilityMoney(value) {
   return value === null || value === undefined ? "暂无数据" : `$${Number(value).toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
 }
 
+function observabilityFilterConfig(scope) {
+  if (scope === "stability") {
+    return {
+      buttonId: "stabilityFiltersButton",
+      panelId: "stabilityFilterPanel",
+      countId: "stabilityFilterCount",
+      resetId: "stabilityResetFiltersButton",
+      activeId: "stabilityActiveFilters",
+      filters: [{ id: "stabilityModel", label: "模型" }],
+    };
+  }
+  return {
+    buttonId: "costFiltersButton",
+    panelId: "costFilterPanel",
+    countId: "costFilterCount",
+    resetId: "costResetFiltersButton",
+    activeId: "costActiveFilters",
+    filters: [
+      { id: "costCategory", label: "成本项" },
+      { id: "costModel", label: "模型" },
+      { id: "costVendor", label: "来源" },
+    ],
+  };
+}
+
+function activeObservabilityFilters(scope) {
+  return observabilityFilterConfig(scope).filters.flatMap(({ id, label }) => {
+    const select = el(id);
+    if (!select?.value) return [];
+    const selectedLabel = select.options?.[select.selectedIndex]?.text || select.value;
+    return [{ id, label, value: select.value, selectedLabel }];
+  });
+}
+
+function setObservabilityFilterPanel(scope, open) {
+  const config = observabilityFilterConfig(scope);
+  const button = el(config.buttonId);
+  const panel = el(config.panelId);
+  if (!button || !panel) return;
+  if (scope === "stability") stabilityFiltersOpen = open;
+  else costFiltersOpen = open;
+  button.classList.toggle("is-open", open);
+  button.setAttribute("aria-expanded", String(open));
+  panel.classList.toggle("is-open", open);
+  panel.setAttribute("aria-hidden", String(!open));
+  panel.inert = !open;
+}
+
+function renderObservabilityFilterState(scope) {
+  const config = observabilityFilterConfig(scope);
+  const active = activeObservabilityFilters(scope);
+  const count = el(config.countId);
+  const reset = el(config.resetId);
+  const container = el(config.activeId);
+  if (count) {
+    count.textContent = String(active.length);
+    count.setAttribute("aria-label", `${active.length} 个筛选条件`);
+    count.classList.toggle("hidden", active.length === 0);
+  }
+  if (reset) reset.disabled = active.length === 0;
+  if (!container) return;
+  container.classList.toggle("hidden", active.length === 0);
+  container.innerHTML = active.map((item) => `<button class="observability-active-filter" type="button" data-observability-clear="${escapeHtml(item.id)}" data-observability-scope="${scope}" aria-label="清除${escapeHtml(item.label)}筛选：${escapeHtml(item.selectedLabel)}"><span>${escapeHtml(item.label)}：${escapeHtml(item.selectedLabel)}</span><svg aria-hidden="true"><use href="#icon-close"></use></svg></button>`).join("");
+}
+
+function resetObservabilityFilters(scope) {
+  observabilityFilterConfig(scope).filters.forEach(({ id }) => {
+    const input = el(id);
+    if (input) input.value = "";
+  });
+  renderObservabilityFilterState(scope);
+  if (scope === "stability") loadStabilityOverview();
+  else loadCostOverview();
+}
+
+function clearObservabilityFilter(scope, id) {
+  const allowed = observabilityFilterConfig(scope).filters.some((filter) => filter.id === id);
+  if (!allowed) return;
+  const input = el(id);
+  if (input) input.value = "";
+  renderObservabilityFilterState(scope);
+  if (scope === "stability") loadStabilityOverview();
+  else loadCostOverview();
+}
+
 function renderStabilityOverview() {
   const payload = stabilityOverview;
   if (!payload) return;
@@ -8104,6 +8191,7 @@ function renderStabilityOverview() {
   const selected = select.value;
   select.innerHTML = `<option value="">全部模型</option>${models.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("")}`;
   select.value = models.includes(selected) ? selected : "";
+  renderObservabilityFilterState("stability");
 }
 
 async function loadStabilityOverview() {
@@ -8168,6 +8256,7 @@ function renderCostOverview() {
     select.innerHTML = `<option value="">${label}</option>${options.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("")}`;
     select.value = options.includes(selected) ? selected : "";
   });
+  renderObservabilityFilterState("cost");
 }
 
 async function loadCostOverview() {
@@ -9632,11 +9721,31 @@ document.querySelectorAll("[data-view]").forEach((button) => button.addEventList
   switchView(button.dataset.view);
 }));
 el("stabilityRange")?.addEventListener("change", loadStabilityOverview);
-el("stabilityModel")?.addEventListener("change", loadStabilityOverview);
+el("stabilityModel")?.addEventListener("change", () => {
+  renderObservabilityFilterState("stability");
+  loadStabilityOverview();
+});
 el("costMonth")?.addEventListener("change", loadCostOverview);
-el("costCategory")?.addEventListener("change", loadCostOverview);
-el("costModel")?.addEventListener("change", loadCostOverview);
-el("costVendor")?.addEventListener("change", loadCostOverview);
+el("costCategory")?.addEventListener("change", () => {
+  renderObservabilityFilterState("cost");
+  loadCostOverview();
+});
+el("costModel")?.addEventListener("change", () => {
+  renderObservabilityFilterState("cost");
+  loadCostOverview();
+});
+el("costVendor")?.addEventListener("change", () => {
+  renderObservabilityFilterState("cost");
+  loadCostOverview();
+});
+el("stabilityFiltersButton")?.addEventListener("click", () => setObservabilityFilterPanel("stability", !stabilityFiltersOpen));
+el("costFiltersButton")?.addEventListener("click", () => setObservabilityFilterPanel("cost", !costFiltersOpen));
+el("stabilityResetFiltersButton")?.addEventListener("click", () => resetObservabilityFilters("stability"));
+el("costResetFiltersButton")?.addEventListener("click", () => resetObservabilityFilters("cost"));
+document.querySelectorAll(".observability-active-filters").forEach((container) => container.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-observability-clear]");
+  if (button) clearObservabilityFilter(button.dataset.observabilityScope, button.dataset.observabilityClear);
+}));
 el("stabilityDrawerClose")?.addEventListener("click", () => el("stabilityDrawer")?.classList.add("hidden"));
 el("stabilityScenarioBody")?.addEventListener("click", (event) => {
   const button = event.target.closest("[data-stability-request]");
