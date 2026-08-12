@@ -1881,7 +1881,7 @@ function modelRankGroup(mode = "personal") {
   const defaultTitle = mode === "admin" ? "全员模型使用排行" : mode === "team" ? "团队模型使用排行" : mode === "department" ? "全部部门模型使用排行" : "模型使用排行";
   const defaultDesc = mode === "admin" ? "按全员总 Token 消耗排序。" : mode === "team" ? "按团队总 Token 消耗排序。" : mode === "department" ? "按全部部门总 Token 消耗排序。" : "按总 Token 消耗排序。";
   return `
-    <section class="metric-group model-rank-group">
+    <section class="metric-group model-rank-group model-rank-group-${mode}">
       <div class="metric-group-head">
         <div class="panel-heading">
           <span class="panel-icon">${icon("model")}</span>
@@ -2492,6 +2492,7 @@ function renderDonutTo(svgId, totalId, legendId, data) {
 function renderModelBarsTo(containerId, data) {
   const container = el(containerId);
   if (!container) return;
+  const showRank = containerId === "teamModelBars";
   // The API owns canonical model names; the browser only combines identical rows.
   const grouped = {};
   data.forEach((item) => {
@@ -2506,7 +2507,7 @@ function renderModelBarsTo(containerId, data) {
   container.classList.toggle("is-compact", rows.length > 0 && rows.length <= 4);
   container.innerHTML = rows.length
     ? rows
-        .map((row) => `<div class="bar-row"><strong>${escapeHtml(displayModelName(row.model))}</strong><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3, (row.value / max) * 100)}%"></div></div><span class="num">${formatTokens(row.value)}</span></div>`)
+        .map((row, index) => `<div class="bar-row">${showRank ? `<span class="bar-rank${index < 3 ? " is-leading" : ""}">${index + 1}</span>` : ""}<strong>${escapeHtml(displayModelName(row.model))}</strong><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3, (row.value / max) * 100)}%"></div></div><span class="num">${formatTokens(row.value)}</span></div>`)
         .join("")
     : `<div class="model-empty">当前筛选范围暂无模型用量</div>`;
 }

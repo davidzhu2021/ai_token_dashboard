@@ -2256,10 +2256,12 @@
         flex: 1 1 auto;
         min-height: 0;
         align-content: start;
+        justify-content: stretch;
         gap: 12px;
         overflow-x: hidden;
         overflow-y: auto;
         padding-right: 8px;
+        padding-block: 4px;
         scrollbar-gutter: stable;
         overscroll-behavior: contain;
       }
@@ -2292,6 +2294,51 @@
       .model-rank-group > div.bars.is-compact,
       .ranking-list-panel > div.bars.is-compact {
         align-content: center;
+        padding-block: 14px;
+      }
+
+      .model-rank-group > div.bars.is-compact {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        width: min(100%, 410px);
+        align-self: center;
+      }
+
+      /* Keep short team/model lists visually centered, while longer lists stay in a bounded scroller. */
+      .model-rank-group .bars.is-compact .bar-row {
+        min-height: 28px;
+      }
+
+      .model-rank-group-team .bars.is-compact,
+      .model-rank-group-team .bars.is-compact .bar-row {
+        width: 100%;
+      }
+
+      .model-rank-group-team .bars.is-compact {
+        width: min(100%, 390px);
+      }
+
+      .model-rank-group-team .bar-row {
+        grid-template-columns: 24px minmax(76px, 0.82fr) minmax(0, 1fr) minmax(64px, auto);
+      }
+
+      .bar-rank {
+        display: grid;
+        place-items: center;
+        width: 22px;
+        height: 22px;
+        border-radius: 7px;
+        background: rgba(22, 33, 46, 0.055);
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 850;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .bar-rank.is-leading {
+        background: var(--blue-soft);
+        color: var(--blue);
       }
 
       .chip {
@@ -9169,6 +9216,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260812-ranking-scroll-center"></script>
+    <script src="/assets/app.js?v=20260812-team-ranking-polish"></script>
   </body>
 </html>

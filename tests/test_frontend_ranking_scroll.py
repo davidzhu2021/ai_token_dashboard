@@ -68,6 +68,11 @@ def test_ranking_tables_keep_headers_visible_and_mobile_heights_bounded() -> Non
     assert markup.index("div.observability-ranking.is-compact") > markup.index(".observability-stability-grid .observability-ranking {")
     assert markup.index("div.observability-model-list.is-compact") > markup.index(".observability-ranking-panel > .observability-model-list {")
     assert 'container.classList.toggle("is-compact", rows.length > 0 && rows.length <= 4);' in source
+    assert 'const showRank = containerId === "teamModelBars";' in source
+    assert 'class="bar-rank${index < 3 ? " is-leading" : ""}"' in source
+    assert ".model-rank-group-team .bar-row" in markup
+    assert ".model-rank-group > div.bars.is-compact" in markup
+    assert "justify-content: center" in markup
     assert 'container.classList.toggle("is-compact", sorted.length > 0 && sorted.length <= 4);' in source
     assert 'el("stabilityRanking").classList.toggle("is-compact", stabilityRankings.length > 0 && stabilityRankings.length <= 4);' in source
     assert 'el("costModelSplit").classList.toggle("is-compact", split.length > 0 && split.length <= 4);' in source
