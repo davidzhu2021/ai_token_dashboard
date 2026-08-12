@@ -2250,8 +2250,27 @@
       }
 
       .model-rank-group .bars {
+        flex: 1 1 auto;
+        min-height: 0;
         align-content: start;
         gap: 12px;
+        overflow-x: hidden;
+        overflow-y: auto;
+        padding-right: 8px;
+        scrollbar-gutter: stable;
+        overscroll-behavior: contain;
+      }
+
+      .model-rank-group {
+        height: 320px;
+        min-height: 320px;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+
+      .model-rank-group .metric-group-head {
+        flex: 0 0 auto;
       }
 
       .model-rank-group .bar-row {
@@ -2574,6 +2593,45 @@
 
       .table-wrap {
         overflow-x: auto;
+      }
+
+      .ranking-list-panel,
+      .ranking-table-panel {
+        min-width: 0;
+        overflow: hidden;
+      }
+
+      .ranking-list-panel {
+        display: flex;
+        flex-direction: column;
+        max-height: 420px;
+      }
+
+      .ranking-list-panel > .panel-header {
+        flex: 0 0 auto;
+      }
+
+      .ranking-list-panel > .bars {
+        min-height: 0;
+        overflow-x: hidden;
+        overflow-y: auto;
+        padding-right: 8px;
+        scrollbar-gutter: stable;
+        overscroll-behavior: contain;
+      }
+
+      .ranking-table-panel > .table-wrap {
+        max-height: 420px;
+        overflow: auto;
+        scrollbar-gutter: stable;
+        overscroll-behavior: contain;
+      }
+
+      .ranking-table-panel > .table-wrap thead th {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        background: var(--panel-strong, #fff);
       }
 
       .usage-detail-toolbar {
@@ -3031,7 +3089,11 @@
       .observability-budget-strip { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)) auto; gap:12px; align-items:end; }
       .observability-budget-strip .field { margin:0; }
       .observability-model-list { display:grid; gap:10px; }
+      .observability-ranking-panel { height:360px; min-height:360px; display:flex; flex-direction:column; overflow:hidden; }
+      .observability-ranking-panel > .panel-header { flex:0 0 auto; }
+      .observability-ranking-panel > .observability-model-list { flex:1 1 auto; min-height:0; align-content:start; overflow-x:hidden; overflow-y:auto; padding-right:8px; scrollbar-gutter:stable; overscroll-behavior:contain; }
       .observability-model-row { display:grid; grid-template-columns:minmax(120px,1fr) 2fr auto; gap:12px; align-items:center; }
+      .observability-model-row > strong { min-width:0; overflow-wrap:anywhere; }
       .observability-drawer-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:18px; }
       .observability-drawer-head h3 { margin:0; }
       .observability-drawer-list { display:grid; gap:0; margin:0; }
@@ -3039,8 +3101,8 @@
       .observability-drawer-row dt { color:var(--muted-text,#68758a); }
       .observability-drawer-row dd { margin:0; word-break:break-word; }
       .observability-drawer { position:fixed; top:0; right:0; width:min(440px,100vw); height:100vh; background:#fff; box-shadow:-12px 0 30px rgba(20,36,58,.16); padding:24px; z-index:20; overflow:auto; }
-      @media (max-width: 900px) { .observability-metric-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .observability-grid { grid-template-columns:1fr; } .observability-stability-grid { grid-template-columns:1fr; } .observability-stability-grid > .panel { height:320px; min-height:320px; } .observability-head { grid-template-columns:1fr; align-items:start; gap:16px; } .observability-filter-bar { justify-content:flex-start; } .observability-filter-fields { grid-template-columns:repeat(2,minmax(180px,1fr)); } .observability-budget-strip { grid-template-columns:repeat(2,minmax(0,1fr)); } }
-      @media (max-width: 560px) { .observability-metric-grid { grid-template-columns:1fr; } .observability-composition-row { grid-template-columns:80px 1fr 64px; } .observability-stability-grid > .panel { height:300px; min-height:300px; } .observability-filter-bar { display:grid; grid-template-columns:minmax(0,1fr) auto auto; width:100%; } .observability-primary-filter { width:100%; min-width:0; } .observability-filter-button { padding:0 11px; } .observability-filter-fields,.observability-filter-fields.single { grid-template-columns:1fr; } .observability-filter-panel.is-open { max-height:420px; } }
+      @media (max-width: 900px) { .observability-metric-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .observability-grid { grid-template-columns:1fr; } .observability-stability-grid { grid-template-columns:1fr; } .observability-stability-grid > .panel { height:320px; min-height:320px; } .observability-ranking-panel { height:320px; min-height:320px; } .observability-head { grid-template-columns:1fr; align-items:start; gap:16px; } .observability-filter-bar { justify-content:flex-start; } .observability-filter-fields { grid-template-columns:repeat(2,minmax(180px,1fr)); } .observability-budget-strip { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+      @media (max-width: 560px) { .observability-metric-grid { grid-template-columns:1fr; } .observability-composition-row { grid-template-columns:80px 1fr 64px; } .observability-stability-grid > .panel { height:300px; min-height:300px; } .observability-ranking-panel { height:300px; min-height:300px; } .model-rank-group { height:300px; min-height:300px; } .ranking-list-panel { max-height:360px; } .ranking-table-panel > .table-wrap { max-height:360px; } .observability-filter-bar { display:grid; grid-template-columns:minmax(0,1fr) auto auto; width:100%; } .observability-primary-filter { width:100%; min-width:0; } .observability-filter-button { padding:0 11px; } .observability-filter-fields,.observability-filter-fields.single { grid-template-columns:1fr; } .observability-filter-panel.is-open { max-height:420px; } }
       @media (prefers-reduced-motion: reduce) { .observability-filter-button,.observability-filter-panel { transition:none; } }
 
       .key-type-label {
@@ -7262,7 +7324,7 @@
             </div>
           </section>
 
-          <section class="panel">
+          <section class="panel ranking-table-panel">
             <div class="panel-header">
               <div class="panel-heading">
                 <span class="panel-icon"><svg><use href="#icon-table"></use></svg></span>
@@ -7543,7 +7605,7 @@
               </div>
             </section>
 
-            <section class="panel table-panel">
+            <section class="panel table-panel ranking-table-panel">
               <div class="panel-header">
                 <div class="panel-heading">
                   <span class="panel-icon"><svg><use href="#icon-team"></use></svg></span>
@@ -7734,7 +7796,7 @@
             </div>
           </section>
 
-          <section class="panel">
+          <section class="panel ranking-list-panel">
             <div class="panel-header">
               <div class="panel-heading">
                 <span class="panel-icon"><svg><use href="#icon-table"></use></svg></span>
@@ -7748,7 +7810,7 @@
             <div id="departmentBars" class="bars"></div>
           </section>
 
-          <section class="panel">
+          <section class="panel ranking-table-panel">
             <div class="panel-header">
               <div class="panel-heading">
                 <span class="panel-icon"><svg><use href="#icon-table"></use></svg></span>
@@ -8569,7 +8631,7 @@
           <div id="stabilityQuality" class="operational-status hidden"></div>
           <div id="stabilityMetrics" class="observability-metric-grid"></div>
           <div class="observability-grid observability-stability-grid"><section class="panel"><div class="panel-header"><div><h3 class="panel-title">异常趋势</h3><p class="panel-desc">用户最终失败与上游异常按日变化</p></div></div><div id="stabilityTrend" class="observability-bars"></div><div class="observability-legend"><span><i></i>上游异常</span><span><i class="secondary"></i>用户最终失败</span></div></section><section class="panel"><div class="panel-header"><div><h3 class="panel-title">模型稳定性排名</h3><p class="panel-desc">失败率与 TTFT P95 共同判断状态</p></div></div><div id="stabilityRanking" class="observability-ranking"></div></section></div>
-          <section class="panel"><div class="panel-header"><div><h3 class="panel-title">Top 异常场景</h3><p class="panel-desc">点击场景查看样本请求，再下钻非内容元数据；不展示提示词和响应正文。</p></div></div><div class="table-wrap"><table><thead><tr><th>场景</th><th>模型</th><th>错误码</th><th>次数</th><th>失败率</th><th>样本</th></tr></thead><tbody id="stabilityScenarioBody"></tbody></table></div></section>
+          <section class="panel ranking-table-panel"><div class="panel-header"><div><h3 class="panel-title">Top 异常场景</h3><p class="panel-desc">点击场景查看样本请求，再下钻非内容元数据；不展示提示词和响应正文。</p></div></div><div class="table-wrap"><table><thead><tr><th>场景</th><th>模型</th><th>错误码</th><th>次数</th><th>失败率</th><th>样本</th></tr></thead><tbody id="stabilityScenarioBody"></tbody></table></div></section>
           <aside id="stabilityDrawer" class="observability-drawer hidden" aria-live="polite"><div class="observability-drawer-head"><h3 id="stabilityDrawerTitle">请求元数据</h3><button id="stabilityDrawerClose" class="ghost-btn" type="button">关闭</button></div><div id="stabilityRequestList"></div><dl id="stabilityRequestDetail" class="observability-drawer-list"></dl></aside>
         </section>
 
@@ -8587,7 +8649,7 @@
           <div id="costQuality" class="operational-status hidden"></div><div id="costMetrics" class="observability-metric-grid"></div>
           <div class="observability-grid"><section class="panel"><div class="panel-header"><div><h3 class="panel-title">实际 / 预测 / 预算趋势</h3><p class="panel-desc">预测按截至今天的已完成日均外推</p></div></div><div id="costTrend" class="observability-bars"></div><div class="observability-legend"><span><i></i>实际</span><span><i class="forecast"></i>预测</span><span><i class="budget"></i>预算线</span></div></section><section class="panel"><div class="panel-header"><div><h3 class="panel-title">成本构成</h3><p class="panel-desc">API Token 与服务期摊销拆分</p></div></div><div id="costComposition" class="observability-composition"></div></section></div>
           <div class="observability-section-stack">
-            <section class="panel"><div class="panel-header"><div><h3 class="panel-title">模型成本与优化空间</h3><p class="panel-desc">按模型查看当月 API Token 支出</p></div></div><div id="costModelSplit" class="observability-model-list"></div></section>
+            <section class="panel observability-ranking-panel"><div class="panel-header"><div><h3 class="panel-title">模型成本与优化空间</h3><p class="panel-desc">按模型查看当月 API Token 支出</p></div></div><div id="costModelSplit" class="observability-model-list"></div></section>
             <section class="panel"><div class="panel-header"><div><h3 class="panel-title">预算设置</h3><p class="panel-desc">未单独设置月份时使用平台默认值</p></div></div><form id="costBudgetForm" class="observability-budget-strip"><div class="field"><label for="costBudgetAmount">月度预算（USD）</label><input id="costBudgetAmount" class="input" type="number" min="0" step="0.01" required /></div><div class="field"><label for="costDailyTarget">日均目标（USD）</label><input id="costDailyTarget" class="input" type="number" min="0" step="0.01" required /></div><div class="hint" id="costBudgetDelta"></div><button id="saveCostBudgetButton" class="primary-btn" type="submit">保存预算</button></form></section>
             <section class="panel"><div class="panel-header"><div><h3 class="panel-title">人工成本项</h3><p class="panel-desc">账号采购、渠道、平台与基础设施按服务期日摊销</p></div><button id="addCostItemButton" class="primary-btn" type="button">新增成本项</button></div><div class="table-wrap"><table><thead><tr><th>名称</th><th>类别</th><th>归属</th><th>服务期</th><th>金额</th><th>状态</th><th>操作</th></tr></thead><tbody id="costItemBody"></tbody></table></div></section>
             <section class="panel"><div class="panel-header"><div><h3 class="panel-title">降本动作</h3><p class="panel-desc">只有已验证动作计入累计节省</p></div><button id="addSavingsActionButton" class="primary-btn" type="button">新增动作</button></div><div id="savingsActionList" class="observability-action-list"></div></section>
