@@ -1,4 +1,5 @@
 import base64
+import math
 import asyncio
 import hashlib
 import inspect
@@ -87,7 +88,13 @@ from .litellm_client import (
     normalize_model_display_name,
     usage_today,
 )
-from .observability import monthly_forecast, model_state, stability_metrics, verified_savings
+from .observability import (
+    STABILITY_DEFINITIONS_VERSION,
+    monthly_forecast,
+    model_state,
+    stability_metrics,
+    verified_savings,
+)
 from .key_vault import KeyVault, KeyVaultError
 from .organization_store import (
     DEFAULT_TOKEN_DAILY_BUDGET_USD,
@@ -108,6 +115,8 @@ from .organization_store import (
 from .organization_repository import PostgreSQLOrganizationRepository
 from .organization_provisioning import OrganizationProvisioningService
 from .usage_store import UsageStore
+from .usage_realtime import UsageRealtimeStore, realtime_enabled
+from .usage_realtime_worker import UsageRealtimeWorker
 from .usage_sync import (
     UsageSynchronizer,
     run_sync_with_recent_refresh,
@@ -243,6 +252,10 @@ _organization_capability_probe_lock = asyncio.Lock()
 local_entitlement_cache = TTLCache()
 _usage_sync_task: asyncio.Task[Any] | None = None
 _usage_refresh_task: asyncio.Task[Any] | None = None
+_usage_realtime_store: UsageRealtimeStore | None = None
+_usage_realtime_read_status: dict[str, Any] = {}
+_usage_realtime_task: asyncio.Task[Any] | None = None
+_usage_realtime_worker: UsageRealtimeWorker | None = None
 _usage_sync_stop: asyncio.Event | None = None
 _organization_outbox_task: asyncio.Task[Any] | None = None
 _organization_outbox_stop: asyncio.Event | None = None
@@ -555,7 +568,12 @@ def resolve_usage_range(start_date: str | None, end_date: str | None) -> tuple[s
 
 def usage_data_freshness(last_synced: datetime | None, start_date: str, end_date: str) -> dict[str, Any]:
     """Mark only ranges containing today as stale when their snapshot is old."""
-    max_age = max(60, env_int("USAGE_LIVE_REFRESH_MAX_AGE_SECONDS", 1800))
+    default_age = (
+        env_int("USAGE_REALTIME_STALE_SECONDS", 30)
+        if realtime_enabled()
+        else env_int("USAGE_LIVE_REFRESH_MAX_AGE_SECONDS", 1800)
+    )
+    max_age = max(10, default_age)
     today = usage_today().isoformat()
     stale = False
     if end_date >= today:
@@ -587,7 +605,29 @@ async def snapshot_revision(start_date: str, end_date: str) -> str:
             status_code=503,
             detail="所选日期范围的用量快照尚未就绪，请等待后台同步完成",
         )
+    if end_date >= usage_today().isoformat() and realtime_enabled():
+        global _usage_realtime_read_status
+        realtime_revision = "fallback"
+        try:
+            realtime = usage_realtime_store()
+            if realtime is not None:
+                await realtime.connect()
+                state = await realtime.status()
+                _usage_realtime_read_status = dict(state)
+                if state.get("ready"):
+                    realtime_revision = str(state.get("revision") or 0)
+        except Exception:
+            logger.exception("usage realtime revision query failed")
+            _usage_realtime_read_status = {"ready": False, "connected": False}
+        return f"{revision}:live:{realtime_revision}"
     return revision
+
+
+def usage_realtime_store() -> UsageRealtimeStore | None:
+    global _usage_realtime_store
+    if _usage_realtime_store is None:
+        _usage_realtime_store = UsageRealtimeStore.from_environment()
+    return _usage_realtime_store
 
 
 def attach_snapshot_freshness(
@@ -599,6 +639,40 @@ def attach_snapshot_freshness(
 ) -> dict[str, Any]:
     freshness = usage_data_freshness(last_synced, start_date, end_date)
     freshness["snapshotRevision"] = revision
+    if end_date < usage_today().isoformat() or not realtime_enabled():
+        freshness["source"] = "database_history"
+    elif ":live:fallback" in revision:
+        freshness.update(
+            {
+                "source": "database_fallback",
+                "degraded": True,
+                "realtimeRevision": None,
+                "latestEventAt": None,
+            }
+        )
+    else:
+        state = _usage_realtime_read_status
+        latest_event = state.get("latestEventAt")
+        if isinstance(latest_event, datetime):
+            freshness["lastSyncedAt"] = latest_event.isoformat()
+        freshness.update(
+            {
+                "source": "realtime",
+                "degraded": False,
+                "realtimeRevision": state.get("revision"),
+                "latestEventAt": latest_event.isoformat()
+                if isinstance(latest_event, datetime)
+                else None,
+                "stale": bool(
+                    not state.get("ready")
+                    or (
+                        state.get("latestEventLagSeconds") is not None
+                        and int(state.get("latestEventLagSeconds"))
+                        > max(10, env_int("USAGE_REALTIME_STALE_SECONDS", 30))
+                    )
+                ),
+            }
+        )
     payload["dataFreshness"] = freshness
     return payload
 
@@ -751,11 +825,24 @@ def trigger_usage_refresh(start_date: str, end_date: str, force: bool = False) -
 
 
 async def start_usage_sync() -> None:
-    global _usage_sync_task, _usage_sync_stop
+    global _usage_sync_task, _usage_sync_stop, _usage_realtime_task, _usage_realtime_worker
     store = usage_store()
     if store is None:
         return
     await store.connect()
+    if realtime_enabled():
+        if usage_sync_role() == "reader" or (_usage_realtime_task is not None and not _usage_realtime_task.done()):
+            return
+        realtime = usage_realtime_store()
+        if realtime is None:
+            return
+        _usage_realtime_worker = UsageRealtimeWorker(
+            client(), store, realtime, worker_id=f"combined:{os.getpid()}"
+        )
+        _usage_realtime_task = asyncio.create_task(
+            _usage_realtime_worker.run(), name="usage-realtime-loop"
+        )
+        return
     if usage_sync_role() == "reader":
         return
     if _usage_sync_task is not None and not _usage_sync_task.done():
@@ -1149,7 +1236,17 @@ def require_real_organization_capability() -> None:
 
 
 async def close_litellm_client() -> None:
-    global _usage_sync_task, _usage_refresh_task, _usage_sync_stop, _organization_outbox_task, _organization_outbox_stop
+    global _usage_sync_task, _usage_refresh_task, _usage_sync_stop, _organization_outbox_task, _organization_outbox_stop, _usage_realtime_task, _usage_realtime_worker
+    if _usage_realtime_worker is not None:
+        _usage_realtime_worker.stop_event.set()
+    if _usage_realtime_task is not None:
+        _usage_realtime_task.cancel()
+        try:
+            await _usage_realtime_task
+        except asyncio.CancelledError:
+            pass
+        _usage_realtime_task = None
+        _usage_realtime_worker = None
     if _organization_outbox_stop is not None:
         _organization_outbox_stop.set()
     if _organization_outbox_task is not None:
@@ -1179,6 +1276,10 @@ async def close_litellm_client() -> None:
         _usage_refresh_task = None
     if usage_store() is not None:
         await usage_store().close()
+    global _usage_realtime_store
+    if _usage_realtime_store is not None:
+        await _usage_realtime_store.close()
+        _usage_realtime_store = None
     if billing_store() is not None:
         await billing_store().close()
     global _organization_store
@@ -1290,6 +1391,10 @@ def organization_access_fields(
     # Enterprise administrators own the complete customer-scoped workspace.
     can_view_usage = role == "admin"
     can_view_billing = role == "admin"
+    observability_enabled = bool(
+        user.get("isPlatformAdmin")
+        and env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False)
+    )
     return {
         "organizationEnabled": enabled,
         "organizationMode": organization_mode(),
@@ -1307,10 +1412,14 @@ def organization_access_fields(
         # advertise demo controls.
         "organizationDemoEnabled": organization_demo_enabled(),
         "isPlatformAdmin": bool(user.get("isPlatformAdmin")),
-        "observabilityDashboardsEnabled": bool(
-            user.get("isPlatformAdmin")
-            and env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False)
-        ),
+        "observabilityDashboardsEnabled": observability_enabled,
+        "observabilityCapabilities": {
+            "stabilityView": observability_enabled,
+            "stabilityManage": observability_enabled,
+            "costView": observability_enabled,
+            "costManage": observability_enabled,
+            "costReconcile": observability_enabled,
+        },
         "organizationId": organization_id,
         # The customer name is safe display context for scoped boards. It lets
         # a customer admin identify their tenant without exposing the seller's
@@ -4663,6 +4772,16 @@ class CostItemRequest(BaseModel):
     serviceStartDate: date
     serviceEndDate: date
     financeBucket: str = Field(default="", max_length=160)
+    costBucket: str = Field(default="", max_length=80)
+    sourceType: Literal["manual", "subscription", "account_procurement", "infra", "labor", "support", "other"] = "manual"
+    provider: str = Field(default="", max_length=160)
+    accountId: str = Field(default="", max_length=256)
+    accountName: str = Field(default="", max_length=160)
+    voucherId: str = Field(default="", max_length=160)
+    voucherNo: str = Field(default="", max_length=160)
+    invoiceNo: str = Field(default="", max_length=160)
+    recognitionStatus: Literal["actual", "committed", "planned"] = "actual"
+    reconciliationStatus: Literal["unreconciled", "pending", "matched", "partial", "exception", "waived"] = "unreconciled"
     notes: str = Field(default="", max_length=1000)
     enabled: bool = True
 
@@ -4682,6 +4801,13 @@ class SavingsActionRequest(BaseModel):
     verifiedDailyCost: Decimal | None = Field(default=None, ge=0)
     owner: str = Field(default="", max_length=160)
     status: Literal["planned", "implemented", "verified"] = "planned"
+    expectedDailyCost: Decimal | None = Field(default=None, ge=0)
+    expectedStartDate: date | None = None
+    provider: str = Field(default="", max_length=160)
+    model: str = Field(default="", max_length=256)
+    costBucket: str = Field(default="", max_length=80)
+    evidenceUrl: str = Field(default="", max_length=1000)
+    financeReviewer: str = Field(default="", max_length=160)
     notes: str = Field(default="", max_length=1000)
 
 
@@ -4966,6 +5092,44 @@ async def health() -> dict[str, Any]:
                     result["status"] = "degraded"
     else:
         result["usageDatabase"] = {"enabled": False, "connected": False, "status": "disabled"}
+    if realtime_enabled():
+        try:
+            realtime = usage_realtime_store()
+            if realtime is None:
+                raise RuntimeError("realtime usage store unavailable")
+            await realtime.connect()
+            realtime_status = await realtime.status()
+            lag = realtime_status.get("latestEventLagSeconds")
+            stale_seconds = max(10, env_int("USAGE_REALTIME_STALE_SECONDS", 30))
+            status = "ok"
+            if not realtime_status.get("ready") or (lag is not None and lag > stale_seconds):
+                status = "degraded"
+            if lag is not None and lag > 120:
+                status = "unhealthy"
+            result["usageRealtime"] = {
+                "status": status,
+                "connected": True,
+                "ready": bool(realtime_status.get("ready")),
+                "revision": realtime_status.get("revision"),
+                "latestEventAt": realtime_status["latestEventAt"].isoformat()
+                if isinstance(realtime_status.get("latestEventAt"), datetime)
+                else None,
+                "latestEventLagSeconds": lag,
+                "pendingArchiveCount": realtime_status.get("pendingArchiveCount", 0),
+                "cursors": realtime_status.get("cursors", {}),
+            }
+            if status != "ok":
+                result["status"] = status
+        except Exception:
+            logger.exception("usage realtime health check failed")
+            result["usageRealtime"] = {
+                "status": "unhealthy",
+                "connected": False,
+                "ready": False,
+            }
+            result["status"] = "unhealthy"
+    else:
+        result["usageRealtime"] = {"status": "disabled", "connected": False, "ready": False}
     billing_ledger = billing_store()
     if billing_ledger is None:
         result["billing"] = {"enabled": False, "status": "disabled"}
@@ -8511,16 +8675,69 @@ def _observability_envelope(data: Any, *, freshness: dict[str, Any] | None = Non
     }
 
 
+def _stability_missing_reasons(
+    sync_states: list[dict[str, Any]],
+    *,
+    start_date: str,
+    end_date: str,
+    configured_backends: set[str],
+    event_count: int,
+) -> tuple[bool, list[str]]:
+    """Return window coverage and stable machine-readable gaps for the UI."""
+
+    states_by_backend = {
+        str(item.get("backend_id") or ""): item
+        for item in sync_states
+        if str(item.get("backend_id") or "")
+    }
+    expected = configured_backends or set(states_by_backend)
+    reasons: list[str] = []
+    if not expected:
+        reasons.append("not_synced")
+    for backend_id in sorted(expected):
+        state = states_by_backend.get(backend_id)
+        if state is None:
+            reasons.append("not_synced")
+            continue
+        if bool(state.get("partial")):
+            reasons.append("partial_scan")
+        if str(state.get("status") or "").lower() in {"error", "failed", "failure"}:
+            reasons.append("sync_error")
+        window_start = str(state.get("window_start") or "")[:10]
+        window_end = str(state.get("window_end") or "")[:10]
+        if not window_start or not window_end or window_start > start_date or window_end < end_date:
+            reasons.append("backfill_pending")
+    if not event_count and not reasons:
+        # An empty but otherwise complete window is useful data. Preserve the
+        # distinction for filters and operators without calling it incomplete.
+        reasons.append("no_events_or_filter_match")
+    return not any(reason in {"not_synced", "partial_scan", "sync_error", "backfill_pending"} for reason in reasons), list(dict.fromkeys(reasons))
+
+
+def _stability_quality(metrics: dict[str, Any]) -> dict[str, Any]:
+    quality = dict(metrics.get("quality") or {})
+    quality.setdefault("definitionsVersion", STABILITY_DEFINITIONS_VERSION)
+    return quality
+
+
 async def _admin_stability_events(start_date: str, end_date: str, model: str = "") -> list[dict[str, Any]]:
     rows = await _admin_observability_store().stability_events(start_date, end_date, model)
     output: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
         status = item.get("status")
+        final_failure = item.get("final_request_failure")
+        if final_failure is None:
+            final_failure = item.get("finalRequestFailure")
+        if final_failure is None:
+            final_failure = item.get("user_visible_failure")
         item.update({
+            # Do not default missing state to successful: older logs may have
+            # no status and must remain excluded from final-failure metrics.
             "status": status or "unknown",
             "scenario": item.get("scenario") or "unknown",
-            "userVisibleFailure": item.get("user_visible_failure"),
+            "finalRequestFailure": final_failure,
+            "userVisibleFailure": final_failure,
             "attemptedRetries": item.get("attempted_retries"),
             "ttftMs": item.get("ttft_ms"),
         })
@@ -8595,28 +8812,42 @@ async def admin_stability_overview(
             ],
             **stability_metrics(items),
         })
-    partial = any(bool(item.get("partial")) for item in sync_states)
-    state_windows = [
-        (str(item.get("window_start") or ""), str(item.get("window_end") or ""))
-        for item in sync_states
-    ]
-    window_covered = bool(state_windows) and all(
-        window_start <= start_date and window_end >= end_date
-        for window_start, window_end in state_windows
+    window_covered, missing_reasons = _stability_missing_reasons(
+        sync_states,
+        start_date=start_date,
+        end_date=end_date,
+        configured_backends=set(usage_backend_ids()),
+        event_count=len(events),
     )
-    expected_backends = {str(item.get("backend_id") or "") for item in sync_states if item.get("backend_id")}
-    configured_backends = set(usage_backend_ids())
-    if configured_backends and expected_backends != configured_backends:
-        window_covered = False
     covered = {
-        "partial": partial,
-        "incomplete": not window_covered or partial,
+        "partial": not window_covered,
+        "incomplete": not window_covered,
         "eventCount": len(events),
         "window": {"startDate": start_date, "endDate": end_date},
         "syncStates": sync_states,
+        "missingReasons": missing_reasons,
+        "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
     }
     freshness = {"status": "available" if events else "empty", "latestCollectedAt": max((str(item.get("collected_at") or "") for item in events), default=None)}
-    return _observability_envelope({"overview": overview, "daily": daily, "modelRankings": sorted(rankings, key=lambda item: (item.get("userVisibleFailureRate") is None, item.get("userVisibleFailureRate") or 0)), "topScenarios": scenarios}, freshness=freshness, coverage=covered, source="稳定性事件快照") | {"startDate": start_date, "endDate": end_date, "model": model}
+    return _observability_envelope(
+        {
+            "overview": overview,
+            "daily": daily,
+            "modelRankings": sorted(
+                rankings,
+                key=lambda item: (
+                    item.get("finalRequestFailureRate") is None,
+                    item.get("finalRequestFailureRate") or 0,
+                ),
+            ),
+            "topScenarios": scenarios,
+            "quality": _stability_quality(overview),
+            "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
+        },
+        freshness=freshness,
+        coverage=covered,
+        source="稳定性事件快照",
+    ) | {"startDate": start_date, "endDate": end_date, "model": model}
 
 
 @app.get("/api/admin/stability/scenarios")
@@ -8637,23 +8868,44 @@ async def admin_stability_scenarios(request: Request, start_date: str | None = N
         filtered = [item for item in events if (not scenario or item.get("scenario") == scenario) and (not error_code or item.get("error_code") == error_code)]
         start = (page - 1) * page_size
         raw_items, total = filtered[start:start + page_size], len(filtered)
-    samples = [{
-        "requestId": item.get("request_id"),
-        "backendId": item.get("backend_id"),
-        "eventTime": item.get("event_time"),
-        "model": item.get("model"),
-        "scenario": item.get("scenario") or "unknown",
-        "errorCode": item.get("error_code"),
-        "status": item.get("status") or "unknown",
-        "userVisibleFailure": item.get("user_visible_failure"),
-        "attemptedRetries": item.get("attempted_retries"),
-        "ttftMs": item.get("ttft_ms"),
-    } for item in raw_items]
+    samples = []
+    for item in raw_items:
+        final_failure = item.get("final_request_failure")
+        if final_failure is None:
+            final_failure = item.get("finalRequestFailure")
+        if final_failure is None:
+            final_failure = item.get("user_visible_failure")
+        samples.append({
+            "requestId": item.get("request_id"),
+            "backendId": item.get("backend_id"),
+            "eventTime": item.get("event_time"),
+            "model": item.get("model"),
+            "scenario": item.get("scenario") or "unknown",
+            "errorCode": item.get("error_code"),
+            "status": item.get("status") or "unknown",
+            "finalRequestFailure": final_failure,
+            "userVisibleFailure": final_failure,
+            "attemptedRetries": item.get("attempted_retries"),
+            "maxRetries": item.get("max_retries"),
+            "ttftMs": item.get("ttft_ms"),
+        })
     sync_states = await store.stability_sync_states()
-    partial = any(bool(item.get("partial")) for item in sync_states)
+    window_covered, missing_reasons = _stability_missing_reasons(
+        sync_states,
+        start_date=start_date,
+        end_date=end_date,
+        configured_backends=set(usage_backend_ids()),
+        event_count=total,
+    )
     return _observability_envelope(
         {"items": samples, "total": total, "page": page, "pageSize": page_size},
-        coverage={"partial": partial, "incomplete": partial, "syncStates": sync_states},
+        coverage={
+            "partial": not window_covered,
+            "incomplete": not window_covered,
+            "syncStates": sync_states,
+            "missingReasons": missing_reasons,
+            "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
+        },
         source="稳定性事件快照",
     )
 
@@ -8675,7 +8927,36 @@ async def admin_stability_request(request: Request, request_id: str, backend_id:
 
 
 def _cost_item_payload(item: dict[str, Any]) -> dict[str, Any]:
-    return {"id": str(item.get("id")), "category": item.get("category"), "name": item.get("name"), "vendor": item.get("vendor"), "model": item.get("model"), "businessScope": item.get("business_scope"), "amount": float(item.get("amount") or 0), "currency": item.get("currency"), "exchangeRate": float(item.get("exchange_rate") or 1), "amountUsd": float(item.get("amount_usd") or 0), "serviceStartDate": str(item.get("service_start_date")), "serviceEndDate": str(item.get("service_end_date")), "financeBucket": item.get("finance_bucket"), "notes": item.get("notes"), "enabled": bool(item.get("enabled"))}
+    category = str(item.get("category") or "")
+    vendor = str(item.get("vendor") or "")
+    raw_bucket = item.get("cost_bucket") or item.get("costBucket") or category or "other"
+    return {
+        "id": str(item.get("id")),
+        "category": category,
+        "name": item.get("name"),
+        "vendor": vendor,
+        "model": item.get("model"),
+        "businessScope": item.get("business_scope"),
+        "amount": float(item.get("amount") or 0),
+        "currency": item.get("currency"),
+        "exchangeRate": float(item.get("exchange_rate") or 1),
+        "amountUsd": float(item.get("amount_usd") or 0),
+        "serviceStartDate": str(item.get("service_start_date")),
+        "serviceEndDate": str(item.get("service_end_date")),
+        "financeBucket": item.get("finance_bucket"),
+        "costBucket": _canonical_cost_bucket(raw_bucket),
+        "sourceType": item.get("source_type") or "manual",
+        "provider": item.get("provider") or vendor or None,
+        "accountId": item.get("account_id") or None,
+        "accountName": item.get("account_name") or None,
+        "voucherId": item.get("voucher_id") or None,
+        "voucherNo": item.get("voucher_no") or None,
+        "invoiceNo": item.get("invoice_no") or None,
+        "recognitionStatus": item.get("recognition_status") or "actual",
+        "reconciliationStatus": item.get("reconciliation_status") or "unreconciled",
+        "notes": item.get("notes"),
+        "enabled": bool(item.get("enabled")),
+    }
 
 
 def _cost_item_overlap_usd(item: dict[str, Any], start: date, end: date) -> float:
@@ -8692,6 +8973,352 @@ def _cost_item_overlap_usd(item: dict[str, Any], start: date, end: date) -> floa
     return float(item.get("amount_usd") or 0) / service_days * overlap_days
 
 
+_COST_BUCKET_LABELS = {
+    "api_usage": "API Token",
+    "account_procurement": "账号采购",
+    "fallback_channel": "兜底渠道",
+    "feishu_surrounding": "飞书 / 周边",
+    "infrastructure": "基础设施",
+    "other": "其他成本",
+}
+
+# Existing rows used free-form categories and a few early implementation names.
+# Keep them queryable while presenting one finance-facing composition taxonomy.
+_COST_BUCKET_ALIASES = {
+    "subscription": "account_procurement",
+    "account_purchase": "account_procurement",
+    "fallback": "fallback_channel",
+    "backup_api": "fallback_channel",
+    "feishu": "feishu_surrounding",
+    "surrounding": "feishu_surrounding",
+    "infra": "infrastructure",
+    "labor": "other",
+    "support": "other",
+}
+
+
+def _canonical_cost_bucket(value: Any) -> str:
+    bucket = str(value or "other").strip() or "other"
+    return _COST_BUCKET_ALIASES.get(bucket, bucket)
+
+
+def _cost_bucket(item: dict[str, Any], *, api: bool = False) -> str:
+    if api:
+        return "api_usage"
+    raw = str(item.get("cost_bucket") or item.get("costBucket") or item.get("category") or "other").strip() or "other"
+    return _canonical_cost_bucket(raw)
+
+
+def _cost_composition_bucket(item: dict[str, Any]) -> str:
+    return _canonical_cost_bucket(item.get("costBucket") or item.get("cost_bucket") or item.get("category"))
+
+
+def _cost_account_id(row: dict[str, Any]) -> str:
+    return str(
+        row.get("account_id")
+        or row.get("accountId")
+        or row.get("key_id")
+        or row.get("principal_id")
+        or row.get("user_id")
+        or ""
+    ).strip()
+
+
+def _cost_account_name(row: dict[str, Any]) -> str:
+    return str(row.get("account_name") or row.get("accountName") or "").strip()
+
+
+def _cost_provider(row: dict[str, Any], *, api: bool = False) -> str:
+    if api:
+        return str(row.get("provider") or "").strip()
+    return str(row.get("provider") or row.get("vendor") or "").strip()
+
+
+def _cost_value_matches(value: Any, expected: str) -> bool:
+    return not expected or str(value or "").strip() == expected
+
+
+def _cost_manual_matches(
+    item: dict[str, Any],
+    *,
+    category: str = "",
+    cost_bucket: str = "",
+    model: str = "",
+    vendor: str = "",
+    provider: str = "",
+    account_id: str = "",
+    reconciliation_status: str = "",
+    recognition_status: str = "",
+) -> bool:
+    if category and str(item.get("category") or "") != category:
+        return False
+    if cost_bucket and _cost_bucket(item) != cost_bucket:
+        return False
+    if not _cost_value_matches(item.get("model"), model):
+        return False
+    item_provider = _cost_provider(item)
+    if vendor and item_provider != vendor and str(item.get("vendor") or "") != vendor:
+        return False
+    if provider and item_provider != provider:
+        return False
+    if account_id and _cost_account_id(item) != account_id:
+        return False
+    if not _cost_value_matches(
+        item.get("reconciliation_status") or item.get("reconciliationStatus") or "unreconciled",
+        reconciliation_status,
+    ):
+        return False
+    return _cost_value_matches(
+        item.get("recognition_status") or item.get("recognitionStatus") or "actual",
+        recognition_status,
+    )
+
+
+def _filter_cost_sources(
+    api_rows: list[dict[str, Any]],
+    items: list[dict[str, Any]],
+    *,
+    category: str = "",
+    cost_bucket: str = "",
+    model: str = "",
+    vendor: str = "",
+    provider: str = "",
+    account_id: str = "",
+    reconciliation_status: str = "",
+    recognition_status: str = "",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    filtered_api = list(api_rows)
+    filtered_items = list(items)
+    if category:
+        if category == "API Token":
+            filtered_items = []
+        else:
+            filtered_api = []
+            filtered_items = [item for item in filtered_items if item.get("category") == category]
+    if cost_bucket:
+        if cost_bucket == "api_usage":
+            filtered_items = []
+        else:
+            filtered_api = []
+            filtered_items = [item for item in filtered_items if _cost_bucket(item) == cost_bucket]
+    if model:
+        filtered_api = [item for item in filtered_api if item.get("model") == model]
+        filtered_items = [item for item in filtered_items if item.get("model") == model]
+    if vendor:
+        filtered_api = [item for item in filtered_api if item.get("source") == vendor]
+        filtered_items = [item for item in filtered_items if item.get("vendor") == vendor]
+    if provider:
+        filtered_api = [item for item in filtered_api if item.get("provider") == provider]
+        filtered_items = [item for item in filtered_items if _cost_provider(item) == provider]
+    if account_id:
+        filtered_api = [item for item in filtered_api if _cost_account_id(item) == account_id]
+        filtered_items = [item for item in filtered_items if _cost_account_id(item) == account_id]
+    if reconciliation_status:
+        # API rows are operational spend and do not participate in finance
+        # reconciliation until a separate voucher is attached.
+        filtered_api = []
+        filtered_items = [
+            item for item in filtered_items
+            if _cost_value_matches(
+                item.get("reconciliation_status") or item.get("reconciliationStatus") or "unreconciled",
+                reconciliation_status,
+            )
+        ]
+    if recognition_status:
+        if recognition_status != "actual":
+            filtered_api = []
+        filtered_items = [
+            item for item in filtered_items
+            if _cost_value_matches(
+                item.get("recognition_status") or item.get("recognitionStatus") or "actual",
+                recognition_status,
+            )
+        ]
+    return filtered_api, filtered_items
+
+
+def _manual_cost_ledger_rows(item: dict[str, Any], start: date, end: date) -> list[dict[str, Any]]:
+    if not bool(item.get("enabled")):
+        return []
+    original_start = item["service_start_date"] if isinstance(item["service_start_date"], date) else date.fromisoformat(str(item["service_start_date"]))
+    original_end = item["service_end_date"] if isinstance(item["service_end_date"], date) else date.fromisoformat(str(item["service_end_date"]))
+    overlap_start = max(start, original_start)
+    overlap_end = min(end, original_end)
+    if overlap_end < overlap_start:
+        return []
+    service_days = max(1, (original_end - original_start).days + 1)
+    per_day = float(item.get("amount_usd") or 0) / service_days
+    currency = str(item.get("currency") or "USD")
+    per_day_original = float(item.get("amount") or 0) / service_days
+    cost_bucket = _cost_composition_bucket(item)
+    result: list[dict[str, Any]] = []
+    current = overlap_start
+    while current <= overlap_end:
+        result.append(
+            {
+                "id": f"manual:{item.get('id')}:{current.isoformat()}",
+                "date": current.isoformat(),
+                "sourceType": item.get("source_type") or "manual",
+                "costBucket": cost_bucket,
+                "category": item.get("category"),
+                "name": item.get("name"),
+                "backendId": None,
+                "accountId": _cost_account_id(item) or None,
+                "accountName": _cost_account_name(item) or None,
+                "provider": _cost_provider(item) or None,
+                "vendor": item.get("vendor") or None,
+                "model": item.get("model") or None,
+                "organizationId": None,
+                "teamId": None,
+                "principalId": None,
+                "amountUsd": per_day,
+                "currency": currency,
+                "amount": per_day_original,
+                "financeBucket": item.get("finance_bucket") or None,
+                "voucherId": item.get("voucher_id") or None,
+                "voucherNo": item.get("voucher_no") or None,
+                "invoiceNo": item.get("invoice_no") or None,
+                "reconciliationStatus": item.get("reconciliation_status") or "unreconciled",
+                "recognitionStatus": item.get("recognition_status") or "actual",
+                "sourceItemId": str(item.get("id") or ""),
+                "requestId": None,
+                "coverage": {"dimensionsComplete": True},
+            }
+        )
+        current += timedelta(days=1)
+    return result
+
+
+def _api_cost_ledger_row(row: dict[str, Any]) -> dict[str, Any]:
+    account_id = _cost_account_id(row)
+    request_id = row.get("request_id") or row.get("requestId") or None
+    return {
+        "id": "api:" + ":".join(
+            str(value or "-")
+            for value in (
+                row.get("backend_id"), row.get("usage_date"), account_id,
+                row.get("source"), row.get("model"), row.get("organization_id"),
+                row.get("team_id"), row.get("key_id"), row.get("request_id") or row.get("id"),
+            )
+        ),
+        "date": str(row.get("usage_date")),
+        "sourceType": "api_usage",
+        "costBucket": "api_usage",
+        "category": "API Token",
+        "name": row.get("model") or "API Token",
+        "backendId": row.get("backend_id") or None,
+        "requestId": request_id,
+        "accountId": account_id or None,
+        "accountName": _cost_account_name(row) or None,
+        "provider": _cost_provider(row, api=True) or None,
+        "vendor": None,
+        "model": row.get("model") or None,
+        "organizationId": row.get("organization_id") or None,
+        "teamId": row.get("team_id") or None,
+        "principalId": row.get("principal_id") or None,
+        "amountUsd": float(row.get("spend") or 0),
+        "currency": "USD",
+        "amount": float(row.get("spend") or 0),
+        "financeBucket": None,
+        "voucherId": None,
+        "voucherNo": None,
+        "invoiceNo": None,
+        "reconciliationStatus": None,
+        "recognitionStatus": "actual",
+        "sourceItemId": None,
+        "coverage": {
+            "dimensionsComplete": bool(account_id and _cost_provider(row, api=True)),
+            "missingDimensions": [
+                field
+                for field, present in (
+                    ("accountId", bool(account_id)),
+                    ("provider", bool(_cost_provider(row, api=True))),
+                )
+                if not present
+            ],
+        },
+    }
+
+
+def _savings_totals(actions: list[dict[str, Any]], as_of: date, period_end: date) -> dict[str, float]:
+    realized = verified_savings(actions, as_of)
+    remaining = 0.0
+    for action in actions:
+        status = str(action.get("status") or "").lower()
+        if status not in {"planned", "implemented"}:
+            continue
+        expected_daily = action.get("expectedDailyCost")
+        if expected_daily is None:
+            continue
+        expected_start_text = action.get("expectedStartDate") or action.get("implementedDate")
+        try:
+            expected_start = date.fromisoformat(str(expected_start_text)[:10])
+        except (TypeError, ValueError):
+            continue
+        start = max(as_of + timedelta(days=1), expected_start)
+        if start > period_end:
+            continue
+        daily_savings = max(0.0, float(action.get("baselineDailyCost") or 0) - float(expected_daily))
+        remaining += daily_savings * ((period_end - start).days + 1)
+    return {
+        "realizedSavingsToDate": round(realized, 2),
+        "forecastSavingsRemaining": round(remaining, 2),
+    }
+
+
+async def _cost_api_rows(
+    store: Any,
+    start: date,
+    end: date,
+    *,
+    model: str = "",
+    provider: str = "",
+    account_id: str = "",
+) -> tuple[list[dict[str, Any]], bool]:
+    query = getattr(store, "api_cost_ledger_rows", None)
+    if callable(query):
+        rows = await query(
+            start.isoformat(),
+            end.isoformat(),
+            model=model,
+            provider=provider,
+            account_id=account_id,
+        )
+        if rows:
+            return rows, True
+    rows = await store.api_cost_rows(start.isoformat(), end.isoformat())
+    return rows, False
+
+
+def _cost_summary_splits(ledger_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Stable P1 aggregates across the unified finance-facing ledger."""
+
+    accounts: dict[str, float] = defaultdict(float)
+    providers: dict[str, float] = defaultdict(float)
+    reconciliation: dict[str, float] = defaultdict(float)
+    for row in ledger_rows:
+        account_id = str(row.get("accountId") or "unknown")
+        provider = str(row.get("provider") or "unknown")
+        accounts[account_id] += float(row.get("amountUsd") or 0)
+        providers[provider] += float(row.get("amountUsd") or 0)
+        status = row.get("reconciliationStatus") or "unreconciled"
+        reconciliation[str(status)] += float(row.get("amountUsd") or 0)
+    return {
+        "accountSplit": [
+            {"accountId": key, "amountUsd": round(value, 2)}
+            for key, value in sorted(accounts.items(), key=lambda pair: pair[1], reverse=True)
+        ],
+        "providerSplit": [
+            {"provider": key, "amountUsd": round(value, 2)}
+            for key, value in sorted(providers.items(), key=lambda pair: pair[1], reverse=True)
+        ],
+        "reconciliationSummary": [
+            {"status": key, "amountUsd": round(value, 2), "count": sum(1 for row in ledger_rows if str(row.get("reconciliationStatus") or "unreconciled") == key)}
+            for key, value in sorted(reconciliation.items(), key=lambda pair: pair[1], reverse=True)
+        ],
+    }
+
+
 @app.get("/api/admin/costs/items")
 async def admin_cost_items(request: Request) -> dict[str, Any]:
     require_platform_admin(request)
@@ -8702,7 +9329,33 @@ def _cost_item_input(data: CostItemRequest, item_id: str | None = None) -> dict[
     if data.serviceEndDate < data.serviceStartDate:
         raise HTTPException(status_code=400, detail="服务结束日期不能早于开始日期")
     rate = data.exchangeRate if data.currency == "CNY" else Decimal("1")
-    return {"id": item_id or uuid.uuid4().hex, "category": data.category.strip(), "name": data.name.strip(), "vendor": data.vendor.strip(), "model": data.model.strip(), "businessScope": data.businessScope.strip(), "amount": data.amount, "currency": data.currency, "exchangeRate": rate, "amountUsd": data.amount / rate, "serviceStartDate": data.serviceStartDate.isoformat(), "serviceEndDate": data.serviceEndDate.isoformat(), "financeBucket": data.financeBucket.strip(), "notes": data.notes.strip(), "enabled": data.enabled}
+    return {
+        "id": item_id or uuid.uuid4().hex,
+        "category": data.category.strip(),
+        "name": data.name.strip(),
+        "vendor": data.vendor.strip(),
+        "model": data.model.strip(),
+        "businessScope": data.businessScope.strip(),
+        "amount": data.amount,
+        "currency": data.currency,
+        "exchangeRate": rate,
+        "amountUsd": data.amount / rate,
+        "serviceStartDate": data.serviceStartDate.isoformat(),
+        "serviceEndDate": data.serviceEndDate.isoformat(),
+        "financeBucket": data.financeBucket.strip(),
+        "costBucket": _canonical_cost_bucket(data.costBucket.strip() or data.category.strip()),
+        "sourceType": data.sourceType,
+        "provider": data.provider.strip() or data.vendor.strip(),
+        "accountId": data.accountId.strip(),
+        "accountName": data.accountName.strip(),
+        "voucherId": data.voucherId.strip(),
+        "voucherNo": data.voucherNo.strip(),
+        "invoiceNo": data.invoiceNo.strip(),
+        "recognitionStatus": data.recognitionStatus,
+        "reconciliationStatus": data.reconciliationStatus,
+        "notes": data.notes.strip(),
+        "enabled": data.enabled,
+    }
 
 
 @app.post("/api/admin/costs/items")
@@ -8750,7 +9403,24 @@ async def admin_update_cost_budget(month: str, data: CostBudgetRequest, request:
 
 
 def _savings_payload(item: dict[str, Any]) -> dict[str, Any]:
-    return {"id": str(item.get("id")), "name": item.get("name"), "baselineDailyCost": float(item.get("baseline_daily_cost") or 0), "implementedDate": str(item.get("implemented_date")), "verifiedDate": str(item.get("verified_date")) if item.get("verified_date") else None, "verifiedDailyCost": float(item.get("verified_daily_cost")) if item.get("verified_daily_cost") is not None else None, "owner": item.get("owner"), "status": item.get("status"), "notes": item.get("notes")}
+    return {
+        "id": str(item.get("id")),
+        "name": item.get("name"),
+        "baselineDailyCost": float(item.get("baseline_daily_cost") or 0),
+        "implementedDate": str(item.get("implemented_date")),
+        "verifiedDate": str(item.get("verified_date")) if item.get("verified_date") else None,
+        "verifiedDailyCost": float(item.get("verified_daily_cost")) if item.get("verified_daily_cost") is not None else None,
+        "owner": item.get("owner"),
+        "status": item.get("status"),
+        "expectedDailyCost": float(item.get("expected_daily_cost")) if item.get("expected_daily_cost") is not None else None,
+        "expectedStartDate": str(item.get("expected_start_date")) if item.get("expected_start_date") else None,
+        "provider": item.get("provider") or None,
+        "model": item.get("model") or None,
+        "costBucket": item.get("cost_bucket") or None,
+        "evidenceUrl": item.get("evidence_url") or None,
+        "financeReviewer": item.get("finance_reviewer") or None,
+        "notes": item.get("notes"),
+    }
 
 
 @app.get("/api/admin/costs/savings-actions")
@@ -8764,7 +9434,26 @@ def _savings_input(data: SavingsActionRequest, action_id: str | None = None) -> 
         raise HTTPException(status_code=400, detail="验证日期不能早于实施日期")
     if data.status == "verified" and (data.verifiedDate is None or data.verifiedDailyCost is None):
         raise HTTPException(status_code=400, detail="已验证动作必须填写验证日期和验证后日均成本")
-    return {"id": action_id or uuid.uuid4().hex, "name": data.name.strip(), "baselineDailyCost": data.baselineDailyCost, "implementedDate": data.implementedDate.isoformat(), "verifiedDate": data.verifiedDate.isoformat() if data.verifiedDate else None, "verifiedDailyCost": data.verifiedDailyCost, "owner": data.owner.strip(), "status": data.status, "notes": data.notes.strip()}
+    if data.expectedStartDate and data.expectedStartDate < data.implementedDate:
+        raise HTTPException(status_code=400, detail="预计节省起始日期不能早于实施日期")
+    return {
+        "id": action_id or uuid.uuid4().hex,
+        "name": data.name.strip(),
+        "baselineDailyCost": data.baselineDailyCost,
+        "implementedDate": data.implementedDate.isoformat(),
+        "verifiedDate": data.verifiedDate.isoformat() if data.verifiedDate else None,
+        "verifiedDailyCost": data.verifiedDailyCost,
+        "owner": data.owner.strip(),
+        "status": data.status,
+        "expectedDailyCost": data.expectedDailyCost,
+        "expectedStartDate": data.expectedStartDate.isoformat() if data.expectedStartDate else None,
+        "provider": data.provider.strip(),
+        "model": data.model.strip(),
+        "costBucket": data.costBucket.strip(),
+        "evidenceUrl": data.evidenceUrl.strip(),
+        "financeReviewer": data.financeReviewer.strip(),
+        "notes": data.notes.strip(),
+    }
 
 
 @app.post("/api/admin/costs/savings-actions")
@@ -8785,7 +9474,19 @@ async def admin_update_savings_action(action_id: str, data: SavingsActionRequest
 
 
 @app.get("/api/admin/costs/overview")
-async def admin_costs_overview(request: Request, month: str | None = None, category: str = "", model: str = "", vendor: str = "") -> dict[str, Any]:
+async def admin_costs_overview(
+    request: Request,
+    month: str | None = None,
+    category: str = "",
+    cost_bucket: str = "",
+    model: str = "",
+    vendor: str = "",
+    provider: str = "",
+    account_id: str = "",
+    reconciliation_status: str = "",
+    recognition_status: str = "",
+    refresh: int = 0,
+) -> dict[str, Any]:
     require_platform_admin(request)
     target = month or date.today().strftime("%Y-%m")
     try:
@@ -8796,7 +9497,9 @@ async def admin_costs_overview(request: Request, month: str | None = None, categ
     end = next_month - timedelta(days=1)
     today = min(date.today(), end)
     store = _admin_observability_store()
-    api_rows = await store.api_cost_rows(start.isoformat(), today.isoformat())
+    api_rows, api_dimensions_complete = await _cost_api_rows(
+        store, start, today, model=model, provider=provider, account_id=account_id
+    )
     items = [item for item in await store.list_cost_items() if bool(item.get("enabled"))]
     has_api_costs = bool(api_rows)
     has_manual_costs = bool(items)
@@ -8804,41 +9507,44 @@ async def admin_costs_overview(request: Request, month: str | None = None, categ
     available_vendors = sorted(
         {str(item.get("source") or "") for item in api_rows if item.get("source")}
         | {str(item.get("vendor") or "") for item in items if item.get("vendor")}
+        | {str(item.get("provider") or "") for item in items if item.get("provider")}
     )
     available_categories = sorted(
         ({"API Token"} if api_rows else set())
         | {str(item.get("category") or "") for item in items if item.get("category")}
     )
-    if category:
-        if category == "API Token":
-            items = []
-        else:
-            api_rows = []
-            items = [item for item in items if item.get("category") == category]
-    if model:
-        api_rows = [item for item in api_rows if item.get("model") == model]
-        items = [item for item in items if item.get("model") == model]
-    if vendor:
-        items = [item for item in items if item.get("vendor") == vendor]
-        api_rows = [item for item in api_rows if item.get("source") == vendor]
-    daily_non_api: dict[str, float] = defaultdict(float)
+    available_cost_buckets = sorted(
+        ({"api_usage"} if api_rows else set()) | {_cost_bucket(item) for item in items}
+    )
+    api_rows, items = _filter_cost_sources(
+        api_rows,
+        items,
+        category=category,
+        cost_bucket=cost_bucket,
+        model=model,
+        vendor=vendor,
+        provider=provider,
+        account_id=account_id,
+        reconciliation_status=reconciliation_status,
+        recognition_status=recognition_status,
+    )
+    ledger_rows = [_api_cost_ledger_row(row) for row in api_rows]
     for item in items:
-        original_start = item["service_start_date"] if isinstance(item["service_start_date"], date) else date.fromisoformat(str(item["service_start_date"]))
-        original_end = item["service_end_date"] if isinstance(item["service_end_date"], date) else date.fromisoformat(str(item["service_end_date"]))
-        service_start = max(start, original_start)
-        service_end = min(today, original_end)
-        if service_end < service_start:
-            continue
-        per_day = float(item.get("amount_usd") or 0) / max(1, (original_end - original_start).days + 1)
-        cursor = service_start
-        while cursor <= service_end:
-            daily_non_api[cursor.isoformat()] += per_day
-            cursor += timedelta(days=1)
+        ledger_rows.extend(_manual_cost_ledger_rows(item, start, today))
+    summary = _cost_summary_splits(ledger_rows)
+    daily_non_api: dict[str, float] = defaultdict(float)
     daily: dict[str, dict[str, float]] = defaultdict(lambda: {"api": 0.0, "nonApi": 0.0})
-    for row in api_rows:
-        daily[str(row["usage_date"])] ["api"] += float(row.get("spend") or 0)
-    for day, value in daily_non_api.items():
-        daily[day]["nonApi"] += value
+    bucket_daily: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for row in ledger_rows:
+        day = str(row.get("date") or "")
+        bucket = str(row.get("costBucket") or "other")
+        amount = float(row.get("amountUsd") or 0)
+        if bucket == "api_usage":
+            daily[day]["api"] += amount
+        else:
+            daily_non_api[day] += amount
+            daily[day]["nonApi"] += amount
+        bucket_daily[day][bucket] += amount
     actual = sum(sum(value.values()) for value in daily.values())
     budgets = await store.list_cost_budgets()
     budget_record = next((item for item in budgets if str(item.get("month"))[:7] == target), None)
@@ -8853,10 +9559,12 @@ async def admin_costs_overview(request: Request, month: str | None = None, categ
         else env_float("COST_DEFAULT_DAILY_TARGET_USD", 2000)
     )
     actions = [_savings_payload(item) for item in await store.list_savings_actions()]
+    savings = _savings_totals(actions, today, end)
     forecast = monthly_forecast(actual, start, today, budget)
     model_split: dict[str, float] = defaultdict(float)
-    for row in api_rows:
-        model_split[str(row.get("model") or "unknown")] += float(row.get("spend") or 0)
+    for row in ledger_rows:
+        if str(row.get("costBucket") or "other") == "api_usage" and row.get("model"):
+            model_split[str(row.get("model") or "unknown")] += float(row.get("amountUsd") or 0)
     trend_end = end if target != date.today().strftime("%Y-%m") else today
     all_days = [start + timedelta(days=offset) for offset in range((trend_end - start).days + 1)]
     month_days = (end - start).days + 1
@@ -8866,10 +9574,21 @@ async def admin_costs_overview(request: Request, month: str | None = None, categ
     return _observability_envelope(
         {
             "month": target,
+            "summary": summary,
             "metrics": {
                 **forecast,
                 "dailyTarget": daily_target,
                 "verifiedSavings": verified_savings(actions, today),
+                **savings,
+                "monthToDateActual": round(actual, 2),
+                "monthForecast": round(float(forecast.get("forecast") or 0), 2),
+                "monthBudget": round(budget, 2) if budget is not None else None,
+                "monthVariance": (
+                    round(float(forecast.get("budgetDelta") or 0), 2)
+                    if forecast.get("budgetDelta") is not None
+                    else None
+                ),
+                "dailyAverage": round(float(forecast.get("dailyAverage") or 0), 2),
             },
             "trend": [
                 {
@@ -8879,6 +9598,7 @@ async def admin_costs_overview(request: Request, month: str | None = None, categ
                     "budget": budget_daily,
                     "api": value["api"],
                     "nonApi": value["nonApi"],
+                    "costBuckets": dict(bucket_daily.get(day.isoformat(), {})),
                 }
                 for day in all_days
                 for value in [daily.get(day.isoformat(), {"api": 0.0, "nonApi": 0.0})]
@@ -8887,16 +9607,225 @@ async def admin_costs_overview(request: Request, month: str | None = None, categ
                 {"model": key, "spend": value}
                 for key, value in sorted(model_split.items(), key=lambda item: item[1], reverse=True)
             ],
+            "providerSplit": [
+                {"provider": key, "spend": value}
+                for key, value in sorted(
+                    ((key, sum(float(row.get("amountUsd") or 0) for row in ledger_rows if str(row.get("provider") or "unknown") == key)) for key in {str(row.get("provider") or "unknown") for row in ledger_rows}),
+                    key=lambda item: item[1], reverse=True
+                )
+            ],
+            "bucketSplit": [
+                {"costBucket": key, "label": _COST_BUCKET_LABELS.get(key, key), "spend": value}
+                for key, value in sorted(
+                    ((key, sum(float(row.get("amountUsd") or 0) for row in ledger_rows if str(row.get("costBucket") or "other") == key)) for key in {str(row.get("costBucket") or "other") for row in ledger_rows}),
+                    key=lambda item: item[1], reverse=True
+                )
+            ],
+            "ledger": {"rows": ledger_rows, "total": len(ledger_rows)},
             "costItems": [_cost_item_payload(item) for item in items],
             "savingsActions": actions,
+            "composition": [
+                {
+                    "key": key,
+                    "label": _COST_BUCKET_LABELS.get(key, key),
+                    "amountUsd": round(value, 2),
+                }
+                for key, value in sorted(
+                    ((key, sum(float(row.get("amountUsd") or 0) for row in ledger_rows if str(row.get("costBucket") or "other") == key)) for key in {str(row.get("costBucket") or "other") for row in ledger_rows}),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )
+            ],
+            **_cost_summary_splits(ledger_rows),
             "filters": {
                 "categories": available_categories,
                 "models": available_models,
                 "vendors": available_vendors,
+                "providers": available_vendors,
+                "accounts": sorted({str(item.get("accountId") or "") for item in ledger_rows if item.get("accountId")}),
+                "costBuckets": available_cost_buckets,
+                "reconciliationStatuses": ["unreconciled", "pending", "matched", "partial", "exception", "waived"],
+                "recognitionStatuses": ["actual", "committed", "planned"],
             },
         },
-        coverage={"partial": False, "incomplete": not has_api_costs or not has_manual_costs},
+        coverage={
+            "partial": False,
+            "incomplete": not has_api_costs or not has_manual_costs or not api_dimensions_complete,
+            "sources": {"api": has_api_costs, "manual": has_manual_costs},
+            "missingDimensions": [] if api_dimensions_complete else ["provider"],
+        },
         source="费用控制账本",
+    )
+
+
+@app.get("/api/admin/costs/ledger")
+async def admin_costs_ledger(
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    cost_bucket: str = "",
+    category: str = "",
+    provider: str = "",
+    vendor: str = "",
+    model: str = "",
+    account_id: str = "",
+    reconciliation_status: str = "",
+    recognition_status: str = "",
+    page: int = 1,
+    page_size: int = 100,
+) -> dict[str, Any]:
+    require_platform_admin(request)
+    try:
+        end = date.fromisoformat(end_date) if end_date else date.today()
+        start = date.fromisoformat(start_date) if start_date else end.replace(day=1)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="日期格式应为 YYYY-MM-DD") from exc
+    if end < start:
+        raise HTTPException(status_code=400, detail="结束日期不能早于开始日期")
+    today = min(date.today(), end)
+    store = _admin_observability_store()
+    api_rows, api_dimensions_complete = await _cost_api_rows(
+        store, start, today, model=model, provider=provider, account_id=account_id
+    )
+    items = [item for item in await store.list_cost_items() if bool(item.get("enabled"))]
+    api_rows, items = _filter_cost_sources(
+        api_rows,
+        items,
+        category=category,
+        cost_bucket=cost_bucket,
+        model=model,
+        vendor=vendor,
+        provider=provider,
+        account_id=account_id,
+        reconciliation_status=reconciliation_status,
+        recognition_status=recognition_status,
+    )
+    ledger_rows = [_api_cost_ledger_row(row) for row in api_rows]
+    for item in items:
+        ledger_rows.extend(_manual_cost_ledger_rows(item, start, today))
+    ledger_rows.sort(key=lambda item: (str(item.get("date") or ""), float(item.get("amountUsd") or 0)), reverse=True)
+    page_size = max(1, min(500, page_size))
+    offset = (max(1, page) - 1) * page_size
+    total_pages = math.ceil(len(ledger_rows) / page_size) if ledger_rows else 0
+    return _observability_envelope(
+        {
+            "items": ledger_rows[offset : offset + page_size],
+            "total": len(ledger_rows),
+            "page": max(1, page),
+            "pageSize": page_size,
+            "totalPages": total_pages,
+            "startDate": start.isoformat(),
+            "endDate": end.isoformat(),
+        },
+        coverage={
+            "partial": False,
+            "incomplete": not bool(api_rows or items) or not api_dimensions_complete,
+            "missingDimensions": [] if api_dimensions_complete else ["provider"],
+        },
+        source="cost ledger",
+    )
+
+
+@app.get("/api/admin/costs/annual")
+async def admin_costs_annual(request: Request, year: int | None = None) -> dict[str, Any]:
+    require_platform_admin(request)
+    target_year = year or date.today().year
+    start = date(target_year, 1, 1)
+    end = date(target_year, 12, 31)
+    today = min(date.today(), end)
+    store = _admin_observability_store()
+    api_rows, api_dimensions_complete = await _cost_api_rows(store, start, today)
+    items = [item for item in await store.list_cost_items() if bool(item.get("enabled"))]
+    monthly: dict[str, float] = defaultdict(float)
+    for row in api_rows:
+        monthly[str(row.get("usage_date"))[:7]] += float(row.get("spend") or 0)
+    for item in items:
+        for row in _manual_cost_ledger_rows(item, start, today):
+            monthly[str(row.get("date") or "")[:7]] += float(row.get("amountUsd") or 0)
+    months: list[dict[str, Any]] = []
+    for month_no in range(1, 13):
+        month_start = date(target_year, month_no, 1)
+        next_start = date(target_year + 1, 1, 1) if month_no == 12 else date(target_year, month_no + 1, 1)
+        month_end = next_start - timedelta(days=1)
+        actual_month = min(today, month_end)
+        elapsed = max(0, (actual_month - month_start).days + 1) if month_start <= actual_month else 0
+        month_actual = monthly.get(month_start.strftime("%Y-%m"), 0.0)
+        month_forecast = (
+            month_actual + max(0, (month_end - month_start).days + 1 - elapsed) * (month_actual / elapsed)
+            if elapsed else None
+        )
+        months.append({
+            "month": month_start.strftime("%Y-%m"),
+            "actual": round(month_actual, 2),
+            "forecast": round(month_forecast, 2) if month_forecast is not None else None,
+            "daysElapsed": elapsed,
+            "daysInMonth": (month_end - month_start).days + 1,
+            "dailyAverage": round(month_actual / elapsed, 2) if elapsed else None,
+            "budgetUsd": None,
+        })
+    actual_total = sum(float(item["actual"]) for item in months)
+    forecast_total = sum(float(item["forecast"] or item["actual"]) for item in months)
+    budgets = await store.list_cost_budgets()
+    for month_item in months:
+        budget_record = next(
+            (item for item in budgets if str(item.get("month"))[:7] == month_item["month"]),
+            None,
+        )
+        if budget_record is not None:
+            month_item["budgetUsd"] = round(float(budget_record.get("budget_usd") or 0), 2)
+    budget_total = sum(
+        float(item.get("budgetUsd") or 0)
+        for item in months
+        if item.get("budgetUsd") is not None
+    )
+    budgeted_months = sum(1 for item in months if item.get("budgetUsd") is not None)
+    year_budget = (
+        round(budget_total / budgeted_months * 12, 2)
+        if budgeted_months
+        else (
+            round(float(env_float("COST_DEFAULT_MONTHLY_BUDGET_USD", 60000)) * 12, 2)
+        )
+    )
+    return _observability_envelope(
+        {
+            "year": target_year,
+            "months": months,
+            "actual": round(actual_total, 2),
+            "forecast": round(forecast_total, 2),
+            "actualToDate": round(actual_total, 2),
+            "yearToDateForecast": round(forecast_total, 2),
+            "budget": year_budget,
+            "budgetDelta": round(forecast_total - year_budget, 2) if year_budget is not None else None,
+            "annualTrend": [
+                {
+                    "month": item["month"],
+                    "actual": item["actual"],
+                    "forecast": item["forecast"],
+                    "budget": item["budgetUsd"],
+                }
+                for item in months
+            ],
+            "throughDate": today.isoformat(),
+        },
+        coverage={
+            "partial": False,
+            "incomplete": not bool(api_rows or items) or not api_dimensions_complete,
+            "missingDimensions": [] if api_dimensions_complete else ["provider"],
+        },
+        source="cost ledger",
+    )
+
+
+@app.get("/api/admin/costs/savings/overview")
+async def admin_costs_savings_overview(request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    today = date.today()
+    store = _admin_observability_store()
+    actions = [_savings_payload(item) for item in await store.list_savings_actions()]
+    return _observability_envelope(
+        {"metrics": _savings_totals(actions, today, date(today.year, 12, 31)), "actions": actions},
+        coverage={"partial": False, "incomplete": False},
+        source="cost ledger",
     )
 
 

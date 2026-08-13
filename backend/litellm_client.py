@@ -3630,6 +3630,101 @@ class LiteLLMClient:
         }, events=event_rows)
         return result, not truncated and not page_failed
 
+    async def incremental_events_from_logs(
+        self,
+        start_time: datetime,
+        end_time: datetime,
+        backend: LiteLLMBackend | None = None,
+        *,
+        page_size: int = 100,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Read one small UTC window and return normalized request events."""
+
+        backend = backend or self.backends[0]
+        await self._ensure_deployment_model_map(backend)
+        page_size = max(1, min(100, page_size))
+        start_text = start_time.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        end_text = end_time.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        page = 1
+        total_pages = 1
+        events: list[dict[str, Any]] = []
+        while page <= total_pages:
+            payload = await self.request_backend(
+                backend,
+                "GET",
+                "/spend/logs/v2",
+                params={
+                    "start_date": start_text,
+                    "end_date": end_text,
+                    "page": page,
+                    "page_size": page_size,
+                    "sort_by": "startTime",
+                    "sort_order": "asc",
+                },
+            )
+            if page == 1:
+                total_pages = max(
+                    1,
+                    _as_int(_first(payload, "total_pages", "totalPages", default=1)),
+                )
+            logs = _records(payload)
+            for log in logs:
+                normalized_log = dict(log)
+                metadata = _metadata_dict(log.get("metadata"))
+                if metadata:
+                    normalized_log["metadata"] = metadata
+                user_id = self._log_raw_user(log) or "unattributed"
+                source = backend.source or detect_source(log)
+                model = self._usage_model_name(log, backend=backend)
+                event_time = str(
+                    _first(log, "startTime", "start_time", "created_at", "date", default="")
+                    or ""
+                )
+                request_id = _clean_text(
+                    _first(log, "request_id", "requestId", "litellm_call_id", "id", default="")
+                )
+                if not request_id:
+                    request_id = hashlib.sha256(
+                        json.dumps(
+                            {
+                                "backend": backend.id,
+                                "eventTime": event_time,
+                                "userId": user_id,
+                                "model": model,
+                                "log": log,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            default=str,
+                        ).encode("utf-8")
+                    ).hexdigest()
+                event = self._empty_usage_row(
+                    _date_text_in_usage_timezone(event_time), source, model
+                )
+                event.update(self._log_usage_attribution(log))
+                event.update(
+                    {
+                        "requestId": request_id,
+                        "eventTime": event_time,
+                        "_userId": user_id,
+                        "provider": _clean_text(
+                            _first(log, "custom_llm_provider", "provider", "llm_provider", default="")
+                        ),
+                        "modelGroup": _clean_text(
+                            _first(log, "model_group", "modelGroup", default="")
+                        ),
+                        "modelId": _clean_text(_first(log, "model_id", "modelId", default="")),
+                        "apiBase": _clean_text(_first(log, "api_base", "apiBase", default="")),
+                        "startTime": _first(log, "startTime", "start_time", default=None),
+                        "endTime": _first(log, "endTime", "end_time", default=None),
+                    }
+                )
+                event.update(normalize_event(normalized_log))
+                self._add_log_to_row(event, log)
+                events.append(event)
+            page += 1
+        return events, page - 1 == total_pages
+
     async def stability_rows_from_logs(
         self,
         start_date: str,

@@ -135,6 +135,9 @@ let isAdminLoading = false;
 let isDepartmentLoading = false;
 let isTeamLoading = false;
 let isTeamMemberLoading = false;
+let usageAutoRefreshTimer = null;
+let usageAutoRefreshPromise = null;
+let lastUsageAutoRefreshAt = 0;
 let organizationSnapshot = null;
 let organizationMembers = [];
 let organizationMemberTotal = 0;
@@ -199,6 +202,35 @@ let costOverview = null;
 let costBudgets = [];
 let isStabilityLoading = false;
 let isCostOverviewLoading = false;
+let stabilityLoadError = "";
+let costOverviewLoadError = "";
+let stabilityOverviewRequestId = 0;
+let costOverviewRequestId = 0;
+let stabilityOverviewController = null;
+let costOverviewController = null;
+let stabilityScenarioRequestId = 0;
+let costLedgerRequestId = 0;
+let stabilityDrawerReturnFocus = null;
+let costDrawerReturnFocus = null;
+let stabilityScenarioState = {
+  page: 1,
+  pageSize: 20,
+  total: 0,
+  items: [],
+  filters: { model: "", scenario: "", errorCode: "" },
+  loading: false,
+  error: "",
+};
+let costLedgerState = {
+  page: 1,
+  pageSize: 20,
+  total: 0,
+  items: [],
+  filters: {},
+  loading: false,
+  error: "",
+  selectedId: "",
+};
 let stabilityFiltersOpen = false;
 let costFiltersOpen = false;
 // 登录身份落地后立即揭示已知入口；异步权限结果随后只补充团队/企业入口。
@@ -752,7 +784,8 @@ function freshnessText(freshness) {
   const parsed = new Date(freshness.lastSyncedAt);
   if (Number.isNaN(parsed.getTime())) return "数据更新时间：未知";
   const timeText = parsed.toLocaleString("zh-CN", { hour12: false });
-  return `${freshness.stale ? "数据更新时间（后台同步中）" : "数据更新时间"}：${timeText}`;
+  const prefix = freshness.source === "realtime" ? "实时数据更新" : "数据更新时间";
+  return `${freshness.stale || freshness.degraded ? `${prefix}（同步延迟）` : prefix}：${timeText}`;
 }
 
 function usageStatusState(freshness = null, dataQuality = null, coverage = null) {
@@ -775,8 +808,8 @@ function usageStatusState(freshness = null, dataQuality = null, coverage = null)
   if (freshness?.stale) {
     return {
       tone: "warning",
-      title: "数据等待刷新",
-      description: "当前仍展示最近一次已提交快照；同步完成后页面会读取到新版本。",
+      title: "同步延迟",
+      description: "当前继续展示最近一次可用数据，不会用空值或 0 覆盖；恢复后页面会自动更新。",
     };
   }
   return null;
@@ -5862,9 +5895,8 @@ function syncNavigationVisibility() {
     button.classList.toggle("hidden", isCustomer);
   });
   el("billingTab")?.classList.toggle("hidden", !canUseBillingSidebar);
-  const canUseObservability = Boolean(isPlatformAdmin() && currentUser?.observabilityDashboardsEnabled);
-  el("stabilityTab")?.classList.toggle("hidden", !canUseObservability);
-  el("costControlTab")?.classList.toggle("hidden", !canUseObservability);
+  el("stabilityTab")?.classList.toggle("hidden", !canViewStability());
+  el("costControlTab")?.classList.toggle("hidden", !canViewCosts());
   document.querySelectorAll('[data-global-page="models"]').forEach((button) => {
     button.classList.toggle("hidden", isCustomer);
   });
@@ -7956,7 +7988,8 @@ function switchView(view) {
   if (view === "organization-tokens" && !canViewOrganizationTokens()) view = "dashboard";
   if (isOrganizationCustomerIdentity() && (view === "keys" || view === "models")) view = "dashboard";
   if (view === "billing" && !canAccessBillingView()) view = "dashboard";
-  if (["stability", "cost-control"].includes(view) && !(isPlatformAdmin() && currentUser?.observabilityDashboardsEnabled)) view = "dashboard";
+  if (view === "stability" && !canViewStability()) view = "dashboard";
+  if (view === "cost-control" && !canViewCosts()) view = "dashboard";
   if (currentView === "keys" && view !== "keys") clearRevealedKeys();
   // 离开充值页就停掉支付轮询与二维码，避免后台空转和收款码久留在页面上。
   if (currentView === "billing" && view !== "billing") {
@@ -8050,6 +8083,39 @@ function switchView(view) {
   }
 }
 
+function observabilityCapabilities() {
+  const explicit = currentUser?.observabilityCapabilities;
+  if (explicit && typeof explicit === "object") return explicit;
+  const legacy = Boolean(isPlatformAdmin() && currentUser?.observabilityDashboardsEnabled);
+  return {
+    stabilityView: legacy,
+    stabilityManage: legacy,
+    costView: legacy,
+    costManage: legacy,
+    costReconcile: legacy,
+  };
+}
+
+function canViewStability() {
+  return Boolean(observabilityCapabilities().stabilityView);
+}
+
+function canManageStability() {
+  return Boolean(observabilityCapabilities().stabilityManage);
+}
+
+function canViewCosts() {
+  return Boolean(observabilityCapabilities().costView);
+}
+
+function canManageCosts() {
+  return Boolean(observabilityCapabilities().costManage);
+}
+
+function canReconcileCosts() {
+  return Boolean(observabilityCapabilities().costReconcile);
+}
+
 async function loadCurrentViewData(forceRefresh = false) {
   if (currentView === "customers") return loadCustomerOrganizations();
   if (currentView === "keys") {
@@ -8067,6 +8133,35 @@ async function loadCurrentViewData(forceRefresh = false) {
   if (currentView === "organization") return loadOrganizationData();
   if (currentView === "organization-tokens") return loadOrganizationTokens();
   return loadDashboardData(forceRefresh);
+}
+
+function isUsageView(view = currentView) {
+  return ["dashboard", "admin", "department", "team"].includes(view);
+}
+
+async function refreshVisibleUsageData() {
+  if (document.hidden || !currentUser || !isUsageView() || usageAutoRefreshPromise) return;
+  usageAutoRefreshPromise = (async () => {
+    try {
+      if (currentView === "team" && selectedTeamEmployee) {
+        await Promise.all([
+          loadTeamMemberData(selectedTeamEmployee, true, false),
+          loadTeamRankingData(true),
+        ]);
+      } else {
+        await loadCurrentViewData(false);
+      }
+      lastUsageAutoRefreshAt = Date.now();
+    } finally {
+      usageAutoRefreshPromise = null;
+    }
+  })();
+  return usageAutoRefreshPromise;
+}
+
+function scheduleUsageAutoRefresh() {
+  if (usageAutoRefreshTimer) clearInterval(usageAutoRefreshTimer);
+  usageAutoRefreshTimer = setInterval(refreshVisibleUsageData, 30_000);
 }
 
 function observabilityPercent(value) {
@@ -8096,8 +8191,12 @@ function observabilityFilterConfig(scope) {
     activeId: "costActiveFilters",
     filters: [
       { id: "costCategory", label: "成本项" },
+      { id: "costBucket", label: "成本桶" },
       { id: "costModel", label: "模型" },
       { id: "costVendor", label: "来源" },
+      { id: "costProvider", label: "供应渠道" },
+      { id: "costAccount", label: "账号" },
+      { id: "costReconciliation", label: "对账状态" },
     ],
   };
 }
@@ -8162,34 +8261,117 @@ function clearObservabilityFilter(scope, id) {
   else loadCostOverview();
 }
 
+function currentStabilityWindow() {
+  const days = Number(el("stabilityRange")?.value || 7);
+  const end = new Date();
+  const start = new Date(end);
+  start.setDate(end.getDate() - days + 1);
+  const day = (value) => value.toISOString().slice(0, 10);
+  return { startDate: day(start), endDate: day(end) };
+}
+
+function currentCostMonth() {
+  return el("costMonth")?.value || new Date().toISOString().slice(0, 7);
+}
+
+function observabilityReasonCopy(payload, scope) {
+  if (scope === "stability" && isStabilityLoading) {
+    return { title: "正在加载稳定性数据", detail: "正在读取当前窗口的事件与覆盖状态。", action: "" };
+  }
+  if (scope === "cost" && isCostOverviewLoading) {
+    return { title: "正在加载费用数据", detail: "正在汇总成本账本、预算与节省动作。", action: "" };
+  }
+  if (scope === "stability" && stabilityLoadError) {
+    return { title: "稳定性数据加载失败", detail: stabilityLoadError, action: "重新加载" };
+  }
+  if (scope === "cost" && costOverviewLoadError) {
+    return { title: "费用数据加载失败", detail: costOverviewLoadError, action: "重新加载" };
+  }
+  const coverage = payload?.coverage || {};
+  const reasons = Array.isArray(coverage.missingReasons) ? coverage.missingReasons : [];
+  const reasonText = {
+    not_synced: "尚未完成数据同步",
+    partial_scan: "同步仍在进行，当前窗口只有部分数据",
+    backfill_pending: "所选窗口早于已回填范围",
+    sync_error: "数据同步出现异常",
+    no_events_or_filter_match: "当前窗口无事件或筛选无结果",
+    field_missing: "上游记录缺少必要字段",
+  };
+  if (reasons.length) {
+    return {
+      title: scope === "stability" ? "稳定性数据覆盖提示" : "费用数据覆盖提示",
+      detail: reasons.map((item) => reasonText[item] || item).join("；"),
+      action: scope === "stability" ? "重新加载" : "查看明细",
+    };
+  }
+  if (coverage.incomplete || coverage.partial) {
+    return {
+      title: scope === "stability" ? "当前窗口覆盖不足" : "当前月份覆盖不足",
+      detail: scope === "stability"
+        ? "缺失字段不会按 0 计算；兜底指标需要上游显式事件。"
+        : "没有记录的成本维度会保留为暂无数据，不会伪造为 0。",
+      action: scope === "stability" ? "重新加载" : "查看明细",
+    };
+  }
+  return null;
+}
+
+function renderObservabilityQuality(elementId, payload, scope) {
+  const target = el(elementId);
+  if (!target) return;
+  const state = observabilityReasonCopy(payload, scope);
+  target.classList.toggle("hidden", !state);
+  target.classList.toggle("danger", Boolean((scope === "stability" && stabilityLoadError) || (scope === "cost" && costOverviewLoadError)));
+  if (!state) {
+    target.innerHTML = "";
+    return;
+  }
+  target.innerHTML = `<span class="operational-status-icon" aria-hidden="true">!</span><div><strong>${escapeHtml(state.title)}</strong><p>${escapeHtml(state.detail)}</p></div>${state.action ? `<button class="ghost-btn operational-status-action" type="button" data-observability-retry="${scope}">${escapeHtml(state.action)}</button>` : ""}`;
+}
+
+function stabilityMetricValue(overview, primary, legacy = null) {
+  const value = overview?.[primary];
+  return value !== undefined ? value : overview?.[legacy];
+}
+
 function renderStabilityOverview() {
   const payload = stabilityOverview;
-  if (!payload) return;
+  if (!payload) {
+    renderObservabilityQuality("stabilityQuality", payload, "stability");
+    return;
+  }
   const data = payload.data || {};
   const overview = data.overview || {};
+  const finalFailureRate = stabilityMetricValue(overview, "finalRequestFailureRate", "userVisibleFailureRate");
+  const retryCount = stabilityMetricValue(overview, "retryAttemptCount", "retryCount");
+  const retryRecoveryRate = stabilityMetricValue(overview, "retryRecoveryRate");
+  const ttft = stabilityMetricValue(overview, "ttftP95Ms");
   el("stabilityMetrics").innerHTML = [
-    ["用户最终失败率", observabilityPercent(overview.userVisibleFailureRate)],
-    ["上游异常 / 重试", `${overview.upstreamExceptionCount ?? "-"} / ${overview.retryCount ?? "-"}`],
-    ["重试恢复率", observabilityPercent(overview.retryRecoveryRate)],
-    ["TTFT P95", overview.ttftP95Ms == null ? "暂无数据" : `${(overview.ttftP95Ms / 1000).toFixed(2)}s`],
+    ["用户最终失败率", observabilityPercent(finalFailureRate)],
+    ["上游异常 / 重试", `${overview.upstreamExceptionCount == null ? "暂无数据" : overview.upstreamExceptionCount} / ${retryCount == null ? "暂无数据" : retryCount}`],
+    ["重试后最终成功率", observabilityPercent(retryRecoveryRate)],
+    ["TTFT P95", ttft == null ? "暂无数据" : `${(ttft / 1000).toFixed(2)}s`],
   ].map(([label, value]) => `<article class="observability-metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`).join("");
   const daily = data.daily || [];
-  const max = Math.max(1, ...daily.flatMap((item) => [Number(item.upstreamExceptionCount || 0), Number(item.userVisibleFailureCount || 0)]));
+  const max = Math.max(1, ...daily.flatMap((item) => [Number(item.upstreamExceptionCount || 0), Number(item.finalRequestFailureCount ?? item.userVisibleFailureCount ?? 0)]));
   el("stabilityTrend").innerHTML = daily.length ? daily.map((item) => {
     const upstream = item.upstreamExceptionCount;
-    const failures = item.userVisibleFailureCount;
+    const failures = item.finalRequestFailureCount ?? item.userVisibleFailureCount;
     return `<div class="observability-bar" title="${escapeHtml(item.date)} · 上游异常 ${upstream ?? "暂无数据"} · 用户最终失败 ${failures ?? "暂无数据"}"><span class="observability-bar-segment" style="height:${upstream == null ? 3 : Math.max(3, Number(upstream) / max * 150)}px"></span><span class="observability-bar-segment secondary" style="height:${failures == null ? 3 : Math.max(3, Number(failures) / max * 150)}px"></span><small>${escapeHtml(String(item.date).slice(5))}</small></div>`;
   }).join("") : `<p class="empty">暂无可用稳定性事件</p>`;
   const stabilityRankings = data.modelRankings || [];
   el("stabilityRanking").classList.toggle("is-compact", stabilityRankings.length > 0 && stabilityRankings.length <= 4);
-  el("stabilityRanking").innerHTML = stabilityRankings.map((item, index) => `<div class="observability-rank-row"><strong>${index + 1}</strong><div><b>${escapeHtml(item.model)}</b><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Math.max(3, 100 - Math.min(100, Number(item.userVisibleFailureRate || 0) * 1000))}%"></div></div></div><span class="chip ${item.state === "稳定" ? "green" : item.state === "观察" ? "gold" : "red"}">${escapeHtml(item.state)}</span></div>`).join("") || `<p class="empty">暂无模型样本</p>`;
+  el("stabilityRanking").innerHTML = stabilityRankings.map((item, index) => {
+    const failureRate = item.finalRequestFailureRate ?? item.userVisibleFailureRate;
+    const retryRate = item.retryAttemptRate;
+    const itemTtft = item.ttftP95Ms;
+    return `<button class="observability-rank-row observability-rank-row-button" type="button" data-stability-model="${escapeHtml(item.model || "")}"><strong>${index + 1}</strong><div><b>${escapeHtml(item.model)}</b><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Math.max(3, 100 - Math.min(100, Number(failureRate || 0) * 1000))}%"></div></div><small class="observability-rank-meta">失败 ${escapeHtml(observabilityPercent(failureRate))} · 重试 ${escapeHtml(observabilityPercent(retryRate))} · TTFT ${itemTtft == null ? "暂无数据" : `${Math.round(itemTtft)}ms`}</small></div><span class="chip ${item.state === "稳定" ? "green" : item.state === "观察" ? "gold" : "red"}">${escapeHtml(item.state)}</span></button>`;
+  }).join("") || `<p class="empty">暂无模型样本</p>`;
   el("stabilityScenarioBody").innerHTML = (data.topScenarios || []).map((item) => {
-    const sample = (item.sampleRequests || [])[0] || { requestId: (item.sampleRequestIds || [])[0], backendId: "" };
-    return `<tr><td>${escapeHtml(item.scenario)}</td><td>${escapeHtml(item.model || "-")}</td><td>${escapeHtml(item.errorCode || "-")}</td><td>${item.count}</td><td>${escapeHtml(observabilityPercent(item.userVisibleFailureRate))}</td><td>${sample.requestId ? `<button class="ghost-btn" type="button" data-stability-request="${escapeHtml(sample.requestId)}" data-stability-backend="${escapeHtml(sample.backendId || "")}">查看样本</button>` : "-"}</td></tr>`;
+    const failureRate = item.finalRequestFailureRate ?? item.userVisibleFailureRate;
+    return `<tr><td>${escapeHtml(item.scenario)}</td><td>${escapeHtml(item.model || "-")}</td><td>${escapeHtml(item.errorCode || "-")}</td><td>${item.count}</td><td>${escapeHtml(observabilityPercent(failureRate))}</td><td><button class="ghost-btn" type="button" data-stability-scenario="${escapeHtml(item.scenario || "")}" data-stability-model="${escapeHtml(item.model || "")}" data-stability-error-code="${escapeHtml(item.errorCode || "")}">查看样本（${item.count || 0}）</button></td></tr>`;
   }).join("") || `<tr><td colspan="6" class="empty">暂无异常场景</td></tr>`;
-  const incomplete = Boolean(payload.coverage?.incomplete || payload.coverage?.partial);
-  el("stabilityQuality").classList.toggle("hidden", !incomplete);
-  el("stabilityQuality").textContent = incomplete ? "当前窗口覆盖不足，缺失字段不会按 0 计算。" : "";
+  renderObservabilityQuality("stabilityQuality", payload, "stability");
   const models = [...new Set((data.modelRankings || []).map((item) => item.model))];
   const select = el("stabilityModel");
   const selected = select.value;
@@ -8198,34 +8380,52 @@ function renderStabilityOverview() {
   renderObservabilityFilterState("stability");
 }
 
-async function loadStabilityOverview() {
-  if (!isPlatformAdmin() || isStabilityLoading) return;
+async function loadStabilityOverview(forceRefresh = false) {
+  if (!canViewStability()) return;
+  const requestId = ++stabilityOverviewRequestId;
+  stabilityOverviewController?.abort();
+  stabilityOverviewController = new AbortController();
   isStabilityLoading = true;
+  stabilityLoadError = "";
+  renderObservabilityQuality("stabilityQuality", stabilityOverview, "stability");
   try {
-    const days = Number(el("stabilityRange")?.value || 7);
-    const end = new Date();
-    const start = new Date(end);
-    start.setDate(end.getDate() - days + 1);
-    const day = (value) => value.toISOString().slice(0, 10);
+    const { startDate, endDate } = currentStabilityWindow();
     const model = el("stabilityModel")?.value || "";
-    stabilityOverview = await api(`/api/admin/stability/overview?start_date=${day(start)}&end_date=${day(end)}&model=${encodeURIComponent(model)}`);
+    const nextOverview = await api(`/api/admin/stability/overview?start_date=${startDate}&end_date=${endDate}&model=${encodeURIComponent(model)}${forceRefresh ? "&refresh=1" : ""}`, { signal: stabilityOverviewController.signal });
+    if (requestId !== stabilityOverviewRequestId) return;
+    stabilityOverview = nextOverview;
     renderStabilityOverview();
   } catch (error) {
-    showToast(error.message || "稳定性看板加载失败");
+    if (error.name !== "AbortError" && requestId === stabilityOverviewRequestId) {
+      stabilityLoadError = error.message || "稳定性看板加载失败";
+      renderObservabilityQuality("stabilityQuality", stabilityOverview, "stability");
+      showToast(stabilityLoadError);
+    }
   } finally {
-    isStabilityLoading = false;
+    if (requestId === stabilityOverviewRequestId) isStabilityLoading = false;
   }
 }
 
 function renderCostOverview() {
-  if (!costOverview) return;
+  if (!costOverview) {
+    renderObservabilityQuality("costQuality", costOverview, "cost");
+    return;
+  }
   const data = costOverview.data || {};
   const metrics = data.metrics || {};
+  const annual = data.annual || {};
+  document.querySelectorAll("#costControlView [data-cost-manage]").forEach((node) => node.classList.toggle("hidden", !canManageCosts()));
+  document.querySelectorAll("#costControlView input, #costControlView textarea, #costControlView select").forEach((node) => {
+    if (node.closest(".observability-filter-bar") || node.closest(".observability-filter-panel")) return;
+    if (node.closest("[data-cost-manage]")) node.disabled = !canManageCosts();
+  });
   el("costMetrics").innerHTML = [
-    ["实际累计支出", observabilityMoney(metrics.actual)],
-    ["日均成本", observabilityMoney(metrics.dailyAverage)],
-    ["预测支出", observabilityMoney(metrics.forecast)],
-    ["累计已验证节省", observabilityMoney(metrics.verifiedSavings)],
+    ["当月实际", observabilityMoney(metrics.monthToDateActual ?? metrics.actual)],
+    ["年度累计实际", observabilityMoney(metrics.yearToDateActual ?? annual.actualToDate)],
+    ["全年预测", observabilityMoney(metrics.yearForecast ?? annual.forecast ?? metrics.forecast)],
+    ["已实现节省", observabilityMoney(metrics.realizedSavingsToDate ?? metrics.verifiedSavings)],
+    ["未来预计节省", observabilityMoney(metrics.forecastSavingsRemaining)],
+    ["日均目标", observabilityMoney(metrics.dailyTarget)],
   ].map(([label, value]) => `<article class="observability-metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`).join("");
   const trend = data.trend || [];
   const max = Math.max(1, ...trend.map((item) => Math.max(Number(item.actual || 0), Number(item.forecast || 0), Number(item.budget || 0))));
@@ -8235,26 +8435,28 @@ function renderCostOverview() {
     const budgetDaily = Number(item.budget || 0);
     return `<div class="observability-bar" title="${escapeHtml(item.date)} · 实际 ${observabilityMoney(actual)} · 预测 ${observabilityMoney(projected)} · 日预算 ${observabilityMoney(budgetDaily)}"><span class="observability-bar-segment" style="height:${Math.max(3, actual / max * 150)}px"></span><span class="observability-bar-segment forecast" style="height:${Math.max(3, projected / max * 150)}px"></span><span style="position:absolute;left:0;right:0;bottom:${Math.min(150, budgetDaily / max * 150)}px;border-top:2px solid #c23b45"></span><small>${escapeHtml(String(item.date).slice(5))}</small></div>`;
   }).join("") : `<p class="empty">本月暂无成本数据</p>`;
-  const api = trend.reduce((sum, item) => sum + Number(item.api || 0), 0);
-  const nonApi = trend.reduce((sum, item) => sum + Number(item.nonApi || 0), 0);
-  const total = Math.max(1, api + nonApi);
-  el("costComposition").innerHTML = [["API Token", api], ["非 API 成本", nonApi]].map(([label, value]) => `<div class="observability-composition-row"><span>${label}</span><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${value / total * 100}%"></div></div><strong>${observabilityMoney(value)}</strong></div>`).join("");
-  el("savingsActionList").innerHTML = (data.savingsActions || []).map((item) => `<article class="observability-action"><div><strong>${escapeHtml(item.name)}</strong><p class="hint">${escapeHtml(item.owner || "未指定负责人")} · ${escapeHtml(item.status)}</p></div><div class="observability-table-actions"><span>${item.status === "verified" ? `${observabilityMoney(Math.max(0, Number(item.baselineDailyCost) - Number(item.verifiedDailyCost || 0)))}/日` : "尚未计入节省"}</span><button class="ghost-btn" type="button" data-edit-savings-action="${escapeHtml(item.id)}">编辑</button></div></article>`).join("") || `<p class="empty">暂无降本动作</p>`;
+  const legacyApi = trend.reduce((sum, item) => sum + Number(item.api || 0), 0);
+  const legacyNonApi = trend.reduce((sum, item) => sum + Number(item.nonApi || 0), 0);
+  const backendComposition = Array.isArray(data.composition) && data.composition.length ? data.composition : data.bucketSplit;
+  const composition = Array.isArray(backendComposition) && backendComposition.length
+    ? backendComposition.map((item) => ({ key: item.key || item.costBucket || "other", label: item.label || item.costBucket || "其他", amountUsd: item.amountUsd ?? item.spend }))
+    : [["api_usage", "API Token", legacyApi], ["other", "非 API 成本", legacyNonApi]].map(([key, label, amountUsd]) => ({ key, label, amountUsd }));
+  const total = Math.max(1, composition.reduce((sum, item) => sum + Number(item.amountUsd || 0), 0));
+  el("costComposition").innerHTML = composition.map((item) => `<button class="observability-composition-row" type="button" data-cost-ledger-filter="${escapeHtml(item.key)}" aria-label="查看${escapeHtml(item.label)}费用明细"><span>${escapeHtml(item.label)}</span><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Number(item.amountUsd || 0) / total * 100}%"></div></div><strong>${observabilityMoney(item.amountUsd)}</strong></button>`).join("");
+  el("savingsActionList").innerHTML = (data.savingsActions || []).map((item) => `<article class="observability-action"><div><strong>${escapeHtml(item.name)}</strong><p class="hint">${escapeHtml(item.owner || "未指定负责人")} · ${escapeHtml(item.status)}${item.evidenceUrl ? " · 有证据" : " · 缺证据"}</p></div><div class="observability-table-actions"><span>${item.status === "verified" ? `${observabilityMoney(item.realizedSavingsToDate ?? Math.max(0, Number(item.baselineDailyCost) - Number(item.verifiedDailyCost || 0)))}/日` : item.forecastSavingsRemaining == null ? "尚未计入节省" : `预计 ${observabilityMoney(item.forecastSavingsRemaining)}`}</span>${canManageCosts() ? `<button class="ghost-btn" type="button" data-edit-savings-action="${escapeHtml(item.id)}">编辑</button>` : "只读"}</div></article>`).join("") || `<p class="empty">暂无降本动作</p>`;
   const split = data.modelSplit || [];
   const maxModelSpend = Math.max(1, ...split.map((item) => Number(item.spend || 0)));
   el("costModelSplit").classList.toggle("is-compact", split.length > 0 && split.length <= 4);
-  el("costModelSplit").innerHTML = split.map((item) => `<div class="observability-model-row"><strong>${escapeHtml(item.model)}</strong><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Math.max(3, Number(item.spend || 0) / maxModelSpend * 100)}%"></div></div><span>${observabilityMoney(item.spend)}</span></div>`).join("") || `<p class="empty">暂无模型成本</p>`;
+  el("costModelSplit").innerHTML = split.map((item) => `<button class="observability-model-row" type="button" data-cost-ledger-model="${escapeHtml(item.model || "")}" aria-label="查看${escapeHtml(item.model || "模型")}费用明细"><strong>${escapeHtml(item.model)}</strong><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Math.max(3, Number(item.spend || 0) / maxModelSpend * 100)}%"></div></div><span>${observabilityMoney(item.spend)}</span></button>`).join("") || `<p class="empty">暂无模型成本</p>`;
   const targetMonth = String(data.month || el("costMonth")?.value || "").slice(0, 7);
   const budget = costBudgets.find((item) => String(item.month).slice(0, 7) === targetMonth);
   if (el("costBudgetAmount")) el("costBudgetAmount").value = String(budget?.budgetUsd ?? metrics.budget ?? "");
   if (el("costDailyTarget")) el("costDailyTarget").value = String(budget?.dailyTargetUsd ?? metrics.dailyTarget ?? "");
   if (el("costBudgetDelta")) el("costBudgetDelta").textContent = metrics.budgetDelta == null ? "暂无预算差额" : `预测与预算差额：${observabilityMoney(metrics.budgetDelta)}`;
-  el("costItemBody").innerHTML = (data.costItems || []).map((item) => `<tr><td>${escapeHtml(item.name)}</td><td>${escapeHtml(item.category)}</td><td>${escapeHtml(item.vendor || item.businessScope || "-")}</td><td>${escapeHtml(item.serviceStartDate)} ～ ${escapeHtml(item.serviceEndDate)}</td><td>${observabilityMoney(item.amountUsd)} <span class="hint">${escapeHtml(item.currency)}</span></td><td>${item.enabled ? "启用" : "停用"}</td><td><button class="ghost-btn" type="button" data-edit-cost-item="${escapeHtml(item.id)}">编辑</button><button class="danger-outline-btn" type="button" data-delete-cost-item="${escapeHtml(item.id)}">删除</button></td></tr>`).join("") || `<tr><td colspan="7" class="empty">暂无人工成本项</td></tr>`;
-  const incomplete = Boolean(costOverview.coverage?.incomplete || costOverview.coverage?.partial);
-  el("costQuality").classList.toggle("hidden", !incomplete);
-  el("costQuality").textContent = incomplete ? "当前月份尚无完整 API 或人工成本数据。" : "";
+  el("costItemBody").innerHTML = (data.costItems || []).map((item) => `<tr><td>${escapeHtml(item.name)}</td><td>${escapeHtml(item.costBucket || item.category)}</td><td>${escapeHtml(item.accountName || item.provider || item.vendor || item.businessScope || "-")}</td><td>${escapeHtml(item.serviceStartDate)} ～ ${escapeHtml(item.serviceEndDate)}</td><td>${observabilityMoney(item.amountUsd)} <span class="hint">${escapeHtml(item.currency)}</span></td><td>${escapeHtml(item.reconciliationStatus || (item.enabled ? "未对账" : "停用"))}</td><td>${canManageCosts() ? `<button class="ghost-btn" type="button" data-edit-cost-item="${escapeHtml(item.id)}">编辑</button><button class="danger-outline-btn" type="button" data-delete-cost-item="${escapeHtml(item.id)}">删除</button>` : "只读"}</td></tr>`).join("") || `<tr><td colspan="7" class="empty">暂无人工成本项</td></tr>`;
+  renderObservabilityQuality("costQuality", costOverview, "cost");
   const filters = data.filters || {};
-  [["costCategory", "全部成本项", filters.categories || []], ["costModel", "全部模型", filters.models || []], ["costVendor", "全部来源", filters.vendors || []]].forEach(([id, label, options]) => {
+  [["costCategory", "全部成本项", filters.categories || []], ["costBucket", "全部成本桶", filters.costBuckets || filters.buckets || []], ["costModel", "全部模型", filters.models || []], ["costVendor", "全部来源", filters.vendors || []], ["costProvider", "全部供应渠道", filters.providers || []], ["costAccount", "全部账号", filters.accounts || []], ["costReconciliation", "全部对账状态", filters.reconciliationStatuses || []]].forEach(([id, label, options]) => {
     const select = el(id);
     if (!select) return;
     const selected = select.value;
@@ -8264,25 +8466,115 @@ function renderCostOverview() {
   renderObservabilityFilterState("cost");
 }
 
-async function loadCostOverview() {
-  if (!isPlatformAdmin() || isCostOverviewLoading) return;
+async function loadCostOverview(forceRefresh = false) {
+  if (!canViewCosts()) return;
+  const requestId = ++costOverviewRequestId;
+  costOverviewController?.abort();
+  costOverviewController = new AbortController();
   isCostOverviewLoading = true;
+  costOverviewLoadError = "";
   try {
-    const month = el("costMonth")?.value || new Date().toISOString().slice(0, 7);
+    const month = currentCostMonth();
     if (el("costMonth") && !el("costMonth").value) el("costMonth").value = month;
     const category = el("costCategory")?.value || "";
+    const costBucket = el("costBucket")?.value || "";
     const model = el("costModel")?.value || "";
     const vendor = el("costVendor")?.value || "";
-    [costOverview, costBudgets] = await Promise.all([
-      api(`/api/admin/costs/overview?month=${encodeURIComponent(month)}&category=${encodeURIComponent(category)}&model=${encodeURIComponent(model)}&vendor=${encodeURIComponent(vendor)}`),
+    const provider = el("costProvider")?.value || "";
+    const accountId = el("costAccount")?.value || "";
+    const reconciliationStatus = el("costReconciliation")?.value || "";
+    const query = `month=${encodeURIComponent(month)}&category=${encodeURIComponent(category)}&cost_bucket=${encodeURIComponent(costBucket)}&model=${encodeURIComponent(model)}&vendor=${encodeURIComponent(vendor)}&provider=${encodeURIComponent(provider)}&account_id=${encodeURIComponent(accountId)}&reconciliation_status=${encodeURIComponent(reconciliationStatus)}${forceRefresh ? "&refresh=1" : ""}`;
+    const [nextOverview, nextBudgets, annualPayload] = await Promise.all([
+      api(`/api/admin/costs/overview?${query}`, { signal: costOverviewController.signal }),
       api("/api/admin/costs/budgets").then((payload) => payload?.data || []),
+      api(`/api/admin/costs/annual?year=${encodeURIComponent(month.slice(0, 4))}`).catch(() => null),
     ]);
+    if (requestId !== costOverviewRequestId) return;
+    costOverview = annualPayload?.data
+      ? { ...nextOverview, data: { ...(nextOverview.data || {}), annual: annualPayload.data, metrics: { ...(nextOverview.data?.metrics || {}), yearToDateActual: nextOverview.data?.metrics?.yearToDateActual ?? annualPayload.data.actual, yearForecast: nextOverview.data?.metrics?.yearForecast ?? annualPayload.data.forecast } } }
+      : nextOverview;
+    costBudgets = nextBudgets;
     renderCostOverview();
   } catch (error) {
-    showToast(error.message || "费用看板加载失败");
+    if (error.name !== "AbortError" && requestId === costOverviewRequestId) {
+      costOverviewLoadError = error.message || "费用看板加载失败";
+      renderObservabilityQuality("costQuality", costOverview, "cost");
+      showToast(costOverviewLoadError);
+    }
   } finally {
-    isCostOverviewLoading = false;
+    if (requestId === costOverviewRequestId) isCostOverviewLoading = false;
   }
+}
+
+function focusDrawer(drawerId, returnFocus = document.activeElement) {
+  const drawer = el(drawerId);
+  if (!drawer) return;
+  drawer.classList.remove("hidden");
+  drawer.setAttribute("aria-hidden", "false");
+  const backdrop = el(drawerId === "stabilityDrawer" ? "stabilityDrawerBackdrop" : "costDetailDrawerBackdrop");
+  backdrop?.classList.remove("hidden");
+  backdrop?.setAttribute("aria-hidden", "false");
+  if (returnFocus) {
+    if (drawerId === "stabilityDrawer") stabilityDrawerReturnFocus = returnFocus;
+    if (drawerId === "costDetailDrawer") costDrawerReturnFocus = returnFocus;
+  }
+  const first = drawer.querySelector("button, [href], input, select, textarea");
+  first?.focus();
+}
+
+function closeStabilityDrawer() {
+  const drawer = el("stabilityDrawer");
+  if (!drawer) return;
+  drawer.classList.add("hidden");
+  drawer.setAttribute("aria-hidden", "true");
+  el("stabilityDrawerBackdrop")?.classList.add("hidden");
+  el("stabilityDrawerBackdrop")?.setAttribute("aria-hidden", "true");
+  stabilityDrawerReturnFocus?.focus?.();
+  stabilityDrawerReturnFocus = null;
+}
+
+function renderStabilityScenarioSamples() {
+  const list = el("stabilityRequestList");
+  if (!list) return;
+  if (stabilityScenarioState.loading) {
+    list.innerHTML = '<p class="empty" aria-live="polite">正在加载样本…</p>';
+    return;
+  }
+  if (stabilityScenarioState.error) {
+    list.innerHTML = `<div class="operational-status danger"><div><strong>样本加载失败</strong><p>${escapeHtml(stabilityScenarioState.error)}</p></div><button class="ghost-btn" type="button" data-stability-scenario-retry>重试</button></div>`;
+    return;
+  }
+  const items = stabilityScenarioState.items || [];
+  const pageCount = Math.max(1, Math.ceil(stabilityScenarioState.total / stabilityScenarioState.pageSize));
+  list.innerHTML = `${items.length ? `<div class="observability-sample-list">${items.map((item) => `<button class="observability-sample-row" type="button" data-stability-request="${escapeHtml(item.requestId || "")}" data-stability-backend="${escapeHtml(item.backendId || "")}"><span><strong>${escapeHtml(item.requestId || "暂无 ID")}</strong><small>${escapeHtml(item.eventTime || "暂无时间")} · ${escapeHtml(item.model || "-")}</small></span><span>${escapeHtml(item.status || "unknown")} · ${item.userVisibleFailure == null ? "最终失败暂无" : item.userVisibleFailure ? "最终失败" : "已成功"}</span></button>`).join(" ")}</div>` : '<p class="empty">当前筛选没有样本</p>'}<div class="observability-pagination"><button class="ghost-btn" type="button" data-stability-page="prev" ${stabilityScenarioState.page <= 1 ? "disabled" : ""}>上一页</button><span>第 ${stabilityScenarioState.page} / ${pageCount} 页 · 共 ${stabilityScenarioState.total} 条</span><button class="ghost-btn" type="button" data-stability-page="next" ${stabilityScenarioState.page >= pageCount ? "disabled" : ""}>下一页</button></div>`;
+}
+
+async function loadStabilityScenarioSamples(filters = stabilityScenarioState.filters, page = 1) {
+  if (!canViewStability()) return;
+  const requestId = ++stabilityScenarioRequestId;
+  stabilityScenarioState = { ...stabilityScenarioState, filters, page, loading: true, error: "" };
+  renderStabilityScenarioSamples();
+  const { startDate, endDate } = currentStabilityWindow();
+  try {
+    const query = new URLSearchParams({ start_date: startDate, end_date: endDate, model: filters.model || "", scenario: filters.scenario || "", error_code: filters.errorCode || "", page: String(page), page_size: String(stabilityScenarioState.pageSize) });
+    const payload = await api(`/api/admin/stability/scenarios?${query.toString()}`);
+    if (requestId !== stabilityScenarioRequestId) return;
+    const data = payload.data || {};
+    stabilityScenarioState = { ...stabilityScenarioState, items: data.items || [], total: Number(data.total || 0), page: Number(data.page || page), loading: false, error: "" };
+    renderStabilityScenarioSamples();
+  } catch (error) {
+    if (requestId !== stabilityScenarioRequestId) return;
+    stabilityScenarioState = { ...stabilityScenarioState, loading: false, error: error.message || "样本加载失败" };
+    renderStabilityScenarioSamples();
+  }
+}
+
+function openStabilityScenario(button) {
+  const filters = { model: button.dataset.stabilityModel || "", scenario: button.dataset.stabilityScenario || "", errorCode: button.dataset.stabilityErrorCode || "" };
+  el("stabilityDrawerTitle").textContent = `场景样本 · ${filters.scenario || "全部异常"}`;
+  el("stabilityRequestDetail").innerHTML = '<p class="empty">选择左侧样本查看请求元数据。</p>';
+  focusDrawer("stabilityDrawer", button);
+  loadStabilityScenarioSamples(filters, 1);
 }
 
 async function openStabilityRequest(requestId, backendId = "") {
@@ -8292,10 +8584,65 @@ async function openStabilityRequest(requestId, backendId = "") {
     const detail = payload.data || {};
     const labels = { request_id: "请求 ID", event_time: "请求时间", model: "模型", provider: "来源", model_group: "模型组", model_id: "模型线路", status: "状态", error_code: "错误码", error_class: "错误分类", error_message: "脱敏错误信息", scenario: "异常场景", request_duration_ms: "请求时长（毫秒）", ttft_ms: "TTFT（毫秒）", prompt_tokens: "输入 Token", completion_tokens: "输出 Token", total_tokens: "总 Token", attempted_retries: "重试次数", max_retries: "最大重试次数", trace_id: "调用链标识", user_visible_failure: "用户最终失败", organization_id: "组织归属", team_id: "团队归属", principal_id: "归属主体", collected_at: "采集时间" };
     el("stabilityRequestDetail").innerHTML = Object.entries(detail).filter(([key]) => labels[key]).map(([key, value]) => `<div class="observability-drawer-row"><dt>${labels[key]}</dt><dd>${escapeHtml(value == null || value === "" ? "暂无数据" : String(value))}</dd></div>`).join("");
-    el("stabilityDrawer").classList.remove("hidden");
+    focusDrawer("stabilityDrawer");
   } catch (error) {
     showToast(error.message || "请求样本加载失败");
   }
+}
+
+function openCostLedger(filters = {}, returnFocus = document.activeElement) {
+  if (!canViewCosts()) return;
+  const normalizedFilters = {
+    ...(filters.costBucket ? { cost_bucket: filters.costBucket } : {}),
+    ...(filters.model ? { model: filters.model } : {}),
+    ...(filters.provider ? { provider: filters.provider } : {}),
+    ...(filters.accountId ? { account_id: filters.accountId } : {}),
+    ...(filters.reconciliationStatus ? { reconciliation_status: filters.reconciliationStatus } : {}),
+  };
+  costLedgerState = { ...costLedgerState, filters: normalizedFilters, page: 1, selectedId: "" };
+  el("costDetailDrawerTitle").textContent = filters.costBucket ? `费用明细 · ${filters.costBucket}` : filters.model ? `费用明细 · ${filters.model}` : "费用明细";
+  el("costLedgerDetail").innerHTML = '<p class="empty">选择左侧账本行查看来源与对账信息。</p>';
+  focusDrawer("costDetailDrawer", returnFocus);
+  loadCostLedger();
+}
+
+async function loadCostLedger() {
+  const requestId = ++costLedgerRequestId;
+  costLedgerState = { ...costLedgerState, loading: true, error: "" };
+  const list = el("costLedgerList");
+  if (list) list.innerHTML = '<p class="empty">正在加载费用明细…</p>';
+  try {
+    const month = currentCostMonth();
+    const start = `${month}-01`;
+    const endDate = new Date(`${month}-01T00:00:00`);
+    endDate.setMonth(endDate.getMonth() + 1);
+    endDate.setDate(0);
+    const query = new URLSearchParams({ start_date: start, end_date: endDate.toISOString().slice(0, 10), page: String(costLedgerState.page), page_size: String(costLedgerState.pageSize), ...(costLedgerState.filters || {}) });
+    const payload = await api(`/api/admin/costs/ledger?${query.toString()}`);
+    if (requestId !== costLedgerRequestId) return;
+    const data = payload.data || {};
+    costLedgerState = { ...costLedgerState, items: data.items || [], total: Number(data.total || 0), page: Number(data.page || costLedgerState.page), loading: false };
+    renderCostLedger();
+  } catch (error) {
+    if (requestId !== costLedgerRequestId) return;
+    costLedgerState = { ...costLedgerState, loading: false, error: error.message || "费用明细加载失败" };
+    if (list) list.innerHTML = `<div class="operational-status danger"><div><strong>费用明细加载失败</strong><p>${escapeHtml(costLedgerState.error)}</p></div><button class="ghost-btn" type="button" data-cost-ledger-retry>重试</button></div>`;
+  }
+}
+
+function renderCostLedger() {
+  const list = el("costLedgerList");
+  if (!list) return;
+  const items = costLedgerState.items || [];
+  const pageCount = Math.max(1, Math.ceil(costLedgerState.total / costLedgerState.pageSize));
+  list.innerHTML = `${items.length ? items.map((item) => `<button class="observability-sample-row" type="button" data-cost-ledger-id="${escapeHtml(item.id || item.requestId || "")}"><span><strong>${escapeHtml(item.name || item.model || item.costBucket || "成本明细")}</strong><small>${escapeHtml(item.date || "暂无日期")} · ${escapeHtml(item.sourceType || "来源未知")} · ${escapeHtml(item.provider || item.vendor || "暂无渠道")}</small></span><span>${observabilityMoney(item.amountUsd)} · ${escapeHtml(item.reconciliationStatus || "未对账")}</span></button>`).join("") : '<p class="empty">当前筛选没有费用明细</p>'}<div class="observability-pagination"><button class="ghost-btn" type="button" data-cost-ledger-page="prev" ${costLedgerState.page <= 1 ? "disabled" : ""}>上一页</button><span>第 ${costLedgerState.page} / ${pageCount} 页 · 共 ${costLedgerState.total} 条</span><button class="ghost-btn" type="button" data-cost-ledger-page="next" ${costLedgerState.page >= pageCount ? "disabled" : ""}>下一页</button></div>`;
+}
+
+function showCostLedgerDetail(itemId) {
+  const item = (costLedgerState.items || []).find((value) => String(value.id || value.requestId) === String(itemId));
+  if (!item) return;
+  const labels = { date: "日期", sourceType: "来源类型", costBucket: "成本桶", category: "类别", name: "名称", provider: "供应渠道", vendor: "供应商", model: "模型", accountName: "账号", amountUsd: "金额（USD）", currency: "原币种", amount: "原币金额", financeBucket: "财务分类", voucherNo: "凭证号", invoiceNo: "发票号", reconciliationStatus: "对账状态", recognitionStatus: "确认状态", requestId: "请求标识", coverage: "覆盖质量" };
+  el("costLedgerDetail").innerHTML = Object.entries(item).filter(([key]) => labels[key]).map(([key, value]) => `<div class="observability-drawer-row"><dt>${labels[key]}</dt><dd>${escapeHtml(value == null || value === "" ? "暂无数据" : typeof value === "object" ? JSON.stringify(value) : String(value))}</dd></div>`).join("");
 }
 
 function closeCostItemModal() {
@@ -8314,6 +8661,16 @@ function openCostItemModal(item = null) {
   el("costItemModel").value = value.model || "";
   el("costItemBusinessScope").value = value.businessScope || "";
   el("costItemFinanceBucket").value = value.financeBucket || "";
+  const bucketSelect = el("costItemCostBucket");
+  const bucketValue = value.costBucket || "other";
+  bucketSelect.value = [...bucketSelect.options].some((option) => option.value === bucketValue) ? bucketValue : "other";
+  el("costItemProvider").value = value.provider || "";
+  el("costItemAccountId").value = value.accountId || "";
+  el("costItemAccountName").value = value.accountName || "";
+  el("costItemVoucherNo").value = value.voucherNo || "";
+  el("costItemInvoiceNo").value = value.invoiceNo || "";
+  el("costItemReconciliationStatus").value = value.reconciliationStatus || "unreconciled";
+  el("costItemRecognitionStatus").value = value.recognitionStatus || "actual";
   el("costItemAmount").value = value.amount ?? "";
   el("costItemCurrency").value = value.currency || "USD";
   el("costItemExchangeRate").value = value.exchangeRate ?? "7.3";
@@ -8341,14 +8698,22 @@ function openSavingsActionModal(item = null) {
   el("savingsActionStatus").value = value.status || "planned";
   el("savingsVerifiedDate").value = value.verifiedDate || "";
   el("savingsVerifiedDailyCost").value = value.verifiedDailyCost ?? "";
+  el("savingsExpectedDailyCost").value = value.expectedDailyCost ?? "";
+  el("savingsExpectedStartDate").value = value.expectedStartDate || "";
+  el("savingsProvider").value = value.provider || "";
+  el("savingsModel").value = value.model || "";
+  el("savingsCostBucket").value = value.costBucket || "";
+  el("savingsEvidenceUrl").value = value.evidenceUrl || "";
+  el("savingsFinanceReviewer").value = value.financeReviewer || "";
   el("savingsActionNotes").value = value.notes || "";
   el("savingsActionModal")?.classList.remove("hidden");
 }
 
 async function saveCostItem(event) {
+  if (!canManageCosts()) return;
   event.preventDefault();
   const id = el("costItemId").value;
-  const body = { category: el("costItemCategory").value.trim(), name: el("costItemName").value.trim(), vendor: el("costItemVendor").value.trim(), model: el("costItemModel").value.trim(), businessScope: el("costItemBusinessScope").value.trim(), amount: Number(el("costItemAmount").value), currency: el("costItemCurrency").value, exchangeRate: Number(el("costItemExchangeRate").value), serviceStartDate: el("costItemStartDate").value, serviceEndDate: el("costItemEndDate").value, financeBucket: el("costItemFinanceBucket").value.trim(), notes: el("costItemNotes").value.trim(), enabled: el("costItemEnabled").value === "true" };
+  const body = { category: el("costItemCategory").value.trim(), name: el("costItemName").value.trim(), vendor: el("costItemVendor").value.trim(), model: el("costItemModel").value.trim(), businessScope: el("costItemBusinessScope").value.trim(), amount: Number(el("costItemAmount").value), currency: el("costItemCurrency").value, exchangeRate: Number(el("costItemExchangeRate").value), serviceStartDate: el("costItemStartDate").value, serviceEndDate: el("costItemEndDate").value, financeBucket: el("costItemFinanceBucket").value.trim(), costBucket: el("costItemCostBucket").value, provider: el("costItemProvider").value.trim(), accountId: el("costItemAccountId").value.trim(), accountName: el("costItemAccountName").value.trim(), voucherNo: el("costItemVoucherNo").value.trim(), invoiceNo: el("costItemInvoiceNo").value.trim(), reconciliationStatus: el("costItemReconciliationStatus").value, recognitionStatus: el("costItemRecognitionStatus").value, notes: el("costItemNotes").value.trim(), enabled: el("costItemEnabled").value === "true" };
   try {
     await ensureCsrfToken();
     await api(id ? `/api/admin/costs/items/${encodeURIComponent(id)}` : "/api/admin/costs/items", { method: id ? "PATCH" : "POST", body: JSON.stringify(body) });
@@ -8359,9 +8724,10 @@ async function saveCostItem(event) {
 }
 
 async function saveSavingsAction(event) {
+  if (!canManageCosts()) return;
   event.preventDefault();
   const id = el("savingsActionId").value;
-  const body = { name: el("savingsActionName").value.trim(), owner: el("savingsActionOwner").value.trim(), baselineDailyCost: Number(el("savingsBaselineDailyCost").value), implementedDate: el("savingsImplementedDate").value, status: el("savingsActionStatus").value, verifiedDate: el("savingsVerifiedDate").value || null, verifiedDailyCost: el("savingsVerifiedDailyCost").value === "" ? null : Number(el("savingsVerifiedDailyCost").value), notes: el("savingsActionNotes").value.trim() };
+  const body = { name: el("savingsActionName").value.trim(), owner: el("savingsActionOwner").value.trim(), baselineDailyCost: Number(el("savingsBaselineDailyCost").value), implementedDate: el("savingsImplementedDate").value, status: el("savingsActionStatus").value, verifiedDate: el("savingsVerifiedDate").value || null, verifiedDailyCost: el("savingsVerifiedDailyCost").value === "" ? null : Number(el("savingsVerifiedDailyCost").value), expectedDailyCost: el("savingsExpectedDailyCost").value === "" ? null : Number(el("savingsExpectedDailyCost").value), expectedStartDate: el("savingsExpectedStartDate").value || null, provider: el("savingsProvider").value.trim(), model: el("savingsModel").value.trim(), costBucket: el("savingsCostBucket").value.trim(), evidenceUrl: el("savingsEvidenceUrl").value.trim(), financeReviewer: el("savingsFinanceReviewer").value.trim(), notes: el("savingsActionNotes").value.trim() };
   try {
     await ensureCsrfToken();
     await api(id ? `/api/admin/costs/savings-actions/${encodeURIComponent(id)}` : "/api/admin/costs/savings-actions", { method: id ? "PATCH" : "POST", body: JSON.stringify(body) });
@@ -8372,6 +8738,7 @@ async function saveSavingsAction(event) {
 }
 
 async function saveCostBudget(event) {
+  if (!canManageCosts()) return;
   event.preventDefault();
   const month = el("costMonth").value;
   try {
@@ -8402,10 +8769,6 @@ async function loadDashboardData(forceRefresh = false) {
     lastPersonalUsageCacheHit = Boolean(payload.cache?.hit);
   } catch (error) {
     showToast(error.message || "用量数据加载失败");
-    usageData = [];
-    usageSummary = null;
-    personalDataQuality = null;
-    personalCoverage = null;
   } finally {
     isDashboardLoading = false;
     renderPersonal();
@@ -8447,11 +8810,6 @@ async function loadAdminData(forceRefresh = false) {
   } catch (error) {
     if (requestId !== adminUsageRequestId || scopeKey !== organizationUsageScopeKey()) return;
     showToast(error.message || "全员数据加载失败");
-    adminUsageData = [];
-    adminSummaryData = [];
-    adminEmployees = [];
-    adminDataQuality = null;
-    adminCoverage = null;
   } finally {
     if (requestId !== adminUsageRequestId) return;
     isAdminLoading = false;
@@ -8505,13 +8863,6 @@ async function loadDepartmentData(forceRefresh = false) {
   } catch (error) {
     if (requestId !== departmentUsageRequestId || scopeKey !== organizationUsageScopeKey()) return;
     showToast(error.message || "部门数据加载失败");
-    departmentUsageData = [];
-    departmentSummaryData = [];
-    departmentRankings = [];
-    departmentEmployees = [];
-    departmentDataQuality = null;
-    departmentCoverage = null;
-    if (!department) departmentPickerOptions = [];
   } finally {
     if (requestId !== departmentUsageRequestId) return;
     isDepartmentLoading = false;
@@ -8569,16 +8920,19 @@ async function loadTeamData(forceRefresh = false) {
   ensureSelectedTeamRef();
   resetTeamMemberSelection();
   const requestId = ++teamUsageRequestId;
+  const preserveCurrentData = Boolean(forceRefresh || usageAutoRefreshPromise);
   if (teamUsageRequestController) teamUsageRequestController.abort();
   if (teamRankingRequestController) teamRankingRequestController.abort();
   teamRankingRequestId += 1;
   isTeamRankingLoading = false;
   teamUsageRequestController = new AbortController();
-  teamUsageData = [];
-  teamSummaryData = [];
-  teamEmployees = [];
-  teamDataQuality = null;
-  teamCoverage = null;
+  if (!preserveCurrentData) {
+    teamUsageData = [];
+    teamSummaryData = [];
+    teamEmployees = [];
+    teamDataQuality = null;
+    teamCoverage = null;
+  }
   teamRankingError = "";
   teamRankingHint = "";
   isTeamLoading = true;
@@ -8618,9 +8972,6 @@ async function loadTeamData(forceRefresh = false) {
     if (error.name === "AbortError") return;
     if (requestId !== teamUsageRequestId) return;
     showToast(error.message || "团队数据加载失败");
-    teamUsageData = [];
-    teamSummaryData = [];
-    teamEmployees = [];
   } finally {
     if (requestId === teamUsageRequestId) {
       isTeamLoading = false;
@@ -8823,6 +9174,33 @@ function showLogin() {
   clearPersonalKeyCache(previousUser);
   currentUser = null;
   authSessionGeneration += 1;
+  stabilityOverviewRequestId += 1;
+  costOverviewRequestId += 1;
+  stabilityScenarioRequestId += 1;
+  costLedgerRequestId += 1;
+  stabilityOverviewController?.abort();
+  costOverviewController?.abort();
+  stabilityOverviewController = null;
+  costOverviewController = null;
+  stabilityDrawerReturnFocus = null;
+  costDrawerReturnFocus = null;
+  stabilityOverview = null;
+  costOverview = null;
+  costBudgets = [];
+  stabilityLoadError = "";
+  costOverviewLoadError = "";
+  isStabilityLoading = false;
+  isCostOverviewLoading = false;
+  stabilityScenarioState = { page: 1, pageSize: 20, total: 0, items: [], filters: { model: "", scenario: "", errorCode: "" }, loading: false, error: "" };
+  costLedgerState = { page: 1, pageSize: 20, total: 0, items: [], filters: {}, loading: false, error: "", selectedId: "" };
+  el("stabilityDrawer")?.classList.add("hidden");
+  el("stabilityDrawer")?.setAttribute("aria-hidden", "true");
+  el("stabilityDrawerBackdrop")?.classList.add("hidden");
+  el("costDetailDrawer")?.classList.add("hidden");
+  el("costDetailDrawer")?.setAttribute("aria-hidden", "true");
+  el("costDetailDrawerBackdrop")?.classList.add("hidden");
+  closeCostItemModal();
+  closeSavingsActionModal();
   authCsrfToken = "";
   csrfRefreshPromise = null;
   isSsoRedirecting = false;
@@ -9743,6 +10121,10 @@ el("costVendor")?.addEventListener("change", () => {
   renderObservabilityFilterState("cost");
   loadCostOverview();
 });
+["costBucket", "costProvider", "costAccount", "costReconciliation"].forEach((id) => el(id)?.addEventListener("change", () => {
+  renderObservabilityFilterState("cost");
+  loadCostOverview();
+}));
 el("stabilityFiltersButton")?.addEventListener("click", () => setObservabilityFilterPanel("stability", !stabilityFiltersOpen));
 el("costFiltersButton")?.addEventListener("click", () => setObservabilityFilterPanel("cost", !costFiltersOpen));
 el("stabilityResetFiltersButton")?.addEventListener("click", () => resetObservabilityFilters("stability"));
@@ -9751,10 +10133,33 @@ document.querySelectorAll(".observability-active-filters").forEach((container) =
   const button = event.target.closest("[data-observability-clear]");
   if (button) clearObservabilityFilter(button.dataset.observabilityScope, button.dataset.observabilityClear);
 }));
-el("stabilityDrawerClose")?.addEventListener("click", () => el("stabilityDrawer")?.classList.add("hidden"));
+el("stabilityDrawerClose")?.addEventListener("click", closeStabilityDrawer);
 el("stabilityScenarioBody")?.addEventListener("click", (event) => {
-  const button = event.target.closest("[data-stability-request]");
-  if (button) openStabilityRequest(button.dataset.stabilityRequest, button.dataset.stabilityBackend || "");
+  const scenarioButton = event.target.closest("[data-stability-scenario]");
+  if (scenarioButton) {
+    openStabilityScenario(scenarioButton);
+    return;
+  }
+  const requestButton = event.target.closest("[data-stability-request]");
+  if (requestButton) openStabilityRequest(requestButton.dataset.stabilityRequest, requestButton.dataset.stabilityBackend || "");
+});
+el("stabilityRequestList")?.addEventListener("click", (event) => {
+  const retry = event.target.closest("[data-stability-scenario-retry]");
+  if (retry) {
+    loadStabilityScenarioSamples(stabilityScenarioState.filters, stabilityScenarioState.page);
+    return;
+  }
+  const requestButton = event.target.closest("[data-stability-request]");
+  if (requestButton) openStabilityRequest(requestButton.dataset.stabilityRequest, requestButton.dataset.stabilityBackend || "");
+  const pageButton = event.target.closest("[data-stability-page]");
+  if (pageButton) {
+    const next = pageButton.dataset.stabilityPage === "next" ? stabilityScenarioState.page + 1 : stabilityScenarioState.page - 1;
+    loadStabilityScenarioSamples(stabilityScenarioState.filters, next);
+  }
+});
+el("stabilityRanking")?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-stability-model]");
+  if (button) openStabilityScenario({ dataset: { stabilityModel: button.dataset.stabilityModel, stabilityScenario: "", stabilityErrorCode: "" } });
 });
 el("addCostItemButton")?.addEventListener("click", () => openCostItemModal());
 el("cancelCostItemButton")?.addEventListener("click", closeCostItemModal);
@@ -9763,6 +10168,41 @@ el("addSavingsActionButton")?.addEventListener("click", () => openSavingsActionM
 el("cancelSavingsActionButton")?.addEventListener("click", closeSavingsActionModal);
 el("savingsActionForm")?.addEventListener("submit", saveSavingsAction);
 el("costBudgetForm")?.addEventListener("submit", saveCostBudget);
+el("costAllLedgerButton")?.addEventListener("click", (event) => openCostLedger({}, event.currentTarget));
+el("costComposition")?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-cost-ledger-filter]");
+  if (button) openCostLedger({ costBucket: button.dataset.costLedgerFilter });
+});
+el("costModelSplit")?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-cost-ledger-model]");
+  if (button) openCostLedger({ model: button.dataset.costLedgerModel });
+});
+el("costLedgerList")?.addEventListener("click", (event) => {
+  const retry = event.target.closest("[data-cost-ledger-retry]");
+  if (retry) {
+    loadCostLedger();
+    return;
+  }
+  const pageButton = event.target.closest("[data-cost-ledger-page]");
+  if (pageButton) {
+    costLedgerState = { ...costLedgerState, page: pageButton.dataset.costLedgerPage === "next" ? costLedgerState.page + 1 : costLedgerState.page - 1 };
+    loadCostLedger();
+    return;
+  }
+  const row = event.target.closest("[data-cost-ledger-id]");
+  if (row) showCostLedgerDetail(row.dataset.costLedgerId);
+});
+el("costDetailDrawerClose")?.addEventListener("click", () => {
+  const drawer = el("costDetailDrawer");
+  drawer?.classList.add("hidden");
+  drawer?.setAttribute("aria-hidden", "true");
+  el("costDetailDrawerBackdrop")?.classList.add("hidden");
+  el("costDetailDrawerBackdrop")?.setAttribute("aria-hidden", "true");
+  costDrawerReturnFocus?.focus?.();
+  costDrawerReturnFocus = null;
+});
+el("stabilityDrawerBackdrop")?.addEventListener("click", closeStabilityDrawer);
+el("costDetailDrawerBackdrop")?.addEventListener("click", () => el("costDetailDrawerClose")?.click());
 el("costItemBody")?.addEventListener("click", (event) => {
   const edit = event.target.closest("[data-edit-cost-item]");
   const remove = event.target.closest("[data-delete-cost-item]");
@@ -9773,6 +10213,13 @@ el("costItemBody")?.addEventListener("click", (event) => {
     ensureCsrfToken().then(() => api(`/api/admin/costs/items/${encodeURIComponent(item.id)}`, { method: "DELETE" })).then(loadCostOverview).then(() => showToast("成本项已删除")).catch((error) => showToast(error.message || "成本项删除失败"));
   }
 });
+document.querySelectorAll("#stabilityQuality, #costQuality").forEach((container) => container.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-observability-retry]");
+  if (!button) return;
+  if (button.dataset.observabilityRetry === "stability") loadStabilityOverview();
+  else if (costOverviewLoadError) loadCostOverview();
+  else openCostLedger({}, button);
+}));
 el("savingsActionList")?.addEventListener("click", (event) => {
   const action = event.target.closest("[data-edit-savings-action]");
   if (!action) return;
@@ -10392,6 +10839,19 @@ document.querySelectorAll(".modal-backdrop").forEach((backdrop) => {
 
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
+  if (!el("stabilityDrawer")?.classList.contains("hidden")) {
+    closeStabilityDrawer();
+    return;
+  }
+  if (!el("costDetailDrawer")?.classList.contains("hidden")) {
+    el("costDetailDrawer").classList.add("hidden");
+    el("costDetailDrawer").setAttribute("aria-hidden", "true");
+    el("costDetailDrawerBackdrop")?.classList.add("hidden");
+    el("costDetailDrawerBackdrop")?.setAttribute("aria-hidden", "true");
+    costDrawerReturnFocus?.focus?.();
+    costDrawerReturnFocus = null;
+    return;
+  }
   if (!el("customRangePanel").classList.contains("hidden")) {
     closeCustomRangePanel(true);
     return;
@@ -10406,18 +10866,23 @@ document.addEventListener("keydown", (event) => {
   else if (!el("organizationDepartmentModal").classList.contains("hidden")) closeOrganizationDepartmentModal();
   else if (!el("organizationTopupModal").classList.contains("hidden")) closeOrganizationTopupModal();
   else if (!el("organizationCreditAdjustmentModal")?.classList.contains("hidden")) closeOrganizationCreditAdjustmentModal();
+  else if (!el("costItemModal")?.classList.contains("hidden")) closeCostItemModal();
+  else if (!el("savingsActionModal")?.classList.contains("hidden")) closeSavingsActionModal();
 });
 
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     clearRevealedKeys();
     clearOrganizationClaimLastUrl();
+  } else if (isUsageView() && Date.now() - lastUsageAutoRefreshAt >= 30_000) {
+    refreshVisibleUsageData();
   }
 });
 
 window.addEventListener("beforeunload", clearRevealedKeys);
 
 async function init() {
+  scheduleUsageAutoRefresh();
   const callbackParams = new URLSearchParams(window.location.search);
   organizationClaimToken = takeOrganizationClaimTokenFromUrl(callbackParams);
   organizationInvitationToken = takeOrganizationInvitationTokenFromUrl(callbackParams);

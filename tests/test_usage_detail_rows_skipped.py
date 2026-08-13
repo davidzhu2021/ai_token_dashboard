@@ -89,7 +89,7 @@ def test_department_rows_uses_event_team_id_without_membership_join() -> None:
 
     asyncio.run(store.department_rows("2026-07-01", "2026-07-30", "all", "dept-a", ["primary"]))
 
-    department_queries = [q for q in pool.queries if "usage_daily" in q]
+    department_queries = [q for q in pool.queries if "usage_query_daily" in q]
     assert department_queries
     assert all("snapshot_date = u.usage_date AND m.user_id = u.user_id" not in q for q in department_queries)
     assert any("u.team_id <> ''" in q and "LEFT JOIN" in q for q in department_queries)

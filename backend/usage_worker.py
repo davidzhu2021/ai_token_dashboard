@@ -11,6 +11,8 @@ from .litellm_client import LiteLLMClient, usage_today
 from .organization_repository import PostgreSQLOrganizationRepository
 from .usage_store import UsageStore
 from .usage_sync import UsageSynchronizer, run_sync_with_recent_refresh, run_usage_backfill_once
+from .usage_realtime import UsageRealtimeStore, realtime_enabled
+from .usage_realtime_worker import UsageRealtimeWorker
 
 
 logger = logging.getLogger("ai-token-dashboard.usage-worker")
@@ -224,13 +226,26 @@ async def _main() -> None:
     repository = None
     if os.getenv("ORGANIZATION_MODE", "disabled").strip().lower() == "real":
         repository = PostgreSQLOrganizationRepository.from_environment()
-    worker = UsageSyncWorker(client, store, repository)
+    realtime = UsageRealtimeStore.from_environment()
+    worker: Any
+    if realtime_enabled() and realtime is not None:
+        worker = UsageRealtimeWorker(
+            client,
+            store,
+            realtime,
+            repository,
+            worker_id=f"{socket.gethostname()}:{os.getpid()}",
+        )
+    else:
+        worker = UsageSyncWorker(client, store, repository)
     try:
         await worker.run()
     finally:
         await client.close()
         if repository is not None:
             await repository.close()
+        if realtime is not None:
+            await realtime.close()
         await store.close()
 
 

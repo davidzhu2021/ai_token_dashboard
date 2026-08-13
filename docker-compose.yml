@@ -1,4 +1,17 @@
 services:
+  usage-redis:
+    image: redis:7.4-alpine
+    container_name: ai-token-dashboard-redis
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - usage-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
   usage-db:
     image: postgres:16-alpine
     container_name: ai-token-dashboard-db
@@ -58,12 +71,15 @@ services:
       - .env
     environment:
       USAGE_SYNC_ROLE: reader
+      USAGE_REDIS_URL: ${USAGE_REDIS_URL:-redis://usage-redis:6379/0}
       USAGE_DB_POOL_MIN_SIZE: ${USAGE_WEB_DB_POOL_MIN_SIZE:-1}
       USAGE_DB_POOL_MAX_SIZE: ${USAGE_WEB_DB_POOL_MAX_SIZE:-5}
     volumes:
       - key-vault-data:/app/.data
     depends_on:
       usage-db:
+        condition: service_healthy
+      usage-redis:
         condition: service_healthy
       mail-relay:
         condition: service_started
@@ -81,12 +97,15 @@ services:
       - .env
     environment:
       USAGE_SYNC_ROLE: worker
+      USAGE_REDIS_URL: ${USAGE_REDIS_URL:-redis://usage-redis:6379/0}
       USAGE_DB_POOL_MIN_SIZE: ${USAGE_WORKER_DB_POOL_MIN_SIZE:-1}
       USAGE_DB_POOL_MAX_SIZE: ${USAGE_WORKER_DB_POOL_MAX_SIZE:-3}
     volumes:
       - key-vault-data:/app/.data
     depends_on:
       usage-db:
+        condition: service_healthy
+      usage-redis:
         condition: service_healthy
     healthcheck:
       disable: true
@@ -95,5 +114,6 @@ services:
 volumes:
   key-vault-data:
   usage-db-data:
+  usage-redis-data:
   mail-relay-dkim:
   mail-relay-spool:

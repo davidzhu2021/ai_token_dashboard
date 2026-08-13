@@ -483,7 +483,7 @@ def test_organization_rows_preserve_department_before_canonical_merge() -> None:
                     {"team_id": "dept-a", "team_name": "部门 A"},
                     {"team_id": "dept-b", "team_name": "部门 B"},
                 ]
-            if "FROM usage_daily" in query:
+            if "FROM usage_query_daily" in query:
                 base = {
                     "backend_id": "primary",
                     "usage_date": date(2026, 8, 3),

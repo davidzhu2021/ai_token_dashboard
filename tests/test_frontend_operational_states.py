@@ -26,7 +26,7 @@ def test_usage_payload_quality_and_coverage_reach_visible_status_regions() -> No
     assert "range.complete === false" in source
     assert 'title: "同步快照暂不可用"' in source
     assert 'title: "数据覆盖不完整"' in source
-    assert 'title: "数据等待刷新"' in source
+    assert 'title: "同步延迟"' in source
     assert 'renderUsageStatus("personalUsageStatus"' in source
     assert 'renderUsageStatus("adminUsageStatus"' in source
     assert 'renderUsageStatus("teamUsageStatus"' in source

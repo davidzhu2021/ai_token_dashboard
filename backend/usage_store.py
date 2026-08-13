@@ -247,6 +247,38 @@ CREATE INDEX IF NOT EXISTS usage_event_attribution_key_time_idx
 CREATE INDEX IF NOT EXISTS usage_event_attribution_stability_idx
     ON usage_event_attribution (usage_date, model, scenario, error_code, event_time DESC);
 
+CREATE TABLE IF NOT EXISTS usage_realtime_daily (
+    LIKE usage_daily INCLUDING DEFAULTS INCLUDING CONSTRAINTS
+);
+CREATE UNIQUE INDEX IF NOT EXISTS usage_realtime_daily_identity_idx ON usage_realtime_daily (
+    backend_id, usage_date, user_id, source, model,
+    organization_id, team_id, key_id, principal_id, attribution_source,
+    billing_eligible
+);
+CREATE INDEX IF NOT EXISTS usage_realtime_daily_date_idx
+    ON usage_realtime_daily (usage_date, backend_id);
+
+CREATE TABLE IF NOT EXISTS usage_realtime_state (
+    usage_date DATE PRIMARY KEY,
+    ready BOOLEAN NOT NULL DEFAULT FALSE,
+    revision BIGINT NOT NULL DEFAULT 0,
+    latest_event_at TIMESTAMPTZ,
+    last_archived_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE OR REPLACE VIEW usage_query_daily AS
+SELECT u.*
+FROM usage_daily u
+WHERE NOT EXISTS (
+    SELECT 1 FROM usage_realtime_state s
+    WHERE s.usage_date=u.usage_date AND s.ready
+)
+UNION ALL
+SELECT r.*
+FROM usage_realtime_daily r
+JOIN usage_realtime_state s ON s.usage_date=r.usage_date AND s.ready;
+
 CREATE TABLE IF NOT EXISTS cost_items (
     id TEXT PRIMARY KEY,
     category TEXT NOT NULL,
@@ -266,7 +298,19 @@ CREATE TABLE IF NOT EXISTS cost_items (
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL
 );
+ALTER TABLE cost_items ADD COLUMN IF NOT EXISTS cost_bucket TEXT NOT NULL DEFAULT '';
+ALTER TABLE cost_items ADD COLUMN IF NOT EXISTS source_type TEXT NOT NULL DEFAULT 'manual';
+ALTER TABLE cost_items ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT '';
+ALTER TABLE cost_items ADD COLUMN IF NOT EXISTS account_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE cost_items ADD COLUMN IF NOT EXISTS account_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE cost_items ADD COLUMN IF NOT EXISTS voucher_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE cost_items ADD COLUMN IF NOT EXISTS voucher_no TEXT NOT NULL DEFAULT '';
+ALTER TABLE cost_items ADD COLUMN IF NOT EXISTS invoice_no TEXT NOT NULL DEFAULT '';
+ALTER TABLE cost_items ADD COLUMN IF NOT EXISTS recognition_status TEXT NOT NULL DEFAULT 'actual';
+ALTER TABLE cost_items ADD COLUMN IF NOT EXISTS reconciliation_status TEXT NOT NULL DEFAULT 'unreconciled';
 CREATE INDEX IF NOT EXISTS cost_items_service_idx ON cost_items (service_start_date, service_end_date, enabled);
+CREATE INDEX IF NOT EXISTS cost_items_ledger_idx
+    ON cost_items (cost_bucket, provider, account_id, reconciliation_status, service_start_date);
 
 CREATE TABLE IF NOT EXISTS cost_budgets (
     month DATE PRIMARY KEY,
@@ -288,6 +332,13 @@ CREATE TABLE IF NOT EXISTS savings_actions (
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL
 );
+ALTER TABLE savings_actions ADD COLUMN IF NOT EXISTS expected_daily_cost NUMERIC(16,4);
+ALTER TABLE savings_actions ADD COLUMN IF NOT EXISTS expected_start_date DATE;
+ALTER TABLE savings_actions ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT '';
+ALTER TABLE savings_actions ADD COLUMN IF NOT EXISTS model TEXT NOT NULL DEFAULT '';
+ALTER TABLE savings_actions ADD COLUMN IF NOT EXISTS cost_bucket TEXT NOT NULL DEFAULT '';
+ALTER TABLE savings_actions ADD COLUMN IF NOT EXISTS evidence_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE savings_actions ADD COLUMN IF NOT EXISTS finance_reviewer TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS stability_sync_state (
     backend_id TEXT PRIMARY KEY,
@@ -645,7 +696,7 @@ class UsageStore:
     ) -> str | None:
         if not backend_ids:
             return None
-        return await self._require_pool().fetchval(
+        coverage_revision = await self._require_pool().fetchval(
             """
             SELECT MIN(synced_at)::text
             FROM usage_sync_coverage
@@ -655,6 +706,20 @@ class UsageStore:
             _as_date(end_date),
             sorted(set(backend_ids)),
         )
+        try:
+            realtime = await self._require_pool().fetchrow(
+                """
+                SELECT revision, updated_at FROM usage_realtime_state
+                WHERE usage_date=$1 AND ready
+                """,
+                _as_date(end_date),
+            )
+        except Exception:
+            # Compatibility with lightweight test doubles and pre-migration DBs.
+            realtime = None
+        if realtime:
+            return f"{coverage_revision or ''}:rt:{int(realtime['revision'] or 0)}:{realtime['updated_at']}"
+        return coverage_revision
 
     async def sync_state(self) -> dict[str, Any]:
         row = await self._require_pool().fetchrow(
@@ -729,6 +794,283 @@ class UsageStore:
             "SELECT last_success_at FROM usage_sync_state WHERE singleton=TRUE"
         )
 
+    async def realtime_recovery_rows(self, usage_date: date) -> list[dict[str, Any]]:
+        records = await self._require_pool().fetch(
+            """
+            SELECT backend_id, usage_date, user_id, employee_email, employee_name,
+                   email_source, source, model, prompt_tokens, completion_tokens,
+                   total_tokens, request_count, success_count, failure_count, spend,
+                   organization_id, team_id, key_id, principal_id,
+                   attribution_source, billing_eligible
+            FROM usage_query_daily WHERE usage_date=$1
+            ORDER BY backend_id, user_id, source, model
+            """,
+            usage_date,
+        )
+        return [
+            {
+                "backendId": str(row["backend_id"]),
+                "date": row["usage_date"].isoformat(),
+                "userId": str(row["user_id"]),
+                "employeeEmail": str(row["employee_email"] or ""),
+                "employeeName": str(row["employee_name"] or ""),
+                "emailSource": str(row["email_source"] or ""),
+                "source": str(row["source"]),
+                "model": str(row["model"]),
+                "promptTokens": int(row["prompt_tokens"] or 0),
+                "completionTokens": int(row["completion_tokens"] or 0),
+                "totalTokens": int(row["total_tokens"] or 0),
+                "requestCount": int(row["request_count"] or 0),
+                "successCount": int(row["success_count"] or 0),
+                "failureCount": int(row["failure_count"] or 0),
+                "spend": float(row["spend"] or 0),
+                "organizationId": str(row["organization_id"] or ""),
+                "teamId": str(row["team_id"] or ""),
+                "keyId": str(row["key_id"] or ""),
+                "principalId": str(row["principal_id"] or ""),
+                "attributionSource": str(row["attribution_source"] or "unattributed"),
+                "billingEligible": bool(row["billing_eligible"]),
+            }
+            for row in records
+        ]
+
+    async def realtime_identity_map(self, usage_date: date) -> dict[tuple[str, str], dict[str, str]]:
+        records = await self._require_pool().fetch(
+            """
+            SELECT backend_id, user_id, employee_email, employee_name, email_source
+            FROM usage_daily
+            WHERE usage_date=$1 AND (employee_email<>'' OR employee_name<>'')
+            """,
+            usage_date,
+        )
+        return {
+            (str(row["backend_id"]), str(row["user_id"])): {
+                "email": str(row["employee_email"] or ""),
+                "name": str(row["employee_name"] or ""),
+                "emailSource": str(row["email_source"] or ""),
+            }
+            for row in records
+        }
+
+    async def realtime_request_ids(self, since: datetime) -> list[tuple[str, str]]:
+        records = await self._require_pool().fetch(
+            """
+            SELECT backend_id, request_id FROM usage_event_attribution
+            WHERE event_time >= $1 ORDER BY event_time
+            """,
+            since,
+        )
+        return [(str(row["backend_id"]), str(row["request_id"])) for row in records]
+
+    async def latest_archived_event_at(self, backend_id: str) -> datetime | None:
+        return await self._require_pool().fetchval(
+            "SELECT MAX(event_time) FROM usage_event_attribution WHERE backend_id=$1",
+            backend_id,
+        )
+
+    async def archive_realtime_events(self, events: list[dict[str, Any]]) -> int:
+        if not events:
+            return 0
+        collected_at = datetime.now(timezone.utc)
+        records = [
+            record
+            for event in events
+            if (record := self._event_record(str(event.get("backendId") or ""), event, collected_at))
+        ]
+        if not records:
+            return 0
+        async with self._require_pool().acquire() as connection:
+            async with connection.transaction():
+                inserted = 0
+                for record in records:
+                    result = await connection.execute(
+                        """
+                        INSERT INTO usage_event_attribution (
+                            backend_id, request_id, event_time, usage_date, raw_user_id,
+                            organization_id, team_id, key_id, principal_id, source, model,
+                            prompt_tokens, completion_tokens, total_tokens, request_count,
+                            success_count, failure_count, spend, attribution_source,
+                            billing_eligible, provider, model_group, model_id, api_base,
+                            status, error_code, error_class, error_message, scenario,
+                            request_duration_ms, ttft_ms, attempted_retries, max_retries,
+                            trace_id, user_visible_failure, collected_at
+                        ) VALUES (
+                            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+                            $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
+                            $31,$32,$33,$34,$35,$36
+                        ) ON CONFLICT (backend_id, request_id) DO NOTHING
+                        """,
+                        *record,
+                    )
+                    if result.endswith(" 1"):
+                        inserted += 1
+        return inserted
+
+    async def publish_realtime_state(
+        self,
+        usage_date: date,
+        *,
+        ready: bool,
+        revision: int,
+        latest_event_at: datetime | None,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        await self._require_pool().execute(
+            """
+            INSERT INTO usage_realtime_state (
+                usage_date, ready, revision, latest_event_at, last_archived_at, updated_at
+            ) VALUES ($1,$2,$3,$4,$5,$5)
+            ON CONFLICT (usage_date) DO UPDATE SET
+                ready=EXCLUDED.ready, revision=EXCLUDED.revision,
+                latest_event_at=COALESCE(EXCLUDED.latest_event_at, usage_realtime_state.latest_event_at),
+                last_archived_at=EXCLUDED.last_archived_at, updated_at=EXCLUDED.updated_at
+            """,
+            usage_date,
+            ready,
+            revision,
+            latest_event_at,
+            now,
+        )
+
+    async def replace_realtime_aggregates(
+        self, usage_date: date, rows: list[dict[str, Any]]
+    ) -> int:
+        collected_at = datetime.now(timezone.utc)
+        records = [
+            self._usage_record(
+                str(row.get("backendId") or ""),
+                {**row, "_userId": row.get("userId")},
+                collected_at,
+            )
+            for row in self._coalesce_usage_rows(rows)
+            if row.get("backendId") and row.get("date")
+        ]
+        async with self._require_pool().acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "DELETE FROM usage_realtime_daily WHERE usage_date=$1", usage_date
+                )
+                if records:
+                    await connection.executemany(
+                        """
+                        INSERT INTO usage_realtime_daily (
+                            backend_id, usage_date, user_id, employee_email, employee_name,
+                            source, model, prompt_tokens, completion_tokens, total_tokens,
+                            request_count, success_count, failure_count, spend, collected_at,
+                            organization_id, team_id, key_id, principal_id,
+                            attribution_source, billing_eligible, email_source
+                        ) VALUES (
+                            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+                            $16,$17,$18,$19,$20,$21,$22
+                        )
+                        """,
+                        records,
+                    )
+        return len(records)
+
+    async def publish_realtime_coverage(
+        self, usage_date: date, backend_ids: list[str]
+    ) -> None:
+        if not backend_ids:
+            return
+        now = datetime.now(timezone.utc)
+        await self._require_pool().executemany(
+            """
+            INSERT INTO usage_sync_coverage (backend_id, usage_date, synced_at)
+            VALUES ($1,$2,$3)
+            ON CONFLICT (backend_id, usage_date) DO UPDATE SET synced_at=EXCLUDED.synced_at
+            """,
+            [(backend_id, usage_date, now) for backend_id in backend_ids],
+        )
+
+    async def finalize_realtime_day(
+        self,
+        usage_date: date,
+        identities: dict[tuple[str, str], dict[str, str]] | None = None,
+    ) -> int:
+        """Promote a completed realtime mirror into the historical base table."""
+
+        async with self._require_pool().acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "DELETE FROM usage_realtime_daily WHERE usage_date=$1", usage_date
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO usage_realtime_daily (
+                        backend_id, usage_date, user_id, organization_id, team_id, key_id,
+                        principal_id, attribution_source, billing_eligible, employee_email,
+                        employee_name, email_source, source, model, prompt_tokens,
+                        completion_tokens, total_tokens, request_count, success_count,
+                        failure_count, spend, collected_at
+                    )
+                    SELECT e.backend_id, e.usage_date, e.raw_user_id, e.organization_id,
+                           e.team_id, e.key_id, e.principal_id, e.attribution_source,
+                           e.billing_eligible, MAX(u.employee_email), MAX(u.employee_name),
+                           MAX(u.email_source), e.source, e.model, SUM(e.prompt_tokens),
+                           SUM(e.completion_tokens), SUM(e.total_tokens), SUM(e.request_count),
+                           SUM(e.success_count), SUM(e.failure_count),
+                           SUM(e.spend)::double precision, $2
+                    FROM usage_event_attribution e
+                    LEFT JOIN usage_daily u ON u.backend_id=e.backend_id
+                        AND u.usage_date=e.usage_date AND u.user_id=e.raw_user_id
+                    WHERE e.usage_date=$1
+                    GROUP BY e.backend_id, e.usage_date, e.raw_user_id, e.organization_id,
+                             e.team_id, e.key_id, e.principal_id, e.attribution_source,
+                             e.billing_eligible, e.source, e.model
+                    """,
+                    usage_date,
+                    datetime.now(timezone.utc),
+                )
+                if identities:
+                    await connection.executemany(
+                        """
+                        UPDATE usage_realtime_daily SET
+                            employee_email=$3, employee_name=$4, email_source=$5
+                        WHERE usage_date=$1 AND backend_id=$2 AND user_id=$6
+                        """,
+                        [
+                            (
+                                usage_date,
+                                backend_id,
+                                item.get("email", ""),
+                                item.get("name", ""),
+                                item.get("emailSource", ""),
+                                user_id,
+                            )
+                            for (backend_id, user_id), item in identities.items()
+                        ],
+                    )
+                await connection.execute(
+                    "DELETE FROM usage_daily WHERE usage_date=$1", usage_date
+                )
+                result = await connection.execute(
+                    """
+                    INSERT INTO usage_daily
+                    SELECT * FROM usage_realtime_daily WHERE usage_date=$1
+                    """,
+                    usage_date,
+                )
+                await connection.execute(
+                    "UPDATE usage_realtime_state SET ready=FALSE, updated_at=$2 WHERE usage_date=$1",
+                    usage_date,
+                    datetime.now(timezone.utc),
+                )
+                await connection.execute(
+                    "DELETE FROM usage_realtime_daily WHERE usage_date=$1", usage_date
+                )
+        return int(result.rsplit(" ", 1)[-1]) if result else 0
+
+    async def realtime_state(self, usage_date: date) -> dict[str, Any]:
+        row = await self._require_pool().fetchrow(
+            """
+            SELECT ready, revision, latest_event_at, last_archived_at, updated_at
+            FROM usage_realtime_state WHERE usage_date=$1
+            """,
+            usage_date,
+        )
+        return dict(row) if row else {}
+
     async def team_rows(self, team_scopes: list[dict[str, Any]], start_date: str, end_date: str, source: str) -> dict[str, Any] | None:
         """Read one logical team from all covered backend/team pairs in one SQL query."""
         backend_ids = [str(item.get("backend")) for item in team_scopes if item.get("backend") and item.get("id")]
@@ -755,7 +1097,7 @@ class UsageStore:
             UNION ALL
             SELECT 'usage', u.backend_id, NULL, NULL, u.user_id, MAX(u.employee_email), MAX(u.employee_name), MAX(u.email_source), NULL,
                    u.usage_date, u.source, {model_sql}, {self._aggregate_metrics_sql('u.')}
-            FROM usage_daily u
+            FROM usage_query_daily u
             WHERE u.backend_id = ANY($1::text[])
               AND u.usage_date BETWEEN $3::date AND $4::date
               AND ($5 = 'all' OR u.source = $5)
@@ -1784,7 +2126,7 @@ class UsageStore:
             f"""
             SELECT organization_id, usage_date,
                    ROUND(COALESCE(SUM(spend), 0)::numeric, 6) AS spend
-            FROM usage_daily
+            FROM usage_query_daily
             WHERE usage_date BETWEEN $1::date AND $2::date
               AND organization_id <> ''
               AND billing_eligible = TRUE{backend_filter}
@@ -1917,7 +2259,7 @@ class UsageStore:
         records = await self._require_pool().fetch(
             """
             SELECT model, SUM(request_count)::bigint AS request_count
-            FROM usage_daily
+            FROM usage_query_daily
             WHERE usage_date BETWEEN $1::date AND $2::date
               AND backend_id = ANY($3::text[])
             GROUP BY model
@@ -1968,7 +2310,7 @@ class UsageStore:
                    MAX(employee_name) AS employee_name, MAX(email_source) AS email_source, source, team_id,
                    model AS model_name,
                    {self._aggregate_metrics_sql()}
-            FROM usage_daily
+            FROM usage_query_daily
             WHERE {where}
             GROUP BY backend_id, usage_date, user_id, principal_id, source, team_id, model
             ORDER BY usage_date, MAX(employee_name), source, model_name
@@ -2029,7 +2371,7 @@ class UsageStore:
         unattributed_records = await self._require_pool().fetchval(
             """
             SELECT COALESCE(SUM(request_count), 0)
-            FROM usage_daily
+            FROM usage_query_daily
             WHERE usage_date BETWEEN $1::date AND $2::date
               AND backend_id=ANY($3::text[])
               AND organization_id=''
@@ -2092,7 +2434,7 @@ class UsageStore:
                    employee_email, employee_name, email_source,
                    source, model, prompt_tokens, completion_tokens, total_tokens,
                    request_count, success_count, failure_count, spend, collected_at
-            FROM usage_daily
+            FROM usage_query_daily
             WHERE usage_date BETWEEN $1::date AND $2::date{backend_filter}
             ORDER BY usage_date, employee_name, source, model
             """,
@@ -2189,7 +2531,7 @@ class UsageStore:
             """
             SELECT usage_date, source, model, prompt_tokens, completion_tokens, total_tokens,
                    request_count, success_count, failure_count, spend
-            FROM usage_daily
+            FROM usage_query_daily
             WHERE usage_date BETWEEN $1::date AND $2::date AND employee_email = $3
               AND backend_id = ANY($4::text[])
               AND ($5 = 'all' OR source = $5)
@@ -2239,7 +2581,7 @@ class UsageStore:
                    SUM(success_count) AS success_count,
                    SUM(failure_count) AS failure_count,
                    SUM(spend) AS spend
-            FROM usage_daily
+            FROM usage_query_daily
             WHERE usage_date BETWEEN $1::date AND $2::date
               AND user_id=ANY($3::text[])
               AND backend_id=ANY($4::text[])
@@ -2446,7 +2788,7 @@ class UsageStore:
                    SUM(failure_count) AS failure_count,
                    SUM(spend) AS spend,
                    ARRAY_AGG(DISTINCT user_id) AS matched_user_ids
-            FROM usage_daily
+            FROM usage_query_daily
             WHERE organization_id=$1
               AND (user_id=ANY($2::text[]) OR principal_id=ANY($3::text[]))
               AND usage_date BETWEEN $4::date AND $5::date
@@ -2506,7 +2848,7 @@ class UsageStore:
             SELECT employee_email, usage_date, source, model, prompt_tokens, completion_tokens,
                    total_tokens, request_count, success_count, failure_count, spend,
                    ARRAY_AGG(DISTINCT user_id) AS user_ids
-            FROM usage_daily
+            FROM usage_query_daily
             WHERE usage_date BETWEEN $1::date AND $2::date
               AND employee_email = ANY($3::text[])
               AND backend_id = ANY($4::text[])
@@ -2615,7 +2957,7 @@ class UsageStore:
                    MAX(u.email_source) AS email_source,
                    u.source, {model_sql} AS model_name,
                    {self._aggregate_metrics_sql('u.')}
-            FROM usage_daily u
+            FROM usage_query_daily u
             {"JOIN usage_team_membership_daily m ON m.backend_id = u.backend_id AND m.snapshot_date = u.usage_date AND m.user_id = u.user_id" if team_id else ""}
             WHERE {" AND ".join(conditions)}
             GROUP BY u.backend_id, u.usage_date, u.user_id, u.source, {model_sql}
@@ -2653,7 +2995,7 @@ class UsageStore:
             SELECT backend_id, usage_date, user_id, MAX(employee_email) AS employee_email,
                    MAX(employee_name) AS employee_name, MAX(email_source) AS email_source, source, {model_sql} AS model_name,
                    {self._aggregate_metrics_sql()}
-            FROM usage_daily
+            FROM usage_query_daily
             WHERE {where_sql}
             GROUP BY backend_id, usage_date, user_id, source, {model_sql}
             ORDER BY usage_date, MAX(employee_name), source, model_name
@@ -2681,7 +3023,7 @@ class UsageStore:
             WITH filtered AS (
                 SELECT *, COALESCE(NULLIF(employee_email, ''), user_id) AS employee_key,
                        {model_sql} AS model_name
-                FROM usage_daily
+                FROM usage_query_daily
                 WHERE {where_sql}
             ), totals AS (
                 SELECT employee_key, MIN(user_id) AS employee_id,
@@ -2747,7 +3089,7 @@ class UsageStore:
         summary_records = await pool.fetch(
             f"""
             SELECT usage_date, source, {model_sql} AS model_name, {self._aggregate_metrics_sql()}
-            FROM usage_daily
+            FROM usage_query_daily
             WHERE {where_sql}
             GROUP BY usage_date, source, {model_sql}
             ORDER BY usage_date, source, model_name
@@ -2902,7 +3244,7 @@ class UsageStore:
                    u.team_id, MAX(dn.team_name) AS team_name, '' AS team_role,
                    u.source, {model_sql} AS model_name,
                    {self._aggregate_metrics_sql('u.')}
-            FROM usage_daily u
+            FROM usage_query_daily u
             {department_join_sql}
             WHERE {where_sql}
             GROUP BY u.backend_id, u.usage_date, u.user_id, u.team_id, u.source, {model_sql}
@@ -2936,7 +3278,7 @@ class UsageStore:
                 SELECT u.*, dn.team_name,
                        lower(COALESCE(NULLIF(u.employee_email, ''), u.user_id)) AS employee_key,
                        {model_sql} AS model_name
-                FROM usage_daily u
+                FROM usage_query_daily u
                 {department_join_sql}
                 WHERE {where_sql}
             ), totals AS (
@@ -2989,7 +3331,7 @@ class UsageStore:
             f"""
             WITH filtered AS (
                 SELECT u.*, dn.team_name, {logical_key_sql} AS department_key, {model_sql} AS model_name
-                FROM usage_daily u
+                FROM usage_query_daily u
                 {department_join_sql}
                 WHERE {where_sql}
             ), source_totals AS (
@@ -3042,7 +3384,7 @@ class UsageStore:
         summary_records = await pool.fetch(
             f"""
             SELECT u.usage_date, u.source, {model_sql} AS model_name, {self._aggregate_metrics_sql('u.')}
-            FROM usage_daily u
+            FROM usage_query_daily u
             {department_join_sql}
             WHERE {where_sql}
             GROUP BY u.usage_date, u.source, {model_sql}
@@ -3096,7 +3438,7 @@ class UsageStore:
                    MAX(u.email_source) AS email_source,
                    u.source, {model_sql} AS model_name,
                    {self._aggregate_metrics_sql('u.')}
-            FROM usage_daily u
+            FROM usage_query_daily u
             JOIN LATERAL (
                 SELECT m.team_role, m.employee_email, m.employee_name
                 FROM usage_team_membership_daily m
@@ -3132,7 +3474,7 @@ class UsageStore:
                 SELECT u.*, m.team_role,
                        lower(COALESCE(NULLIF(btrim(m.employee_email), ''), NULLIF(btrim(u.employee_email), ''), btrim(u.user_id))) AS employee_key,
                        {model_sql} AS model_name
-                FROM usage_daily u
+                FROM usage_query_daily u
                 JOIN LATERAL (
                     SELECT m.team_role, m.employee_email
                     FROM usage_team_membership_daily m
@@ -3195,7 +3537,7 @@ class UsageStore:
         summary_records = await pool.fetch(
             f"""
             SELECT u.usage_date, u.source, {model_sql} AS model_name, {self._aggregate_metrics_sql('u.')}
-            FROM usage_daily u
+            FROM usage_query_daily u
             JOIN LATERAL (
                 SELECT 1
                 FROM usage_team_membership_daily m
@@ -3289,7 +3631,7 @@ class UsageStore:
                    MAX(u.email_source) AS email_source,
                    u.source, {model_sql} AS model_name,
                    {self._aggregate_metrics_sql('u.')}
-            FROM usage_daily u
+            FROM usage_query_daily u
             JOIN LATERAL (
                 SELECT 1
                 FROM usage_team_membership_daily m
@@ -3375,7 +3717,7 @@ class UsageStore:
             UNION ALL
             SELECT 'usage', MIN(u.backend_id), NULL, NULL, MIN(u.user_id), MAX(u.employee_email), MAX(u.employee_name), MAX(u.email_source), NULL,
                    u.usage_date, u.source, {model_sql} AS model_name, {self._aggregate_metrics_sql('u.')}
-            FROM usage_daily u
+            FROM usage_query_daily u
             WHERE u.backend_id=ANY($1::text[]) AND u.usage_date BETWEEN $3::date AND $4::date
               AND ($7='all' OR u.source=$7)
               AND EXISTS (SELECT 1 FROM selected s WHERE s.backend_id=u.backend_id AND (s.user_id=u.user_id OR (NULLIF(btrim(s.employee_email),'') IS NOT NULL AND lower(btrim(s.employee_email))=lower(btrim(u.employee_email)))))
@@ -3538,17 +3880,68 @@ class UsageStore:
         )
         return [dict(record) for record in records]
 
-    async def api_cost_rows(self, start_date: str, end_date: str) -> list[dict[str, Any]]:
+    async def api_cost_rows(
+        self,
+        start_date: str,
+        end_date: str,
+        *,
+        model: str = "",
+        vendor: str = "",
+        account_id: str = "",
+    ) -> list[dict[str, Any]]:
         records = await self._require_pool().fetch(
             """
-            SELECT usage_date, source, model, SUM(spend)::double precision AS spend
-            FROM usage_daily
+            SELECT usage_date, backend_id, user_id, organization_id, team_id,
+                   key_id, principal_id, source, model,
+                   SUM(spend)::double precision AS spend
+            FROM usage_query_daily
             WHERE usage_date BETWEEN $1::date AND $2::date
-            GROUP BY usage_date, source, model
+              AND ($3='' OR model=$3)
+              AND ($4='' OR source=$4)
+              AND ($5='' OR user_id=$5 OR key_id=$5 OR principal_id=$5)
+            GROUP BY usage_date, backend_id, user_id, organization_id, team_id,
+                     key_id, principal_id, source, model
             ORDER BY usage_date, spend DESC
             """,
             _as_date(start_date),
             _as_date(end_date),
+            _clean_text(model),
+            _clean_text(vendor),
+            _clean_text(account_id),
+        )
+        return [dict(record) for record in records]
+
+    async def api_cost_ledger_rows(
+        self,
+        start_date: str,
+        end_date: str,
+        *,
+        model: str = "",
+        provider: str = "",
+        account_id: str = "",
+    ) -> list[dict[str, Any]]:
+        records = await self._require_pool().fetch(
+            """
+            SELECT usage_date, backend_id, raw_user_id AS user_id, organization_id,
+                   team_id, key_id, principal_id, source, model, provider,
+                   model_group, model_id, api_base,
+                   SUM(spend)::double precision AS spend,
+                   COUNT(*)::bigint AS request_count
+            FROM usage_event_attribution
+            WHERE usage_date BETWEEN $1::date AND $2::date
+              AND ($3='' OR model=$3)
+              AND ($4='' OR provider=$4)
+              AND ($5='' OR raw_user_id=$5 OR key_id=$5 OR principal_id=$5)
+            GROUP BY usage_date, backend_id, raw_user_id, organization_id, team_id,
+                     key_id, principal_id, source, model, provider, model_group,
+                     model_id, api_base
+            ORDER BY usage_date, spend DESC
+            """,
+            _as_date(start_date),
+            _as_date(end_date),
+            _clean_text(model),
+            _clean_text(provider),
+            _clean_text(account_id),
         )
         return [dict(record) for record in records]
 
@@ -3562,8 +3955,11 @@ class UsageStore:
             """
             INSERT INTO cost_items (id, category, name, vendor, model, business_scope,
                 amount, currency, exchange_rate, amount_usd, service_start_date,
-                service_end_date, finance_bucket, notes, enabled, created_at, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7::numeric,$8,$9::numeric,$10::numeric,$11::date,$12::date,$13,$14,$15,$16,$16)
+                service_end_date, finance_bucket, notes, enabled, created_at, updated_at,
+                cost_bucket, source_type, provider, account_id, account_name, voucher_id,
+                voucher_no, invoice_no, recognition_status, reconciliation_status)
+            VALUES ($1,$2,$3,$4,$5,$6,$7::numeric,$8,$9::numeric,$10::numeric,$11::date,$12::date,$13,$14,$15,$16,$16,
+                $17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
             RETURNING *
             """,
             item["id"], item["category"], item["name"], item.get("vendor", ""),
@@ -3571,6 +3967,10 @@ class UsageStore:
             item["currency"], str(item["exchangeRate"]), str(item["amountUsd"]),
             _as_date(item["serviceStartDate"]), _as_date(item["serviceEndDate"]),
             item.get("financeBucket", ""), item.get("notes", ""), bool(item.get("enabled", True)), now,
+            item.get("costBucket", ""), item.get("sourceType", "manual"),
+            item.get("provider", ""), item.get("accountId", ""), item.get("accountName", ""),
+            item.get("voucherId", ""), item.get("voucherNo", ""), item.get("invoiceNo", ""),
+            item.get("recognitionStatus", "actual"), item.get("reconciliationStatus", "unreconciled"),
         )
         return dict(record)
 
@@ -3581,7 +3981,10 @@ class UsageStore:
                 business_scope=$6, amount=$7::numeric, currency=$8,
                 exchange_rate=$9::numeric, amount_usd=$10::numeric,
                 service_start_date=$11::date, service_end_date=$12::date,
-                finance_bucket=$13, notes=$14, enabled=$15, updated_at=$16
+                finance_bucket=$13, notes=$14, enabled=$15, updated_at=$16,
+                cost_bucket=$17, source_type=$18, provider=$19, account_id=$20,
+                account_name=$21, voucher_id=$22, voucher_no=$23, invoice_no=$24,
+                recognition_status=$25, reconciliation_status=$26
             WHERE id=$1 RETURNING *
             """,
             item_id, item["category"], item["name"], item.get("vendor", ""),
@@ -3590,6 +3993,10 @@ class UsageStore:
             _as_date(item["serviceStartDate"]), _as_date(item["serviceEndDate"]),
             item.get("financeBucket", ""), item.get("notes", ""), bool(item.get("enabled", True)),
             datetime.now(timezone.utc),
+            item.get("costBucket", ""), item.get("sourceType", "manual"),
+            item.get("provider", ""), item.get("accountId", ""), item.get("accountName", ""),
+            item.get("voucherId", ""), item.get("voucherNo", ""), item.get("invoiceNo", ""),
+            item.get("recognitionStatus", "actual"), item.get("reconciliationStatus", "unreconciled"),
         )
         return dict(record) if record else None
 
@@ -3623,13 +4030,20 @@ class UsageStore:
         record = await self._require_pool().fetchrow(
             """
             INSERT INTO savings_actions (id, name, baseline_daily_cost, implemented_date,
-                verified_date, verified_daily_cost, owner, status, notes, created_at, updated_at)
-            VALUES ($1,$2,$3::numeric,$4::date,$5::date,$6::numeric,$7,$8,$9,$10,$10) RETURNING *
+                verified_date, verified_daily_cost, owner, status, notes, created_at, updated_at,
+                expected_daily_cost, expected_start_date, provider, model, cost_bucket,
+                evidence_url, finance_reviewer)
+            VALUES ($1,$2,$3::numeric,$4::date,$5::date,$6::numeric,$7,$8,$9,$10,$10,
+                $11::numeric,$12::date,$13,$14,$15,$16,$17) RETURNING *
             """,
             action["id"], action["name"], str(action["baselineDailyCost"]),
             _as_date(action["implementedDate"]), _as_date(action["verifiedDate"]) if action.get("verifiedDate") else None,
             str(action["verifiedDailyCost"]) if action.get("verifiedDailyCost") is not None else None,
             action.get("owner", ""), action.get("status", "planned"), action.get("notes", ""), now,
+            str(action["expectedDailyCost"]) if action.get("expectedDailyCost") is not None else None,
+            _as_date(action["expectedStartDate"]) if action.get("expectedStartDate") else None,
+            action.get("provider", ""), action.get("model", ""), action.get("costBucket", ""),
+            action.get("evidenceUrl", ""), action.get("financeReviewer", ""),
         )
         return dict(record)
 
@@ -3638,7 +4052,10 @@ class UsageStore:
             """
             UPDATE savings_actions SET name=$2, baseline_daily_cost=$3::numeric,
                 implemented_date=$4::date, verified_date=$5::date,
-                verified_daily_cost=$6::numeric, owner=$7, status=$8, notes=$9, updated_at=$10
+                verified_daily_cost=$6::numeric, owner=$7, status=$8, notes=$9, updated_at=$10,
+                expected_daily_cost=$11::numeric, expected_start_date=$12::date,
+                provider=$13, model=$14, cost_bucket=$15, evidence_url=$16,
+                finance_reviewer=$17
             WHERE id=$1 RETURNING *
             """,
             action_id, action["name"], str(action["baselineDailyCost"]),
@@ -3646,5 +4063,9 @@ class UsageStore:
             str(action["verifiedDailyCost"]) if action.get("verifiedDailyCost") is not None else None,
             action.get("owner", ""), action.get("status", "planned"), action.get("notes", ""),
             datetime.now(timezone.utc),
+            str(action["expectedDailyCost"]) if action.get("expectedDailyCost") is not None else None,
+            _as_date(action["expectedStartDate"]) if action.get("expectedStartDate") else None,
+            action.get("provider", ""), action.get("model", ""), action.get("costBucket", ""),
+            action.get("evidenceUrl", ""), action.get("financeReviewer", ""),
         )
         return dict(record) if record else None
