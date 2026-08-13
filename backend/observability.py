@@ -7,6 +7,10 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
+# This version is part of the API contract. Bump it when metric definitions
+# change so cached dashboard payloads can be audited against their semantics.
+STABILITY_DEFINITIONS_VERSION = "2026-08-12"
+
 
 def first(record: dict[str, Any], *names: str, default: Any = None) -> Any:
     for name in names:
