@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import date, datetime, timezone
 
 from backend.litellm_client import LiteLLMBackend, LiteLLMClient
+from backend.usage_realtime import UsageRealtimeStore
+from backend.usage_realtime_worker import UsageRealtimeWorker
 from backend.usage_store import UsageStore
 
 
@@ -126,3 +129,60 @@ def test_usage_query_view_replaces_ready_day_instead_of_adding_it() -> None:
     assert "CREATE OR REPLACE VIEW usage_query_daily" in USAGE_SCHEMA
     assert "WHERE NOT EXISTS" in USAGE_SCHEMA
     assert "JOIN usage_realtime_state s ON s.usage_date=r.usage_date AND s.ready" in USAGE_SCHEMA
+
+
+def test_realtime_configuration_enables_postgres_history_store(monkeypatch) -> None:
+    monkeypatch.setenv("USAGE_DATABASE_URL", "postgresql://unused")
+    monkeypatch.setenv("USAGE_SYNC_ENABLED", "false")
+    monkeypatch.setenv("USAGE_REALTIME_ENABLED", "true")
+
+    assert UsageStore.from_environment() is not None
+
+
+def test_archive_reader_claims_stale_pending_messages_before_new_ones() -> None:
+    class Client:
+        async def xautoclaim(self, *_args, **_kwargs):
+            return (
+                "0-0",
+                [("1-0", {"event": json.dumps({"requestId": "req-1"})})],
+                [],
+            )
+
+        async def xreadgroup(self, *_args, **_kwargs):
+            raise AssertionError("new messages must wait until pending messages are replayed")
+
+    store = UsageRealtimeStore.__new__(UsageRealtimeStore)
+    store.client = Client()
+    store.consumer_name = "test-consumer"
+
+    messages = asyncio.run(store.read_archive_batch())
+
+    assert messages == [("1-0", {"requestId": "req-1"})]
+
+
+def test_incomplete_realtime_window_does_not_advance_cursor() -> None:
+    class Realtime:
+        cursor_value = datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc)
+
+        async def cursor(self, _backend_id):
+            return self.cursor_value
+
+        async def set_cursor(self, *_args):
+            raise AssertionError("an incomplete window must not advance the cursor")
+
+    class Client:
+        async def incremental_events_from_logs(self, *_args, **_kwargs):
+            return [], False
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.realtime = Realtime()
+    worker.client = Client()
+    worker.overlap_seconds = 60
+
+    inserted = asyncio.run(
+        worker.poll_backend(
+            BACKEND, datetime(2026, 8, 13, 2, 1, tzinfo=timezone.utc)
+        )
+    )
+
+    assert inserted == 0
