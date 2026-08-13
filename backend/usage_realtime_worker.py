@@ -103,11 +103,15 @@ class UsageRealtimeWorker:
         )
         await self.realtime.seed_request_ids(request_ids)
         await self._refresh_directories()
+        today_start = datetime.combine(
+            today, datetime.min.time(), tzinfo=timezone.utc
+        )
         for backend in self.client.backends:
             last_archived = await self.store.latest_archived_event_at(backend.id)
-            cursor = last_archived or datetime.combine(
-                today, datetime.min.time(), tzinfo=timezone.utc
-            )
+            # The archive table spans all history. Never let an old event from
+            # a previous day turn the first realtime request into a multi-day
+            # scan; today's recovery is seeded from the database separately.
+            cursor = max(last_archived, today_start) if last_archived else today_start
             await self.realtime.set_cursor(backend.id, cursor)
         await self.poll_once(datetime.now(timezone.utc))
         await self.flush_archive()
@@ -167,6 +171,9 @@ class UsageRealtimeWorker:
             if not messages:
                 break
             valid = [event for _message_id, event in messages if event]
+            # A database outage must leave the messages pending so the next
+            # pass can retry them; acknowledging on failure would lose the
+            # only durable copy outside Redis.
             await self.store.archive_realtime_events(valid)
             await self.realtime.acknowledge([message_id for message_id, _ in messages])
             total += len(messages)

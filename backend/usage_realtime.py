@@ -328,13 +328,38 @@ return {1, revision}
     async def read_archive_batch(
         self, count: int = 200, block_ms: int = 100
     ) -> list[tuple[str, dict[str, Any]]]:
-        records = await self.client.xreadgroup(
-            self.consumer_group,
-            self.consumer_name,
-            {self.stream_key: ">"},
-            count=count,
-            block=block_ms,
-        )
+        # Claim stale messages first so a worker restart cannot strand events
+        # in another consumer's pending list forever.
+        records = []
+        try:
+            claimed = await self.client.xautoclaim(
+                self.stream_key,
+                self.consumer_group,
+                self.consumer_name,
+                min_idle_time=30_000,
+                start_id="0-0",
+                count=count,
+            )
+            records = [(self.stream_key, claimed[1])] if claimed and claimed[1] else []
+        except (AttributeError, TypeError, NotImplementedError):
+            # Older redis clients/test doubles may not expose XAUTOCLAIM.
+            records = []
+        if not records:
+            records = await self.client.xreadgroup(
+                self.consumer_group,
+                self.consumer_name,
+                {self.stream_key: "0"},
+                count=count,
+                block=0,
+            )
+        if not records:
+            records = await self.client.xreadgroup(
+                self.consumer_group,
+                self.consumer_name,
+                {self.stream_key: ">"},
+                count=count,
+                block=block_ms,
+            )
         output: list[tuple[str, dict[str, Any]]] = []
         for _stream, messages in records or []:
             for message_id, fields in messages:

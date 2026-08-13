@@ -551,7 +551,12 @@ class UsageStore:
     @classmethod
     def from_environment(cls) -> UsageStore | None:
         dsn = os.getenv("USAGE_DATABASE_URL", "").strip()
+        # Realtime mode always needs PostgreSQL for history, archive and
+        # database fallback. Keep the legacy flag for old local deployments,
+        # but do not let it accidentally disable the new realtime pipeline.
         enabled = os.getenv("USAGE_SYNC_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+        realtime = os.getenv("USAGE_REALTIME_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+        enabled = enabled or realtime
         if not enabled or not dsn:
             return None
         try:
