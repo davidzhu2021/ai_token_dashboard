@@ -306,14 +306,14 @@ return {1, revision}
     async def ready(self) -> bool:
         return await self.client.get(f"{self.prefix}:ready") == "1"
 
-    async def acquire_worker_lock(self, worker_id: str, ttl_seconds: int = 30) -> bool:
+    async def acquire_worker_lock(self, worker_id: str, ttl_seconds: int = 300) -> bool:
         return bool(
             await self.client.set(
                 f"{self.prefix}:worker-lock", worker_id, nx=True, ex=ttl_seconds
             )
         )
 
-    async def renew_worker_lock(self, worker_id: str, ttl_seconds: int = 30) -> bool:
+    async def renew_worker_lock(self, worker_id: str, ttl_seconds: int = 300) -> bool:
         key = f"{self.prefix}:worker-lock"
         current = await self.client.get(key)
         if current != worker_id:

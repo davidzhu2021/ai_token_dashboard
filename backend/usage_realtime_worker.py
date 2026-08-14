@@ -45,6 +45,9 @@ class UsageRealtimeWorker:
         self.reconcile_seconds = max(
             60, _env_int("USAGE_REALTIME_RECONCILE_INTERVAL_SECONDS", 300)
         )
+        self.directory_refresh_seconds = max(
+            60, _env_int("USAGE_REALTIME_DIRECTORY_REFRESH_SECONDS", 300)
+        )
         self.directory: dict[str, Any] = {}
         self.token_maps: dict[str, dict[Any, Any]] = {}
         self.current_day = usage_today()
@@ -54,18 +57,19 @@ class UsageRealtimeWorker:
         if callable(connect):
             await connect()
 
-    async def _refresh_directories(self) -> None:
+    async def _refresh_directories(self, *, refresh_departments: bool = True) -> None:
         self.directory = await self.synchronizer._identity_directory()
         self.token_maps = {
             backend.id: await self.synchronizer._token_attribution_map(backend.id)
             for backend in self.client.backends
         }
-        try:
-            await self.synchronizer.sync_department_directories()
-        except Exception:
-            # Usage ingestion can continue with the last durable directory;
-            # the next five-minute refresh will retry upstream department names.
-            logger.exception("realtime department directory refresh failed")
+        if refresh_departments:
+            try:
+                await self.synchronizer.sync_department_directories()
+            except Exception:
+                # Usage ingestion can continue with the last durable directory;
+                # the next five-minute refresh will retry upstream department names.
+                logger.exception("realtime department directory refresh failed")
 
     def _enrich_event(
         self, backend: LiteLLMBackend, event: dict[str, Any]
@@ -108,7 +112,9 @@ class UsageRealtimeWorker:
             datetime.now(timezone.utc) - timedelta(days=3)
         )
         await self.realtime.seed_request_ids(request_ids)
-        await self._refresh_directories()
+        # Directory names are already durable in PostgreSQL; refresh them
+        # after the realtime cursor is running so a slow upstream directory
+        # API cannot block cold-start recovery.
         today_start = datetime.combine(
             today, datetime.min.time(), tzinfo=timezone.utc
         )
@@ -244,7 +250,7 @@ class UsageRealtimeWorker:
                     await self.recover()
                     last_reconcile = now
                     last_directory_refresh = now
-                if (now - last_directory_refresh).total_seconds() >= 300:
+                if (now - last_directory_refresh).total_seconds() >= self.directory_refresh_seconds:
                     await self._refresh_directories()
                     last_directory_refresh = now
                 await self.poll_once(now)
