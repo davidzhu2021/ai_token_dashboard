@@ -805,13 +805,6 @@ function usageStatusState(freshness = null, dataQuality = null, coverage = null)
       description: "所选日期范围尚未全部同步，当前合计和排行可能低于实际用量。",
     };
   }
-  if (freshness?.stale) {
-    return {
-      tone: "warning",
-      title: "同步延迟",
-      description: "当前继续展示最近一次可用数据，不会用空值或 0 覆盖；恢复后页面会自动更新。",
-    };
-  }
   return null;
 }
 
