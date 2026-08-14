@@ -36,6 +36,15 @@ def test_ranking_tables_expose_sortable_numeric_headers() -> None:
         assert head.count('class="num sortable"') == len(SORT_KEYS)
         assert head.count('aria-sort="none"') == len(SORT_KEYS)
         assert head.count('<button class="th-sort" type="button"') == len(SORT_KEYS)
+        assert '<th class="rank-head">排名</th>' in head
+
+
+def test_ranking_rows_render_dynamic_badges_after_sorting() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert 'function rankingBadge(index)' in source
+    assert '<td class="rank-cell">${rankingBadge(index)}</td>' in source
+    assert source.count('.map((item, index) => {') >= 2
 
 
 def test_non_ranking_tables_stay_unsorted() -> None:

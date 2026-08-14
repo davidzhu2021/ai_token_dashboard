@@ -2525,7 +2525,6 @@ function renderDonutTo(svgId, totalId, legendId, data) {
 function renderModelBarsTo(containerId, data) {
   const container = el(containerId);
   if (!container) return;
-  const showRank = containerId === "teamModelBars";
   // The API owns canonical model names; the browser only combines identical rows.
   const grouped = {};
   data.forEach((item) => {
@@ -2540,7 +2539,7 @@ function renderModelBarsTo(containerId, data) {
   container.classList.toggle("is-compact", rows.length > 0 && rows.length <= 4);
   container.innerHTML = rows.length
     ? rows
-        .map((row, index) => `<div class="bar-row">${showRank ? `<span class="bar-rank${index < 3 ? " is-leading" : ""}">${index + 1}</span>` : ""}<strong>${escapeHtml(displayModelName(row.model))}</strong><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3, (row.value / max) * 100)}%"></div></div><span class="num">${formatTokens(row.value)}</span></div>`)
+        .map((row, index) => `<div class="bar-row">${rankingBadge(index)}<strong>${escapeHtml(displayModelName(row.model))}</strong><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3, (row.value / max) * 100)}%"></div></div><span class="num">${formatTokens(row.value)}</span></div>`)
         .join("")
     : `<div class="model-empty">当前筛选范围暂无模型用量</div>`;
 }
@@ -2743,6 +2742,11 @@ const DEFAULT_RANKING_SORT = { key: "totalTokens", direction: "desc" };
 const RANKING_SORT_KEYS = ["requestCount", "totalTokens", "spend", "successRate"];
 const RANKING_SORT_TIP = "默认按 Token 从高到低排序，点击请求数 / Token / 金额 / 成功率表头可切换升降序";
 const rankingSortState = new Map();
+
+function rankingBadge(index) {
+  const rank = index + 1;
+  return `<span class="bar-rank${rank <= 3 ? " is-leading" : ""}" aria-label="第 ${rank} 名">${rank}</span>`;
+}
 
 function rankingSort(tableId) {
   return rankingSortState.get(tableId) || DEFAULT_RANKING_SORT;
@@ -3008,11 +3012,12 @@ function renderEmployeeRanking(tableId, countId, employees, emptyText) {
   el(countId).textContent = `${sorted.length} 人`;
   el(tableId).innerHTML = sorted.length
     ? sorted
-        .map((item) => {
+        .map((item, index) => {
           const requests = Number(item.requestCount || 0);
           const successRate = requests ? Math.round((Number(item.successCount || 0) / requests) * 1000) / 10 : 0;
           return `
             <tr class="admin-employee-row ${(tableId === "teamUserTable" && selectedTeamEmployee === (item.employeeEmail || item.employeeId)) || (tableId === "departmentUserTable" && employeeMatchesIdentity(item, selectedDepartmentEmployeeInfo())) ? "active" : ""}" data-employee="${escapeHtml(item.employeeEmail || item.employeeId)}">
+              <td class="rank-cell">${rankingBadge(index)}</td>
               <td><strong>${item.employeeName || item.employeeId}</strong></td>
               <td>${item.employeeEmail || "未绑定邮箱"}</td>
               ${showDepartment ? `<td>${escapeHtml(employeeDepartmentText(item))}</td>` : ""}
@@ -3027,7 +3032,7 @@ function renderEmployeeRanking(tableId, countId, employees, emptyText) {
           `;
         })
         .join("")
-    : `<tr><td colspan="${isTeamTable || showDepartment ? 9 : 8}" style="text-align:center;color:var(--muted);padding:26px">${emptyText}</td></tr>`;
+    : `<tr><td colspan="${isTeamTable || showDepartment ? 10 : 9}" style="text-align:center;color:var(--muted);padding:26px">${emptyText}</td></tr>`;
 }
 
 function renderDepartmentRanking(tableId, countId, departments, emptyText) {
@@ -3036,11 +3041,12 @@ function renderDepartmentRanking(tableId, countId, departments, emptyText) {
   el(countId).textContent = `${sorted.length} 个部门`;
   el(tableId).innerHTML = sorted.length
     ? sorted
-        .map((item) => {
+        .map((item, index) => {
           const requests = Number(item.requestCount || 0);
           const successRate = requests ? Math.round((Number(item.successCount || 0) / requests) * 1000) / 10 : 0;
           return `
             <tr class="admin-employee-row" data-department="${escapeHtml(departmentOptionKey(item))}">
+              <td class="rank-cell">${rankingBadge(index)}</td>
               <td><strong>${item.departmentName || item.departmentId}</strong></td>
               <td>${item.departmentId || "未绑定部门"}</td>
               <td>${displaySource(item.primarySource)}</td>
@@ -3053,7 +3059,7 @@ function renderDepartmentRanking(tableId, countId, departments, emptyText) {
           `;
         })
         .join("")
-    : `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:26px">${emptyText}</td></tr>`;
+    : `<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:26px">${emptyText}</td></tr>`;
 }
 
 function renderAdminUsers() {
@@ -3076,7 +3082,7 @@ function renderDepartmentUsers() {
 
 function renderTeamUsers() {
   if (isTeamRankingLoading) {
-    renderTableSkeleton("teamUserTable", "teamUserCount", 9);
+    renderTableSkeleton("teamUserTable", "teamUserCount", 10);
   } else {
     setText("teamLimitHint", teamRankingError || teamRankingHint || "按当前筛选范围统计");
     renderEmployeeRanking("teamUserTable", "teamUserCount", teamEmployees, teamRankingError || "当前团队暂无成员用量");
@@ -3214,13 +3220,14 @@ function renderDonutSkeleton(totalId, legendId) {
   );
 }
 
-function renderBarsSkeleton(containerId) {
+function renderBarsSkeleton(containerId, showRank = false) {
   setHtml(
     containerId,
     Array.from({ length: 5 })
     .map(
       (_, index) => `
         <div class="bar-row">
+          ${showRank ? '<span class="bar-rank" aria-hidden="true"></span>' : ''}
           <strong><span class="loading-line" style="display:block;width:${70 - index * 6}px"></span></strong>
           <div class="bar-track"><div class="bar-fill" style="width:${78 - index * 10}%;background:#dee5ee"></div></div>
           <span class="num">--</span>
@@ -3278,7 +3285,7 @@ function renderPersonalLoading() {
   renderChartSkeleton("spendChart");
   toggleTrendGrid("personalTrendGrid");
   renderDonutSkeleton("donutTotal", "sourceLegend");
-  renderBarsSkeleton("modelBars");
+  renderBarsSkeleton("modelBars", true);
   renderTableSkeleton("usageTable", "tableCount", 8);
 }
 
@@ -3308,8 +3315,8 @@ function renderAdminLoading() {
   renderChartSkeleton("adminSpendChart");
   toggleTrendGrid("adminTrendGrid");
   renderDonutSkeleton("adminDonutTotal", "adminSourceLegend");
-  renderBarsSkeleton("adminModelBars");
-  renderTableSkeleton("adminUserTable", "adminUserCount", 9);
+  renderBarsSkeleton("adminModelBars", true);
+  renderTableSkeleton("adminUserTable", "adminUserCount", 10);
   renderAdminDetailCard();
 }
 
@@ -3348,9 +3355,9 @@ function renderDepartmentLoading() {
   renderChartSkeleton("departmentSpendChart");
   if (selectedDepartment) toggleTrendGrid("departmentTrendGrid");
   renderDonutSkeleton("departmentDonutTotal", "departmentSourceLegend");
-  renderBarsSkeleton("departmentModelBars");
+  renderBarsSkeleton("departmentModelBars", true);
   renderBarsSkeleton("departmentBars");
-  renderTableSkeleton("departmentUserTable", "departmentUserCount", 8);
+  renderTableSkeleton("departmentUserTable", "departmentUserCount", 9);
   if (selectedDepartmentEmployee) renderTableSkeleton("departmentEmployeeUsageTable", "departmentEmployeeTableCount", 8);
 }
 
@@ -3393,17 +3400,17 @@ function renderTeamLoading() {
   renderChartSkeleton("teamSpendChart");
   toggleTrendGrid("teamTrendGrid");
   renderDonutSkeleton("teamDonutTotal", "teamSourceLegend");
-  renderBarsSkeleton("teamModelBars");
+  renderBarsSkeleton("teamModelBars", true);
   if (selectedTeamEmployee) {
     if (isTeamRankingLoading) {
-      renderTableSkeleton("teamUserTable", "teamUserCount", 8);
+      renderTableSkeleton("teamUserTable", "teamUserCount", 10);
     } else {
       setText("teamLimitHint", teamRankingError || teamRankingHint || "按当前筛选范围统计");
       renderEmployeeRanking("teamUserTable", "teamUserCount", teamEmployees, teamRankingError || "当前团队暂无成员用量");
     }
     renderTableSkeleton("teamMemberUsageTable", "teamMemberTableCount", 8);
   } else {
-    renderTableSkeleton("teamUserTable", "teamUserCount", 8);
+    renderTableSkeleton("teamUserTable", "teamUserCount", 10);
   }
 }
 
@@ -8365,7 +8372,7 @@ function renderStabilityOverview() {
     const failureRate = item.finalRequestFailureRate ?? item.userVisibleFailureRate;
     const retryRate = item.retryAttemptRate;
     const itemTtft = item.ttftP95Ms;
-    return `<button class="observability-rank-row observability-rank-row-button" type="button" data-stability-model="${escapeHtml(item.model || "")}"><strong>${index + 1}</strong><div><b>${escapeHtml(item.model)}</b><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Math.max(3, 100 - Math.min(100, Number(failureRate || 0) * 1000))}%"></div></div><small class="observability-rank-meta">失败 ${escapeHtml(observabilityPercent(failureRate))} · 重试 ${escapeHtml(observabilityPercent(retryRate))} · TTFT ${itemTtft == null ? "暂无数据" : `${Math.round(itemTtft)}ms`}</small></div><span class="chip ${item.state === "稳定" ? "green" : item.state === "观察" ? "gold" : "red"}">${escapeHtml(item.state)}</span></button>`;
+    return `<button class="observability-rank-row observability-rank-row-button" type="button" data-stability-model="${escapeHtml(item.model || "")}">${rankingBadge(index)}<div><b>${escapeHtml(item.model)}</b><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Math.max(3, 100 - Math.min(100, Number(failureRate || 0) * 1000))}%"></div></div><small class="observability-rank-meta">失败 ${escapeHtml(observabilityPercent(failureRate))} · 重试 ${escapeHtml(observabilityPercent(retryRate))} · TTFT ${itemTtft == null ? "暂无数据" : `${Math.round(itemTtft)}ms`}</small></div><span class="chip ${item.state === "稳定" ? "green" : item.state === "观察" ? "gold" : "red"}">${escapeHtml(item.state)}</span></button>`;
   }).join("") || `<p class="empty">暂无模型样本</p>`;
   el("stabilityScenarioBody").innerHTML = (data.topScenarios || []).map((item) => {
     const failureRate = item.finalRequestFailureRate ?? item.userVisibleFailureRate;

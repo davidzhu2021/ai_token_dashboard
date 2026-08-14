@@ -2279,7 +2279,7 @@
       }
 
       .model-rank-group .bar-row {
-        grid-template-columns: minmax(72px, 0.82fr) minmax(0, 1fr) minmax(64px, auto);
+        grid-template-columns: 24px minmax(72px, 0.82fr) minmax(0, 1fr) minmax(64px, auto);
         gap: 10px;
         font-size: 12px;
       }
@@ -2319,10 +2319,6 @@
         width: min(100%, 390px);
       }
 
-      .model-rank-group-team .bar-row {
-        grid-template-columns: 24px minmax(76px, 0.82fr) minmax(0, 1fr) minmax(64px, auto);
-      }
-
       .bar-rank {
         display: grid;
         place-items: center;
@@ -2339,6 +2335,17 @@
       .bar-rank.is-leading {
         background: var(--blue-soft);
         color: var(--blue);
+      }
+
+      th.rank-head,
+      td.rank-cell {
+        width: 52px;
+        min-width: 52px;
+        text-align: center;
+      }
+
+      td.rank-cell .bar-rank {
+        margin-inline: auto;
       }
 
       .chip {
@@ -7406,6 +7413,7 @@
               <table>
                 <thead>
                   <tr>
+                    <th class="rank-head">排名</th>
                     <th>员工</th>
                     <th>邮箱</th>
                     <th>部门</th>
@@ -7683,6 +7691,7 @@
                 <table>
                   <thead>
                     <tr>
+                      <th class="rank-head">排名</th>
                       <th>成员</th>
                       <th>邮箱</th>
                       <th>主要来源</th>
@@ -7898,6 +7907,7 @@
               <table>
                 <thead>
                   <tr>
+                    <th class="rank-head">排名</th>
                     <th>部门 / 员工</th>
                     <th>ID / 邮箱</th>
                     <th>主要来源</th>
@@ -9216,6 +9226,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260812-team-ranking-polish"></script>
+    <script src="/assets/app.js?v=20260814-ranking-badges"></script>
   </body>
 </html>

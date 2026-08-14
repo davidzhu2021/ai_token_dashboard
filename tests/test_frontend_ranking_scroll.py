@@ -68,9 +68,11 @@ def test_ranking_tables_keep_headers_visible_and_mobile_heights_bounded() -> Non
     assert markup.index("div.observability-ranking.is-compact") > markup.index(".observability-stability-grid .observability-ranking {")
     assert markup.index("div.observability-model-list.is-compact") > markup.index(".observability-ranking-panel > .observability-model-list {")
     assert 'container.classList.toggle("is-compact", rows.length > 0 && rows.length <= 4);' in source
-    assert 'const showRank = containerId === "teamModelBars";' in source
-    assert 'class="bar-rank${index < 3 ? " is-leading" : ""}"' in source
-    assert ".model-rank-group-team .bar-row" in markup
+    assert 'function rankingBadge(index)' in source
+    assert '.map((row, index) => `<div class="bar-row">${rankingBadge(index)}' in source
+    assert 'function renderBarsSkeleton(containerId, showRank = false)' in source
+    assert 'renderBarsSkeleton("adminModelBars", true)' in source
+    assert "grid-template-columns: 24px minmax(72px, 0.82fr)" in markup
     assert ".model-rank-group > div.bars.is-compact" in markup
     assert "justify-content: center" in markup
     assert 'container.classList.toggle("is-compact", sorted.length > 0 && sorted.length <= 4);' in source

@@ -275,7 +275,7 @@ def test_only_the_admin_ranking_gets_a_department_column() -> None:
     assert 'const showDepartment = tableId === "adminUserTable"' in source
     assert '${showDepartment ? `<td>${escapeHtml(employeeDepartmentText(item))}</td>` : ""}' in source
     # 空表提示要跨满新的列数，否则会短一格。
-    assert 'colspan="${isTeamTable || showDepartment ? 9 : 8}"' in source
+    assert 'colspan="${isTeamTable || showDepartment ? 10 : 9}"' in source
 
 
 def test_admin_ranking_header_and_skeleton_match_the_new_column_count() -> None:
@@ -286,13 +286,14 @@ def test_admin_ranking_header_and_skeleton_match_the_new_column_count() -> None:
 
     header_start = markup.index('<tbody id="adminUserTable">')
     header = markup[markup.rindex("<thead>", 0, header_start) : header_start]
-    assert _column_count(header) == 9, "全员排行表头列数应为 9"
+    assert _column_count(header) == 10, "全员排行表头列数应为 10"
+    assert '<th class="rank-head">排名</th>' in header
     assert header.index("<th>部门</th>") > header.index("<th>邮箱</th>"), "部门列应紧随邮箱列"
 
-    assert 'renderTableSkeleton("adminUserTable", "adminUserCount", 9)' in source
+    assert 'renderTableSkeleton("adminUserTable", "adminUserCount", 10)' in source
 
     # 另两张表没加列，表头保持原样。
-    for table_id, expected in (("departmentUserTable", 8), ("teamUserTable", 9)):
+    for table_id, expected in (("departmentUserTable", 9), ("teamUserTable", 10)):
         start = markup.index(f'<tbody id="{table_id}">')
         block = markup[markup.rindex("<thead>", 0, start) : start]
         assert _column_count(block) == expected, f"{table_id} 表头列数被意外改动"

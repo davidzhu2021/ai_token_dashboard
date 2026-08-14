@@ -81,7 +81,7 @@ def test_custom_range_validation_and_reload_are_wired() -> None:
 def test_static_asset_version_follows_custom_range_change() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
 
-    assert "/assets/app.js?v=20260812-team-ranking-polish" in markup
+    assert "/assets/app.js?v=20260814-ranking-badges" in markup
     assert "20260805-team-member-keys" not in markup
 
 
