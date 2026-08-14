@@ -423,3 +423,51 @@ def test_realtime_worker_consumes_reader_refresh_queue() -> None:
     assert asyncio.run(worker.consume_refresh_requests()) is True
     assert worker.synchronizer.range == ("2026-08-10", "2026-08-14")
     assert worker.store.finished == (["r1"], True, "")
+
+
+def test_realtime_worker_waits_for_existing_lock(monkeypatch) -> None:
+    attempts = 0
+
+    class Store:
+        async def connect(self):
+            return None
+
+    class Realtime:
+        async def connect(self):
+            return None
+
+        async def acquire_worker_lock(self, _worker_id):
+            nonlocal attempts
+            attempts += 1
+            return attempts >= 2
+
+        async def release_worker_lock(self, _worker_id):
+            return None
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.store = Store()
+    worker.realtime = Realtime()
+    worker.synchronizer = type("Sync", (), {"organization_repository": None})()
+    worker.worker_id = "worker-new"
+    worker.poll_seconds = 2
+    worker.stop_event = asyncio.Event()
+    worker._lock_lost = asyncio.Event()
+    worker._lock_renew_task = None
+
+    async def no_repository():
+        return None
+
+    async def renew_loop():
+        await worker.stop_event.wait()
+
+    async def recover():
+        worker.stop_event.set()
+
+    monkeypatch.setattr(worker, "_connect_repository", no_repository)
+    monkeypatch.setattr(worker, "_renew_worker_lock_loop", renew_loop)
+    monkeypatch.setattr(worker, "recover", recover)
+    monkeypatch.setenv("USAGE_REALTIME_LOCK_RETRY_SECONDS", "0")
+
+    asyncio.run(worker.run())
+
+    assert attempts == 2

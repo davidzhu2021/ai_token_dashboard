@@ -408,8 +408,24 @@ class UsageRealtimeWorker:
         await self.store.connect()
         await self.realtime.connect()
         await self._connect_repository()
-        if not await self.realtime.acquire_worker_lock(self.worker_id):
-            raise RuntimeError("another realtime usage worker is active")
+        lock_retry_seconds = max(
+            2, _env_int("USAGE_REALTIME_LOCK_RETRY_SECONDS", self.poll_seconds)
+        )
+        while not self.stop_event.is_set():
+            if await self.realtime.acquire_worker_lock(self.worker_id):
+                break
+            logger.warning(
+                "another realtime usage worker is active; retrying in %ss",
+                lock_retry_seconds,
+            )
+            try:
+                await asyncio.wait_for(
+                    self.stop_event.wait(), timeout=lock_retry_seconds
+                )
+            except asyncio.TimeoutError:
+                continue
+        if self.stop_event.is_set():
+            return
         self._lock_renew_task = asyncio.create_task(
             self._renew_worker_lock_loop(), name="usage-realtime-lock-renewal"
         )
