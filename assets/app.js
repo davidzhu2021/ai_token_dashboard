@@ -8625,14 +8625,19 @@ function renderStabilityOverview() {
     ? observabilityEmptyState("本期确无异常记录", "当前统计期间内，已接入指标均为真实零值。", [{ label: "调整筛选", attr: 'data-observability-empty-action="filters" data-observability-scope="stability"' }])
     : observabilityEmptyState("异常趋势暂不可用", "尝试事件尚未接入或当前窗口尚未同步，缺失数据不会绘制为零值。", [{ label: "重新加载", attr: 'data-observability-retry="stability"' }, { label: "进入治理工作台", attr: 'data-open-governance-tab="stability-actions"' }]);
   const stabilityRankings = data.modelRankings || [];
-  el("stabilityRanking").classList.toggle("is-compact", stabilityRankings.length > 0 && stabilityRankings.length <= 4);
-  el("stabilityRanking").innerHTML = stabilityRankings.map((item, index) => {
+  const stabilityRanking = el("stabilityRanking");
+  stabilityRanking.classList.toggle("is-compact", stabilityRankings.length > 0 && stabilityRankings.length <= 4);
+  const formatStabilityTtft = (value) => {
+    if (value == null || !Number.isFinite(Number(value))) return "暂无数据";
+    return Number(value) >= 1000 ? `${(Number(value) / 1000).toFixed(1)}s` : `${Math.round(Number(value))}ms`;
+  };
+  const stabilityRankingStateClass = (state) => ({ "稳定": "stable", "观察": "observe", "需治理": "repair" }[state] || "unknown");
+  stabilityRanking.innerHTML = stabilityRankings.length ? `<div class="observability-ranking-head" aria-hidden="true"><span>模型</span><span>失败</span><span>兜底</span><span>TTFT</span><span>状态</span></div>${stabilityRankings.map((item) => {
     const failureRate = item.finalRequestFailureRate ?? item.userVisibleFailureRate;
-    const retryRate = item.retryAttemptRate;
-    const itemTtft = item.ttftP95Ms;
-    const riskWidth = failureRate == null ? 0 : Math.max(3, Math.min(100, Number(failureRate) * 1000));
-    return `<button class="observability-rank-row observability-rank-row-button" type="button" data-stability-model="${escapeHtml(item.model || item.requestedModelGroup || "")}">${rankingBadge(index)}<div><b>${escapeHtml(item.requestedModelGroup || item.model || "未知模型")}</b><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${riskWidth}%"></div></div><small class="observability-rank-meta">失败 ${escapeHtml(observabilityPercent(failureRate))} · 重试恢复 ${escapeHtml(observabilityPercent(item.retryRecoveryRate ?? retryRate))} · TTFT ${itemTtft == null ? "暂无数据" : `${Math.round(itemTtft)}ms`} · 覆盖 ${item.ttftCoverageRate == null ? "暂无" : `${(Number(item.ttftCoverageRate) * 100).toFixed(0)}%`}</small></div><span class="chip ${item.state === "稳定" ? "green" : item.state === "观察" ? "gold" : "red"}">${escapeHtml(item.state || "待判断")}</span></button>`;
-  }).join("") || observabilityEmptyState("暂无模型排名", "当前窗口没有可比较的模型样本。", [{ label: "调整筛选", attr: 'data-observability-empty-action="filters" data-observability-scope="stability"' }]);
+    const modelName = item.requestedModelGroup || item.model || "未知模型";
+    const state = item.state || "暂无数据";
+    return `<button class="observability-rank-row observability-rank-row-button is-${stabilityRankingStateClass(state)}" type="button" title="${escapeHtml(modelName)}" data-stability-model="${escapeHtml(item.model || item.requestedModelGroup || "")}"><strong class="observability-rank-model">${escapeHtml(modelName)}</strong><span>${escapeHtml(observabilityPercent(failureRate))}</span><span>${escapeHtml(observabilityPercent(item.fallbackRecoveryRate))}</span><span>${escapeHtml(formatStabilityTtft(item.ttftP95Ms))}</span><span class="observability-rank-state">${escapeHtml(state)}</span></button>`;
+  }).join("")}` : observabilityEmptyState("暂无模型排名", "当前窗口没有可比较的模型样本。", [{ label: "调整筛选", attr: 'data-observability-empty-action="filters" data-observability-scope="stability"' }]);
   el("stabilityScenarioBody").innerHTML = (data.topScenarios || []).map((item) => {
     const failureRate = item.finalRequestFailureRate ?? item.userVisibleFailureRate;
     return `<tr><td>${escapeHtml(item.scenario)}</td><td>${escapeHtml(item.requestedModelGroup || item.model || "-")}</td><td>${escapeHtml(item.errorCode || "-")}</td><td>${item.count}</td><td>${escapeHtml(observabilityPercent(failureRate))}</td><td><button class="ghost-btn" type="button" data-stability-scenario="${escapeHtml(item.scenario || "")}" data-stability-model="${escapeHtml(item.requestedModelGroup || item.model || "")}" data-stability-error-code="${escapeHtml(item.errorCode || "")}">查看样本（${item.count || 0}）</button></td></tr>`;

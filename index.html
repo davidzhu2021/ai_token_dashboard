@@ -3147,17 +3147,20 @@
       .observability-legend .secondary { background:#e2783d; }
       .observability-legend .forecast { background:#dce6f5; border:1px dashed #87a5ca; }
       .observability-legend .budget { height:2px; border-radius:0; background:#c23b45; }
-      .observability-ranking { display:grid; gap:12px; padding:4px 0; }
-      .observability-stability-grid .observability-ranking { flex:1 1 auto; min-height:0; align-content:start; overflow-x:hidden; overflow-y:auto; padding:4px 8px 4px 0; scrollbar-gutter:stable; overscroll-behavior:contain; }
-      .observability-rank-row { display:grid; grid-template-columns:26px 1fr auto; gap:10px; align-items:center; }
-      .observability-rank-row-button { width:100%; min-height:52px; padding:7px 8px; border:0; border-radius:10px; background:transparent; color:inherit; text-align:left; }
-      .observability-rank-row-button:hover { background:#f3f7fc; }
+      .observability-ranking { display:grid; gap:8px; padding:4px 0; }
+      .observability-stability-grid .observability-ranking { flex:1 1 auto; min-height:0; align-content:start; overflow:auto; padding:4px 8px 4px 0; scrollbar-gutter:stable; overscroll-behavior:contain; }
+      .observability-ranking-head,.observability-rank-row { display:grid; min-width:580px; grid-template-columns:minmax(144px,1.65fr) repeat(3,minmax(66px,.72fr)) minmax(58px,.58fr); gap:10px; align-items:center; }
+      .observability-ranking-head { position:sticky; top:0; z-index:1; padding:2px 10px 8px; background:var(--surface,#fff); color:var(--muted-text,#68758a); font-size:12px; font-weight:750; }
+      .observability-ranking-head span:not(:first-child),.observability-rank-row > span { text-align:center; }
+      .observability-rank-row-button { width:100%; min-height:44px; padding:9px 10px; border:0; border-radius:10px; background:#f4f6f9; color:inherit; text-align:left; font-weight:700; }
+      .observability-rank-row-button.is-stable { background:#edfaf1; }
+      .observability-rank-row-button.is-observe { background:#fff7e9; }
+      .observability-rank-row-button.is-repair { background:#fff0ef; }
+      .observability-rank-row-button.is-unknown { background:#f3f5f8; color:var(--muted-text,#68758a); }
+      .observability-rank-row-button:hover { filter:brightness(.98); }
       .observability-rank-row-button:focus-visible,.observability-composition-row:focus-visible,.observability-model-row:focus-visible,.observability-sample-row:focus-visible { outline:2px solid var(--brand,#0673d2); outline-offset:2px; }
-      .observability-rank-row > div { min-width:0; }
-      .observability-rank-row b { display:block; overflow-wrap:anywhere; }
-      .observability-rank-meta { display:block; margin-top:6px; color:var(--muted-text,#68758a); font-size:11px; line-height:1.45; }
-      .observability-rank-track { height:7px; margin-top:6px; background:#e8edf4; border-radius:10px; overflow:hidden; }
-      .observability-rank-fill { height:100%; background:#2f7df4; border-radius:10px; }
+      .observability-rank-model { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .observability-rank-state { font-weight:800; }
       .observability-composition { display:grid; gap:12px; padding:10px 0; }
       .observability-composition-row { display:grid; width:100%; min-height:44px; grid-template-columns:120px 1fr 96px; gap:10px; align-items:center; padding:6px 8px; border:0; border-radius:10px; background:transparent; color:inherit; text-align:left; }
       .observability-composition-row:hover,.observability-model-row:hover { background:#f3f7fc; }
@@ -8813,7 +8816,7 @@
           <div id="stabilityMetrics" class="observability-metric-grid" role="status" aria-live="polite" aria-atomic="true"></div>
           <div class="observability-grid observability-stability-grid">
             <section class="panel"><div class="panel-header"><div><h3 class="panel-title">分指标趋势</h3><p class="panel-desc">上游异常与用户最终失败保持独立口径，缺失事件不绘制伪柱。</p></div></div><div id="stabilityTrend" class="observability-bars" role="status" aria-live="polite" aria-atomic="true"></div><div class="observability-legend"><span><i></i>上游异常</span><span><i class="secondary"></i>用户最终失败</span></div></section>
-            <section class="panel"><div class="panel-header"><div><h3 class="panel-title">最差模型排名</h3><p class="panel-desc">按治理风险排序；低覆盖 TTFT 不参与绿色稳定判断。</p></div></div><div id="stabilityRanking" class="observability-ranking" role="status" aria-live="polite" aria-atomic="true"></div></section>
+            <section class="panel"><div class="panel-header"><div><h3 class="panel-title">模型排名</h3><p class="panel-desc">按综合稳定度排序；低覆盖 TTFT 不参与稳定判定。</p></div></div><div id="stabilityRanking" class="observability-ranking" role="status" aria-live="polite" aria-atomic="true"></div></section>
           </div>
           <div class="observability-grid">
             <section class="panel"><div class="panel-header"><div><h3 class="panel-title">排障动作</h3><p class="panel-desc">只读展示负责人、严重度、目标日期与最近回归结论。</p></div><button class="ghost-btn" type="button" data-open-governance-tab="stability-actions">进入治理工作台</button></div><div id="stabilityActions" class="observability-action-list" role="status" aria-live="polite" aria-atomic="true"></div></section>

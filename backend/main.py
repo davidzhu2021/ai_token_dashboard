@@ -9447,6 +9447,35 @@ async def _admin_stability_events(start_date: str, end_date: str, model: str = "
     return output
 
 
+def _stability_model_ranking_key(item: dict[str, Any]) -> tuple[int, int, float, int, float, int, float, str]:
+    """Sort comparable models by status, then by the metrics shown in the ranking."""
+
+    state_rank = {"\u7a33\u5b9a": 0, "\u89c2\u5bdf": 1, "\u9700\u6cbb\u7406": 2, "\u6682\u65e0\u6570\u636e": 3}
+
+    def metric(name: str) -> tuple[int, float]:
+        value = item.get(name)
+        if value is None:
+            return (1, 0.0)
+        try:
+            return (0, float(value))
+        except (TypeError, ValueError):
+            return (1, 0.0)
+
+    failure_missing, failure_rate = metric("finalRequestFailureRate")
+    fallback_missing, fallback_rate = metric("fallbackRecoveryRate")
+    ttft_missing, ttft_p95 = metric("ttftP95Ms")
+    return (
+        state_rank.get(str(item.get("state") or "\u6682\u65e0\u6570\u636e"), 3),
+        failure_missing,
+        failure_rate,
+        fallback_missing,
+        -fallback_rate,
+        ttft_missing,
+        ttft_p95,
+        str(item.get("requestedModelGroup") or item.get("model") or "").casefold(),
+    )
+
+
 async def _build_stability_overview(start_date: str, end_date: str, model: str) -> dict[str, Any]:
     store = _admin_observability_store()
     aggregate_query = getattr(store, "stability_overview_aggregates", None)
@@ -9512,7 +9541,7 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
             {
                 "overview": overview,
                 "daily": daily,
-                "modelRankings": sorted(rankings, key=lambda item: (item.get("finalRequestFailureRate") is None, -(item.get("finalRequestFailureRate") or 0))),
+                "modelRankings": sorted(rankings, key=_stability_model_ranking_key),
                 "topScenarios": scenarios,
                 "actions": actions or [],
                 "regressions": regressions or [],
@@ -9613,13 +9642,7 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
         {
             "overview": overview,
             "daily": daily,
-            "modelRankings": sorted(
-                rankings,
-                key=lambda item: (
-                    item.get("finalRequestFailureRate") is None,
-                    item.get("finalRequestFailureRate") or 0,
-                ),
-            ),
+            "modelRankings": sorted(rankings, key=_stability_model_ranking_key),
             "topScenarios": scenarios,
             "actions": actions or [],
             "regressions": regressions or [],

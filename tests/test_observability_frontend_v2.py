@@ -46,7 +46,22 @@ def test_stability_dashboard_has_four_primary_metrics_and_governance_drilldown()
         assert f'id="{element_id}"' in markup
     assert "requestedModelGroup" in source
     assert "ttftCoverageRate" in source
-    assert "低覆盖 TTFT 不参与绿色稳定判断" in markup
+    assert "低覆盖 TTFT 不参与稳定判定" in markup
+
+
+def test_stability_model_ranking_uses_compact_metric_columns() -> None:
+    markup, source = sources()
+
+    assert "<h3 class=\"panel-title\">模型排名</h3>" in markup
+    assert "按综合稳定度排序；低覆盖 TTFT 不参与稳定判定。" in markup
+    assert "observability-ranking-head" in markup
+    for label in ("模型", "失败", "兜底", "TTFT", "状态"):
+        assert f">{label}<" in source
+    assert "fallbackRecoveryRate" in source
+    assert "formatStabilityTtft" in source
+    assert "Number(value) >= 1000" in source
+    assert "is-${stabilityRankingStateClass(state)}" in source
+    assert "data-stability-model=" in source
 
 
 def test_cost_dashboard_separates_actual_forecast_and_auditable_metrics() -> None:
