@@ -95,6 +95,22 @@ def test_department_rows_uses_event_team_id_without_membership_join() -> None:
     assert any("u.team_id <> ''" in q and "LEFT JOIN" in q for q in department_queries)
 
 
+def test_department_rows_prefers_directory_name_without_current_membership_snapshot() -> None:
+    pool = _FakePool()
+    store = _store_with(pool)
+
+    asyncio.run(store.department_rows("2026-08-14", "2026-08-14", "all", None, ["primary"]))
+
+    department_queries = [q for q in pool.queries if "usage_query_daily" in q]
+    assert department_queries
+    assert all("LEFT JOIN usage_department_directory dd" in q for q in department_queries)
+    assert all(
+        "COALESCE(NULLIF(dd.department_name, ''), NULLIF(dn.team_name, ''), u.team_id)"
+        in q
+        for q in department_queries
+    )
+
+
 def test_department_rows_exposes_zero_usage_directory_options_without_ranking_them() -> None:
     class Pool(_FakePool):
         async def fetch(self, query: str, *args: Any) -> list[Any]:

@@ -186,3 +186,29 @@ def test_incomplete_realtime_window_does_not_advance_cursor() -> None:
     )
 
     assert inserted == 0
+
+
+def test_realtime_directory_refresh_updates_department_directory() -> None:
+    calls = []
+
+    class Synchronizer:
+        organization_repository = None
+
+        async def _identity_directory(self):
+            return {"byUserId": {}}
+
+        async def _token_attribution_map(self, backend_id):
+            return {("backend", backend_id): []}
+
+        async def sync_department_directories(self):
+            calls.append("departments")
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.client = type("Client", (), {"backends": [BACKEND]})()
+    worker.synchronizer = Synchronizer()
+    worker.directory = {}
+    worker.token_maps = {}
+
+    asyncio.run(worker._refresh_directories())
+
+    assert calls == ["departments"]

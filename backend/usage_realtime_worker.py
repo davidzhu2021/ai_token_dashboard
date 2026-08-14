@@ -60,6 +60,12 @@ class UsageRealtimeWorker:
             backend.id: await self.synchronizer._token_attribution_map(backend.id)
             for backend in self.client.backends
         }
+        try:
+            await self.synchronizer.sync_department_directories()
+        except Exception:
+            # Usage ingestion can continue with the last durable directory;
+            # the next five-minute refresh will retry upstream department names.
+            logger.exception("realtime department directory refresh failed")
 
     def _enrich_event(
         self, backend: LiteLLMBackend, event: dict[str, Any]

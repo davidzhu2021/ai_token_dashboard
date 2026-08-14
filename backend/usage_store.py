@@ -3213,11 +3213,12 @@ class UsageStore:
             return None
         department_filter = normalize_team_text(department)
         args: list[Any] = [_as_date(start_date), _as_date(end_date), covered, source or "all", department_filter]
-        # Keep the team recorded on the usage event authoritative. Membership
-        # snapshots are only a display-name fallback and may be late or contain
-        # multiple rows for one account.
+        # Keep the team recorded on the usage event authoritative. Resolve its
+        # display name from the durable directory first because realtime mode
+        # does not publish a membership snapshot for every current day.
         team_id_sql = "lower(btrim(u.team_id))"
-        team_name_sql = "lower(regexp_replace(btrim(COALESCE(dn.team_name, u.team_id)), '\\s+', ' ', 'g'))"
+        resolved_team_name_sql = "COALESCE(NULLIF(dd.department_name, ''), NULLIF(dn.team_name, ''), u.team_id)"
+        team_name_sql = f"lower(regexp_replace(btrim({resolved_team_name_sql}), '\\s+', ' ', 'g'))"
         logical_key_sql = f"{team_id_sql} || '::' || {team_name_sql}"
         where_sql = f"""
             u.usage_date BETWEEN $1::date AND $2::date
@@ -3227,6 +3228,8 @@ class UsageStore:
             AND ($5 = '' OR {logical_key_sql} = $5 OR {team_id_sql} = $5 OR {team_name_sql} = $5)
         """
         department_join_sql = """
+            LEFT JOIN usage_department_directory dd
+              ON dd.backend_id = u.backend_id AND dd.department_id = u.team_id
             LEFT JOIN (
                 SELECT backend_id, team_id, MAX(NULLIF(team_name, '')) AS team_name
                 FROM usage_team_membership_daily
@@ -3246,14 +3249,14 @@ class UsageStore:
                    MAX(u.employee_email) AS employee_email,
                    MAX(u.employee_name) AS employee_name,
                    MAX(u.email_source) AS email_source,
-                   u.team_id, MAX(dn.team_name) AS team_name, '' AS team_role,
+                   u.team_id, MAX({resolved_team_name_sql}) AS team_name, '' AS team_role,
                    u.source, {model_sql} AS model_name,
                    {self._aggregate_metrics_sql('u.')}
             FROM usage_query_daily u
             {department_join_sql}
             WHERE {where_sql}
             GROUP BY u.backend_id, u.usage_date, u.user_id, u.team_id, u.source, {model_sql}
-            ORDER BY u.usage_date, MAX(dn.team_name), MAX(u.employee_name), u.source, model_name
+            ORDER BY u.usage_date, MAX({resolved_team_name_sql}), MAX(u.employee_name), u.source, model_name
             """,
                 *args,
             )
@@ -3280,7 +3283,7 @@ class UsageStore:
         employee_records = await pool.fetch(
             f"""
             WITH filtered AS (
-                SELECT u.*, dn.team_name,
+                SELECT u.*, {resolved_team_name_sql} AS team_name,
                        lower(COALESCE(NULLIF(u.employee_email, ''), u.user_id)) AS employee_key,
                        {model_sql} AS model_name
                 FROM usage_query_daily u
@@ -3335,7 +3338,7 @@ class UsageStore:
         department_records = await pool.fetch(
             f"""
             WITH filtered AS (
-                SELECT u.*, dn.team_name, {logical_key_sql} AS department_key, {model_sql} AS model_name
+                SELECT u.*, {resolved_team_name_sql} AS team_name, {logical_key_sql} AS department_key, {model_sql} AS model_name
                 FROM usage_query_daily u
                 {department_join_sql}
                 WHERE {where_sql}
@@ -3378,7 +3381,9 @@ class UsageStore:
         for option in directory:
             current = usage_by_id.get(str(option["departmentId"]))
             if current:
+                directory_name = str(option.get("departmentName") or "")
                 option.update(current)
+                option["departmentName"] = directory_name or str(current.get("departmentName") or option["departmentId"])
                 option["departmentKey"] = department_key(str(option["departmentId"]), str(option["departmentName"]))
             else:
                 option.update({
