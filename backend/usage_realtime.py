@@ -41,6 +41,22 @@ class UsageRealtimeStore:
     stream_key = f"{prefix}:archive"
     consumer_group = "usage-archive"
 
+    _LOCK_RENEW_LUA = """
+local key = KEYS[1]
+if redis.call('GET', key) ~= ARGV[1] then
+  return 0
+end
+return redis.call('EXPIRE', key, ARGV[2])
+"""
+
+    _LOCK_RELEASE_LUA = """
+local key = KEYS[1]
+if redis.call('GET', key) ~= ARGV[1] then
+  return 0
+end
+return redis.call('DEL', key)
+"""
+
     _INGEST_LUA = """
 local dedup_key = KEYS[1]
 local aggregate_key = KEYS[2]
@@ -87,8 +103,13 @@ return {1, revision}
         self.ttl_seconds = max(
             3600, _env_int("USAGE_REALTIME_EVENT_TTL_SECONDS", 259200)
         )
+        self.lock_ttl_seconds = max(
+            60, _env_int("USAGE_REALTIME_LOCK_TTL_SECONDS", 300)
+        )
         self.consumer_name = f"{socket.gethostname()}-{os.getpid()}"
         self._ingest_script: Any | None = None
+        self._lock_renew_script: Any | None = None
+        self._lock_release_script: Any | None = None
         self._connected = False
 
     @classmethod
@@ -102,6 +123,8 @@ return {1, revision}
             return
         await self.client.ping()
         self._ingest_script = self.client.register_script(self._INGEST_LUA)
+        self._lock_renew_script = self.client.register_script(self._LOCK_RENEW_LUA)
+        self._lock_release_script = self.client.register_script(self._LOCK_RELEASE_LUA)
         try:
             await self.client.xgroup_create(
                 self.stream_key, self.consumer_group, id="0", mkstream=True
@@ -306,24 +329,32 @@ return {1, revision}
     async def ready(self) -> bool:
         return await self.client.get(f"{self.prefix}:ready") == "1"
 
-    async def acquire_worker_lock(self, worker_id: str, ttl_seconds: int = 300) -> bool:
+    async def acquire_worker_lock(self, worker_id: str, ttl_seconds: int | None = None) -> bool:
+        ttl_seconds = max(1, int(ttl_seconds or self.lock_ttl_seconds))
         return bool(
             await self.client.set(
                 f"{self.prefix}:worker-lock", worker_id, nx=True, ex=ttl_seconds
             )
         )
 
-    async def renew_worker_lock(self, worker_id: str, ttl_seconds: int = 300) -> bool:
+    async def renew_worker_lock(self, worker_id: str, ttl_seconds: int | None = None) -> bool:
         key = f"{self.prefix}:worker-lock"
-        current = await self.client.get(key)
-        if current != worker_id:
-            return False
-        return bool(await self.client.expire(key, ttl_seconds))
+        ttl_seconds = max(1, int(ttl_seconds or self.lock_ttl_seconds))
+        script = self._lock_renew_script
+        if script is None:
+            script = self.client.register_script(self._LOCK_RENEW_LUA)
+            self._lock_renew_script = script
+        return bool(
+            await script(keys=[key], args=[worker_id, str(ttl_seconds)])
+        )
 
     async def release_worker_lock(self, worker_id: str) -> None:
         key = f"{self.prefix}:worker-lock"
-        if await self.client.get(key) == worker_id:
-            await self.client.delete(key)
+        script = self._lock_release_script
+        if script is None:
+            script = self.client.register_script(self._LOCK_RELEASE_LUA)
+            self._lock_release_script = script
+        await script(keys=[key], args=[worker_id])
 
     async def read_archive_batch(
         self, count: int = 200, block_ms: int = 100

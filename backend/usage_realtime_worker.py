@@ -45,12 +45,56 @@ class UsageRealtimeWorker:
         self.reconcile_seconds = max(
             60, _env_int("USAGE_REALTIME_RECONCILE_INTERVAL_SECONDS", 300)
         )
+        self.lock_ttl_seconds = max(
+            60,
+            int(
+                getattr(
+                    realtime,
+                    "lock_ttl_seconds",
+                    _env_int("USAGE_REALTIME_LOCK_TTL_SECONDS", 300),
+                )
+            ),
+        )
+        self.lock_renew_seconds = max(
+            1,
+            min(
+                self.lock_ttl_seconds // 3,
+                _env_int(
+                    "USAGE_REALTIME_LOCK_RENEW_SECONDS",
+                    max(1, self.lock_ttl_seconds // 3),
+                ),
+            ),
+        )
         self.directory_refresh_seconds = max(
             60, _env_int("USAGE_REALTIME_DIRECTORY_REFRESH_SECONDS", 300)
         )
         self.directory: dict[str, Any] = {}
         self.token_maps: dict[str, dict[Any, Any]] = {}
         self.current_day = usage_today()
+        self._lock_renew_task: asyncio.Task[None] | None = None
+        self._lock_lost = asyncio.Event()
+
+    async def _renew_worker_lock_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self.stop_event.wait(), timeout=self.lock_renew_seconds
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                renewed = await self.realtime.renew_worker_lock(
+                    self.worker_id, self.lock_ttl_seconds
+                )
+            except Exception:
+                logger.exception("realtime worker lock renewal failed")
+                renewed = False
+            if not renewed:
+                logger.error("realtime worker lock was lost during renewal")
+                self._lock_lost.set()
+                self.stop_event.set()
+                return
 
     async def _connect_repository(self) -> None:
         connect = getattr(self.synchronizer.organization_repository, "connect", None)
@@ -239,6 +283,9 @@ class UsageRealtimeWorker:
         await self._connect_repository()
         if not await self.realtime.acquire_worker_lock(self.worker_id):
             raise RuntimeError("another realtime usage worker is active")
+        self._lock_renew_task = asyncio.create_task(
+            self._renew_worker_lock_loop(), name="usage-realtime-lock-renewal"
+        )
         try:
             await self.recover()
             last_reconcile = datetime.now(timezone.utc)
@@ -268,14 +315,12 @@ class UsageRealtimeWorker:
                 await self.store.publish_realtime_coverage(
                     usage_today(), [backend.id for backend in self.client.backends]
                 )
-                if not await self.realtime.renew_worker_lock(self.worker_id):
-                    raise RuntimeError("realtime usage worker lock was lost")
                 await self.store.update_worker_state(
                     worker_id=self.worker_id,
                     status="idle",
-                    heartbeat_at=now,
-                    last_finished_at=now,
-                    last_success_at=now,
+                    heartbeat_at=datetime.now(timezone.utc),
+                    last_finished_at=datetime.now(timezone.utc),
+                    last_success_at=datetime.now(timezone.utc),
                     snapshot_revision=str(await self.realtime.revision()),
                     last_error="",
                 )
@@ -286,4 +331,14 @@ class UsageRealtimeWorker:
                 except asyncio.TimeoutError:
                     continue
         finally:
+            self.stop_event.set()
+            if self._lock_renew_task is not None:
+                self._lock_renew_task.cancel()
+                try:
+                    await self._lock_renew_task
+                except asyncio.CancelledError:
+                    pass
+                self._lock_renew_task = None
             await self.realtime.release_worker_lock(self.worker_id)
+        if self._lock_lost.is_set():
+            raise RuntimeError("realtime usage worker lock was lost")

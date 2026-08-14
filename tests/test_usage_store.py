@@ -1002,6 +1002,9 @@ def test_team_rows_uses_one_cross_backend_query_and_merges_email_identity() -> N
             if "FROM usage_sync_coverage" in query:
                 return [{"backend_id": "primary"}, {"backend_id": "her"}]
             self.calls += 1
+            assert "u.team_id" in query
+            assert "m.snapshot_date=u.usage_date" not in query
+            assert "m.snapshot_date <= $4::date" in query
             assert args[0] == ["primary", "her"]
             assert args[1] == ["team-a", "team-a"]
             return [

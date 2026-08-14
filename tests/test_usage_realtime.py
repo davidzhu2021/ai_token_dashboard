@@ -212,3 +212,64 @@ def test_realtime_directory_refresh_updates_department_directory() -> None:
     asyncio.run(worker._refresh_directories())
 
     assert calls == ["departments"]
+
+
+def test_worker_lock_scripts_are_atomic_and_owner_scoped() -> None:
+    calls = []
+
+    class Script:
+        def __init__(self, name):
+            self.name = name
+
+        async def __call__(self, *, keys, args):
+            calls.append((self.name, keys, args))
+            return 1
+
+    class Client:
+        def register_script(self, source):
+            name = "renew" if "EXPIRE" in source else "release"
+            return Script(name)
+
+    store = UsageRealtimeStore.__new__(UsageRealtimeStore)
+    store.client = Client()
+    store.lock_ttl_seconds = 300
+    store._lock_renew_script = None
+    store._lock_release_script = None
+
+    assert asyncio.run(store.renew_worker_lock("worker-a", 90)) is True
+    asyncio.run(store.release_worker_lock("worker-a"))
+
+    assert calls == [
+        ("renew", ["usage:realtime:worker-lock"], ["worker-a", "90"]),
+        ("release", ["usage:realtime:worker-lock"], ["worker-a"]),
+    ]
+
+
+def test_realtime_worker_renews_lock_independently_of_work_loop(monkeypatch) -> None:
+    calls = []
+
+    class Realtime:
+        lock_ttl_seconds = 60
+
+        async def renew_worker_lock(self, worker_id, ttl_seconds):
+            calls.append((worker_id, ttl_seconds))
+            return len(calls) < 2
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.realtime = Realtime()
+    worker.worker_id = "worker-a"
+    worker.stop_event = asyncio.Event()
+    worker._lock_lost = asyncio.Event()
+    worker.lock_ttl_seconds = 60
+    worker.lock_renew_seconds = 0.01
+
+    async def run_loop():
+        task = asyncio.create_task(worker._renew_worker_lock_loop())
+        await asyncio.sleep(0.04)
+        await task
+
+    asyncio.run(run_loop())
+
+    assert calls[0] == ("worker-a", 60)
+    assert worker._lock_lost.is_set()
+    assert worker.stop_event.is_set()

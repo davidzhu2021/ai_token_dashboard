@@ -1091,7 +1091,7 @@ class UsageStore:
                 SELECT DISTINCT ON (m.backend_id, m.user_id) m.backend_id, m.team_id, m.team_name,
                        m.user_id, m.employee_email, m.employee_name, m.team_role
                 FROM usage_team_membership_daily m JOIN scope s ON s.backend_id=m.backend_id AND s.team_id=m.team_id
-                WHERE m.snapshot_date BETWEEN $3::date AND $4::date
+                WHERE m.snapshot_date <= $4::date
                 ORDER BY m.backend_id, m.user_id, m.snapshot_date DESC
             )
             SELECT 'member' AS kind, m.backend_id, m.team_id, m.team_name, m.user_id, m.employee_email, m.employee_name, ''::text AS email_source, m.team_role,
@@ -1100,39 +1100,22 @@ class UsageStore:
                    0::bigint AS request_count, 0::bigint AS success_count, 0::bigint AS failure_count, 0::double precision AS spend
             FROM members m
             UNION ALL
-            SELECT 'usage', u.backend_id, NULL, NULL, u.user_id, MAX(u.employee_email), MAX(u.employee_name), MAX(u.email_source), NULL,
-                   u.usage_date, u.source, {model_sql}, {self._aggregate_metrics_sql('u.')}
-            FROM usage_query_daily u
-            WHERE u.backend_id = ANY($1::text[])
-              AND u.usage_date BETWEEN $3::date AND $4::date
-              AND ($5 = 'all' OR u.source = $5)
-              AND EXISTS (
-                  SELECT 1 FROM usage_team_membership_daily m JOIN scope s ON s.backend_id=m.backend_id AND s.team_id=m.team_id
-                  WHERE m.backend_id=u.backend_id AND m.snapshot_date=u.usage_date
-                    AND (m.user_id=u.user_id OR (NULLIF(btrim(m.employee_email),'') IS NOT NULL AND lower(btrim(m.employee_email))=lower(btrim(u.employee_email))))
-              )
-            GROUP BY u.backend_id, u.usage_date, u.user_id, u.source, {model_sql}
+             SELECT 'usage', u.backend_id, u.team_id, NULL, u.user_id, MAX(u.employee_email), MAX(u.employee_name), MAX(u.email_source), NULL,
+                    u.usage_date, u.source, {model_sql}, {self._aggregate_metrics_sql('u.')}
+             FROM usage_query_daily u
+             WHERE u.backend_id = ANY($1::text[])
+               AND u.usage_date BETWEEN $3::date AND $4::date
+               AND ($5 = 'all' OR u.source = $5)
+               AND EXISTS (
+                   SELECT 1 FROM scope s
+                   WHERE s.backend_id=u.backend_id AND s.team_id=u.team_id
+               )
+             GROUP BY u.backend_id, u.usage_date, u.user_id, u.team_id, u.source, {model_sql}
             ORDER BY kind, usage_date NULLS FIRST, backend_id, user_id, source, model_name
             """,
             backend_ids, team_ids, _as_date(start_date), _as_date(end_date), source or "all",
         )
         member_records = [item for item in records if item["kind"] == "member"]
-        if not member_records:
-            anchor = team_scopes[0]
-            return {
-                "rows": [],
-                "summaryRows": [],
-                "employees": [],
-                "team": {"id": anchor["id"], "name": anchor.get("name") or anchor["id"], "memberCount": 0, "backend": anchor["backend"]},
-                "pageLimit": 0,
-                "pageSize": 0,
-                "pagesRead": 0,
-                "totalPages": 0,
-                "totalRecords": 0,
-                "truncated": False,
-                "dataQuality": {"summarySource": "database", "rankingSource": "database", "backends": covered, "scopeCount": len(team_scopes), "memberIdentityMatch": "normalized_email_or_backend_user_id"},
-                "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered),
-            }
         usage_records = [item for item in records if item["kind"] == "usage"]
         rows = []
         for record in usage_records:
@@ -1162,11 +1145,16 @@ class UsageStore:
             if source_totals[identity]:
                 item["primarySource"] = max(source_totals[identity].items(), key=lambda pair: (pair[1], pair[0]))[0]
         latest_members = member_records
-        employees = self._merge_team_members(latest_members, employees_by_identity)
+        employees = (
+            self._merge_team_members(latest_members, employees_by_identity)
+            if latest_members
+            else list(employees_by_identity.values())
+        )
         employees.sort(key=lambda item: (-item["totalTokens"], -item["spend"], str(item["employeeName"]).casefold()))
         summary_rows = self._group_rows(rows, ("date", "source", "model"))
         anchor = team_scopes[0]
-        return {"rows": self._public_rows(rows), "summaryRows": summary_rows, "employees": employees, "team": {"id": anchor["id"], "name": anchor.get("name") or member_records[0]["team_name"] or anchor["id"], "memberCount": len(employees), "backend": anchor["backend"]}, "pageLimit": 0, "pageSize": 0, "pagesRead": 0, "totalPages": 0, "totalRecords": len(rows), "truncated": False, "dataQuality": {"summarySource": "database", "rankingSource": "database", "backends": covered, "scopeCount": len(team_scopes), "memberIdentityMatch": "normalized_email_or_backend_user_id"}, "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered)}
+        team_name = anchor.get("name") or (member_records[0]["team_name"] if member_records else "") or anchor["id"]
+        return {"rows": self._public_rows(rows), "summaryRows": summary_rows, "employees": employees, "team": {"id": anchor["id"], "name": team_name, "memberCount": len(employees), "backend": anchor["backend"]}, "pageLimit": 0, "pageSize": 0, "pagesRead": 0, "totalPages": 0, "totalRecords": len(rows), "truncated": False, "dataQuality": {"summarySource": "database", "rankingSource": "database", "backends": covered, "scopeCount": len(team_scopes), "memberIdentityMatch": "normalized_email_or_backend_user_id", "teamAttribution": "usage_event_team_id"}, "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered)}
 
     @staticmethod
     def _usage_record(backend_id: str, row: dict[str, Any], collected_at: datetime) -> tuple[Any, ...]:
@@ -3714,7 +3702,7 @@ class UsageStore:
                 SELECT DISTINCT ON (m.backend_id, m.user_id) m.backend_id, m.team_id, m.team_name, m.user_id,
                        m.employee_email, m.employee_name, m.team_role
                 FROM usage_team_membership_daily m JOIN scope s ON s.backend_id=m.backend_id AND s.team_id=m.team_id
-                WHERE m.snapshot_date BETWEEN $3::date AND $4::date
+                WHERE m.snapshot_date <= $4::date
                   AND (($6<>'' AND m.backend_id=$6 AND $5=lower(btrim(m.user_id)))
                        OR ($6='' AND ($5=lower(btrim(m.user_id)) OR $5=lower(btrim(m.employee_email)) OR $5=lower(btrim(m.employee_name)))))
                 ORDER BY m.backend_id, m.user_id, m.snapshot_date DESC
@@ -3731,7 +3719,7 @@ class UsageStore:
             WHERE u.backend_id=ANY($1::text[]) AND u.usage_date BETWEEN $3::date AND $4::date
               AND ($7='all' OR u.source=$7)
               AND EXISTS (SELECT 1 FROM selected s WHERE s.backend_id=u.backend_id AND (s.user_id=u.user_id OR (NULLIF(btrim(s.employee_email),'') IS NOT NULL AND lower(btrim(s.employee_email))=lower(btrim(u.employee_email)))))
-              AND EXISTS (SELECT 1 FROM usage_team_membership_daily m JOIN scope sc ON sc.backend_id=m.backend_id AND sc.team_id=m.team_id WHERE m.backend_id=u.backend_id AND m.snapshot_date=u.usage_date AND (m.user_id=u.user_id OR (NULLIF(btrim(m.employee_email),'') IS NOT NULL AND lower(btrim(m.employee_email))=lower(btrim(u.employee_email)))))
+             AND EXISTS (SELECT 1 FROM scope sc WHERE sc.backend_id=u.backend_id AND sc.team_id=u.team_id)
             GROUP BY u.usage_date, u.source, {model_sql}
             ORDER BY kind, usage_date NULLS FIRST, source, model_name
             """,
@@ -3777,7 +3765,7 @@ class UsageStore:
         }
         selected.update(summarize(rows)["rangeTotal"])
         anchor = team_scopes[0]
-        return {"rows": rows, "summary": summarize(rows), "employee": selected, "team": {"id": anchor["id"], "name": anchor.get("name") or first["team_name"] or anchor["id"], "memberCount": len(members), "backend": anchor["backend"]}, "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered), "dataQuality": {"backends": covered, "scopeCount": len(team_scopes), "memberIdentityMatch": "normalized_email_or_backend_user_id"}}
+        return {"rows": rows, "summary": summarize(rows), "employee": selected, "team": {"id": anchor["id"], "name": anchor.get("name") or first["team_name"] or anchor["id"], "memberCount": len(members), "backend": anchor["backend"]}, "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered), "dataQuality": {"backends": covered, "scopeCount": len(team_scopes), "memberIdentityMatch": "normalized_email_or_backend_user_id", "teamAttribution": "usage_event_team_id"}}
 
     async def health(self) -> dict[str, Any]:
         if self.pool is None:
