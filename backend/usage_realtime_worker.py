@@ -81,6 +81,36 @@ class UsageRealtimeWorker:
         self._lock_renew_task: asyncio.Task[None] | None = None
         self._lock_lost = asyncio.Event()
 
+    async def consume_refresh_requests(self) -> bool:
+        """Process durable reader refresh requests outside the API request path."""
+
+        claim = getattr(self.store, "claim_refresh_requests", None)
+        finish = getattr(self.store, "finish_refresh_requests", None)
+        if not callable(claim) or not callable(finish):
+            return False
+        requests = await claim(
+            limit=max(1, _env_int("USAGE_REFRESH_QUEUE_BATCH_SIZE", 100))
+        )
+        if not requests:
+            return False
+        request_keys = [str(item["requestKey"]) for item in requests]
+        start_date = min(str(item["startDate"]) for item in requests)
+        end_date = max(str(item["endDate"]) for item in requests)
+        try:
+            result = await self.synchronizer.sync(start_date, end_date)
+            success = result.get("status") in {"ok", "partial"}
+            await finish(
+                request_keys,
+                success=success,
+                error="" if success else "; ".join(result.get("errors") or ["sync failed"]),
+            )
+        except Exception as exc:
+            await finish(request_keys, success=False, error=exc.__class__.__name__)
+            logger.exception(
+                "realtime queued refresh failed start=%s end=%s", start_date, end_date
+            )
+        return True
+
     async def _renew_worker_lock_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
@@ -399,6 +429,7 @@ class UsageRealtimeWorker:
                     last_directory_refresh = now
                 await self.poll_once(now)
                 await self.backfill_once()
+                await self.consume_refresh_requests()
                 if (now - last_reconcile).total_seconds() >= self.reconcile_seconds:
                     for backend in self.client.backends:
                         try:

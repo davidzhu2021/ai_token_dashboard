@@ -401,3 +401,25 @@ def test_realtime_worker_renews_lock_independently_of_work_loop(monkeypatch) -> 
     assert calls[0] == ("worker-a", 60)
     assert worker._lock_lost.is_set()
     assert worker.stop_event.is_set()
+
+
+def test_realtime_worker_consumes_reader_refresh_queue() -> None:
+    class Store:
+        async def claim_refresh_requests(self, **_kwargs):
+            return [{"requestKey": "r1", "startDate": "2026-08-10", "endDate": "2026-08-14"}]
+
+        async def finish_refresh_requests(self, keys, *, success, error=""):
+            self.finished = (keys, success, error)
+
+    class Synchronizer:
+        async def sync(self, start_date, end_date):
+            self.range = (start_date, end_date)
+            return {"status": "ok"}
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.store = Store()
+    worker.synchronizer = Synchronizer()
+
+    assert asyncio.run(worker.consume_refresh_requests()) is True
+    assert worker.synchronizer.range == ("2026-08-10", "2026-08-14")
+    assert worker.store.finished == (["r1"], True, "")

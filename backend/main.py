@@ -5273,6 +5273,10 @@ async def debug_admin_usage_compare(
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     result: dict[str, Any] = {"status": "ok", "usageSync": {"status": "disabled"}}
+    reader_config = usage_reader_config_status()
+    result["usageReaderConfig"] = reader_config
+    if not reader_config["configured"]:
+        result["status"] = "degraded"
     if organization_real_enabled() and (
         not _organization_capability_status.get("available")
         or organization_capability_probe_due()
@@ -5390,6 +5394,12 @@ async def health() -> dict[str, Any]:
                     result["status"] = "degraded"
     else:
         result["usageDatabase"] = {"enabled": False, "connected": False, "status": "disabled"}
+        if usage_sync_role() == "reader":
+            result["usageSync"] = {
+                "role": "reader",
+                "status": "misconfigured",
+                "missing": reader_config["missing"],
+            }
     if realtime_enabled():
         try:
             realtime = usage_realtime_store()

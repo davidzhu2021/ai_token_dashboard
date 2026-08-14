@@ -24,6 +24,21 @@ def test_reader_role_does_not_start_usage_sync(monkeypatch) -> None:
     assert main._usage_sync_task is None
 
 
+def test_health_exposes_missing_reader_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("USAGE_SYNC_ROLE", "reader")
+    monkeypatch.delenv("USAGE_DATABASE_URL", raising=False)
+    monkeypatch.delenv("USAGE_SYNC_ENABLED", raising=False)
+    monkeypatch.delenv("USAGE_REALTIME_ENABLED", raising=False)
+    monkeypatch.setattr(main, "_usage_store", None)
+    monkeypatch.setattr(main, "organization_real_enabled", lambda: False)
+
+    payload = asyncio.run(main.health())
+
+    assert payload["status"] == "degraded"
+    assert payload["usageSync"]["status"] == "misconfigured"
+    assert "USAGE_DATABASE_URL" in payload["usageReaderConfig"]["missing"]
+
+
 def test_worker_consumes_reader_refresh_queue(monkeypatch) -> None:
     class Store:
         async def claim_refresh_requests(self, **_kwargs):
