@@ -8199,10 +8199,6 @@ function switchView(view) {
   }
   if (view === "governance-workbench") {
     renderGovernanceWorkbench();
-    if ((!stabilityOverview && canViewStability() && !isStabilityLoading) || (!costOverview && canViewCosts() && !isCostOverviewLoading)) {
-      if (!stabilityOverview && canViewStability()) loadStabilityOverview();
-      if (!costOverview && canViewCosts()) loadCostOverview();
-    }
     if (!governanceWorkbenchLoading && !(governanceWorkbenchData.stabilityActions.length || governanceWorkbenchData.planVersions.length || governanceWorkbenchData.savingsMeasurements.length)) loadGovernanceWorkbench();
   }
 }
@@ -8357,7 +8353,7 @@ function observabilityEmptyState(title, detail, actions = []) {
 }
 
 function observabilityPayloadMeta(payload, data = {}) {
-  const asOf = data.asOf || data.as_of || payload?.asOf || payload?.as_of || data.throughDate || data.annual?.throughDate || payload?.generatedAt?.slice?.(0, 10) || "";
+  const asOf = data.asOf || data.as_of || payload?.asOf || payload?.as_of || data.throughDate || data.annual?.throughDate || payload?.cache?.generatedAt?.slice?.(0, 10) || payload?.generatedAt?.slice?.(0, 10) || "";
   const source = payload?.source || data.source || "";
   const period = data.period || (data.month ? data.month : payload?.startDate && payload?.endDate ? `${payload.startDate} 至 ${payload.endDate}` : "");
   return { asOf, source, period };
@@ -8476,17 +8472,33 @@ function currentCostMonth() {
 }
 
 function observabilityReasonCopy(payload, scope) {
-  if (scope === "stability" && isStabilityLoading) {
+  const hasPayload = Boolean(payload?.data);
+  const cache = payload?.cache || {};
+  const loading = scope === "stability" ? isStabilityLoading : isCostOverviewLoading;
+  const loadError = scope === "stability" ? stabilityLoadError : costOverviewLoadError;
+  if (loadError) {
+    return {
+      title: hasPayload ? "刷新失败，继续显示最近成功快照" : `${scope === "stability" ? "稳定性" : "费用"}数据加载失败`,
+      detail: loadError,
+      action: "重新加载",
+    };
+  }
+  if (loading && hasPayload) {
+    return { title: "正在后台刷新", detail: "当前图表保持可用，刷新完成后会自动替换为最新数据。", action: "" };
+  }
+  if (scope === "stability" && loading) {
     return { title: "正在加载稳定性数据", detail: "正在读取当前窗口的事件与覆盖状态。", action: "" };
   }
-  if (scope === "cost" && isCostOverviewLoading) {
+  if (scope === "cost" && loading) {
     return { title: "正在加载费用数据", detail: "正在汇总成本账本、预算与节省动作。", action: "" };
   }
-  if (scope === "stability" && stabilityLoadError) {
-    return { title: "稳定性数据加载失败", detail: stabilityLoadError, action: "重新加载" };
-  }
-  if (scope === "cost" && costOverviewLoadError) {
-    return { title: "费用数据加载失败", detail: costOverviewLoadError, action: "重新加载" };
+  if (["stale", "refreshing"].includes(String(cache.state || "").toLowerCase())) {
+    const age = Number.isFinite(Number(cache.ageSeconds)) ? `，快照生成于 ${Math.max(0, Math.round(Number(cache.ageSeconds) / 60))} 分钟前` : "";
+    return {
+      title: cache.refreshing ? "正在刷新，显示最近成功快照" : "显示最近成功快照",
+      detail: `${cache.lastRefreshError ? `上次刷新失败：${cache.lastRefreshError}` : "后台正在准备最新数据"}${age}。`,
+      action: "再次刷新",
+    };
   }
   const coverage = payload?.coverage || {};
   const freshness = payload?.freshness || {};
@@ -8864,16 +8876,10 @@ async function loadCostOverview(forceRefresh = false) {
     const recognitionStatus = el("costRecognition")?.value || "";
     const asOf = new Date().toISOString().slice(0, 10);
     const query = `month=${encodeURIComponent(month)}&as_of=${encodeURIComponent(asOf)}&category=${encodeURIComponent(category)}&cost_bucket=${encodeURIComponent(costBucket)}&model=${encodeURIComponent(model)}&vendor=${encodeURIComponent(vendor)}&provider=${encodeURIComponent(provider)}&account_id=${encodeURIComponent(accountId)}&reconciliation_status=${encodeURIComponent(reconciliationStatus)}&recognition_status=${encodeURIComponent(recognitionStatus)}${forceRefresh ? "&refresh=1" : ""}`;
-    const [nextOverview, nextBudgets, annualPayload] = await Promise.all([
-      api(`/api/admin/costs/overview?${query}`, { signal: costOverviewController.signal }),
-      api("/api/admin/costs/budgets").then((payload) => payload?.data || []),
-      api(`/api/admin/costs/annual?year=${encodeURIComponent(month.slice(0, 4))}&as_of=${encodeURIComponent(asOf)}&category=${encodeURIComponent(category)}&cost_bucket=${encodeURIComponent(costBucket)}&model=${encodeURIComponent(model)}&vendor=${encodeURIComponent(vendor)}&provider=${encodeURIComponent(provider)}&account_id=${encodeURIComponent(accountId)}&reconciliation_status=${encodeURIComponent(reconciliationStatus)}&recognition_status=${encodeURIComponent(recognitionStatus)}`).catch(() => null),
-    ]);
+    const nextOverview = await api(`/api/admin/costs/overview?${query}`, { signal: costOverviewController.signal });
     if (requestId !== costOverviewRequestId) return;
-    costOverview = annualPayload?.data
-      ? { ...nextOverview, data: { ...(nextOverview.data || {}), annual: annualPayload.data, metrics: { ...(nextOverview.data?.metrics || {}), yearToDateActual: nextOverview.data?.metrics?.yearToDateActual ?? annualPayload.data.actual, yearForecast: nextOverview.data?.metrics?.yearForecast ?? annualPayload.data.forecast } } }
-      : nextOverview;
-    costBudgets = nextBudgets;
+    costOverview = nextOverview;
+    costBudgets = Array.isArray(nextOverview?.data?.budgets) ? nextOverview.data.budgets : costBudgets;
   } catch (error) {
     if (error.name !== "AbortError" && requestId === costOverviewRequestId) {
       costOverviewLoadError = error.message || "费用看板加载失败";

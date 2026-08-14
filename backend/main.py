@@ -30,6 +30,7 @@ import httpx
 from authlib.integrations.base_client import OAuthError
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -252,6 +253,8 @@ department_usage_cache = TTLCache()
 team_auth_cache = TTLCache()
 team_usage_cache = TTLCache()
 team_member_usage_cache = TTLCache()
+_observability_refresh_tasks: dict[str, asyncio.Task[Any]] = {}
+_observability_refresh_lock = asyncio.Lock()
 _usage_singleflight: dict[str, asyncio.Task[Any]] = {}
 _usage_singleflight_lock = asyncio.Lock()
 _usage_last_good_payloads: dict[str, dict[str, Any]] = {}
@@ -287,6 +290,183 @@ _usage_sync_stop: asyncio.Event | None = None
 _organization_outbox_task: asyncio.Task[Any] | None = None
 _organization_outbox_stop: asyncio.Event | None = None
 _usage_sync_status: dict[str, Any] = {"status": "disabled", "lastRun": None}
+
+
+def _observability_snapshot_key(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _observability_cache_meta(
+    record: dict[str, Any] | None,
+    *,
+    state: str,
+    refreshing: bool = False,
+) -> dict[str, Any]:
+    generated = record.get("generated_at") if record else None
+    if isinstance(generated, datetime):
+        generated_at = generated.astimezone(timezone.utc).isoformat()
+        age_seconds = max(0, int((datetime.now(timezone.utc) - generated).total_seconds()))
+    else:
+        generated_at = str(generated or "") or None
+        try:
+            parsed = datetime.fromisoformat(str(generated).replace("Z", "+00:00"))
+            age_seconds = max(0, int((datetime.now(timezone.utc) - parsed).total_seconds()))
+        except (TypeError, ValueError):
+            age_seconds = None
+    return {
+        "state": state,
+        "generatedAt": generated_at,
+        "ageSeconds": age_seconds,
+        "refreshing": refreshing,
+        "lastRefreshError": str((record or {}).get("last_refresh_error") or ""),
+        "dataRevision": str((record or {}).get("data_revision") or ""),
+    }
+
+
+def _snapshot_payload(record: dict[str, Any]) -> dict[str, Any]:
+    payload = record.get("payload")
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, str):
+        decoded = json.loads(payload)
+        return dict(decoded) if isinstance(decoded, dict) else {}
+    return {}
+
+
+async def _observability_refresh(
+    dashboard_type: str,
+    snapshot_key: str,
+    builder: Any,
+) -> dict[str, Any]:
+    store = _admin_observability_store()
+    started = asyncio.get_running_loop().time()
+    try:
+        payload = jsonable_encoder(await asyncio.wait_for(
+            builder(), timeout=max(1, env_int("OBSERVABILITY_REFRESH_TIMEOUT_SECONDS", 30))
+        ))
+        state = await _call_store_optional(store, ("snapshot_state",), default={})
+        revision = str((state or {}).get("revision") or (state or {}).get("snapshotRevision") or "")
+        record = await _call_store_optional(
+            store,
+            ("save_observability_snapshot",),
+            dashboard_type,
+            snapshot_key,
+            payload,
+            data_revision=revision,
+            default=None,
+        )
+        if not record:
+            record = {
+                "payload": payload,
+                "generated_at": datetime.now(timezone.utc),
+                "data_revision": revision,
+                "last_refresh_error": "",
+            }
+        logger.info(
+            "observability refresh dashboard=%s total_ms=%.0f cache_state=stored",
+            dashboard_type,
+            (asyncio.get_running_loop().time() - started) * 1000,
+        )
+        return {**payload, "cache": _observability_cache_meta(record, state="fresh")}
+    except Exception as exc:
+        await _call_store_optional(
+            store,
+            ("mark_observability_snapshot_refresh",),
+            dashboard_type,
+            snapshot_key,
+            refreshing=False,
+            error=exc.__class__.__name__,
+            default=None,
+        )
+        logger.exception("observability refresh failed dashboard=%s", dashboard_type)
+        raise
+    finally:
+        async with _observability_refresh_lock:
+            _observability_refresh_tasks.pop(f"{dashboard_type}:{snapshot_key}", None)
+
+
+async def _start_observability_refresh(
+    dashboard_type: str, snapshot_key: str, builder: Any
+) -> asyncio.Task[Any]:
+    task_key = f"{dashboard_type}:{snapshot_key}"
+    async with _observability_refresh_lock:
+        existing = _observability_refresh_tasks.get(task_key)
+        if existing and not existing.done():
+            return existing
+        await _call_store_optional(
+            _admin_observability_store(),
+            ("mark_observability_snapshot_refresh",),
+            dashboard_type,
+            snapshot_key,
+            refreshing=True,
+            default=None,
+        )
+        task = asyncio.create_task(
+            _observability_refresh(dashboard_type, snapshot_key, builder),
+            name=f"observability-refresh-{dashboard_type}",
+        )
+        _observability_refresh_tasks[task_key] = task
+        return task
+
+
+async def _cached_observability_dashboard(
+    dashboard_type: str,
+    key_payload: dict[str, Any],
+    builder: Any,
+    *,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    store = _admin_observability_store()
+    snapshot_key = _observability_snapshot_key(key_payload)
+    record = await _call_store_optional(
+        store, ("get_observability_snapshot",), dashboard_type, snapshot_key, default=None
+    )
+    fresh_seconds = max(1, env_int("OBSERVABILITY_CACHE_FRESH_SECONDS", 60))
+    stale_seconds = max(fresh_seconds, env_int("OBSERVABILITY_CACHE_STALE_MAX_SECONDS", 86400))
+    age = None
+    if record and isinstance(record.get("generated_at"), datetime):
+        age = (datetime.now(timezone.utc) - record["generated_at"]).total_seconds()
+    if record and age is not None and age <= fresh_seconds and not refresh:
+        payload = _snapshot_payload(record)
+        payload["cache"] = _observability_cache_meta(record, state="fresh")
+        return payload
+    if record and age is not None and age <= stale_seconds:
+        task = await _start_observability_refresh(dashboard_type, snapshot_key, builder)
+        payload = _snapshot_payload(record)
+        payload["cache"] = _observability_cache_meta(record, state="refreshing" if not task.done() else "stale", refreshing=not task.done())
+        return payload
+    task = await _start_observability_refresh(dashboard_type, snapshot_key, builder)
+    budget = max(100, env_int("OBSERVABILITY_COLD_QUERY_BUDGET_MS", 1500)) / 1000
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=budget)
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="看板数据正在生成，请稍后重试",
+            headers={"Retry-After": "2"},
+        ) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "observability cold query failed dashboard=%s cache_state=unavailable",
+            dashboard_type,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="看板数据暂不可用，后台刷新仍在重试",
+            headers={"Retry-After": "5"},
+        ) from exc
+
+
+async def _invalidate_observability_dashboard(dashboard_type: str) -> None:
+    await _call_store_optional(
+        _admin_observability_store(),
+        ("delete_observability_snapshots",),
+        dashboard_type,
+        default=0,
+    )
 
 
 def usage_sync_role() -> str:
@@ -9037,6 +9217,70 @@ def _stability_quality(metrics: dict[str, Any]) -> dict[str, Any]:
     return quality
 
 
+def _stability_metrics_from_aggregate(
+    row: dict[str, Any], attempts: dict[str, Any] | None, *, period: dict[str, str], as_of: str
+) -> dict[str, Any]:
+    attempts = attempts or {}
+    total = int(row.get("request_count") or 0)
+    explicit_count = int(row.get("explicit_count") or 0)
+    known_count = int(row.get("failure_known_count") or 0)
+    failure_count = int(row.get("explicit_failure_count") or 0) if explicit_count else int(row.get("failure_count") or 0)
+    failure_samples = explicit_count or known_count
+    retry_count = int(attempts.get("retry_count") or row.get("retry_count") or 0)
+    retry_recovered = int(attempts.get("retry_recovered_count") or row.get("retry_recovered_count") or 0)
+    attempt_count = int(attempts.get("attempt_count") or 0)
+    attempt_status_count = int(attempts.get("attempt_status_count") or 0)
+    failed_attempt_count = int(attempts.get("failed_attempt_count") or 0)
+    fallback_count = int(attempts.get("fallback_count") or 0)
+    fallback_recovered = int(attempts.get("fallback_recovered_count") or 0)
+    ttft_count = int(row.get("ttft_sample_count") or 0)
+    ttft_coverage = ttft_count / total if total else None
+    failure_rate = failure_count / failure_samples if failure_samples else None
+    result = {
+        "requestCount": total,
+        "userVisibleFailureCount": failure_count if failure_samples else None,
+        "userVisibleFailureRate": failure_rate,
+        "finalRequestFailureCount": failure_count if failure_samples else None,
+        "finalRequestFailureRate": failure_rate,
+        "finalRequestFailureExplicitCoverageRate": explicit_count / total if total else None,
+        "finalRequestFailureSource": "explicit" if explicit_count else ("derived" if known_count else None),
+        "upstreamExceptionCount": failed_attempt_count if attempt_count else None,
+        "upstreamExceptionRate": failed_attempt_count / attempt_status_count if attempt_status_count else None,
+        "upstreamAttemptCount": attempt_count or None,
+        "retryCount": int(row.get("retry_count") or 0) if row.get("retry_known_count") else None,
+        "retryAttemptCount": retry_count or None,
+        "retryRecoveryCount": retry_recovered if retry_count else None,
+        "retryRecoveryRate": retry_recovered / retry_count if retry_count else None,
+        "fallbackAttemptCount": fallback_count or None,
+        "fallbackRecoveryCount": fallback_recovered if fallback_count else None,
+        "fallbackRecoveryRate": fallback_recovered / fallback_count if fallback_count else None,
+        "ttftP95Ms": float(row["ttft_p95_ms"]) if row.get("ttft_p95_ms") is not None else None,
+        "ttftSampleCount": ttft_count,
+        "ttftCoverageRate": ttft_coverage,
+        "statusComplete": int(row.get("status_count") or 0) == total and total > 0,
+        "retryComplete": int(row.get("retry_known_count") or 0) == total and total > 0,
+        "failureComplete": known_count == total and total > 0,
+        "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
+    }
+    result["metricEnvelopes"] = {
+        "finalRequestFailureRate": metric_envelope(failure_rate, "ratio", period=period, as_of=as_of, status="observed" if explicit_count else ("derived" if known_count else "unavailable"), source="final request events", coverage_rate=explicit_count / total if total else None, sample_count=failure_samples, missing_reasons=[] if failure_samples else ["final_request_status_missing"]),
+        "upstreamExceptionRate": metric_envelope(result["upstreamExceptionRate"], "ratio", period=period, as_of=as_of, status="observed" if attempt_count else "unavailable", source="upstream attempt events", coverage_rate=attempt_status_count / attempt_count if attempt_count else 0.0, sample_count=attempt_status_count, missing_reasons=[] if attempt_count else ["upstream_attempt_logs_unavailable"]),
+        "fallbackRecoveryRate": metric_envelope(result["fallbackRecoveryRate"], "ratio", period=period, as_of=as_of, status="observed" if fallback_count else "unavailable", source="upstream attempt events", coverage_rate=1.0 if fallback_count else 0.0, sample_count=fallback_count, missing_reasons=[] if fallback_count else ["fallback_attempt_logs_unavailable"]),
+        "retryRecoveryRate": metric_envelope(result["retryRecoveryRate"], "ratio", period=period, as_of=as_of, status="observed" if retry_count else "unavailable", source="upstream attempt events", coverage_rate=1.0 if retry_count else 0.0, sample_count=retry_count),
+        "ttftP95Ms": metric_envelope(result["ttftP95Ms"], "ms", period=period, as_of=as_of, status="observed" if ttft_count else "unavailable", source="final request events", coverage_rate=ttft_coverage, sample_count=ttft_count, missing_reasons=[] if ttft_count else ["ttft_samples_missing"]),
+    }
+    result["quality"] = {
+        "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
+        "finalRequestFailure": {"status": result["metricEnvelopes"]["finalRequestFailureRate"]["status"], "completeness": result["finalRequestFailureExplicitCoverageRate"] or 0.0, "sampleCount": failure_samples, "explicitSampleCount": explicit_count},
+        "upstreamException": {"status": result["metricEnvelopes"]["upstreamExceptionRate"]["status"], "completeness": attempt_status_count / attempt_count if attempt_count else 0.0, "sampleCount": attempt_status_count},
+        "retryRecovery": {"status": result["metricEnvelopes"]["retryRecoveryRate"]["status"], "completeness": 1.0 if retry_count else 0.0},
+        "fallbackRecovery": {"status": result["metricEnvelopes"]["fallbackRecoveryRate"]["status"], "completeness": 1.0 if fallback_count else 0.0, "sampleCount": fallback_count},
+        "ttft": {"status": result["metricEnvelopes"]["ttftP95Ms"]["status"], "completeness": ttft_coverage or 0.0, "sampleCount": ttft_count},
+    }
+    result["missingReasons"] = [key for key, value in (("final_request_status_missing", not failure_samples), ("ttft_samples_missing", not ttft_count), ("upstream_attempt_logs_unavailable", not attempt_count), ("fallback_attempt_logs_unavailable", not fallback_count)) if value]
+    return result
+
+
 async def _call_store_optional(store: Any, method_names: tuple[str, ...], *args: Any, default: Any = None, **kwargs: Any) -> Any:
     """Keep v2 routes compatible while UsageStore migrations roll out."""
 
@@ -9203,17 +9447,83 @@ async def _admin_stability_events(start_date: str, end_date: str, model: str = "
     return output
 
 
-@app.get("/api/admin/stability/overview")
-async def admin_stability_overview(
-    request: Request,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    model: str = "",
-) -> dict[str, Any]:
-    require_platform_admin(request)
-    if not env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False):
-        raise HTTPException(status_code=404, detail="看板尚未开放")
-    start_date, end_date = resolve_usage_range(start_date, end_date)
+async def _build_stability_overview(start_date: str, end_date: str, model: str) -> dict[str, Any]:
+    store = _admin_observability_store()
+    aggregate_query = getattr(store, "stability_overview_aggregates", None)
+    if callable(aggregate_query):
+        metric_period = _metric_period(start_date, end_date)
+        aggregates = await aggregate_query(start_date, end_date, model)
+        overall_row = aggregates.get("overall") or {}
+        attempts = aggregates.get("attempts") or {}
+        overview = _stability_metrics_from_aggregate(
+            overall_row, attempts, period=metric_period, as_of=end_date
+        )
+        daily = [
+            {
+                "date": str(row.get("dimension")),
+                **_stability_metrics_from_aggregate(row, None, period=metric_period, as_of=end_date),
+            }
+            for row in aggregates.get("daily") or []
+        ]
+        rankings = []
+        for row in aggregates.get("models") or []:
+            metrics = _stability_metrics_from_aggregate(
+                row, None, period=metric_period, as_of=end_date
+            )
+            rankings.append({
+                "model": str(row.get("dimension") or "unknown"),
+                **metrics,
+                "state": model_state(
+                    metrics["userVisibleFailureRate"], metrics["ttftP95Ms"],
+                    env_float("STABILITY_FAILURE_STABLE_THRESHOLD", 0.01),
+                    env_float("STABILITY_FAILURE_OBSERVE_THRESHOLD", 0.03),
+                    env_float("STABILITY_TTFT_STABLE_MS", 2000),
+                    env_float("STABILITY_TTFT_OBSERVE_MS", 4000),
+                    ttft_coverage_rate=metrics.get("ttftCoverageRate"),
+                    ttft_sample_count=metrics.get("ttftSampleCount"),
+                    minimum_ttft_coverage=env_float("STABILITY_TTFT_MIN_COVERAGE", 0.8),
+                    minimum_ttft_samples=int(env_float("STABILITY_TTFT_MIN_SAMPLES", 30)),
+                ),
+            })
+        scenarios = []
+        for row in aggregates.get("scenarios") or []:
+            sample_ids = list(row.get("sample_request_ids") or [])
+            scenarios.append({
+                "scenario": str(row.get("scenario") or "unknown"),
+                "count": int(row.get("count") or 0),
+                "model": str(row.get("requested_model_group") or "unknown"),
+                "requestedModelGroup": str(row.get("requested_model_group") or "unknown"),
+                "errorCode": str(row.get("error_code") or "") or None,
+                "sampleRequestIds": sample_ids,
+                "sampleRequests": [{"requestId": item} for item in sample_ids],
+                **_stability_metrics_from_aggregate(row, None, period=metric_period, as_of=end_date),
+            })
+        sync_states = await store.stability_sync_states()
+        event_count = int(overall_row.get("request_count") or 0)
+        window_covered, missing_reasons = _stability_missing_reasons(
+            sync_states, start_date=start_date, end_date=end_date,
+            configured_backends=set(usage_backend_ids()), event_count=event_count,
+        )
+        actions, regressions = await asyncio.gather(
+            _call_store_optional(store, ("list_stability_actions",), model=model, default=[]),
+            _call_store_optional(store, ("list_stability_regressions",), default=[]),
+        )
+        return _observability_envelope(
+            {
+                "overview": overview,
+                "daily": daily,
+                "modelRankings": sorted(rankings, key=lambda item: (item.get("finalRequestFailureRate") is None, -(item.get("finalRequestFailureRate") or 0))),
+                "topScenarios": scenarios,
+                "actions": actions or [],
+                "regressions": regressions or [],
+                "attemptEventsAvailableFrom": attempts.get("available_from"),
+                "quality": _stability_quality(overview),
+                "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
+            },
+            freshness={"status": "available" if event_count else "empty", "latestCollectedAt": overall_row.get("latest_collected_at")},
+            coverage={"partial": not window_covered, "incomplete": not window_covered, "eventCount": event_count, "window": {"startDate": start_date, "endDate": end_date}, "syncStates": sync_states, "missingReasons": missing_reasons, "definitionsVersion": STABILITY_DEFINITIONS_VERSION},
+            source="稳定性事件快照",
+        ) | {"startDate": start_date, "endDate": end_date, "model": model}
     events = await _admin_stability_events(start_date, end_date, model)
     store = _admin_observability_store()
     sync_states = await store.stability_sync_states()
@@ -9321,6 +9631,26 @@ async def admin_stability_overview(
         coverage=covered,
         source="稳定性事件快照",
     ) | {"startDate": start_date, "endDate": end_date, "model": model}
+
+
+@app.get("/api/admin/stability/overview")
+async def admin_stability_overview(
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    model: str = "",
+    refresh: int = 0,
+) -> dict[str, Any]:
+    require_platform_admin(request)
+    if not env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False):
+        raise HTTPException(status_code=404, detail="看板尚未开放")
+    start_date, end_date = resolve_usage_range(start_date, end_date)
+    return await _cached_observability_dashboard(
+        "stability",
+        {"startDate": start_date, "endDate": end_date, "model": model, "definition": STABILITY_DEFINITIONS_VERSION},
+        lambda: _build_stability_overview(start_date, end_date, model),
+        refresh=bool(refresh),
+    )
 
 
 @app.get("/api/admin/stability/scenarios")
@@ -9470,6 +9800,7 @@ async def admin_create_stability_action(data: StabilityActionRequest, request: R
     item = await _call_store_optional(store, ("create_stability_action",), _stability_action_input(data), default=None)
     if item is None:
         raise HTTPException(status_code=503, detail="稳定性治理存储尚未就绪")
+    await _invalidate_observability_dashboard("stability")
     return _observability_envelope(item, source="stability governance")
 
 
@@ -9481,6 +9812,7 @@ async def admin_update_stability_action(action_id: str, data: StabilityActionReq
     item = await _call_store_optional(store, ("update_stability_action",), action_id, _stability_action_input(data, action_id), default=None)
     if item is None:
         raise HTTPException(status_code=404, detail="稳定性治理动作不存在")
+    await _invalidate_observability_dashboard("stability")
     return _observability_envelope(item, source="stability governance")
 
 
@@ -9491,6 +9823,7 @@ async def admin_delete_stability_action(action_id: str, request: Request) -> dic
     deleted = await _call_store_optional(_admin_observability_store(), ("delete_stability_action",), action_id, default=False)
     if not deleted:
         raise HTTPException(status_code=404, detail="稳定性治理动作不存在")
+    await _invalidate_observability_dashboard("stability")
     return _observability_envelope({"deleted": True}, source="stability governance")
 
 
@@ -9508,6 +9841,7 @@ async def admin_create_stability_regression(data: StabilityRegressionRequest, re
     item = await _call_store_optional(_admin_observability_store(), ("create_stability_regression",), _stability_regression_input(data), default=None)
     if item is None:
         raise HTTPException(status_code=503, detail="回归验证存储尚未就绪")
+    await _invalidate_observability_dashboard("stability")
     return _observability_envelope(item, source="stability governance")
 
 
@@ -9518,6 +9852,7 @@ async def admin_update_stability_regression(regression_id: str, data: StabilityR
     item = await _call_store_optional(_admin_observability_store(), ("update_stability_regression",), regression_id, _stability_regression_input(data, regression_id), default=None)
     if item is None:
         raise HTTPException(status_code=404, detail="回归验证记录不存在")
+    await _invalidate_observability_dashboard("stability")
     return _observability_envelope(item, source="stability governance")
 
 
@@ -9528,6 +9863,7 @@ async def admin_delete_stability_regression(regression_id: str, request: Request
     deleted = await _call_store_optional(_admin_observability_store(), ("delete_stability_regression",), regression_id, default=False)
     if not deleted:
         raise HTTPException(status_code=404, detail="回归验证记录不存在")
+    await _invalidate_observability_dashboard("stability")
     return _observability_envelope({"deleted": True}, source="stability governance")
 
 
@@ -10067,7 +10403,9 @@ def _cost_item_input(data: CostItemRequest, item_id: str | None = None) -> dict[
 async def admin_create_cost_item(data: CostItemRequest, request: Request) -> dict[str, Any]:
     require_platform_admin(request)
     await enforce_csrf(request)
-    return _observability_envelope(_cost_item_payload(await _admin_observability_store().create_cost_item(_cost_item_input(data))), source="费用控制账本")
+    item = _cost_item_payload(await _admin_observability_store().create_cost_item(_cost_item_input(data)))
+    await _invalidate_observability_dashboard("cost")
+    return _observability_envelope(item, source="费用控制账本")
 
 
 @app.patch("/api/admin/costs/items/{item_id}")
@@ -10077,6 +10415,7 @@ async def admin_update_cost_item(item_id: str, data: CostItemRequest, request: R
     record = await _admin_observability_store().update_cost_item(item_id, _cost_item_input(data, item_id))
     if not record:
         raise HTTPException(status_code=404, detail="成本项不存在")
+    await _invalidate_observability_dashboard("cost")
     return _observability_envelope(_cost_item_payload(record), source="费用控制账本")
 
 
@@ -10086,6 +10425,7 @@ async def admin_delete_cost_item(item_id: str, request: Request) -> dict[str, An
     await enforce_csrf(request)
     if not await _admin_observability_store().delete_cost_item(item_id):
         raise HTTPException(status_code=404, detail="成本项不存在")
+    await _invalidate_observability_dashboard("cost")
     return _observability_envelope({"deleted": True}, source="费用控制账本")
 
 
@@ -10104,6 +10444,7 @@ async def admin_update_cost_budget(month: str, data: CostBudgetRequest, request:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="月份格式应为 YYYY-MM") from exc
     item = await _admin_observability_store().upsert_cost_budget(month, float(data.budgetUsd), float(data.dailyTargetUsd))
+    await _invalidate_observability_dashboard("cost")
     return _observability_envelope({"month": str(item.get("month")), "budgetUsd": float(item.get("budget_usd") or 0), "dailyTargetUsd": float(item.get("daily_target_usd") or 0)}, source="费用控制账本")
 
 
@@ -10155,6 +10496,7 @@ async def admin_create_cost_plan_version(data: CostPlanVersionRequest, request: 
     item = await _call_store_optional(_admin_observability_store(), ("create_cost_plan_version",), _cost_plan_input(data), default=None)
     if item is None:
         raise HTTPException(status_code=503, detail="费用计划存储尚未就绪")
+    await _invalidate_observability_dashboard("cost")
     return _observability_envelope(_plan_version_payload(dict(item)), source="cost plan ledger")
 
 
@@ -10165,6 +10507,7 @@ async def admin_update_cost_plan_version(plan_id: str, data: CostPlanVersionRequ
     item = await _call_store_optional(_admin_observability_store(), ("update_cost_plan_version",), plan_id, _cost_plan_input(data, plan_id), default=None)
     if item is None:
         raise HTTPException(status_code=404, detail="费用计划版本不存在")
+    await _invalidate_observability_dashboard("cost")
     return _observability_envelope(_plan_version_payload(dict(item)), source="cost plan ledger")
 
 
@@ -10180,6 +10523,7 @@ async def _change_cost_plan_state(plan_id: str, request: Request, operation: str
     )
     if item is None:
         raise HTTPException(status_code=404, detail="费用计划版本不存在或状态不可变更")
+    await _invalidate_observability_dashboard("cost")
     return _observability_envelope(_plan_version_payload(dict(item)), source="cost plan ledger")
 
 
@@ -10230,6 +10574,7 @@ async def admin_create_savings_measurement(data: SavingsMeasurementRequest, requ
     item = await _call_store_optional(_admin_observability_store(), ("create_savings_measurement",), _savings_measurement_input(data), default=None)
     if item is None:
         raise HTTPException(status_code=503, detail="节省核验存储尚未就绪")
+    await _invalidate_observability_dashboard("cost")
     return _observability_envelope(item, source="reviewed savings measurements")
 
 
@@ -10240,6 +10585,7 @@ async def admin_update_savings_measurement(measurement_id: str, data: SavingsMea
     item = await _call_store_optional(_admin_observability_store(), ("update_savings_measurement",), measurement_id, _savings_measurement_input(data, measurement_id), default=None)
     if item is None:
         raise HTTPException(status_code=404, detail="节省核验记录不存在")
+    await _invalidate_observability_dashboard("cost")
     return _observability_envelope(item, source="reviewed savings measurements")
 
 
@@ -10250,6 +10596,7 @@ async def admin_delete_savings_measurement(measurement_id: str, request: Request
     deleted = await _call_store_optional(_admin_observability_store(), ("delete_savings_measurement",), measurement_id, default=False)
     if not deleted:
         raise HTTPException(status_code=404, detail="节省核验记录不存在")
+    await _invalidate_observability_dashboard("cost")
     return _observability_envelope({"deleted": True}, source="reviewed savings measurements")
 
 
@@ -10303,9 +10650,7 @@ async def admin_update_savings_action(action_id: str, data: SavingsActionRequest
     return _observability_envelope(_savings_payload(item), source="费用控制账本")
 
 
-@app.get("/api/admin/costs/overview")
-async def admin_costs_overview(
-    request: Request,
+async def _build_costs_overview(
     month: str | None = None,
     category: str = "",
     cost_bucket: str = "",
@@ -10316,9 +10661,7 @@ async def admin_costs_overview(
     reconciliation_status: str = "",
     recognition_status: str = "",
     as_of: str | None = None,
-    refresh: int = 0,
 ) -> dict[str, Any]:
-    require_platform_admin(request)
     target = month or date.today().strftime("%Y-%m")
     try:
         start = date.fromisoformat(f"{target}-01")
@@ -10409,7 +10752,7 @@ async def admin_costs_overview(
     budget_daily = budget / month_days if budget is not None else None
     elapsed_days = max(1, (today - start).days + 1)
     projected_daily = actual / elapsed_days if elapsed_days else 0.0
-    return _observability_envelope(
+    response = _observability_envelope(
         {
             "month": target,
             "summary": summary,
@@ -10502,6 +10845,40 @@ async def admin_costs_overview(
         },
         source="费用控制账本",
     )
+    annual, all_budgets = await asyncio.gather(
+        _build_costs_annual(
+            year=start.year, as_of=today.isoformat(), category=category,
+            cost_bucket=cost_bucket, model=model, vendor=vendor, provider=provider,
+            account_id=account_id, reconciliation_status=reconciliation_status,
+            recognition_status=recognition_status,
+        ),
+        store.list_cost_budgets(),
+    )
+    response["data"]["annual"] = annual.get("data") or {}
+    response["data"]["budgets"] = [
+        {"month": str(item.get("month")), "budgetUsd": float(item.get("budget_usd") or 0), "dailyTargetUsd": float(item.get("daily_target_usd") or 0)}
+        for item in all_budgets
+    ]
+    return response
+
+
+@app.get("/api/admin/costs/overview")
+async def admin_costs_overview(
+    request: Request,
+    month: str | None = None,
+    category: str = "", cost_bucket: str = "", model: str = "", vendor: str = "",
+    provider: str = "", account_id: str = "", reconciliation_status: str = "",
+    recognition_status: str = "", as_of: str | None = None, refresh: int = 0,
+) -> dict[str, Any]:
+    require_platform_admin(request)
+    target = month or date.today().strftime("%Y-%m")
+    cutoff = as_of or date.today().isoformat()
+    key = {"month": target, "asOf": cutoff, "category": category, "costBucket": cost_bucket, "model": model, "vendor": vendor, "provider": provider, "accountId": account_id, "reconciliation": reconciliation_status, "recognition": recognition_status, "definition": "cost-v2"}
+    return await _cached_observability_dashboard(
+        "cost", key,
+        lambda: _build_costs_overview(target, category, cost_bucket, model, vendor, provider, account_id, reconciliation_status, recognition_status, cutoff),
+        refresh=bool(refresh),
+    )
 
 
 @app.get("/api/admin/costs/ledger")
@@ -10577,9 +10954,7 @@ async def admin_costs_ledger(
     )
 
 
-@app.get("/api/admin/costs/annual")
-async def admin_costs_annual(
-    request: Request,
+async def _build_costs_annual(
     year: int | None = None,
     as_of: str | None = None,
     category: str = "",
@@ -10591,7 +10966,6 @@ async def admin_costs_annual(
     reconciliation_status: str = "",
     recognition_status: str = "",
 ) -> dict[str, Any]:
-    require_platform_admin(request)
     target_year = year or date.today().year
     start = date(target_year, 1, 1)
     end = date(target_year, 12, 31)
@@ -10711,6 +11085,35 @@ async def admin_costs_annual(
             "missingDimensions": [] if api_dimensions_complete else ["provider"],
         },
         source="cost ledger",
+    )
+
+
+@app.get("/api/admin/costs/annual")
+async def admin_costs_annual(
+    request: Request,
+    year: int | None = None,
+    as_of: str | None = None,
+    category: str = "",
+    cost_bucket: str = "",
+    model: str = "",
+    vendor: str = "",
+    provider: str = "",
+    account_id: str = "",
+    reconciliation_status: str = "",
+    recognition_status: str = "",
+) -> dict[str, Any]:
+    require_platform_admin(request)
+    return await _build_costs_annual(
+        year=year,
+        as_of=as_of,
+        category=category,
+        cost_bucket=cost_bucket,
+        model=model,
+        vendor=vendor,
+        provider=provider,
+        account_id=account_id,
+        reconciliation_status=reconciliation_status,
+        recognition_status=recognition_status,
     )
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import uuid
@@ -270,6 +271,11 @@ CREATE INDEX IF NOT EXISTS usage_event_attribution_key_time_idx
     WHERE key_id <> '';
 CREATE INDEX IF NOT EXISTS usage_event_attribution_stability_idx
     ON usage_event_attribution (usage_date, model, scenario, error_code, event_time DESC);
+CREATE INDEX IF NOT EXISTS usage_event_attribution_ttft_idx
+    ON usage_event_attribution (usage_date, model, ttft_ms)
+    WHERE ttft_ms IS NOT NULL;
+CREATE INDEX IF NOT EXISTS usage_event_attribution_failure_idx
+    ON usage_event_attribution (usage_date, model, final_failure_source, user_visible_failure);
 
 CREATE TABLE IF NOT EXISTS usage_realtime_daily (
     LIKE usage_daily INCLUDING DEFAULTS INCLUDING CONSTRAINTS
@@ -302,6 +308,50 @@ UNION ALL
 SELECT r.*
 FROM usage_realtime_daily r
 JOIN usage_realtime_state s ON s.usage_date=r.usage_date AND s.ready;
+
+-- Dashboard-facing API cost facts. Request-level attribution remains the
+-- audit source; this table keeps overview queries bounded as history grows.
+CREATE TABLE IF NOT EXISTS cost_api_daily (
+    usage_date DATE NOT NULL,
+    backend_id TEXT NOT NULL,
+    account_id TEXT NOT NULL DEFAULT '',
+    organization_id TEXT NOT NULL DEFAULT '',
+    team_id TEXT NOT NULL DEFAULT '',
+    key_id TEXT NOT NULL DEFAULT '',
+    principal_id TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    model_group TEXT NOT NULL DEFAULT '',
+    model_id TEXT NOT NULL DEFAULT '',
+    api_base TEXT NOT NULL DEFAULT '',
+    spend NUMERIC(18,6) NOT NULL DEFAULT 0,
+    request_count BIGINT NOT NULL DEFAULT 0,
+    refreshed_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (
+        usage_date, backend_id, account_id, organization_id, team_id,
+        key_id, principal_id, source, model, provider, model_group,
+        model_id, api_base
+    )
+);
+CREATE INDEX IF NOT EXISTS cost_api_daily_date_idx
+    ON cost_api_daily (usage_date, model, provider);
+CREATE INDEX IF NOT EXISTS cost_api_daily_account_idx
+    ON cost_api_daily (usage_date, account_id, key_id, principal_id);
+
+CREATE TABLE IF NOT EXISTS observability_dashboard_snapshots (
+    dashboard_type TEXT NOT NULL,
+    snapshot_key TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    generated_at TIMESTAMPTZ NOT NULL,
+    data_revision TEXT NOT NULL DEFAULT '',
+    refreshing BOOLEAN NOT NULL DEFAULT FALSE,
+    last_refresh_error TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (dashboard_type, snapshot_key)
+);
+CREATE INDEX IF NOT EXISTS observability_dashboard_snapshots_updated_idx
+    ON observability_dashboard_snapshots (dashboard_type, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS cost_items (
     id TEXT PRIMARY KEY,
@@ -4495,6 +4545,105 @@ class UsageStore:
         )
         return [dict(record) for record in records]
 
+    async def stability_overview_aggregates(
+        self, start_date: str, end_date: str, model: str = ""
+    ) -> dict[str, Any]:
+        """Return compact SQL aggregates for the stability overview."""
+
+        pool = self._require_pool()
+        args = (_as_date(start_date), _as_date(end_date), _clean_text(model))
+        base = """
+            usage_date BETWEEN $1::date AND $2::date
+              AND ($3='' OR model=$3 OR model_group=$3)
+        """
+        select_metrics = """
+            COUNT(*)::bigint AS request_count,
+            COUNT(*) FILTER (WHERE status IN ('success','failure'))::bigint AS status_count,
+            COUNT(*) FILTER (WHERE final_failure_source='explicit')::bigint AS explicit_count,
+            COUNT(*) FILTER (WHERE final_failure_source='explicit' AND user_visible_failure IS TRUE)::bigint AS explicit_failure_count,
+            COUNT(*) FILTER (WHERE user_visible_failure IS NOT NULL)::bigint AS failure_known_count,
+            COUNT(*) FILTER (WHERE user_visible_failure IS TRUE)::bigint AS failure_count,
+            COUNT(*) FILTER (WHERE attempted_retries IS NOT NULL)::bigint AS retry_known_count,
+            COUNT(*) FILTER (WHERE attempted_retries > 0)::bigint AS retry_count,
+            COUNT(*) FILTER (WHERE attempted_retries > 0 AND status='success')::bigint AS retry_recovered_count,
+            COUNT(ttft_ms)::bigint AS ttft_sample_count,
+            percentile_cont(0.95) WITHIN GROUP (ORDER BY ttft_ms) FILTER (WHERE ttft_ms IS NOT NULL)::double precision AS ttft_p95_ms,
+            MAX(collected_at) AS latest_collected_at
+        """
+        overall = await pool.fetchrow(
+            f"SELECT {select_metrics} FROM usage_event_attribution WHERE {base}", *args
+        )
+        daily = await pool.fetch(
+            f"SELECT usage_date AS dimension, {select_metrics} FROM usage_event_attribution WHERE {base} GROUP BY usage_date ORDER BY usage_date",
+            *args,
+        )
+        models = await pool.fetch(
+            f"SELECT COALESCE(NULLIF(model_group,''), NULLIF(model,''), 'unknown') AS dimension, {select_metrics} FROM usage_event_attribution WHERE {base} GROUP BY 1",
+            *args,
+        )
+        scenarios = await pool.fetch(
+            f"""
+            SELECT COALESCE(NULLIF(model_group,''), NULLIF(model,''), 'unknown') AS requested_model_group,
+                   COALESCE(NULLIF(scenario,''), 'unknown') AS scenario,
+                   COALESCE(error_code,'') AS error_code,
+                   COUNT(*)::bigint AS count,
+                   (ARRAY_AGG(request_id ORDER BY event_time DESC))[1:5] AS sample_request_ids,
+                   {select_metrics}
+            FROM usage_event_attribution
+            WHERE {base} AND (
+                user_visible_failure IS TRUE OR attempted_retries > 0 OR
+                COALESCE(error_code,'') <> '' OR COALESCE(error_class,'') <> '' OR
+                COALESCE(scenario,'unknown') <> 'unknown'
+            )
+            GROUP BY 1,2,3 ORDER BY count DESC LIMIT 10
+            """,
+            *args,
+        )
+        attempt_args = args
+        attempt_base = """
+            event_date BETWEEN $1::date AND $2::date
+              AND ($3='' OR requested_model_group=$3 OR actual_model=$3)
+        """
+        terminal_attempts = f"""
+            SELECT DISTINCT ON (
+                COALESCE(NULLIF(trace_id,''), NULLIF(request_id,''), event_id),
+                COALESCE(NULLIF(attempt_id,''), attempt_index::text || ':' || actual_model || ':' || route_name)
+            ) *
+            FROM stability_attempt_events WHERE {attempt_base}
+            ORDER BY COALESCE(NULLIF(trace_id,''), NULLIF(request_id,''), event_id),
+                     COALESCE(NULLIF(attempt_id,''), attempt_index::text || ':' || actual_model || ':' || route_name),
+                     COALESCE(ended_at,event_time) DESC, event_id DESC
+        """
+        attempts = await pool.fetchrow(
+            f"""
+            WITH terminal AS ({terminal_attempts}), traces AS (
+                SELECT COALESCE(NULLIF(trace_id,''), NULLIF(request_id,''), event_id) AS trace_key,
+                       BOOL_OR(is_fallback OR event_type LIKE 'fallback_%' OR fallback_from<>'' OR fallback_to<>'') AS fallback_triggered,
+                       BOOL_OR((is_fallback OR event_type LIKE 'fallback_%' OR fallback_from<>'' OR fallback_to<>'') AND status='success') AS fallback_recovered,
+                       BOOL_OR(is_retry OR event_type LIKE 'retry_%' OR (attempt_index>0 AND NOT is_fallback)) AS retry_triggered,
+                       BOOL_OR((is_retry OR event_type LIKE 'retry_%' OR (attempt_index>0 AND NOT is_fallback)) AND status='success') AS retry_recovered
+                FROM terminal GROUP BY 1
+            )
+            SELECT (SELECT COUNT(*) FROM terminal)::bigint AS attempt_count,
+                   (SELECT COUNT(*) FROM terminal WHERE status IN ('success','failure'))::bigint AS attempt_status_count,
+                   (SELECT COUNT(*) FROM terminal WHERE status='failure')::bigint AS failed_attempt_count,
+                   COUNT(*) FILTER (WHERE fallback_triggered)::bigint AS fallback_count,
+                   COUNT(*) FILTER (WHERE fallback_recovered)::bigint AS fallback_recovered_count,
+                   COUNT(*) FILTER (WHERE retry_triggered)::bigint AS retry_count,
+                   COUNT(*) FILTER (WHERE retry_recovered)::bigint AS retry_recovered_count,
+                   (SELECT MIN(COALESCE(started_at,event_time)) FROM terminal) AS available_from
+            FROM traces
+            """,
+            *attempt_args,
+        )
+        return {
+            "overall": dict(overall or {}),
+            "daily": [dict(item) for item in daily],
+            "models": [dict(item) for item in models],
+            "scenarios": [dict(item) for item in scenarios],
+            "attempts": dict(attempts or {}),
+        }
+
     async def stability_scenario_samples(
         self,
         start_date: str,
@@ -4613,19 +4762,15 @@ class UsageStore:
     ) -> list[dict[str, Any]]:
         records = await self._require_pool().fetch(
             """
-            SELECT usage_date, backend_id, raw_user_id AS user_id, organization_id,
+            SELECT usage_date, backend_id, account_id AS user_id, organization_id,
                    team_id, key_id, principal_id, source, model, provider,
                    model_group, model_id, api_base,
-                   SUM(spend)::double precision AS spend,
-                   COUNT(*)::bigint AS request_count
-            FROM usage_event_attribution
+                   spend::double precision AS spend, request_count
+            FROM cost_api_daily
             WHERE usage_date BETWEEN $1::date AND $2::date
               AND ($3='' OR model=$3)
               AND ($4='' OR provider=$4)
-              AND ($5='' OR raw_user_id=$5 OR key_id=$5 OR principal_id=$5)
-            GROUP BY usage_date, backend_id, raw_user_id, organization_id, team_id,
-                     key_id, principal_id, source, model, provider, model_group,
-                     model_id, api_base
+              AND ($5='' OR account_id=$5 OR key_id=$5 OR principal_id=$5)
             ORDER BY usage_date, spend DESC
             """,
             _as_date(start_date),
@@ -4635,6 +4780,121 @@ class UsageStore:
             _clean_text(account_id),
         )
         return [dict(record) for record in records]
+
+    async def rebuild_cost_api_daily(self, start_date: str | date, end_date: str | date) -> int:
+        """Replace only the affected daily cost aggregates."""
+
+        start = _as_date(start_date)
+        end = _as_date(end_date)
+        async with self._require_pool().acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "DELETE FROM cost_api_daily WHERE usage_date BETWEEN $1::date AND $2::date",
+                    start,
+                    end,
+                )
+                result = await connection.execute(
+                    """
+                    INSERT INTO cost_api_daily (
+                        usage_date, backend_id, account_id, organization_id, team_id,
+                        key_id, principal_id, source, model, provider, model_group,
+                        model_id, api_base, spend, request_count, refreshed_at
+                    )
+                    SELECT usage_date, backend_id, raw_user_id, organization_id, team_id,
+                           key_id, principal_id, source, model, COALESCE(provider, ''),
+                           COALESCE(model_group, ''), COALESCE(model_id, ''),
+                           COALESCE(api_base, ''), SUM(spend), COUNT(*), NOW()
+                    FROM usage_event_attribution
+                    WHERE usage_date BETWEEN $1::date AND $2::date
+                    GROUP BY usage_date, backend_id, raw_user_id, organization_id,
+                             team_id, key_id, principal_id, source, model,
+                             COALESCE(provider, ''), COALESCE(model_group, ''),
+                             COALESCE(model_id, ''), COALESCE(api_base, '')
+                    """,
+                    start,
+                    end,
+                )
+        return int(result.rsplit(" ", 1)[-1])
+
+    async def cost_api_daily_bounds(self) -> dict[str, Any]:
+        record = await self._require_pool().fetchrow(
+            "SELECT MIN(usage_date) AS start_date, MAX(usage_date) AS end_date, COUNT(*) AS row_count FROM cost_api_daily"
+        )
+        return dict(record) if record else {"start_date": None, "end_date": None, "row_count": 0}
+
+    async def next_cost_api_backfill_range(self, batch_days: int = 7) -> dict[str, Any] | None:
+        record = await self._require_pool().fetchrow(
+            """
+            WITH event_days AS (
+                SELECT DISTINCT usage_date FROM usage_event_attribution
+            ), missing AS (
+                SELECT e.usage_date FROM event_days e
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM cost_api_daily c WHERE c.usage_date=e.usage_date
+                )
+            )
+            SELECT MIN(usage_date) AS start_date,
+                   LEAST(MAX(usage_date), MIN(usage_date) + ($1::int - 1)) AS end_date
+            FROM missing
+            """,
+            max(1, int(batch_days)),
+        )
+        if not record or record["start_date"] is None:
+            return None
+        return dict(record)
+
+    async def get_observability_snapshot(self, dashboard_type: str, snapshot_key: str) -> dict[str, Any] | None:
+        record = await self._require_pool().fetchrow(
+            "SELECT * FROM observability_dashboard_snapshots WHERE dashboard_type=$1 AND snapshot_key=$2",
+            _clean_text(dashboard_type),
+            _clean_text(snapshot_key),
+        )
+        return dict(record) if record else None
+
+    async def save_observability_snapshot(
+        self,
+        dashboard_type: str,
+        snapshot_key: str,
+        payload: dict[str, Any],
+        *,
+        data_revision: str = "",
+    ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        record = await self._require_pool().fetchrow(
+            """
+            INSERT INTO observability_dashboard_snapshots (
+                dashboard_type, snapshot_key, payload, generated_at, data_revision,
+                refreshing, last_refresh_error, updated_at
+            ) VALUES ($1,$2,$3::jsonb,$4,$5,FALSE,'',$4)
+            ON CONFLICT (dashboard_type, snapshot_key) DO UPDATE SET
+                payload=EXCLUDED.payload, generated_at=EXCLUDED.generated_at,
+                data_revision=EXCLUDED.data_revision, refreshing=FALSE,
+                last_refresh_error='', updated_at=EXCLUDED.updated_at
+            RETURNING *
+            """,
+            _clean_text(dashboard_type), _clean_text(snapshot_key),
+            json.dumps(payload, ensure_ascii=False), now, _clean_text(data_revision),
+        )
+        return dict(record)
+
+    async def mark_observability_snapshot_refresh(
+        self, dashboard_type: str, snapshot_key: str, *, refreshing: bool, error: str = ""
+    ) -> None:
+        await self._require_pool().execute(
+            """
+            UPDATE observability_dashboard_snapshots
+            SET refreshing=$3, last_refresh_error=$4, updated_at=NOW()
+            WHERE dashboard_type=$1 AND snapshot_key=$2
+            """,
+            _clean_text(dashboard_type), _clean_text(snapshot_key), bool(refreshing), _clean_text(error)[:500],
+        )
+
+    async def delete_observability_snapshots(self, dashboard_type: str) -> int:
+        result = await self._require_pool().execute(
+            "DELETE FROM observability_dashboard_snapshots WHERE dashboard_type=$1",
+            _clean_text(dashboard_type),
+        )
+        return int(result.rsplit(" ", 1)[-1])
 
     async def list_cost_items(
         self,

@@ -111,6 +111,23 @@ class UsageRealtimeWorker:
             )
         return True
 
+    async def backfill_cost_aggregates(self) -> bool:
+        next_range = getattr(self.store, "next_cost_api_backfill_range", None)
+        rebuild = getattr(self.store, "rebuild_cost_api_daily", None)
+        if not callable(next_range) or not callable(rebuild):
+            return False
+        window = await next_range(
+            max(1, _env_int("COST_AGGREGATE_BACKFILL_DAYS_PER_BATCH", 7))
+        )
+        if not window:
+            return False
+        await rebuild(window["start_date"], window["end_date"])
+        logger.info(
+            "cost aggregate backfill start=%s end=%s",
+            window["start_date"], window["end_date"],
+        )
+        return True
+
     async def _renew_worker_lock_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
@@ -349,6 +366,7 @@ class UsageRealtimeWorker:
 
     async def flush_archive(self) -> int:
         total = 0
+        affected_dates: set[date] = set()
         while True:
             messages = await self.realtime.read_archive_batch()
             if not messages:
@@ -358,10 +376,19 @@ class UsageRealtimeWorker:
             # pass can retry them; acknowledging on failure would lose the
             # only durable copy outside Redis.
             await self.store.archive_realtime_events(valid)
+            for event in valid:
+                value = str(event.get("date") or event.get("usage_date") or event.get("eventTime") or event.get("event_time") or "")[:10]
+                try:
+                    affected_dates.add(date.fromisoformat(value))
+                except ValueError:
+                    continue
             await self.realtime.acknowledge([message_id for message_id, _ in messages])
             total += len(messages)
             if len(messages) < 200:
                 break
+        rebuild = getattr(self.store, "rebuild_cost_api_daily", None)
+        if affected_dates and callable(rebuild):
+            await rebuild(min(affected_dates), max(affected_dates))
         return total
 
     async def calibrate_previous_day(self) -> None:
@@ -445,6 +472,7 @@ class UsageRealtimeWorker:
                     last_directory_refresh = now
                 await self.poll_once(now)
                 await self.backfill_once()
+                await self.backfill_cost_aggregates()
                 await self.consume_refresh_requests()
                 if (now - last_reconcile).total_seconds() >= self.reconcile_seconds:
                     for backend in self.client.backends:

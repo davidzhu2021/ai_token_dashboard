@@ -151,6 +151,24 @@ class UsageSyncWorker:
         )
         return True
 
+    async def backfill_cost_aggregates(self) -> bool:
+        next_range = getattr(self.store, "next_cost_api_backfill_range", None)
+        rebuild = getattr(self.store, "rebuild_cost_api_daily", None)
+        if not callable(next_range) or not callable(rebuild):
+            return False
+        window = await next_range(
+            max(1, _env_int("COST_AGGREGATE_BACKFILL_DAYS_PER_BATCH", 7))
+        )
+        if not window:
+            return False
+        await rebuild(window["start_date"], window["end_date"])
+        logger.info(
+            "cost aggregate backfill start=%s end=%s",
+            window["start_date"],
+            window["end_date"],
+        )
+        return True
+
     def _intervals(self) -> tuple[int, int, int, int]:
         recent_days = max(1, _env_int("USAGE_SYNC_RECENT_DAYS", 2))
         calibration_days = max(recent_days, _env_int("USAGE_SYNC_CALIBRATION_DAYS", 3))
@@ -216,6 +234,8 @@ class UsageSyncWorker:
                 last_refresh = await self.store.latest_success_at() or self.now()
             last_calibration = self.now()
             while not self.stop_event.is_set():
+                if await self.backfill_cost_aggregates():
+                    continue
                 if await self.consume_refresh_requests():
                     last_refresh = self.now()
                     continue
