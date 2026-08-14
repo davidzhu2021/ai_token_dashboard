@@ -1062,7 +1062,7 @@ class UsageStore:
                 SELECT request_key
                 FROM usage_refresh_requests
                 WHERE status='pending'
-                   OR (status='running' AND claimed_at < $1 - ($2 * INTERVAL '1 second'))
+                   OR (status='running' AND claimed_at < $1::timestamptz - ($2::double precision * INTERVAL '1 second'))
                 ORDER BY requested_at
                 FOR UPDATE SKIP LOCKED
                 LIMIT $3

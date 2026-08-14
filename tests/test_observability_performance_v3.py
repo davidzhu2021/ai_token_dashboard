@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 
 from backend import main
+from backend.usage_store import UsageStore
 
 
 class SnapshotStore:
@@ -108,3 +109,22 @@ def test_governance_workbench_does_not_preload_full_overviews() -> None:
     assert "loadGovernanceWorkbench()" in block
     assert "loadStabilityOverview()" not in block
     assert "loadCostOverview()" not in block
+
+
+def test_refresh_claim_casts_timestamp_and_interval_parameters() -> None:
+    class Pool:
+        query = ""
+
+        async def fetch(self, query, *_args):
+            self.query = query
+            return []
+
+    async def run() -> None:
+        store = UsageStore("postgresql://unused")
+        pool = Pool()
+        store.pool = pool
+        await store.claim_refresh_requests()
+        assert "$1::timestamptz" in pool.query
+        assert "$2::double precision * INTERVAL '1 second'" in pool.query
+
+    asyncio.run(run())
