@@ -23,7 +23,9 @@ def test_trustworthy_observability_statuses_and_loading_lifecycle() -> None:
     assert 'isStabilityLoading = false;\n      renderStabilityOverview();' in source
     assert 'isCostOverviewLoading = false;\n      renderCostOverview();' in source
     assert 'upstream == null ? ""' in source
-    assert 'actual == null ? ""' in source
+    assert 'class="cost-scenario-item run-rate"' in source
+    assert 'const sumAvailable = (key) =>' in source
+    assert 'class="cost-scenario-summary"' in markup
     assert "本期确无异常记录" in source
     assert "异常趋势暂不可用" in source
     assert "本期确无费用记录" in source
