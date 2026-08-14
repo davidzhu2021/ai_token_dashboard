@@ -80,6 +80,7 @@ def test_ranking_tables_keep_headers_visible_and_mobile_heights_bounded() -> Non
     team_bars_rule = markup[team_bars_start : markup.index("}", team_bars_start)]
     assert "width: min(100%, 390px)" in team_bars_rule
     assert "align-self: center" in team_bars_rule
+    assert "align-content: safe center" in team_bars_rule
     assert 'container.classList.toggle("is-compact", sorted.length > 0 && sorted.length <= 4);' in source
     assert 'el("stabilityRanking").classList.toggle("is-compact", stabilityRankings.length > 0 && stabilityRankings.length <= 4);' in source
     assert 'el("costModelSplit").classList.toggle("is-compact", split.length > 0 && split.length <= 4);' in source
