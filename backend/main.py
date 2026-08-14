@@ -168,6 +168,21 @@ app = FastAPI(title="通衢 API", lifespan=app_lifespan)
 # 它们是纯文本，压缩后只剩两成，是首屏可感知延迟里最便宜的一段。
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 VERSIONED_APP_CACHE_CONTROL = "public, max-age=31536000, immutable"
+APP_JS_VERSION_PLACEHOLDER = "__APP_JS_VERSION__"
+
+
+def app_js_version() -> str:
+    """Return a content fingerprint so immutable script URLs never serve stale code."""
+
+    return hashlib.sha256((ROOT_DIR / "assets" / "app.js").read_bytes()).hexdigest()[:16]
+
+
+def spa_html_response() -> HTMLResponse:
+    markup = (ROOT_DIR / "index.html").read_text(encoding="utf-8")
+    return HTMLResponse(
+        markup.replace(APP_JS_VERSION_PLACEHOLDER, app_js_version()),
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "no-referrer"},
+    )
 
 
 class VersionedAppStaticFiles(StaticFiles):
@@ -255,6 +270,7 @@ team_usage_cache = TTLCache()
 team_member_usage_cache = TTLCache()
 _observability_refresh_tasks: dict[str, asyncio.Task[Any]] = {}
 _observability_refresh_lock = asyncio.Lock()
+_observability_memory_snapshots: dict[str, dict[str, Any]] = {}
 _usage_singleflight: dict[str, asyncio.Task[Any]] = {}
 _usage_singleflight_lock = asyncio.Lock()
 _usage_last_good_payloads: dict[str, dict[str, Any]] = {}
@@ -302,6 +318,8 @@ def _observability_cache_meta(
     *,
     state: str,
     refreshing: bool = False,
+    layer: str = "database",
+    response_bytes: int | None = None,
 ) -> dict[str, Any]:
     generated = record.get("generated_at") if record else None
     if isinstance(generated, datetime):
@@ -321,7 +339,13 @@ def _observability_cache_meta(
         "refreshing": refreshing,
         "lastRefreshError": str((record or {}).get("last_refresh_error") or ""),
         "dataRevision": str((record or {}).get("data_revision") or ""),
+        "layer": layer,
+        "responseBytes": response_bytes,
     }
+
+
+def _observability_response_bytes(payload: dict[str, Any]) -> int:
+    return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
 
 
 def _snapshot_payload(record: dict[str, Any]) -> dict[str, Any]:
@@ -363,12 +387,15 @@ async def _observability_refresh(
                 "data_revision": revision,
                 "last_refresh_error": "",
             }
+        memory_key = f"{dashboard_type}:{snapshot_key}"
+        _observability_memory_snapshots[memory_key] = dict(record)
+        response_bytes = _observability_response_bytes(payload)
         logger.info(
             "observability refresh dashboard=%s total_ms=%.0f cache_state=stored",
             dashboard_type,
             (asyncio.get_running_loop().time() - started) * 1000,
         )
-        return {**payload, "cache": _observability_cache_meta(record, state="fresh")}
+        return {**payload, "cache": _observability_cache_meta(record, state="fresh", layer="rebuild", response_bytes=response_bytes)}
     except Exception as exc:
         await _call_store_optional(
             store,
@@ -419,22 +446,30 @@ async def _cached_observability_dashboard(
 ) -> dict[str, Any]:
     store = _admin_observability_store()
     snapshot_key = _observability_snapshot_key(key_payload)
-    record = await _call_store_optional(
-        store, ("get_observability_snapshot",), dashboard_type, snapshot_key, default=None
-    )
-    fresh_seconds = max(1, env_int("OBSERVABILITY_CACHE_FRESH_SECONDS", 60))
+    memory_key = f"{dashboard_type}:{snapshot_key}"
+    lookup_started = asyncio.get_running_loop().time()
+    record = _observability_memory_snapshots.get(memory_key)
+    layer = "memory" if record else "database"
+    if not record:
+        record = await _call_store_optional(
+            store, ("get_observability_snapshot",), dashboard_type, snapshot_key, default=None
+        )
+        if record:
+            _observability_memory_snapshots[memory_key] = dict(record)
+    fresh_seconds = max(1, env_int("OBSERVABILITY_CACHE_FRESH_SECONDS", 300))
     stale_seconds = max(fresh_seconds, env_int("OBSERVABILITY_CACHE_STALE_MAX_SECONDS", 86400))
     age = None
     if record and isinstance(record.get("generated_at"), datetime):
         age = (datetime.now(timezone.utc) - record["generated_at"]).total_seconds()
     if record and age is not None and age <= fresh_seconds and not refresh:
         payload = _snapshot_payload(record)
-        payload["cache"] = _observability_cache_meta(record, state="fresh")
+        payload["cache"] = _observability_cache_meta(record, state="fresh", layer=layer, response_bytes=_observability_response_bytes(payload))
+        logger.info("observability overview dashboard=%s snapshot_ms=%.0f total_ms=%.0f cache_layer=%s cache_state=fresh response_bytes=%s", dashboard_type, (asyncio.get_running_loop().time() - lookup_started) * 1000, (asyncio.get_running_loop().time() - lookup_started) * 1000, layer, payload["cache"]["responseBytes"])
         return payload
     if record and age is not None and age <= stale_seconds:
         task = await _start_observability_refresh(dashboard_type, snapshot_key, builder)
         payload = _snapshot_payload(record)
-        payload["cache"] = _observability_cache_meta(record, state="refreshing" if not task.done() else "stale", refreshing=not task.done())
+        payload["cache"] = _observability_cache_meta(record, state="refreshing" if not task.done() else "stale", refreshing=not task.done(), layer=layer, response_bytes=_observability_response_bytes(payload))
         return payload
     task = await _start_observability_refresh(dashboard_type, snapshot_key, builder)
     budget = max(100, env_int("OBSERVABILITY_COLD_QUERY_BUDGET_MS", 1500)) / 1000
@@ -461,6 +496,9 @@ async def _cached_observability_dashboard(
 
 
 async def _invalidate_observability_dashboard(dashboard_type: str) -> None:
+    prefix = f"{dashboard_type}:"
+    for key in [item for item in _observability_memory_snapshots if item.startswith(prefix)]:
+        _observability_memory_snapshots.pop(key, None)
     await _call_store_optional(
         _admin_observability_store(),
         ("delete_observability_snapshots",),
@@ -9543,8 +9581,8 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
                 "daily": daily,
                 "modelRankings": sorted(rankings, key=_stability_model_ranking_key),
                 "topScenarios": scenarios,
-                "actions": actions or [],
-                "regressions": regressions or [],
+                "actions": [dict(item) for item in (actions or [])[:5]],
+                "regressions": [dict(item) for item in (regressions or [])[:5]],
                 "attemptEventsAvailableFrom": attempts.get("available_from"),
                 "quality": _stability_quality(overview),
                 "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
@@ -9663,17 +9701,18 @@ async def admin_stability_overview(
     end_date: str | None = None,
     model: str = "",
     refresh: int = 0,
-) -> dict[str, Any]:
+) -> JSONResponse:
     require_platform_admin(request)
     if not env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False):
         raise HTTPException(status_code=404, detail="看板尚未开放")
     start_date, end_date = resolve_usage_range(start_date, end_date)
-    return await _cached_observability_dashboard(
+    payload = await _cached_observability_dashboard(
         "stability",
         {"startDate": start_date, "endDate": end_date, "model": model, "definition": STABILITY_DEFINITIONS_VERSION},
         lambda: _build_stability_overview(start_date, end_date, model),
         refresh=bool(refresh),
     )
+    return JSONResponse(payload, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 
 
 @app.get("/api/admin/stability/scenarios")
@@ -10832,6 +10871,7 @@ async def _build_costs_overview(
                 )
             ],
             "ledger": {"rows": ledger_rows, "total": len(ledger_rows)},
+            # Keep the legacy overview fields while the dedicated endpoints migrate consumers.
             "costItems": [_cost_item_payload(item) for item in items],
             "savingsActions": actions,
             "savingsMeasurements": audited_savings,
@@ -10882,6 +10922,7 @@ async def _build_costs_overview(
         {"month": str(item.get("month")), "budgetUsd": float(item.get("budget_usd") or 0), "dailyTargetUsd": float(item.get("daily_target_usd") or 0)}
         for item in all_budgets
     ]
+    response["data"]["savingsSummary"] = audited_savings
     return response
 
 
@@ -12082,18 +12123,12 @@ async def models(request: Request) -> dict[str, Any]:
 
 
 @app.get("/")
-async def index() -> FileResponse:
-    return FileResponse(
-        ROOT_DIR / "index.html",
-        headers={"Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "no-referrer"},
-    )
+async def index() -> HTMLResponse:
+    return spa_html_response()
 
 
 @app.get("/{path:path}")
-async def spa_fallback(path: str) -> FileResponse:
+async def spa_fallback(path: str) -> HTMLResponse:
     if path.startswith("api/"):
         raise HTTPException(status_code=404, detail="接口不存在")
-    return FileResponse(
-        ROOT_DIR / "index.html",
-        headers={"Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "no-referrer"},
-    )
+    return spa_html_response()

@@ -161,6 +161,8 @@ def test_stability_overview_and_request_metadata_are_admin_only(monkeypatch) -> 
     client = _client(monkeypatch)
     response = client.get("/api/admin/stability/overview?start_date=2026-08-06&end_date=2026-08-12")
     assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Pragma"] == "no-cache"
     payload = response.json()
     assert payload["data"]["overview"]["retryRecoveryRate"] == 0.5
     assert payload["coverage"]["partial"] is False

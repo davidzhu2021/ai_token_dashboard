@@ -4570,18 +4570,18 @@ class UsageStore:
             percentile_cont(0.95) WITHIN GROUP (ORDER BY ttft_ms) FILTER (WHERE ttft_ms IS NOT NULL)::double precision AS ttft_p95_ms,
             MAX(collected_at) AS latest_collected_at
         """
-        overall = await pool.fetchrow(
+        overall_query = pool.fetchrow(
             f"SELECT {select_metrics} FROM usage_event_attribution WHERE {base}", *args
         )
-        daily = await pool.fetch(
+        daily_query = pool.fetch(
             f"SELECT usage_date AS dimension, {select_metrics} FROM usage_event_attribution WHERE {base} GROUP BY usage_date ORDER BY usage_date",
             *args,
         )
-        models = await pool.fetch(
+        models_query = pool.fetch(
             f"SELECT COALESCE(NULLIF(model_group,''), NULLIF(model,''), 'unknown') AS dimension, {select_metrics} FROM usage_event_attribution WHERE {base} GROUP BY 1",
             *args,
         )
-        scenarios = await pool.fetch(
+        scenarios_query = pool.fetch(
             f"""
             SELECT COALESCE(NULLIF(model_group,''), NULLIF(model,''), 'unknown') AS requested_model_group,
                    COALESCE(NULLIF(scenario,''), 'unknown') AS scenario,
@@ -4614,7 +4614,7 @@ class UsageStore:
                      COALESCE(NULLIF(attempt_id,''), attempt_index::text || ':' || actual_model || ':' || route_name),
                      COALESCE(ended_at,event_time) DESC, event_id DESC
         """
-        attempts = await pool.fetchrow(
+        attempts_query = pool.fetchrow(
             f"""
             WITH terminal AS ({terminal_attempts}), traces AS (
                 SELECT COALESCE(NULLIF(trace_id,''), NULLIF(request_id,''), event_id) AS trace_key,
@@ -4635,6 +4635,9 @@ class UsageStore:
             FROM traces
             """,
             *attempt_args,
+        )
+        overall, daily, models, scenarios, attempts = await asyncio.gather(
+            overall_query, daily_query, models_query, scenarios_query, attempts_query
         )
         return {
             "overall": dict(overall or {}),

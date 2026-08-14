@@ -19,6 +19,8 @@ def test_index_uses_fresh_app_asset_and_disables_html_cache() -> None:
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["Referrer-Policy"] == "no-referrer"
     assert re.search(r'<script src="/assets/app\.js\?v=[^"]+"></script>', response.text)
+    assert main.APP_JS_VERSION_PLACEHOLDER not in response.text
+    assert main.app_js_version() in response.text
     assert "20260807-personal-key-speed" not in response.text
     assert "20260805-team-member-keys" not in response.text
     assert "20260805-owner-identity" not in response.text
@@ -92,6 +94,20 @@ def test_spa_fallback_disables_html_cache() -> None:
     assert response.status_code == 200
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["Referrer-Policy"] == "no-referrer"
+    assert main.app_js_version() in response.text
+
+
+def test_app_js_version_is_a_content_fingerprint(tmp_path, monkeypatch) -> None:
+    asset_dir = tmp_path / "assets"
+    asset_dir.mkdir()
+    app_script = asset_dir / "app.js"
+    app_script.write_text("first", encoding="utf-8")
+    monkeypatch.setattr(main, "ROOT_DIR", tmp_path)
+
+    first_version = main.app_js_version()
+    app_script.write_text("second", encoding="utf-8")
+
+    assert first_version != main.app_js_version()
 
 
 def test_versioned_app_asset_uses_immutable_cache() -> None:

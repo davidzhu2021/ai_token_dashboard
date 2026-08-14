@@ -8666,7 +8666,7 @@ async function loadStabilityOverview(forceRefresh = false) {
   try {
     const { startDate, endDate } = currentStabilityWindow();
     const model = el("stabilityModel")?.value || "";
-    const nextOverview = await api(`/api/admin/stability/overview?start_date=${startDate}&end_date=${endDate}&model=${encodeURIComponent(model)}${forceRefresh ? "&refresh=1" : ""}`, { signal: stabilityOverviewController.signal });
+    const nextOverview = await api(`/api/admin/stability/overview?start_date=${startDate}&end_date=${endDate}&model=${encodeURIComponent(model)}${forceRefresh ? "&refresh=1" : ""}`, { signal: stabilityOverviewController.signal, cache: "no-store" });
     if (requestId !== stabilityOverviewRequestId) return;
     stabilityOverview = nextOverview;
   } catch (error) {
