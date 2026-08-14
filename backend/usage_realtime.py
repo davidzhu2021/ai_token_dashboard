@@ -323,6 +323,49 @@ return {1, revision}
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
+    async def set_backfill_checkpoint(
+        self,
+        backend_id: str,
+        *,
+        start_time: datetime,
+        end_time: datetime,
+        next_page: int,
+    ) -> None:
+        payload = json.dumps(
+            {
+                "startTime": start_time.astimezone(timezone.utc).isoformat(),
+                "endTime": end_time.astimezone(timezone.utc).isoformat(),
+                "nextPage": max(1, int(next_page)),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        await self.client.hset(f"{self.prefix}:backfill-checkpoints", backend_id, payload)
+
+    async def backfill_checkpoint(self, backend_id: str) -> dict[str, Any] | None:
+        raw = await self.client.hget(f"{self.prefix}:backfill-checkpoints", backend_id)
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw)
+            start_time = datetime.fromisoformat(str(payload["startTime"]).replace("Z", "+00:00"))
+            end_time = datetime.fromisoformat(str(payload["endTime"]).replace("Z", "+00:00"))
+            if start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=timezone.utc)
+            if end_time.tzinfo is None:
+                end_time = end_time.replace(tzinfo=timezone.utc)
+            return {
+                "startTime": start_time.astimezone(timezone.utc),
+                "endTime": end_time.astimezone(timezone.utc),
+                "nextPage": max(1, int(payload.get("nextPage") or 1)),
+            }
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            await self.clear_backfill_checkpoint(backend_id)
+            return None
+
+    async def clear_backfill_checkpoint(self, backend_id: str) -> None:
+        await self.client.hdel(f"{self.prefix}:backfill-checkpoints", backend_id)
+
     async def set_ready(self, ready: bool) -> None:
         await self.client.set(f"{self.prefix}:ready", "1" if ready else "0")
 
@@ -417,6 +460,9 @@ return {1, revision}
                 latest_dt = None
         pending = await self.client.xpending(self.stream_key, self.consumer_group)
         cursors = await self.client.hgetall(f"{self.prefix}:cursors")
+        backfill_checkpoints = await self.client.hgetall(
+            f"{self.prefix}:backfill-checkpoints"
+        )
         return {
             "connected": True,
             "ready": await self.ready(),
@@ -429,4 +475,7 @@ return {1, revision}
             ),
             "pendingArchiveCount": int((pending or {}).get("pending") or 0),
             "cursors": cursors,
+            "backfillActive": bool(backfill_checkpoints),
+            "backfillBackends": sorted(backfill_checkpoints),
+            "backfillCheckpoints": backfill_checkpoints,
         }

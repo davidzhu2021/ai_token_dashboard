@@ -95,7 +95,7 @@ console.log(JSON.stringify(employeeMatchesIdentity(first, second)));
 
 def test_selected_employee_snapshot_survives_empty_filtered_response() -> None:
     source = APP_JS.read_text(encoding="utf-8")
-    load_block = source[source.index("async function loadDepartmentData(") : source.index("async function loadTeamRankingData(")]
+    load_block = source[source.index("function loadDepartmentData(") : source.index("async function loadTeamRankingData(")]
 
     assert "if (selectedDepartmentEmployee)" in load_block
     assert "if (matchedEmployee)" in load_block

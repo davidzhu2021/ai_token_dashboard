@@ -80,6 +80,24 @@ def test_incremental_spend_logs_use_small_sorted_window_and_return_events() -> N
     ]
 
 
+def test_incremental_spend_logs_resume_from_bounded_page_checkpoint() -> None:
+    client = IncrementalClient([[], [], [], [], []])
+
+    events, complete = asyncio.run(
+        client.incremental_events_from_logs(
+            datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 13, 2, 5, tzinfo=timezone.utc),
+            BACKEND,
+            start_page=2,
+            max_pages=2,
+        )
+    )
+
+    assert events == []
+    assert complete is False
+    assert [request["page"] for request in client.requests] == [2, 3]
+
+
 def test_publish_snapshot_date_parameters_are_date_objects() -> None:
     captured = []
 
@@ -139,6 +157,40 @@ def test_realtime_configuration_enables_postgres_history_store(monkeypatch) -> N
     assert UsageStore.from_environment() is not None
 
 
+def test_realtime_backfill_checkpoint_round_trips_through_redis_hash() -> None:
+    values = {}
+
+    class Client:
+        async def hset(self, key, field, value):
+            values[(key, field)] = value
+
+        async def hget(self, key, field):
+            return values.get((key, field))
+
+        async def hdel(self, key, field):
+            values.pop((key, field), None)
+
+    store = UsageRealtimeStore.__new__(UsageRealtimeStore)
+    store.client = Client()
+    start_time = datetime(2026, 8, 13, 1, 0, tzinfo=timezone.utc)
+    end_time = datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc)
+
+    asyncio.run(
+        store.set_backfill_checkpoint(
+            "primary", start_time=start_time, end_time=end_time, next_page=11
+        )
+    )
+    checkpoint = asyncio.run(store.backfill_checkpoint("primary"))
+
+    assert checkpoint == {
+        "startTime": start_time,
+        "endTime": end_time,
+        "nextPage": 11,
+    }
+    asyncio.run(store.clear_backfill_checkpoint("primary"))
+    assert asyncio.run(store.backfill_checkpoint("primary")) is None
+
+
 def test_archive_reader_claims_stale_pending_messages_before_new_ones() -> None:
     class Client:
         async def xautoclaim(self, *_args, **_kwargs):
@@ -186,6 +238,82 @@ def test_incomplete_realtime_window_does_not_advance_cursor() -> None:
     )
 
     assert inserted == 0
+
+
+def test_realtime_backfill_persists_next_page_after_each_bounded_batch() -> None:
+    calls = []
+
+    class Realtime:
+        async def backfill_checkpoint(self, _backend_id):
+            return {
+                "startTime": datetime(2026, 8, 13, 1, 0, tzinfo=timezone.utc),
+                "endTime": datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc),
+                "nextPage": 11,
+            }
+
+        async def ingest_event(self, *_args):
+            return True, 1
+
+        async def set_backfill_checkpoint(self, backend_id, **checkpoint):
+            calls.append((backend_id, checkpoint))
+
+        async def clear_backfill_checkpoint(self, *_args):
+            raise AssertionError("an incomplete batch must retain its checkpoint")
+
+    class Client:
+        async def incremental_events_from_logs(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return [{"requestId": "req-1"}], False
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.realtime = Realtime()
+    worker.client = Client()
+    worker.backfill_pages_per_cycle = 10
+    worker.live_window_seconds = 60
+    worker._enrich_event = lambda _backend, event: event
+
+    inserted = asyncio.run(worker.backfill_backend(BACKEND))
+
+    assert inserted == 1
+    request_kwargs = calls[0][1]
+    assert request_kwargs["start_page"] == 11
+    assert request_kwargs["max_pages"] == 10
+    assert calls[1][1]["next_page"] == 21
+
+
+def test_realtime_backfill_clears_checkpoint_after_final_page() -> None:
+    cleared = []
+
+    class Realtime:
+        async def backfill_checkpoint(self, _backend_id):
+            return {
+                "startTime": datetime(2026, 8, 13, 1, 0, tzinfo=timezone.utc),
+                "endTime": datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc),
+                "nextPage": 21,
+            }
+
+        async def ingest_event(self, *_args):
+            return False, 1
+
+        async def cursor(self, _backend_id):
+            return datetime(2026, 8, 13, 2, 0, 30, tzinfo=timezone.utc)
+
+        async def clear_backfill_checkpoint(self, backend_id):
+            cleared.append(backend_id)
+
+    class Client:
+        async def incremental_events_from_logs(self, *_args, **_kwargs):
+            return [], True
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.realtime = Realtime()
+    worker.client = Client()
+    worker.backfill_pages_per_cycle = 10
+    worker.live_window_seconds = 60
+    worker._enrich_event = lambda _backend, event: event
+
+    assert asyncio.run(worker.backfill_backend(BACKEND)) == 0
+    assert cleared == ["primary"]
 
 
 def test_realtime_directory_refresh_updates_department_directory() -> None:

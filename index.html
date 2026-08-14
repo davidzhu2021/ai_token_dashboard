@@ -3118,8 +3118,8 @@
       .observability-active-filter:hover { background:#e7f2ff; border-color:#a9ceef; }
       .observability-active-filter:focus-visible { outline:none; box-shadow:0 0 0 3px rgba(6,115,210,.14); }
       .observability-active-filter svg { width:13px; height:13px; }
-      .observability-filter-panel { max-height:0; margin:0; opacity:0; overflow:hidden; visibility:hidden; transform:translateY(-5px); border:1px solid transparent; border-radius:12px; background:#f5f8fc; transition:max-height 220ms ease-out,margin 220ms ease-out,padding 220ms ease-out,opacity 150ms ease-out,transform 180ms ease-out,border-color 180ms ease-out,visibility 0s linear 220ms; }
-      .observability-filter-panel.is-open { max-height:240px; margin:0 0 16px; padding:14px; opacity:1; visibility:visible; transform:translateY(0); border-color:#dbe5ef; transition:max-height 220ms ease-out,margin 220ms ease-out,padding 220ms ease-out,opacity 150ms ease-out,transform 180ms ease-out,border-color 180ms ease-out,visibility 0s; }
+      .observability-filter-panel { display:none; margin:0 0 16px; padding:14px; opacity:0; visibility:hidden; transform:translateY(-5px); border:1px solid #dbe5ef; border-radius:12px; background:#f5f8fc; transition:opacity 150ms ease-out,transform 180ms ease-out,visibility 0s linear 180ms; }
+      .observability-filter-panel.is-open { display:block; opacity:1; visibility:visible; transform:translateY(0); transition:opacity 150ms ease-out,transform 180ms ease-out,visibility 0s; }
       .observability-filter-fields { display:grid; grid-template-columns:repeat(3,minmax(180px,1fr)); gap:12px; }
       .observability-filter-fields.single { grid-template-columns:minmax(220px,360px); }
       .observability-filter-field { display:grid; gap:6px; }
@@ -3148,12 +3148,17 @@
       .observability-ranking { display:grid; gap:12px; padding:4px 0; }
       .observability-stability-grid .observability-ranking { flex:1 1 auto; min-height:0; align-content:start; overflow-x:hidden; overflow-y:auto; padding:4px 8px 4px 0; scrollbar-gutter:stable; overscroll-behavior:contain; }
       .observability-rank-row { display:grid; grid-template-columns:26px 1fr auto; gap:10px; align-items:center; }
+      .observability-rank-row-button { width:100%; min-height:52px; padding:7px 8px; border:0; border-radius:10px; background:transparent; color:inherit; text-align:left; }
+      .observability-rank-row-button:hover { background:#f3f7fc; }
+      .observability-rank-row-button:focus-visible,.observability-composition-row:focus-visible,.observability-model-row:focus-visible,.observability-sample-row:focus-visible { outline:2px solid var(--brand,#0673d2); outline-offset:2px; }
       .observability-rank-row > div { min-width:0; }
       .observability-rank-row b { display:block; overflow-wrap:anywhere; }
+      .observability-rank-meta { display:block; margin-top:6px; color:var(--muted-text,#68758a); font-size:11px; line-height:1.45; }
       .observability-rank-track { height:7px; margin-top:6px; background:#e8edf4; border-radius:10px; overflow:hidden; }
       .observability-rank-fill { height:100%; background:#2f7df4; border-radius:10px; }
       .observability-composition { display:grid; gap:12px; padding:10px 0; }
-      .observability-composition-row { display:grid; grid-template-columns:100px 1fr 80px; gap:10px; align-items:center; }
+      .observability-composition-row { display:grid; width:100%; min-height:44px; grid-template-columns:120px 1fr 96px; gap:10px; align-items:center; padding:6px 8px; border:0; border-radius:10px; background:transparent; color:inherit; text-align:left; }
+      .observability-composition-row:hover,.observability-model-row:hover { background:#f3f7fc; }
       .observability-action-list { display:grid; gap:10px; }
       .observability-action { padding:14px; border:1px solid var(--line,#dfe5ec); border-radius:12px; display:flex; justify-content:space-between; gap:10px; }
       .observability-section-stack { display:grid; gap:16px; margin-top:16px; }
@@ -3166,18 +3171,106 @@
       .observability-ranking-panel > .observability-model-list { flex:1 1 auto; min-height:0; align-content:start; overflow-x:hidden; overflow-y:auto; padding-right:8px; scrollbar-gutter:stable; overscroll-behavior:contain; }
       .observability-stability-grid > .panel > div.observability-ranking.is-compact,
       .observability-ranking-panel > div.observability-model-list.is-compact { align-content:center; }
-      .observability-model-row { display:grid; grid-template-columns:minmax(120px,1fr) 2fr auto; gap:12px; align-items:center; }
+      .observability-model-row { display:grid; width:100%; min-height:48px; grid-template-columns:minmax(120px,1fr) 2fr auto; gap:12px; align-items:center; padding:7px 8px; border:0; border-radius:10px; background:transparent; color:inherit; text-align:left; }
       .observability-model-row > strong { min-width:0; overflow-wrap:anywhere; }
       .observability-drawer-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:18px; }
       .observability-drawer-head h3 { margin:0; }
+      .observability-drawer-head p { margin:5px 0 0; color:var(--muted-text,#68758a); font-size:12px; line-height:1.5; }
       .observability-drawer-list { display:grid; gap:0; margin:0; }
       .observability-drawer-row { display:grid; grid-template-columns:140px minmax(0,1fr); gap:14px; padding:12px 0; border-bottom:1px solid var(--line,#dfe5ec); }
       .observability-drawer-row dt { color:var(--muted-text,#68758a); }
       .observability-drawer-row dd { margin:0; word-break:break-word; }
-      .observability-drawer { position:fixed; top:0; right:0; width:min(440px,100vw); height:100vh; background:#fff; box-shadow:-12px 0 30px rgba(20,36,58,.16); padding:24px; z-index:20; overflow:auto; }
-      @media (max-width: 900px) { .observability-metric-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .observability-grid { grid-template-columns:1fr; } .observability-stability-grid { grid-template-columns:1fr; } .observability-stability-grid > .panel { height:320px; min-height:320px; } .observability-ranking-panel { height:320px; min-height:320px; } .observability-head { grid-template-columns:1fr; align-items:start; gap:16px; } .observability-filter-bar { justify-content:flex-start; } .observability-filter-fields { grid-template-columns:repeat(2,minmax(180px,1fr)); } .observability-budget-strip { grid-template-columns:repeat(2,minmax(0,1fr)); } }
-      @media (max-width: 560px) { .observability-metric-grid { grid-template-columns:1fr; } .observability-composition-row { grid-template-columns:80px 1fr 64px; } .observability-stability-grid > .panel { height:300px; min-height:300px; } .observability-ranking-panel { height:300px; min-height:300px; } .model-rank-group { height:100%; min-height:0; } .ranking-list-panel { height:360px; min-height:360px; } .ranking-table-panel > .table-wrap { max-height:360px; } .observability-filter-bar { display:grid; grid-template-columns:minmax(0,1fr) auto auto; width:100%; } .observability-primary-filter { width:100%; min-width:0; } .observability-filter-button { padding:0 11px; } .observability-filter-fields,.observability-filter-fields.single { grid-template-columns:1fr; } .observability-filter-panel.is-open { max-height:420px; } }
+      .observability-drawer { position:fixed; top:0; right:0; width:min(760px,100vw); height:100vh; background:#fff; box-shadow:-12px 0 30px rgba(20,36,58,.16); padding:24px; z-index:42; overflow:auto; }
+      .observability-drawer-backdrop { position:fixed; inset:0; z-index:41; background:rgba(20,36,58,.24); }
+      .observability-drawer-layout { display:grid; grid-template-columns:minmax(260px,.9fr) minmax(320px,1.1fr); gap:20px; align-items:start; }
+      .observability-drawer-layout > section { min-width:0; }
+      .observability-sample-list { display:grid; gap:8px; }
+      .observability-sample-row { display:flex; width:100%; min-height:58px; align-items:center; justify-content:space-between; gap:12px; padding:10px 12px; border:1px solid var(--line,#dfe5ec); border-radius:10px; background:#fff; color:inherit; text-align:left; }
+      .observability-sample-row:hover { border-color:#a9c9ea; background:#f5f9fe; }
+      .observability-sample-row > span { min-width:0; }
+      .observability-sample-row strong,.observability-sample-row small { display:block; overflow-wrap:anywhere; }
+      .observability-sample-row small { margin-top:4px; color:var(--muted-text,#68758a); }
+      .observability-pagination { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:14px; color:var(--muted-text,#68758a); font-size:12px; }
+      @media (max-width: 1200px) { .observability-metric-grid { grid-template-columns:repeat(3,minmax(0,1fr)); } }
+      @media (max-width: 900px) { .observability-metric-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .observability-grid { grid-template-columns:1fr; } .observability-stability-grid { grid-template-columns:1fr; } .observability-stability-grid > .panel { height:320px; min-height:320px; } .observability-ranking-panel { height:320px; min-height:320px; } .observability-head { grid-template-columns:1fr; align-items:start; gap:16px; } .observability-filter-bar { justify-content:flex-start; } .observability-filter-fields { grid-template-columns:repeat(2,minmax(180px,1fr)); } .observability-budget-strip { grid-template-columns:repeat(2,minmax(0,1fr)); } .observability-drawer-layout { grid-template-columns:1fr; } }
+      @media (max-width: 560px) { .observability-metric-grid { grid-template-columns:1fr; } .observability-composition-row { grid-template-columns:96px 1fr 72px; } .observability-stability-grid > .panel { height:300px; min-height:300px; } .observability-ranking-panel { height:300px; min-height:300px; } .model-rank-group { height:100%; min-height:0; } .ranking-list-panel { height:360px; min-height:360px; } .ranking-table-panel > .table-wrap { max-height:360px; } .observability-filter-bar { display:grid; grid-template-columns:minmax(0,1fr) auto auto; width:100%; } .observability-primary-filter { width:100%; min-width:0; } .observability-filter-button { padding:0 11px; } .observability-filter-fields,.observability-filter-fields.single { grid-template-columns:1fr; } .observability-drawer { padding:18px; } .observability-pagination { align-items:stretch; flex-direction:column; } }
       @media (prefers-reduced-motion: reduce) { .observability-filter-button,.observability-filter-panel { transition:none; } }
+
+      /* Governance dashboards favor auditability over decorative density. */
+      .observability-metric-grid { grid-template-columns:repeat(4,minmax(0,1fr)); }
+      .observability-metric { min-width:0; display:grid; align-content:start; gap:8px; }
+      .observability-metric.is-action { width:100%; border-color:var(--line,#dfe5ec); color:inherit; text-align:left; cursor:pointer; transition:background 160ms ease-out,border-color 160ms ease-out,transform 160ms ease-out; }
+      .observability-metric.is-action:hover { background:#f6f9fd; border-color:#aac7e5; transform:translateY(-1px); }
+      .observability-metric.is-action:focus-visible { outline:2px solid var(--brand,#0673d2); outline-offset:3px; }
+      .observability-metric-label { display:flex; align-items:flex-start; justify-content:space-between; gap:8px; }
+      .observability-metric-label > span { color:var(--muted-text,#68758a); font-size:13px; font-weight:750; }
+      .observability-metric strong { margin:0; font-size:clamp(22px,2.2vw,30px); line-height:1.15; overflow-wrap:anywhere; }
+      .observability-metric-meta { display:grid; gap:3px; min-height:36px; color:var(--muted-text,#68758a); font-size:11px; line-height:1.45; }
+      .observability-metric-meta span { color:inherit; font-size:inherit; }
+      .observability-metric-status { display:inline-flex; width:fit-content; min-height:22px; align-items:center; padding:0 7px; border-radius:999px; background:#eef3f8; color:#52657c; font-size:11px; font-weight:800; }
+      .observability-metric-status.good { background:#e8f6ef; color:#1d6a49; }
+      .observability-metric-status.warning { background:#fff3d8; color:#805b12; }
+      .observability-metric-status.danger { background:#ffebe8; color:#8a373b; }
+      .observability-context { display:flex; align-items:center; gap:7px; flex-wrap:wrap; margin:0 0 12px; color:var(--muted-text,#68758a); font-size:12px; }
+      .observability-context strong { color:var(--ink,#14243a); }
+      .observability-context-chip { display:inline-flex; min-height:26px; align-items:center; padding:0 9px; border-radius:999px; background:#edf3f9; color:#486078; font-weight:700; }
+      .observability-bar-segment { min-height:0; }
+      .observability-bars.is-empty { display:grid; min-height:180px; align-items:center; padding:12px; overflow:visible; }
+      .observability-empty-state { width:100%; max-width:620px; margin:auto; padding:18px; border:1px dashed #c8d6e5; border-radius:12px; background:#f8fafc; color:#52657c; text-align:left; }
+      .observability-empty-state strong { display:block; color:var(--ink,#14243a); font-size:14px; }
+      .observability-empty-state p { margin:5px 0 0; line-height:1.55; }
+      .observability-empty-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+      .observability-section-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+      .observability-action { min-width:0; align-items:flex-start; }
+      .observability-action > div { min-width:0; }
+      .observability-action strong,.observability-action p { overflow-wrap:anywhere; }
+      .observability-timeline { display:grid; gap:0; margin:6px 0 18px; }
+      .observability-timeline-item { position:relative; display:grid; grid-template-columns:18px minmax(0,1fr); gap:10px; padding:0 0 16px; }
+      .observability-timeline-item::before { content:""; position:absolute; left:8px; top:16px; bottom:0; width:1px; background:#d7e2ed; }
+      .observability-timeline-item:last-child::before { display:none; }
+      .observability-timeline-dot { position:relative; z-index:1; width:17px; height:17px; border:4px solid #e6f1fb; border-radius:50%; background:#2778c9; }
+      .observability-timeline-item.failure .observability-timeline-dot { border-color:#fde8e4; background:#bd4851; }
+      .observability-timeline-copy { min-width:0; }
+      .observability-timeline-copy strong,.observability-timeline-copy small { display:block; overflow-wrap:anywhere; }
+      .observability-timeline-copy small { margin-top:3px; color:var(--muted-text,#68758a); line-height:1.45; }
+      .observability-detail-section { margin-top:20px; }
+      .observability-detail-section h4 { margin:0 0 10px; font-size:14px; }
+      .observability-composition-panels { grid-template-columns:repeat(2,minmax(0,1fr)); }
+      .observability-composition-panels > .panel { min-width:0; }
+      .governance-workbench-tabs { display:flex; gap:6px; margin:16px 0; padding:5px; overflow-x:auto; border:1px solid var(--line,#dfe5ec); border-radius:12px; background:#f3f6fa; scrollbar-width:none; }
+      .governance-workbench-tabs::-webkit-scrollbar { display:none; }
+      .governance-workbench-tab { min-height:38px; padding:0 13px; flex:0 0 auto; border:0; border-radius:9px; background:transparent; color:#52657c; font-weight:800; }
+      .governance-workbench-tab:hover { background:rgba(255,255,255,.72); color:var(--ink,#14243a); }
+      .governance-workbench-tab[aria-selected="true"] { background:#fff; color:#075fae; box-shadow:0 5px 14px rgba(20,40,68,.08); }
+      .governance-workbench-panel { display:grid; gap:16px; }
+      .governance-workbench-summary { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }
+      .governance-workbench-summary > div { min-width:0; padding:14px; border:1px solid var(--line,#dfe5ec); border-radius:12px; background:#fff; }
+      .governance-workbench-summary span,.governance-workbench-summary strong { display:block; overflow-wrap:anywhere; }
+      .governance-workbench-summary span { color:var(--muted-text,#68758a); font-size:12px; }
+      .governance-workbench-summary strong { margin-top:5px; }
+      .mobile-view-picker { display:none; }
+
+      @media (max-width: 900px) {
+        .observability-composition-panels { grid-template-columns:1fr; }
+        .governance-workbench-summary { grid-template-columns:repeat(2,minmax(0,1fr)); }
+      }
+      @media (max-width: 560px) {
+        .observability-metric-grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+        .observability-metric { padding:13px; }
+        .observability-metric strong { font-size:21px; }
+        .observability-metric-meta { min-height:0; }
+        .observability-context { align-items:flex-start; }
+        .observability-action { flex-direction:column; }
+        .observability-table-actions { width:100%; justify-content:flex-start; }
+        .governance-workbench-summary { grid-template-columns:1fr; }
+      }
+
+      @media (max-width: 820px) {
+        .mobile-view-picker { display:grid; gap:5px; }
+        .mobile-view-picker label { color:#52657c; font-size:12px; font-weight:800; }
+        .mobile-view-picker .select { width:100%; min-height:42px; background-color:#fff; }
+        .sidebar .nav-zone > #viewTabs:not(.nav-pending) { display:none; }
+      }
 
       .key-type-label {
         display: inline-flex;
@@ -7057,6 +7150,10 @@
       <div id="appShell" class="app-shell">
         <aside class="sidebar" aria-label="主导航">
           <p class="sidebar-label">用量导航</p>
+          <div id="mobileViewPicker" class="mobile-view-picker">
+            <label for="mobileViewSelect">当前视图</label>
+            <select id="mobileViewSelect" class="select" aria-label="切换控制台视图"></select>
+          </div>
           <div class="nav-zone">
             <!-- 防止旧身份入口闪现：每项初始隐藏，auth/me 返回后立即揭示已知入口，
                  较慢的团队权限随后只补充对应入口。 -->
@@ -7109,6 +7206,10 @@
               <button id="costControlTab" class="view-tab hidden" type="button" data-view="cost-control">
                 <span class="nav-icon"><svg><use href="#icon-cost"></use></svg></span>
                 费用看板
+              </button>
+              <button id="governanceWorkbenchTab" class="governance-view-tab view-tab hidden" type="button" data-view="governance-workbench">
+                <span class="nav-icon"><svg><use href="#icon-shield"></use></svg></span>
+                治理工作台
               </button>
             </nav>
           </div>
@@ -8696,41 +8797,65 @@
 
         <section id="stabilityView" class="view-section hidden" aria-labelledby="stabilityTitle">
           <div class="observability-head">
-            <div><span class="eyebrow">平台治理</span><h2 id="stabilityTitle">稳定性看板</h2><p>只展示非内容元数据；字段缺失时保留覆盖提示。</p></div>
+            <div><span class="eyebrow">平台治理</span><h2 id="stabilityTitle">稳定性看板</h2><p>从模型风险下钻到异常场景、请求链路、治理动作与回归结果。</p></div>
             <div class="observability-filter-bar">
               <select id="stabilityRange" class="select observability-primary-filter" aria-label="稳定性时间范围"><option value="1">最近 24 小时</option><option value="7" selected>最近 7 天</option><option value="30">最近 30 天</option></select>
-              <button id="stabilityFiltersButton" class="observability-filter-button" type="button" aria-expanded="false" aria-controls="stabilityFilterPanel"><span class="app-icon" aria-hidden="true"><svg><use href="#icon-filter"></use></svg></span><span>筛选</span><span id="stabilityFilterCount" class="observability-filter-count hidden" aria-label="0 个筛选条件">0</span></button>
+              <button id="stabilityFiltersButton" class="observability-filter-button" type="button" aria-expanded="false" aria-controls="stabilityFilterPanel"><span class="app-icon" aria-hidden="true"><svg><use href="#icon-filter"></use></svg></span><span>更多筛选</span><span id="stabilityFilterCount" class="observability-filter-count hidden" aria-label="0 个筛选条件">0</span></button>
               <button id="stabilityResetFiltersButton" class="observability-filter-button" type="button" disabled><span class="app-icon" aria-hidden="true"><svg><use href="#icon-refresh"></use></svg></span><span>重置</span></button>
             </div>
           </div>
+          <div id="stabilityContext" class="observability-context" aria-live="polite"></div>
           <div id="stabilityActiveFilters" class="observability-active-filters hidden" aria-label="当前稳定性筛选条件"></div>
           <div id="stabilityFilterPanel" class="observability-filter-panel" aria-hidden="true" inert><div class="observability-filter-fields single"><div class="observability-filter-field"><label for="stabilityModel">模型</label><select id="stabilityModel" class="select"><option value="">全部模型</option></select></div></div></div>
-          <div id="stabilityQuality" class="operational-status hidden"></div>
-          <div id="stabilityMetrics" class="observability-metric-grid"></div>
-          <div class="observability-grid observability-stability-grid"><section class="panel"><div class="panel-header"><div><h3 class="panel-title">异常趋势</h3><p class="panel-desc">用户最终失败与上游异常按日变化</p></div></div><div id="stabilityTrend" class="observability-bars"></div><div class="observability-legend"><span><i></i>上游异常</span><span><i class="secondary"></i>用户最终失败</span></div></section><section class="panel"><div class="panel-header"><div><h3 class="panel-title">模型稳定性排名</h3><p class="panel-desc">失败率与 TTFT P95 共同判断状态</p></div></div><div id="stabilityRanking" class="observability-ranking"></div></section></div>
-          <section class="panel ranking-table-panel"><div class="panel-header"><div><h3 class="panel-title">Top 异常场景</h3><p class="panel-desc">点击场景查看样本请求，再下钻非内容元数据；不展示提示词和响应正文。</p></div></div><div class="table-wrap"><table><thead><tr><th>场景</th><th>模型</th><th>错误码</th><th>次数</th><th>失败率</th><th>样本</th></tr></thead><tbody id="stabilityScenarioBody"></tbody></table></div></section>
-          <aside id="stabilityDrawer" class="observability-drawer hidden" aria-live="polite"><div class="observability-drawer-head"><h3 id="stabilityDrawerTitle">请求元数据</h3><button id="stabilityDrawerClose" class="ghost-btn" type="button">关闭</button></div><div id="stabilityRequestList"></div><dl id="stabilityRequestDetail" class="observability-drawer-list"></dl></aside>
+          <div id="stabilityQuality" class="operational-status hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+          <div id="stabilityMetrics" class="observability-metric-grid" role="status" aria-live="polite" aria-atomic="true"></div>
+          <div class="observability-grid observability-stability-grid">
+            <section class="panel"><div class="panel-header"><div><h3 class="panel-title">分指标趋势</h3><p class="panel-desc">上游异常与用户最终失败保持独立口径，缺失事件不绘制伪柱。</p></div></div><div id="stabilityTrend" class="observability-bars" role="status" aria-live="polite" aria-atomic="true"></div><div class="observability-legend"><span><i></i>上游异常</span><span><i class="secondary"></i>用户最终失败</span></div></section>
+            <section class="panel"><div class="panel-header"><div><h3 class="panel-title">最差模型排名</h3><p class="panel-desc">按治理风险排序；低覆盖 TTFT 不参与绿色稳定判断。</p></div></div><div id="stabilityRanking" class="observability-ranking" role="status" aria-live="polite" aria-atomic="true"></div></section>
+          </div>
+          <div class="observability-grid">
+            <section class="panel"><div class="panel-header"><div><h3 class="panel-title">排障动作</h3><p class="panel-desc">只读展示负责人、严重度、目标日期与最近回归结论。</p></div><button class="ghost-btn" type="button" data-open-governance-tab="stability-actions">进入治理工作台</button></div><div id="stabilityActions" class="observability-action-list" role="status" aria-live="polite" aria-atomic="true"></div></section>
+            <section class="panel"><div class="panel-header"><div><h3 class="panel-title">场景矩阵</h3><p class="panel-desc">按模型组、异常场景与错误码聚合。</p></div></div><div id="stabilityScenarioMatrix" class="observability-composition" role="status" aria-live="polite" aria-atomic="true"></div></section>
+          </div>
+          <section class="panel ranking-table-panel"><div class="panel-header"><div><h3 class="panel-title">Top 异常场景</h3><p class="panel-desc">列表次数与抽屉样本使用同一筛选口径；不展示提示词和响应正文。</p></div></div><div class="table-wrap"><table><thead><tr><th>场景</th><th>模型组</th><th>错误码</th><th>次数</th><th>最终失败率</th><th>样本</th></tr></thead><tbody id="stabilityScenarioBody"></tbody></table></div></section>
+          <div id="stabilityDrawerBackdrop" class="observability-drawer-backdrop hidden" aria-hidden="true"></div><aside id="stabilityDrawer" class="observability-drawer hidden" role="dialog" aria-modal="true" aria-labelledby="stabilityDrawerTitle" aria-hidden="true" tabindex="-1"><div class="observability-drawer-head"><div><h3 id="stabilityDrawerTitle">请求链路</h3><p>展示脱敏尝试时间线、最终结果、关联动作与最近回归；不展示内容字段。</p></div><button id="stabilityDrawerClose" class="ghost-btn" type="button">关闭</button></div><div class="observability-drawer-layout"><section aria-label="场景样本列表"><div id="stabilityRequestList" role="status" aria-live="polite" aria-atomic="true"></div></section><section aria-label="请求链路详情"><div id="stabilityAttemptTimeline"></div><dl id="stabilityRequestDetail" class="observability-drawer-list"></dl><div id="stabilityRequestActions" class="observability-detail-section"></div><div id="stabilityRequestRegression" class="observability-detail-section"></div></section></div></aside>
         </section>
 
         <section id="costControlView" class="view-section hidden" aria-labelledby="costControlTitle">
           <div class="observability-head">
-            <div><span class="eyebrow">平台治理</span><h2 id="costControlTitle">费用看板</h2><p>API Token 与人工维护成本统一按财务口径归因。</p></div>
+            <div><span class="eyebrow">平台治理</span><h2 id="costControlTitle">费用看板</h2><p>实际、计划、预测与节省分轨展示，每个金额均可追溯到期间和账本来源。</p></div>
             <div class="observability-filter-bar">
               <input id="costMonth" class="input observability-primary-filter" type="month" aria-label="费用月份" />
-              <button id="costFiltersButton" class="observability-filter-button" type="button" aria-expanded="false" aria-controls="costFilterPanel"><span class="app-icon" aria-hidden="true"><svg><use href="#icon-filter"></use></svg></span><span>筛选</span><span id="costFilterCount" class="observability-filter-count hidden" aria-label="0 个筛选条件">0</span></button>
+              <button id="costFiltersButton" class="observability-filter-button" type="button" aria-expanded="false" aria-controls="costFilterPanel"><span class="app-icon" aria-hidden="true"><svg><use href="#icon-filter"></use></svg></span><span>更多筛选</span><span id="costFilterCount" class="observability-filter-count hidden" aria-label="0 个筛选条件">0</span></button>
               <button id="costResetFiltersButton" class="observability-filter-button" type="button" disabled><span class="app-icon" aria-hidden="true"><svg><use href="#icon-refresh"></use></svg></span><span>重置</span></button>
             </div>
           </div>
+          <div id="costContext" class="observability-context" aria-live="polite"></div>
           <div id="costActiveFilters" class="observability-active-filters hidden" aria-label="当前费用筛选条件"></div>
-          <div id="costFilterPanel" class="observability-filter-panel" aria-hidden="true" inert><div class="observability-filter-fields"><div class="observability-filter-field"><label for="costCategory">成本项</label><select id="costCategory" class="select"><option value="">全部成本项</option></select></div><div class="observability-filter-field"><label for="costModel">模型</label><select id="costModel" class="select"><option value="">全部模型</option></select></div><div class="observability-filter-field"><label for="costVendor">来源</label><select id="costVendor" class="select"><option value="">全部来源</option></select></div></div></div>
-          <div id="costQuality" class="operational-status hidden"></div><div id="costMetrics" class="observability-metric-grid"></div>
-          <div class="observability-grid"><section class="panel"><div class="panel-header"><div><h3 class="panel-title">实际 / 预测 / 预算趋势</h3><p class="panel-desc">预测按截至今天的已完成日均外推</p></div></div><div id="costTrend" class="observability-bars"></div><div class="observability-legend"><span><i></i>实际</span><span><i class="forecast"></i>预测</span><span><i class="budget"></i>预算线</span></div></section><section class="panel"><div class="panel-header"><div><h3 class="panel-title">成本构成</h3><p class="panel-desc">API Token 与服务期摊销拆分</p></div></div><div id="costComposition" class="observability-composition"></div></section></div>
-          <div class="observability-section-stack">
-            <section class="panel observability-ranking-panel"><div class="panel-header"><div><h3 class="panel-title">模型成本与优化空间</h3><p class="panel-desc">按模型查看当月 API Token 支出</p></div></div><div id="costModelSplit" class="observability-model-list"></div></section>
-            <section class="panel"><div class="panel-header"><div><h3 class="panel-title">预算设置</h3><p class="panel-desc">未单独设置月份时使用平台默认值</p></div></div><form id="costBudgetForm" class="observability-budget-strip"><div class="field"><label for="costBudgetAmount">月度预算（USD）</label><input id="costBudgetAmount" class="input" type="number" min="0" step="0.01" required /></div><div class="field"><label for="costDailyTarget">日均目标（USD）</label><input id="costDailyTarget" class="input" type="number" min="0" step="0.01" required /></div><div class="hint" id="costBudgetDelta"></div><button id="saveCostBudgetButton" class="primary-btn" type="submit">保存预算</button></form></section>
-            <section class="panel"><div class="panel-header"><div><h3 class="panel-title">人工成本项</h3><p class="panel-desc">账号采购、渠道、平台与基础设施按服务期日摊销</p></div><button id="addCostItemButton" class="primary-btn" type="button">新增成本项</button></div><div class="table-wrap"><table><thead><tr><th>名称</th><th>类别</th><th>归属</th><th>服务期</th><th>金额</th><th>状态</th><th>操作</th></tr></thead><tbody id="costItemBody"></tbody></table></div></section>
-            <section class="panel"><div class="panel-header"><div><h3 class="panel-title">降本动作</h3><p class="panel-desc">只有已验证动作计入累计节省</p></div><button id="addSavingsActionButton" class="primary-btn" type="button">新增动作</button></div><div id="savingsActionList" class="observability-action-list"></div></section>
+          <div id="costFilterPanel" class="observability-filter-panel" aria-hidden="true" inert><div class="observability-filter-fields"><div class="observability-filter-field"><label for="costCategory">成本项</label><select id="costCategory" class="select"><option value="">全部成本项</option></select></div><div class="observability-filter-field"><label for="costBucket">成本桶</label><select id="costBucket" class="select"><option value="">全部成本桶</option></select></div><div class="observability-filter-field"><label for="costModel">模型</label><select id="costModel" class="select"><option value="">全部模型</option></select></div><div class="observability-filter-field"><label for="costVendor">来源</label><select id="costVendor" class="select"><option value="">全部来源</option></select></div><div class="observability-filter-field"><label for="costProvider">供应渠道</label><select id="costProvider" class="select"><option value="">全部供应渠道</option></select></div><div class="observability-filter-field"><label for="costAccount">账号</label><select id="costAccount" class="select"><option value="">全部账号</option></select></div><div class="observability-filter-field"><label for="costReconciliation">对账状态</label><select id="costReconciliation" class="select"><option value="">全部对账状态</option></select></div><div class="observability-filter-field"><label for="costRecognition">确认状态</label><select id="costRecognition" class="select"><option value="">全部确认状态</option></select></div></div></div>
+          <div id="costQuality" class="operational-status hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+          <div id="costMetrics" class="observability-metric-grid" role="status" aria-live="polite" aria-atomic="true"></div>
+          <div class="observability-grid"><section class="panel"><div class="panel-header"><div><h3 class="panel-title">实际与运行速率情景</h3><p class="panel-desc">官方预测只来自生效基准计划；日均外推单独标为运行速率情景。</p></div></div><div id="costTrend" class="observability-bars" role="status" aria-live="polite" aria-atomic="true"></div><div class="observability-legend"><span><i></i>实际</span><span><i class="forecast"></i>运行速率情景</span><span><i class="budget"></i>预算线</span></div></section><section class="panel"><div class="panel-header"><div><h3 class="panel-title">异常月份与对账提示</h3><p class="panel-desc">聚焦预算偏差、对账异常和缺失证明。</p></div></div><div id="costAnomalies" class="observability-action-list" role="status" aria-live="polite" aria-atomic="true"></div></section></div>
+          <div class="observability-grid observability-composition-panels"><section class="panel"><div class="panel-header"><div><h3 class="panel-title">实际组成</h3><p class="panel-desc">仅包含已发生 API 费用和确认状态为 actual 的人工账本。</p></div><button id="costAllLedgerButton" class="ghost-btn" type="button">查看实际账本</button></div><div id="costComposition" class="observability-composition"></div></section><section class="panel"><div class="panel-header"><div><h3 class="panel-title">官方预测组成</h3><p class="panel-desc">来自生效基准计划中截止日后的 committed / planned 成本。</p></div><button class="ghost-btn" type="button" data-open-governance-tab="plans">查看计划版本</button></div><div id="costForecastComposition" class="observability-composition" role="status" aria-live="polite" aria-atomic="true"></div></section></div>
+          <section class="panel observability-ranking-panel"><div class="panel-header"><div><h3 class="panel-title">模型成本与优化空间</h3><p class="panel-desc">按当前同一筛选范围查看 API Token 实际支出。</p></div></div><div id="costModelSplit" class="observability-model-list"></div></section>
+          <div id="costDetailDrawerBackdrop" class="observability-drawer-backdrop hidden" aria-hidden="true"></div><aside id="costDetailDrawer" class="observability-drawer hidden" role="dialog" aria-modal="true" aria-labelledby="costDetailDrawerTitle" aria-hidden="true" tabindex="-1"><div class="observability-drawer-head"><div><h3 id="costDetailDrawerTitle">费用明细</h3><p>展示原币、汇率快照、确认状态、凭证、计划版本与对账状态，不展示任何密钥。</p></div><button id="costDetailDrawerClose" class="ghost-btn" type="button">关闭</button></div><div class="observability-drawer-layout"><section aria-label="费用账本列表"><div id="costLedgerList" role="status" aria-live="polite" aria-atomic="true"></div></section><section aria-label="费用明细详情"><dl id="costLedgerDetail" class="observability-drawer-list"></dl></section></div></aside>
+        </section>
+
+        <section id="governanceWorkbenchView" class="view-section hidden" aria-labelledby="governanceWorkbenchTitle">
+          <div class="observability-head"><div><span class="eyebrow">平台治理</span><h2 id="governanceWorkbenchTitle">治理工作台</h2><p>编辑治理动作、回归验证、实际账本、计划预算与降本证明；主看板保持只读。</p></div><div><span id="governancePermissionBadge" class="chip blue">按权限展示</span></div></div>
+          <div id="governanceWorkbenchTabs" class="governance-workbench-tabs" role="tablist" aria-label="治理工作台功能">
+            <button class="governance-workbench-tab" type="button" role="tab" data-governance-tab="stability-actions" aria-selected="true">稳定性动作</button>
+            <button class="governance-workbench-tab" type="button" role="tab" data-governance-tab="regressions" aria-selected="false">回归验证</button>
+            <button class="governance-workbench-tab" type="button" role="tab" data-governance-tab="actual-ledger" aria-selected="false">实际账本</button>
+            <button class="governance-workbench-tab" type="button" role="tab" data-governance-tab="plans" aria-selected="false">计划与预算</button>
+            <button class="governance-workbench-tab" type="button" role="tab" data-governance-tab="savings" aria-selected="false">降本核验</button>
           </div>
+          <div id="governanceWorkbenchStatus" class="operational-status hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+          <section id="governanceStabilityActionsPanel" class="governance-workbench-panel" role="tabpanel" data-governance-panel="stability-actions"><section class="panel"><div class="panel-header"><div><h3 class="panel-title">稳定性治理动作</h3><p class="panel-desc">负责人、严重度、状态、目标日期、修复引用与关联场景。</p></div><button id="addStabilityActionButton" class="primary-btn" type="button" data-stability-manage>新增动作</button></div><div id="governanceStabilityActions" class="observability-action-list"></div></section></section>
+          <section id="governanceRegressionsPanel" class="governance-workbench-panel hidden" role="tabpanel" data-governance-panel="regressions"><section class="panel"><div class="panel-header"><div><h3 class="panel-title">回归验证</h3><p class="panel-desc">对比基线窗口与回归窗口，保留指标、结论及修复引用。</p></div><button id="addStabilityRegressionButton" class="primary-btn" type="button" data-stability-manage>新增回归</button></div><div id="governanceRegressions" class="observability-action-list"></div></section></section>
+          <section id="governanceActualLedgerPanel" class="governance-workbench-panel hidden" role="tabpanel" data-governance-panel="actual-ledger"><section class="panel"><div class="panel-header"><div><h3 class="panel-title">实际账本维护</h3><p class="panel-desc">录入与对账人工成本；只有 actual 且不晚于截止日的记录进入实际。</p></div><button id="addCostItemButton" class="primary-btn" type="button" data-cost-manage>新增成本项</button></div><div class="table-wrap"><table><thead><tr><th>名称</th><th>成本桶</th><th>归属</th><th>服务期</th><th>金额</th><th>对账</th><th>操作</th></tr></thead><tbody id="costItemBody"></tbody></table></div></section></section>
+          <section id="governancePlansPanel" class="governance-workbench-panel hidden" role="tabpanel" data-governance-panel="plans"><section class="panel"><div class="panel-header"><div><h3 class="panel-title">计划版本</h3><p class="panel-desc">官方预测使用同年度唯一生效且已批准的基准计划。</p></div><button id="addCostPlanButton" class="primary-btn" type="button" data-cost-manage>新增草稿</button></div><div id="costPlanVersions" class="observability-action-list"></div></section><section class="panel" data-cost-manage><div class="panel-header"><div><h3 class="panel-title">预算设置</h3><p class="panel-desc">预算与日均目标仅作为治理目标，不替代官方预测。</p></div></div><form id="costBudgetForm" class="observability-budget-strip"><div class="field"><label for="costBudgetAmount">月度预算（USD）</label><input id="costBudgetAmount" class="input" type="number" min="0" step="0.01" required /></div><div class="field"><label for="costDailyTarget">日均目标（USD）</label><input id="costDailyTarget" class="input" type="number" min="0" step="0.01" required /></div><div class="hint" id="costBudgetDelta"></div><button id="saveCostBudgetButton" class="primary-btn" type="submit">保存预算</button></form></section></section>
+          <section id="governanceSavingsPanel" class="governance-workbench-panel hidden" role="tabpanel" data-governance-panel="savings"><section class="panel"><div class="panel-header"><div><h3 class="panel-title">降本核验</h3><p class="panel-desc">只有证据完整且已财务复核的 measurement 计入已核验累计节省；未来预计节省单独保留为计划值。</p></div><div class="observability-table-actions"><button id="addSavingsActionButton" class="ghost-btn" type="button" data-cost-manage>新增动作</button><button id="addSavingsMeasurementButton" class="primary-btn" type="button" data-cost-manage>录入核验</button></div></div><div id="savingsActionList" class="observability-action-list"></div></section></section>
         </section>
 
         <section id="modelsView" class="view-section hidden">
@@ -8796,6 +8921,17 @@
           <div class="field"><label for="costItemModel">模型归属</label><input id="costItemModel" class="input" maxlength="256" /></div>
           <div class="field"><label for="costItemBusinessScope">业务归属</label><input id="costItemBusinessScope" class="input" maxlength="160" /></div>
           <div class="field"><label for="costItemFinanceBucket">财务分类</label><input id="costItemFinanceBucket" class="input" maxlength="160" /></div>
+          <div class="field"><label for="costItemCostBucket">成本桶</label><select id="costItemCostBucket" class="select"><option value="api_usage">API Token</option><option value="account_procurement">账号采购</option><option value="fallback_channel">兜底渠道</option><option value="feishu_surrounding">飞书 / 周边</option><option value="infrastructure">基础设施</option><option value="other" selected>其他</option></select></div>
+          <div class="field"><label for="costItemProvider">供应渠道</label><input id="costItemProvider" class="input" maxlength="160" /></div>
+          <div class="field"><label for="costItemAccountId">账号标识</label><input id="costItemAccountId" class="input" maxlength="160" placeholder="仅填写别名或不可逆标识" /></div>
+          <div class="field"><label for="costItemAccountName">账号名称</label><input id="costItemAccountName" class="input" maxlength="160" /></div>
+          <div class="field"><label for="costItemVoucherNo">财务凭证号</label><input id="costItemVoucherNo" class="input" maxlength="160" /></div>
+          <div class="field"><label for="costItemInvoiceNo">发票号</label><input id="costItemInvoiceNo" class="input" maxlength="160" /></div>
+          <div class="field"><label for="costItemReconciliationStatus">对账状态</label><select id="costItemReconciliationStatus" class="select"><option value="unreconciled">未对账</option><option value="pending">对账中</option><option value="matched">已匹配</option><option value="partial">部分匹配</option><option value="exception">对账异常</option><option value="waived">无需对账</option></select></div>
+          <div class="field"><label for="costItemRecognitionStatus">确认状态</label><select id="costItemRecognitionStatus" class="select"><option value="actual">已发生</option><option value="committed">已承诺</option><option value="planned">计划中</option></select></div>
+          <div class="field"><label for="costItemPlanVersionId">计划版本</label><select id="costItemPlanVersionId" class="select"><option value="">不属于计划</option></select></div>
+          <div class="field"><label for="costItemScenario">计划情景</label><input id="costItemScenario" class="input" maxlength="80" placeholder="baseline / optimistic / conservative" /></div>
+          <div class="field"><label for="costItemSourceEvidence">来源证明</label><input id="costItemSourceEvidence" class="input" type="url" maxlength="1000" placeholder="合同、报价或财务凭证链接" /></div>
           <div class="field"><label for="costItemAmount">金额</label><input id="costItemAmount" class="input" type="number" min="0.01" step="0.01" required /></div>
           <div class="field"><label for="costItemCurrency">币种</label><select id="costItemCurrency" class="select"><option value="USD">USD</option><option value="CNY">CNY</option></select></div>
           <div class="field"><label for="costItemExchangeRate">汇率（CNY / USD）</label><input id="costItemExchangeRate" class="input" type="number" min="0.000001" step="0.000001" value="7.3" required /></div>
@@ -8806,6 +8942,26 @@
         <div class="field"><label for="costItemNotes">备注</label><textarea id="costItemNotes" class="input" maxlength="1000"></textarea></div>
         <div class="modal-actions"><button id="cancelCostItemButton" class="ghost-btn" type="button">取消</button><button id="submitCostItemButton" class="primary-btn" type="submit">保存成本项</button></div>
       </form>
+    </div>
+
+    <div id="stabilityActionModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="stabilityActionModalTitle">
+      <form id="stabilityActionForm" class="modal">
+        <h3 id="stabilityActionModalTitle">新增稳定性动作</h3><input id="stabilityActionId" type="hidden" />
+        <div class="form-grid"><div class="field"><label for="stabilityActionTitle">动作标题</label><input id="stabilityActionTitle" class="input" maxlength="200" required /></div><div class="field"><label for="stabilityActionOwner">负责人</label><input id="stabilityActionOwner" class="input" maxlength="160" /></div><div class="field"><label for="stabilityActionSeverity">严重度</label><select id="stabilityActionSeverity" class="select"><option value="low">低</option><option value="medium" selected>中</option><option value="high">高</option><option value="critical">严重</option></select></div><div class="field"><label for="stabilityActionStatus">状态</label><select id="stabilityActionStatus" class="select"><option value="open">待处理</option><option value="in_progress">处理中</option><option value="resolved">已修复</option><option value="verified">已验证</option><option value="closed">已关闭</option></select></div><div class="field"><label for="stabilityActionTargetDate">目标日期</label><input id="stabilityActionTargetDate" class="input" type="date" /></div><div class="field"><label for="stabilityActionFixReference">修复引用</label><input id="stabilityActionFixReference" class="input" maxlength="1000" /></div><div class="field"><label for="stabilityActionModel">模型组</label><input id="stabilityActionModel" class="input" maxlength="256" /></div><div class="field"><label for="stabilityActionScenario">异常场景</label><input id="stabilityActionScenario" class="input" maxlength="64" /></div><div class="field"><label for="stabilityActionErrorCode">错误码</label><input id="stabilityActionErrorCode" class="input" maxlength="120" /></div></div>
+        <div class="field"><label for="stabilityActionNotes">备注</label><textarea id="stabilityActionNotes" class="input" maxlength="2000"></textarea></div><div class="modal-actions"><button id="cancelStabilityActionButton" class="ghost-btn" type="button">取消</button><button class="primary-btn" type="submit">保存动作</button></div>
+      </form>
+    </div>
+
+    <div id="stabilityRegressionModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="stabilityRegressionModalTitle">
+      <form id="stabilityRegressionForm" class="modal"><h3 id="stabilityRegressionModalTitle">新增回归验证</h3><div class="form-grid"><div class="field"><label for="stabilityRegressionActionId">关联动作</label><select id="stabilityRegressionActionId" class="select" required></select></div><div class="field"><label for="stabilityRegressionMetric">回归指标</label><input id="stabilityRegressionMetric" class="input" maxlength="120" required placeholder="例如：finalRequestFailureRate" /></div><div class="field"><label for="stabilityBaselineStart">基线开始</label><input id="stabilityBaselineStart" class="input" type="date" required /></div><div class="field"><label for="stabilityBaselineEnd">基线结束</label><input id="stabilityBaselineEnd" class="input" type="date" required /></div><div class="field"><label for="stabilityRegressionStart">回归开始</label><input id="stabilityRegressionStart" class="input" type="date" required /></div><div class="field"><label for="stabilityRegressionEnd">回归结束</label><input id="stabilityRegressionEnd" class="input" type="date" required /></div><div class="field"><label for="stabilityBaselineValue">基线值</label><input id="stabilityBaselineValue" class="input" type="number" step="any" /></div><div class="field"><label for="stabilityRegressionValue">回归值</label><input id="stabilityRegressionValue" class="input" type="number" step="any" /></div><div class="field"><label for="stabilityRegressionConclusion">结论</label><select id="stabilityRegressionConclusion" class="select"><option value="passed">通过</option><option value="failed">未通过</option><option value="inconclusive">证据不足</option></select></div></div><div class="field"><label for="stabilityRegressionNotes">备注</label><textarea id="stabilityRegressionNotes" class="input" maxlength="2000"></textarea></div><div class="modal-actions"><button id="cancelStabilityRegressionButton" class="ghost-btn" type="button">取消</button><button class="primary-btn" type="submit">保存回归</button></div></form>
+    </div>
+
+    <div id="costPlanModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="costPlanModalTitle">
+      <form id="costPlanForm" class="modal"><h3 id="costPlanModalTitle">新增计划草稿</h3><input id="costPlanId" type="hidden" /><div class="form-grid"><div class="field"><label for="costPlanYear">年度</label><input id="costPlanYear" class="input" type="number" min="2020" max="2100" required /></div><div class="field"><label for="costPlanVersion">版本</label><input id="costPlanVersion" class="input" maxlength="80" required /></div><div class="field"><label for="costPlanScenario">情景</label><select id="costPlanScenario" class="select"><option value="baseline">基准</option><option value="optimistic">乐观</option><option value="conservative">保守</option></select></div><div class="field"><label for="costPlanAsOf">截止日</label><input id="costPlanAsOf" class="input" type="date" required /></div><div class="field"><label for="costPlanCoverageComplete">覆盖完整</label><select id="costPlanCoverageComplete" class="select"><option value="false">否</option><option value="true">是</option></select></div></div><div class="field"><label for="costPlanNotes">备注</label><textarea id="costPlanNotes" class="input" maxlength="2000"></textarea></div><div class="modal-actions"><button id="cancelCostPlanButton" class="ghost-btn" type="button">取消</button><button class="primary-btn" type="submit">保存草稿</button></div></form>
+    </div>
+
+    <div id="savingsMeasurementModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="savingsMeasurementModalTitle">
+      <form id="savingsMeasurementForm" class="modal"><h3 id="savingsMeasurementModalTitle">录入降本核验</h3><input id="savingsMeasurementId" type="hidden" /><div class="form-grid"><div class="field"><label for="savingsMeasurementActionId">关联动作 ID</label><input id="savingsMeasurementActionId" class="input" maxlength="128" required /></div><div class="field"><label for="savingsMeasurementScope">适用范围</label><input id="savingsMeasurementScope" class="input" maxlength="256" /></div><div class="field"><label for="savingsMeasurementProvider">供应渠道</label><input id="savingsMeasurementProvider" class="input" maxlength="160" /></div><div class="field"><label for="savingsMeasurementModel">模型</label><input id="savingsMeasurementModel" class="input" maxlength="256" /></div><div class="field"><label for="savingsMeasurementBucket">成本桶</label><input id="savingsMeasurementBucket" class="input" maxlength="80" /></div><div class="field"><label for="savingsMeasurementBaselineStart">基线开始</label><input id="savingsMeasurementBaselineStart" class="input" type="date" required /></div><div class="field"><label for="savingsMeasurementBaselineEnd">基线结束</label><input id="savingsMeasurementBaselineEnd" class="input" type="date" required /></div><div class="field"><label for="savingsMeasurementStart">测量开始</label><input id="savingsMeasurementStart" class="input" type="date" required /></div><div class="field"><label for="savingsMeasurementEnd">测量结束</label><input id="savingsMeasurementEnd" class="input" type="date" required /></div><div class="field"><label for="savingsMeasurementBaselineAmount">基线金额（USD）</label><input id="savingsMeasurementBaselineAmount" class="input" type="number" min="0" step="0.01" required /></div><div class="field"><label for="savingsMeasurementActualAmount">实际金额（USD）</label><input id="savingsMeasurementActualAmount" class="input" type="number" min="0" step="0.01" required /></div><div class="field"><label for="savingsMeasurementEvidence">证明链接</label><input id="savingsMeasurementEvidence" class="input" type="url" maxlength="1000" /></div><div class="field"><label for="savingsMeasurementReviewer">财务复核人</label><input id="savingsMeasurementReviewer" class="input" maxlength="160" /></div><div class="field"><label for="savingsMeasurementReviewedAt">复核时间</label><input id="savingsMeasurementReviewedAt" class="input" type="datetime-local" /></div><div class="field"><label for="savingsMeasurementStatus">状态</label><select id="savingsMeasurementStatus" class="select"><option value="pending_evidence">待证据</option><option value="reviewed">已复核</option><option value="rejected">已驳回</option></select></div></div><div class="field"><label for="savingsMeasurementNotes">备注</label><textarea id="savingsMeasurementNotes" class="input" maxlength="2000"></textarea></div><div class="modal-actions"><button id="cancelSavingsMeasurementButton" class="ghost-btn" type="button">取消</button><button class="primary-btn" type="submit">保存核验</button></div></form>
     </div>
 
     <div id="savingsActionModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="savingsActionModalTitle">
@@ -8820,6 +8976,13 @@
           <div class="field"><label for="savingsActionStatus">状态</label><select id="savingsActionStatus" class="select"><option value="planned">计划中</option><option value="implemented">已实施</option><option value="verified">已验证</option></select></div>
           <div class="field"><label for="savingsVerifiedDate">验证日期</label><input id="savingsVerifiedDate" class="input" type="date" /></div>
           <div class="field"><label for="savingsVerifiedDailyCost">验证后日均成本（USD）</label><input id="savingsVerifiedDailyCost" class="input" type="number" min="0" step="0.01" /></div>
+          <div class="field"><label for="savingsExpectedDailyCost">预计日均成本（USD）</label><input id="savingsExpectedDailyCost" class="input" type="number" min="0" step="0.01" /></div>
+          <div class="field"><label for="savingsExpectedStartDate">预计生效日期</label><input id="savingsExpectedStartDate" class="input" type="date" /></div>
+          <div class="field"><label for="savingsProvider">供应渠道</label><input id="savingsProvider" class="input" maxlength="160" /></div>
+          <div class="field"><label for="savingsModel">模型</label><input id="savingsModel" class="input" maxlength="256" /></div>
+          <div class="field"><label for="savingsCostBucket">成本桶</label><input id="savingsCostBucket" class="input" maxlength="80" /></div>
+          <div class="field"><label for="savingsEvidenceUrl">证明链接</label><input id="savingsEvidenceUrl" class="input" type="url" maxlength="500" /></div>
+          <div class="field"><label for="savingsFinanceReviewer">财务复核人</label><input id="savingsFinanceReviewer" class="input" maxlength="160" /></div>
         </div>
         <div class="field"><label for="savingsActionNotes">备注</label><textarea id="savingsActionNotes" class="input" maxlength="1000"></textarea></div>
         <div class="modal-actions"><button id="cancelSavingsActionButton" class="ghost-btn" type="button">取消</button><button id="submitSavingsActionButton" class="primary-btn" type="submit">保存动作</button></div>
@@ -9233,6 +9396,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js?v=20260814-sync-banner-removed"></script>
+    <script src="/assets/app.js?v=20260814-governance-trust"></script>
   </body>
 </html>

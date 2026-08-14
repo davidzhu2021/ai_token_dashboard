@@ -176,6 +176,28 @@ CREATE TABLE IF NOT EXISTS usage_sync_state (
     snapshot_revision TEXT NOT NULL DEFAULT ''
 );
 
+-- Reader instances enqueue a bounded refresh request for the worker instead of
+-- waiting on an upstream query.  The request key makes repeated browser
+-- refreshes idempotent; the worker may merge adjacent/overlapping rows before
+-- running one synchronization pass.
+CREATE TABLE IF NOT EXISTS usage_refresh_requests (
+    request_key TEXT PRIMARY KEY,
+    start_date DATE NOT NULL,
+    end_date DATE NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    claimed_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT ''
+);
+ALTER TABLE usage_refresh_requests ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
+ALTER TABLE usage_refresh_requests ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+ALTER TABLE usage_refresh_requests ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE usage_refresh_requests ADD COLUMN IF NOT EXISTS last_error TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS usage_refresh_requests_pending_idx
+    ON usage_refresh_requests (status, requested_at);
+
 INSERT INTO usage_snapshot_state (singleton) VALUES (TRUE)
 ON CONFLICT (singleton) DO NOTHING;
 INSERT INTO usage_sync_state (singleton) VALUES (TRUE)
@@ -219,6 +241,7 @@ CREATE TABLE IF NOT EXISTS usage_event_attribution (
     max_retries INTEGER,
     trace_id TEXT,
     user_visible_failure BOOLEAN,
+    final_failure_source TEXT,
     collected_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (backend_id, request_id)
 );
@@ -238,6 +261,7 @@ ALTER TABLE usage_event_attribution ADD COLUMN IF NOT EXISTS attempted_retries I
 ALTER TABLE usage_event_attribution ADD COLUMN IF NOT EXISTS max_retries INTEGER;
 ALTER TABLE usage_event_attribution ADD COLUMN IF NOT EXISTS trace_id TEXT;
 ALTER TABLE usage_event_attribution ADD COLUMN IF NOT EXISTS user_visible_failure BOOLEAN;
+ALTER TABLE usage_event_attribution ADD COLUMN IF NOT EXISTS final_failure_source TEXT;
 CREATE INDEX IF NOT EXISTS usage_event_attribution_org_time_idx
     ON usage_event_attribution (organization_id, event_time)
     WHERE organization_id <> '';
@@ -308,9 +332,14 @@ ALTER TABLE cost_items ADD COLUMN IF NOT EXISTS voucher_no TEXT NOT NULL DEFAULT
 ALTER TABLE cost_items ADD COLUMN IF NOT EXISTS invoice_no TEXT NOT NULL DEFAULT '';
 ALTER TABLE cost_items ADD COLUMN IF NOT EXISTS recognition_status TEXT NOT NULL DEFAULT 'actual';
 ALTER TABLE cost_items ADD COLUMN IF NOT EXISTS reconciliation_status TEXT NOT NULL DEFAULT 'unreconciled';
+ALTER TABLE cost_items ADD COLUMN IF NOT EXISTS plan_version_id TEXT;
+ALTER TABLE cost_items ADD COLUMN IF NOT EXISTS scenario TEXT NOT NULL DEFAULT '';
+ALTER TABLE cost_items ADD COLUMN IF NOT EXISTS source_evidence TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS cost_items_service_idx ON cost_items (service_start_date, service_end_date, enabled);
 CREATE INDEX IF NOT EXISTS cost_items_ledger_idx
     ON cost_items (cost_bucket, provider, account_id, reconciliation_status, service_start_date);
+CREATE INDEX IF NOT EXISTS cost_items_plan_version_idx
+    ON cost_items (plan_version_id, recognition_status, service_start_date);
 
 CREATE TABLE IF NOT EXISTS cost_budgets (
     month DATE PRIMARY KEY,
@@ -339,6 +368,197 @@ ALTER TABLE savings_actions ADD COLUMN IF NOT EXISTS model TEXT NOT NULL DEFAULT
 ALTER TABLE savings_actions ADD COLUMN IF NOT EXISTS cost_bucket TEXT NOT NULL DEFAULT '';
 ALTER TABLE savings_actions ADD COLUMN IF NOT EXISTS evidence_url TEXT NOT NULL DEFAULT '';
 ALTER TABLE savings_actions ADD COLUMN IF NOT EXISTS finance_reviewer TEXT NOT NULL DEFAULT '';
+
+-- Legacy savings require evidence and finance review before they remain verified.
+UPDATE savings_actions
+SET status='pending_evidence', updated_at=NOW()
+WHERE lower(status)='verified'
+  AND (btrim(evidence_url)='' OR btrim(finance_reviewer)='');
+
+CREATE TABLE IF NOT EXISTS stability_attempt_events (
+    backend_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    request_id TEXT NOT NULL DEFAULT '',
+    trace_id TEXT NOT NULL DEFAULT '',
+    attempt_id TEXT NOT NULL DEFAULT '',
+    attempt_index INTEGER NOT NULL DEFAULT 0,
+    retry_index INTEGER NOT NULL DEFAULT 0,
+    requested_model_group TEXT NOT NULL DEFAULT '',
+    actual_model TEXT NOT NULL DEFAULT '',
+    route_name TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    event_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'unknown',
+    error_code TEXT NOT NULL DEFAULT '',
+    error_class TEXT NOT NULL DEFAULT '',
+    error_category TEXT NOT NULL DEFAULT '',
+    scenario TEXT NOT NULL DEFAULT 'unknown',
+    scenario_version TEXT NOT NULL DEFAULT '',
+    event_time TIMESTAMPTZ NOT NULL,
+    event_date DATE NOT NULL,
+    started_at TIMESTAMPTZ,
+    ended_at TIMESTAMPTZ,
+    ttft_ms DOUBLE PRECISION,
+    duration_ms DOUBLE PRECISION,
+    fallback_from TEXT NOT NULL DEFAULT '',
+    fallback_to TEXT NOT NULL DEFAULT '',
+    is_retry BOOLEAN NOT NULL DEFAULT FALSE,
+    is_fallback BOOLEAN NOT NULL DEFAULT FALSE,
+    collected_at TIMESTAMPTZ,
+    received_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (backend_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS stability_attempt_events_date_model_idx
+    ON stability_attempt_events (event_date, requested_model_group, scenario, error_code, event_time DESC);
+CREATE INDEX IF NOT EXISTS stability_attempt_events_request_idx
+    ON stability_attempt_events (backend_id, request_id, attempt_index, event_time);
+CREATE INDEX IF NOT EXISTS stability_attempt_events_trace_idx
+    ON stability_attempt_events (trace_id, event_time) WHERE trace_id <> '';
+ALTER TABLE stability_attempt_events ADD COLUMN IF NOT EXISTS retry_index INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE stability_attempt_events ADD COLUMN IF NOT EXISTS error_category TEXT NOT NULL DEFAULT '';
+ALTER TABLE stability_attempt_events ADD COLUMN IF NOT EXISTS event_time TIMESTAMPTZ;
+ALTER TABLE stability_attempt_events ADD COLUMN IF NOT EXISTS event_date DATE;
+ALTER TABLE stability_attempt_events ADD COLUMN IF NOT EXISTS duration_ms DOUBLE PRECISION;
+ALTER TABLE stability_attempt_events ADD COLUMN IF NOT EXISTS is_retry BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE stability_attempt_events ADD COLUMN IF NOT EXISTS is_fallback BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE stability_attempt_events ADD COLUMN IF NOT EXISTS collected_at TIMESTAMPTZ;
+ALTER TABLE stability_attempt_events ADD COLUMN IF NOT EXISTS received_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS stability_actions (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    owner TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL DEFAULT 'medium',
+    status TEXT NOT NULL DEFAULT 'open',
+    target_date DATE,
+    fix_reference TEXT NOT NULL DEFAULT '',
+    requested_model_group TEXT NOT NULL DEFAULT '',
+    scenario TEXT NOT NULL DEFAULT '',
+    error_code TEXT NOT NULL DEFAULT '',
+    request_id TEXT NOT NULL DEFAULT '',
+    baseline_start_date DATE,
+    baseline_end_date DATE,
+    created_by TEXT NOT NULL DEFAULT '',
+    updated_by TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS stability_actions_risk_idx
+    ON stability_actions (status, severity, target_date, requested_model_group, scenario);
+
+CREATE TABLE IF NOT EXISTS stability_regressions (
+    id TEXT PRIMARY KEY,
+    action_id TEXT NOT NULL REFERENCES stability_actions(id) ON DELETE CASCADE,
+    scenario TEXT NOT NULL DEFAULT '',
+    baseline_start_date DATE NOT NULL,
+    baseline_end_date DATE NOT NULL,
+    regression_start_date DATE NOT NULL,
+    regression_end_date DATE NOT NULL,
+    metric_name TEXT NOT NULL,
+    baseline_value DOUBLE PRECISION,
+    regression_value DOUBLE PRECISION,
+    unit TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    conclusion TEXT NOT NULL DEFAULT '',
+    evidence_url TEXT NOT NULL DEFAULT '',
+    reviewer TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    CHECK (baseline_start_date <= baseline_end_date),
+    CHECK (regression_start_date <= regression_end_date)
+);
+ALTER TABLE stability_actions ADD COLUMN IF NOT EXISTS notes TEXT NOT NULL DEFAULT '';
+ALTER TABLE stability_actions ADD COLUMN IF NOT EXISTS request_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE stability_regressions ADD COLUMN IF NOT EXISTS notes TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS stability_regressions_action_idx
+    ON stability_regressions (action_id, regression_end_date DESC);
+
+CREATE TABLE IF NOT EXISTS cost_plan_versions (
+    id TEXT PRIMARY KEY,
+    year INTEGER NOT NULL CHECK (year BETWEEN 2000 AND 2200),
+    version TEXT NOT NULL,
+    scenario TEXT NOT NULL DEFAULT 'baseline',
+    as_of DATE NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    is_active BOOLEAN NOT NULL DEFAULT FALSE,
+    approved_by TEXT NOT NULL DEFAULT '',
+    approved_at TIMESTAMPTZ,
+    activated_by TEXT NOT NULL DEFAULT '',
+    activated_at TIMESTAMPTZ,
+    archived_by TEXT NOT NULL DEFAULT '',
+    archived_at TIMESTAMPTZ,
+    created_by TEXT NOT NULL DEFAULT '',
+    updated_by TEXT NOT NULL DEFAULT '',
+    coverage_complete BOOLEAN NOT NULL DEFAULT FALSE,
+    coverage_notes TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    UNIQUE (year, version, scenario),
+    CHECK (status IN ('draft', 'approved', 'archived')),
+    CHECK (NOT is_active OR (status='approved' AND scenario='baseline'))
+);
+ALTER TABLE cost_plan_versions ADD COLUMN IF NOT EXISTS activated_by TEXT NOT NULL DEFAULT '';
+ALTER TABLE cost_plan_versions ADD COLUMN IF NOT EXISTS activated_at TIMESTAMPTZ;
+ALTER TABLE cost_plan_versions ADD COLUMN IF NOT EXISTS archived_by TEXT NOT NULL DEFAULT '';
+ALTER TABLE cost_plan_versions ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+ALTER TABLE cost_plan_versions ADD COLUMN IF NOT EXISTS updated_by TEXT NOT NULL DEFAULT '';
+ALTER TABLE cost_plan_versions ADD COLUMN IF NOT EXISTS coverage_complete BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE cost_plan_versions ADD COLUMN IF NOT EXISTS coverage_notes TEXT NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX IF NOT EXISTS cost_plan_versions_active_baseline_year_idx
+    ON cost_plan_versions (year)
+    WHERE is_active AND status='approved' AND scenario='baseline';
+CREATE INDEX IF NOT EXISTS cost_plan_versions_lookup_idx
+    ON cost_plan_versions (year, status, scenario, updated_at DESC);
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname='cost_items_plan_version_fk'
+          AND conrelid='cost_items'::regclass
+    ) THEN
+        ALTER TABLE cost_items ADD CONSTRAINT cost_items_plan_version_fk
+        FOREIGN KEY (plan_version_id) REFERENCES cost_plan_versions(id) ON DELETE RESTRICT;
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS savings_measurements (
+    id TEXT PRIMARY KEY,
+    action_id TEXT REFERENCES savings_actions(id) ON DELETE SET NULL,
+    scope TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    account_id TEXT NOT NULL DEFAULT '',
+    cost_bucket TEXT NOT NULL DEFAULT '',
+    baseline_start_date DATE NOT NULL,
+    baseline_end_date DATE NOT NULL,
+    measurement_start_date DATE NOT NULL,
+    measurement_end_date DATE NOT NULL,
+    baseline_amount_usd NUMERIC(16,4) NOT NULL,
+    actual_amount_usd NUMERIC(16,4) NOT NULL,
+    evidence_url TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending_evidence',
+    finance_reviewer TEXT NOT NULL DEFAULT '',
+    reviewed_at TIMESTAMPTZ,
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    CHECK (baseline_start_date <= baseline_end_date),
+    CHECK (measurement_start_date <= measurement_end_date),
+    CHECK (baseline_amount_usd >= 0),
+    CHECK (actual_amount_usd >= 0),
+    CHECK (
+        status NOT IN ('reviewed', 'verified', 'approved')
+        OR (btrim(evidence_url) <> '' AND btrim(finance_reviewer) <> '' AND reviewed_at IS NOT NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS savings_measurements_period_idx
+    ON savings_measurements (status, measurement_start_date, measurement_end_date);
+CREATE INDEX IF NOT EXISTS savings_measurements_scope_idx
+    ON savings_measurements (scope, status, measurement_start_date, measurement_end_date);
 
 CREATE TABLE IF NOT EXISTS stability_sync_state (
     backend_id TEXT PRIMARY KEY,
@@ -465,12 +685,51 @@ def _as_float(value: Any) -> float:
         return 0.0
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def _as_date(value: Any) -> date:
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
         return value
     return date.fromisoformat(_clean_text(value)[:10])
+
+
+def _as_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        result = value
+    elif isinstance(value, date):
+        result = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+    else:
+        text = _clean_text(value)
+        if not text:
+            raise ValueError("缺少时间字段")
+        try:
+            result = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            result = datetime.fromtimestamp(float(text), tz=timezone.utc)
+    if result.tzinfo is None:
+        result = result.replace(tzinfo=timezone.utc)
+    return result.astimezone(timezone.utc)
+
+
+def _optional_date(value: Any) -> date | None:
+    return _as_date(value) if value not in (None, "") else None
+
+
+def _optional_datetime(value: Any) -> datetime | None:
+    return _as_datetime(value) if value not in (None, "") else None
+
+
+def _input_value(data: dict[str, Any], *names: str, default: Any = None) -> Any:
+    for name in names:
+        if name in data:
+            return data[name]
+    return default
 
 
 def empty_totals() -> dict[str, Any]:
@@ -693,6 +952,130 @@ class UsageStore:
             heartbeat_at=datetime.now(timezone.utc),
         )
 
+    async def enqueue_refresh_request(self, start_date: str, end_date: str) -> bool:
+        """Queue one idempotent reader refresh request for the sync worker."""
+
+        request_key = hashlib.sha256(
+            f"{start_date}:{end_date}".encode("ascii")
+        ).hexdigest()
+        result = await self._require_pool().execute(
+            """
+            INSERT INTO usage_refresh_requests (
+                request_key, start_date, end_date, status, requested_at,
+                claimed_at, completed_at, attempts, last_error
+            ) VALUES ($1, $2::date, $3::date, 'pending', $4, NULL, NULL, 0, '')
+            ON CONFLICT (request_key) DO UPDATE SET
+                status=CASE
+                    WHEN usage_refresh_requests.status='running'
+                    THEN usage_refresh_requests.status
+                    ELSE 'pending'
+                END,
+                requested_at=CASE
+                    WHEN usage_refresh_requests.status='running'
+                    THEN usage_refresh_requests.requested_at
+                    ELSE EXCLUDED.requested_at
+                END,
+                claimed_at=CASE
+                    WHEN usage_refresh_requests.status='running'
+                    THEN usage_refresh_requests.claimed_at
+                    ELSE NULL
+                END,
+                completed_at=CASE
+                    WHEN usage_refresh_requests.status='running'
+                    THEN usage_refresh_requests.completed_at
+                    ELSE NULL
+                END,
+                last_error=CASE
+                    WHEN usage_refresh_requests.status='running'
+                    THEN usage_refresh_requests.last_error
+                    ELSE ''
+                END
+            """,
+            request_key,
+            _as_date(start_date),
+            _as_date(end_date),
+            datetime.now(timezone.utc),
+        )
+        return result.endswith(" 1")
+
+    async def claim_refresh_requests(
+        self,
+        *,
+        limit: int = 100,
+        stale_after_seconds: int = 3600,
+    ) -> list[dict[str, Any]]:
+        """Claim pending refreshes, recovering requests stranded by a restart."""
+
+        rows = await self._require_pool().fetch(
+            """
+            WITH candidates AS (
+                SELECT request_key
+                FROM usage_refresh_requests
+                WHERE status='pending'
+                   OR (status='running' AND claimed_at < $1 - ($2 * INTERVAL '1 second'))
+                ORDER BY requested_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT $3
+            )
+            UPDATE usage_refresh_requests AS request
+            SET status='running', claimed_at=$1, attempts=request.attempts + 1,
+                last_error=''
+            FROM candidates
+            WHERE request.request_key=candidates.request_key
+            RETURNING request.request_key, request.start_date, request.end_date,
+                      request.requested_at, request.attempts
+            """,
+            datetime.now(timezone.utc),
+            max(60, int(stale_after_seconds)),
+            max(1, int(limit)),
+        )
+        return [
+            {
+                "requestKey": str(row["request_key"]),
+                "startDate": row["start_date"].isoformat(),
+                "endDate": row["end_date"].isoformat(),
+                "requestedAt": row["requested_at"],
+                "attempts": int(row["attempts"] or 0),
+            }
+            for row in rows
+        ]
+
+    async def finish_refresh_requests(
+        self,
+        request_keys: list[str],
+        *,
+        success: bool,
+        error: str = "",
+    ) -> None:
+        if not request_keys:
+            return
+        await self._require_pool().execute(
+            """
+            UPDATE usage_refresh_requests
+            SET status=$1, completed_at=$2, last_error=$3
+            WHERE request_key=ANY($4::text[])
+            """,
+            "completed" if success else "pending",
+            datetime.now(timezone.utc) if success else None,
+            str(error or "")[:2000],
+            request_keys,
+        )
+
+    async def refresh_queue_status(self) -> dict[str, Any]:
+        row = await self._require_pool().fetchrow(
+            """
+            SELECT COUNT(*) FILTER (WHERE status='pending') AS pending_count,
+                   COUNT(*) FILTER (WHERE status='running') AS running_count,
+                   MIN(requested_at) FILTER (WHERE status IN ('pending', 'running')) AS oldest_requested_at
+            FROM usage_refresh_requests
+            """
+        )
+        return {
+            "pendingCount": int((row or {}).get("pending_count") or 0),
+            "runningCount": int((row or {}).get("running_count") or 0),
+            "oldestRequestedAt": (row or {}).get("oldest_requested_at"),
+        }
+
     async def snapshot_revision(
         self,
         start_date: str,
@@ -898,11 +1281,11 @@ class UsageStore:
                             billing_eligible, provider, model_group, model_id, api_base,
                             status, error_code, error_class, error_message, scenario,
                             request_duration_ms, ttft_ms, attempted_retries, max_retries,
-                            trace_id, user_visible_failure, collected_at
+                            trace_id, user_visible_failure, final_failure_source, collected_at
                         ) VALUES (
                             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
                             $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
-                            $31,$32,$33,$34,$35,$36
+                            $31,$32,$33,$34,$35,$36,$37
                         ) ON CONFLICT (backend_id, request_id) DO NOTHING
                         """,
                         *record,
@@ -1349,6 +1732,7 @@ class UsageStore:
             observed["maxRetries"],
             observed["traceId"],
             observed["userVisibleFailure"],
+            observed["finalRequestFailureSource"],
             collected_at,
         )
 
@@ -1491,10 +1875,10 @@ class UsageStore:
                             success_count, failure_count, spend,
                             attribution_source, billing_eligible, provider, model_group, model_id, api_base,
                             status, error_code, error_class, error_message, scenario, request_duration_ms,
-                            ttft_ms, attempted_retries, max_retries, trace_id, user_visible_failure, collected_at
+                            ttft_ms, attempted_retries, max_retries, trace_id, user_visible_failure, final_failure_source, collected_at
                         ) VALUES (
                             $1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,
-                            $14,$15,$16,$17,$18::numeric,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36
+                            $14,$15,$16,$17,$18::numeric,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37
                         )
                         ON CONFLICT (backend_id, request_id) DO UPDATE SET
                             event_time=EXCLUDED.event_time,
@@ -1530,6 +1914,7 @@ class UsageStore:
                             max_retries=EXCLUDED.max_retries,
                             trace_id=EXCLUDED.trace_id,
                             user_visible_failure=EXCLUDED.user_visible_failure,
+                            final_failure_source=EXCLUDED.final_failure_source,
                             collected_at=EXCLUDED.collected_at
                         """,
                         event_records,
@@ -1588,11 +1973,11 @@ class UsageStore:
                             billing_eligible, provider, model_group, model_id, api_base,
                             status, error_code, error_class, error_message, scenario,
                             request_duration_ms, ttft_ms, attempted_retries, max_retries,
-                            trace_id, user_visible_failure, collected_at
+                            trace_id, user_visible_failure, final_failure_source, collected_at
                         ) VALUES (
                             $1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
                             $17,$18::numeric,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
-                            $31,$32,$33,$34,$35,$36
+                            $31,$32,$33,$34,$35,$36,$37
                         )
                         ON CONFLICT (backend_id, request_id) DO UPDATE SET
                             event_time=EXCLUDED.event_time, usage_date=EXCLUDED.usage_date,
@@ -1613,6 +1998,7 @@ class UsageStore:
                             ttft_ms=EXCLUDED.ttft_ms, attempted_retries=EXCLUDED.attempted_retries,
                             max_retries=EXCLUDED.max_retries, trace_id=EXCLUDED.trace_id,
                             user_visible_failure=EXCLUDED.user_visible_failure,
+                            final_failure_source=EXCLUDED.final_failure_source,
                             collected_at=EXCLUDED.collected_at
                         """,
                         records,
@@ -1773,7 +2159,7 @@ class UsageStore:
                             "model_group", "model_id", "api_base", "status",
                             "error_code", "error_class", "error_message", "scenario",
                             "request_duration_ms", "ttft_ms", "attempted_retries",
-                            "max_retries", "trace_id", "user_visible_failure", "collected_at",
+                            "max_retries", "trace_id", "user_visible_failure", "final_failure_source", "collected_at",
                         ),
                     )
                 if department_records:
@@ -1980,8 +2366,8 @@ class UsageStore:
                             success_count, failure_count, spend,
                             attribution_source, billing_eligible, provider, model_group, model_id, api_base,
                             status, error_code, error_class, error_message, scenario, request_duration_ms,
-                            ttft_ms, attempted_retries, max_retries, trace_id, user_visible_failure, collected_at
-                        ) VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::numeric,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36)
+                            ttft_ms, attempted_retries, max_retries, trace_id, user_visible_failure, final_failure_source, collected_at
+                        ) VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::numeric,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37)
                         ON CONFLICT (backend_id, request_id) DO UPDATE SET
                             event_time=EXCLUDED.event_time,
                             usage_date=EXCLUDED.usage_date,
@@ -2016,6 +2402,7 @@ class UsageStore:
                             max_retries=EXCLUDED.max_retries,
                             trace_id=EXCLUDED.trace_id,
                             user_visible_failure=EXCLUDED.user_visible_failure,
+                            final_failure_source=EXCLUDED.final_failure_source,
                             collected_at=EXCLUDED.collected_at
                         """,
                         event_records,
@@ -3776,6 +4163,312 @@ class UsageStore:
             return {"enabled": True, "connected": False, "status": "error", "error": exc.__class__.__name__}
         return {"enabled": True, "connected": True, "status": "ok"}
 
+    @staticmethod
+    def _stability_attempt_record(event: dict[str, Any], received_at: datetime) -> tuple[Any, ...]:
+        backend_id = _clean_text(_input_value(event, "backend_id", "backendId"))
+        event_id = _clean_text(_input_value(event, "event_id", "eventId"))
+        if not backend_id or not event_id:
+            raise ValueError("稳定性尝试事件缺少 backend_id 或 event_id")
+        started_at = _optional_datetime(_input_value(event, "started_at", "startedAt"))
+        ended_at = _optional_datetime(_input_value(event, "ended_at", "endedAt"))
+        collected_at = _optional_datetime(_input_value(event, "collected_at", "collectedAt"))
+        event_time = collected_at or ended_at or started_at
+        if event_time is None:
+            raise ValueError("稳定性尝试事件缺少 started_at、ended_at 或 collected_at")
+        duration_ms = _input_value(event, "duration_ms", "durationMs")
+        if duration_ms in (None, "") and started_at and ended_at:
+            duration_ms = max(0.0, (ended_at - started_at).total_seconds() * 1000)
+        attempt_index = max(0, _as_int(_input_value(event, "attempt_index", "attemptIndex")))
+        retry_index = max(0, _as_int(_input_value(event, "retry_index", "retryIndex")))
+        event_type = _clean_text(_input_value(event, "event_type", "eventType"))[:64]
+        fallback_from = _clean_text(_input_value(event, "fallback_from", "fallbackFrom"))[:256]
+        fallback_to = _clean_text(_input_value(event, "fallback_to", "fallbackTo"))[:256]
+        is_retry = _as_bool(_input_value(event, "is_retry", "isRetry", default=False)) or retry_index > 0 or "retry" in event_type
+        is_fallback = _as_bool(_input_value(event, "is_fallback", "isFallback", default=False)) or bool(fallback_from or fallback_to) or "fallback" in event_type
+        return (
+            backend_id[:120],
+            event_id[:256],
+            _clean_text(_input_value(event, "request_id", "requestId"))[:512],
+            _clean_text(_input_value(event, "trace_id", "traceId"))[:512],
+            _clean_text(_input_value(event, "attempt_id", "attemptId"))[:256],
+            attempt_index,
+            retry_index,
+            _clean_text(_input_value(event, "requested_model_group", "requestedModelGroup"))[:256],
+            _clean_text(_input_value(event, "actual_model", "actualModel"))[:256],
+            _clean_text(_input_value(event, "route_name", "route"))[:256],
+            _clean_text(event.get("provider"))[:160],
+            event_type or "attempt",
+            (_clean_text(event.get("status")) or "unknown")[:64],
+            _clean_text(_input_value(event, "error_code", "errorCode"))[:120],
+            _clean_text(_input_value(event, "error_class", "errorClass"))[:160],
+            _clean_text(_input_value(event, "error_category", "errorCategory"))[:120],
+            (_clean_text(event.get("scenario")) or "unknown")[:64],
+            _clean_text(_input_value(event, "scenario_version", "scenarioVersion"))[:64],
+            event_time,
+            event_time.date(),
+            started_at,
+            ended_at,
+            _as_float(_input_value(event, "ttft_ms", "ttftMs")) if _input_value(event, "ttft_ms", "ttftMs") not in (None, "") else None,
+            _as_float(duration_ms) if duration_ms not in (None, "") else None,
+            fallback_from,
+            fallback_to,
+            is_retry,
+            is_fallback,
+            collected_at,
+            received_at,
+        )
+
+    async def insert_stability_attempt_events(self, events: list[dict[str, Any]]) -> int:
+        if not events:
+            return 0
+        received_at = datetime.now(timezone.utc)
+        records = [self._stability_attempt_record(event, received_at) for event in events]
+        inserted = 0
+        async with self._require_pool().acquire() as connection:
+            async with connection.transaction():
+                for record in records:
+                    result = await connection.execute(
+                        """
+                        INSERT INTO stability_attempt_events (
+                            backend_id, event_id, request_id, trace_id, attempt_id,
+                            attempt_index, retry_index, requested_model_group,
+                            actual_model, route_name, provider, event_type, status,
+                            error_code, error_class, error_category, scenario,
+                            scenario_version, event_time, event_date, started_at,
+                            ended_at, ttft_ms, duration_ms, fallback_from, fallback_to,
+                            is_retry, is_fallback, collected_at, received_at
+                        ) VALUES (
+                            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+                            $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30
+                        ) ON CONFLICT (backend_id, event_id) DO NOTHING
+                        """,
+                        *record,
+                    )
+                    inserted += int(result.endswith(" 1"))
+        return inserted
+
+    async def stability_attempt_events(
+        self,
+        start_date: str,
+        end_date: str,
+        model: str = "",
+        trace_id: str = "",
+        request_id: str = "",
+        backend_id: str = "",
+    ) -> list[dict[str, Any]]:
+        records = await self._require_pool().fetch(
+            """
+            SELECT * FROM stability_attempt_events
+            WHERE event_date BETWEEN $1::date AND $2::date
+              AND ($3='' OR requested_model_group=$3 OR actual_model=$3)
+              AND ($4='' OR trace_id=$4)
+              AND ($5='' OR request_id=$5)
+              AND ($6='' OR backend_id=$6)
+            ORDER BY event_time, attempt_index, retry_index, event_id
+            """,
+            _as_date(start_date), _as_date(end_date), _clean_text(model),
+            _clean_text(trace_id), _clean_text(request_id), _clean_text(backend_id),
+        )
+        return [dict(record) for record in records]
+
+    async def stability_attempt_timeline(self, request_id: str, backend_id: str = "") -> list[dict[str, Any]]:
+        records = await self._require_pool().fetch(
+            """
+            SELECT * FROM stability_attempt_events
+            WHERE request_id=$1 AND ($2='' OR backend_id=$2)
+            ORDER BY event_time, attempt_index, retry_index, event_id
+            """,
+            _clean_text(request_id), _clean_text(backend_id),
+        )
+        return [dict(record) for record in records]
+
+    async def list_stability_actions(
+        self,
+        *,
+        status: str = "",
+        severity: str = "",
+        owner: str = "",
+        model: str = "",
+        scenario: str = "",
+        request_id: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> list[dict[str, Any]]:
+        records = await self._require_pool().fetch(
+            """
+            SELECT * FROM stability_actions
+            WHERE ($1='' OR status=$1) AND ($2='' OR severity=$2)
+              AND ($3='' OR owner=$3) AND ($4='' OR requested_model_group=$4)
+              AND ($5='' OR scenario=$5)
+              AND ($6='' OR request_id=$6)
+            ORDER BY
+              CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                            WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
+              target_date NULLS LAST, updated_at DESC
+            """,
+            _clean_text(status), _clean_text(severity), _clean_text(owner),
+            _clean_text(model), _clean_text(scenario), _clean_text(request_id),
+        )
+        return [dict(record) for record in records]
+
+    async def create_stability_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        record = await self._require_pool().fetchrow(
+            """
+            INSERT INTO stability_actions (
+                id, title, description, notes, owner, severity, status, target_date,
+                fix_reference, requested_model_group, scenario, error_code, request_id,
+                baseline_start_date, baseline_end_date, created_by, updated_by,
+                created_at, updated_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::date,$9,$10,$11,$12,$13,$14::date,$15::date,$16,$16,$17,$17)
+            RETURNING *
+            """,
+            _clean_text(action.get("id")) or str(uuid.uuid4()),
+            _clean_text(_input_value(action, "title", "name")),
+            _clean_text(action.get("description")), _clean_text(action.get("notes")),
+            _clean_text(action.get("owner")),
+            _clean_text(action.get("severity")) or "medium",
+            _clean_text(action.get("status")) or "open",
+            _optional_date(_input_value(action, "target_date", "targetDate")),
+            _clean_text(_input_value(action, "fix_reference", "fixReference")),
+            _clean_text(_input_value(action, "requested_model_group", "requestedModelGroup", "model")),
+            _clean_text(action.get("scenario")),
+            _clean_text(_input_value(action, "error_code", "errorCode")),
+            _clean_text(_input_value(action, "request_id", "requestId")),
+            _optional_date(_input_value(action, "baseline_start_date", "baselineStartDate")),
+            _optional_date(_input_value(action, "baseline_end_date", "baselineEndDate")),
+            _clean_text(_input_value(action, "created_by", "createdBy", "actor")), now,
+        )
+        return dict(record)
+
+    async def update_stability_action(self, action_id: str, action: dict[str, Any]) -> dict[str, Any] | None:
+        current = await self._require_pool().fetchrow("SELECT * FROM stability_actions WHERE id=$1", action_id)
+        if current is None:
+            return None
+        merged = dict(current)
+        aliases = {
+            "title": ("title", "name"), "description": ("description",), "notes": ("notes",), "owner": ("owner",),
+            "severity": ("severity",), "status": ("status",), "target_date": ("target_date", "targetDate"),
+            "fix_reference": ("fix_reference", "fixReference"),
+            "requested_model_group": ("requested_model_group", "requestedModelGroup", "model"),
+            "scenario": ("scenario",), "error_code": ("error_code", "errorCode"),
+            "request_id": ("request_id", "requestId"),
+            "baseline_start_date": ("baseline_start_date", "baselineStartDate"),
+            "baseline_end_date": ("baseline_end_date", "baselineEndDate"),
+            "updated_by": ("updated_by", "updatedBy", "actor"),
+        }
+        for field, names in aliases.items():
+            value = _input_value(action, *names, default=None)
+            if any(name in action for name in names):
+                merged[field] = value
+        record = await self._require_pool().fetchrow(
+            """
+            UPDATE stability_actions SET title=$2, description=$3, notes=$4, owner=$5,
+                severity=$6, status=$7, target_date=$8::date, fix_reference=$9,
+                requested_model_group=$10, scenario=$11, error_code=$12, request_id=$13,
+                baseline_start_date=$14::date, baseline_end_date=$15::date,
+                updated_by=$16, updated_at=$17
+            WHERE id=$1 RETURNING *
+            """,
+            action_id, _clean_text(merged["title"]), _clean_text(merged["description"]),
+            _clean_text(merged["notes"]), _clean_text(merged["owner"]),
+            _clean_text(merged["severity"]) or "medium",
+            _clean_text(merged["status"]) or "open", _optional_date(merged["target_date"]),
+            _clean_text(merged["fix_reference"]), _clean_text(merged["requested_model_group"]),
+            _clean_text(merged["scenario"]), _clean_text(merged["error_code"]),
+            _clean_text(merged["request_id"]),
+            _optional_date(merged["baseline_start_date"]), _optional_date(merged["baseline_end_date"]),
+            _clean_text(merged["updated_by"]), datetime.now(timezone.utc),
+        )
+        return dict(record) if record else None
+
+    async def delete_stability_action(self, action_id: str) -> bool:
+        result = await self._require_pool().execute("DELETE FROM stability_actions WHERE id=$1", action_id)
+        return result.endswith(" 1")
+
+    async def list_stability_regressions(self, action_id: str = "", scenario: str = "") -> list[dict[str, Any]]:
+        records = await self._require_pool().fetch(
+            """
+            SELECT * FROM stability_regressions
+            WHERE ($1='' OR action_id=$1) AND ($2='' OR scenario=$2)
+            ORDER BY regression_end_date DESC, updated_at DESC
+            """,
+            _clean_text(action_id), _clean_text(scenario),
+        )
+        return [dict(record) for record in records]
+
+    async def create_stability_regression(self, regression: dict[str, Any]) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        record = await self._require_pool().fetchrow(
+            """
+            INSERT INTO stability_regressions (
+                id, action_id, scenario, baseline_start_date, baseline_end_date,
+                regression_start_date, regression_end_date, metric_name,
+                baseline_value, regression_value, unit, status, conclusion,
+                evidence_url, reviewer, notes, created_at, updated_at
+            ) VALUES ($1,$2,$3,$4::date,$5::date,$6::date,$7::date,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17)
+            RETURNING *
+            """,
+            _clean_text(regression.get("id")) or str(uuid.uuid4()),
+            _clean_text(_input_value(regression, "action_id", "actionId")),
+            _clean_text(regression.get("scenario")),
+            _as_date(_input_value(regression, "baseline_start_date", "baselineStartDate", "baselineStart")),
+            _as_date(_input_value(regression, "baseline_end_date", "baselineEndDate", "baselineEnd")),
+            _as_date(_input_value(regression, "regression_start_date", "regressionStartDate", "regressionStart")),
+            _as_date(_input_value(regression, "regression_end_date", "regressionEndDate", "regressionEnd")),
+            _clean_text(_input_value(regression, "metric_name", "metricName", "metric")),
+            _input_value(regression, "baseline_value", "baselineValue"),
+            _input_value(regression, "regression_value", "regressionValue"),
+            _clean_text(regression.get("unit")), _clean_text(regression.get("status")) or "completed",
+            _clean_text(regression.get("conclusion")),
+            _clean_text(_input_value(regression, "evidence_url", "evidenceUrl")),
+            _clean_text(regression.get("reviewer")), _clean_text(regression.get("notes")), now,
+        )
+        return dict(record)
+
+    async def update_stability_regression(self, regression_id: str, regression: dict[str, Any]) -> dict[str, Any] | None:
+        current = await self._require_pool().fetchrow("SELECT * FROM stability_regressions WHERE id=$1", regression_id)
+        if current is None:
+            return None
+        merged = dict(current)
+        aliases = {
+            "action_id": ("action_id", "actionId"), "scenario": ("scenario",),
+            "baseline_start_date": ("baseline_start_date", "baselineStartDate", "baselineStart"),
+            "baseline_end_date": ("baseline_end_date", "baselineEndDate", "baselineEnd"),
+            "regression_start_date": ("regression_start_date", "regressionStartDate", "regressionStart"),
+            "regression_end_date": ("regression_end_date", "regressionEndDate", "regressionEnd"),
+            "metric_name": ("metric_name", "metricName", "metric"), "baseline_value": ("baseline_value", "baselineValue"),
+            "regression_value": ("regression_value", "regressionValue"), "unit": ("unit",),
+            "status": ("status",), "conclusion": ("conclusion",),
+            "evidence_url": ("evidence_url", "evidenceUrl"), "reviewer": ("reviewer",), "notes": ("notes",),
+        }
+        for field, names in aliases.items():
+            if any(name in regression for name in names):
+                merged[field] = _input_value(regression, *names)
+        record = await self._require_pool().fetchrow(
+            """
+            UPDATE stability_regressions SET action_id=$2, scenario=$3,
+                baseline_start_date=$4::date, baseline_end_date=$5::date,
+                regression_start_date=$6::date, regression_end_date=$7::date,
+                metric_name=$8, baseline_value=$9, regression_value=$10,
+                unit=$11, status=$12, conclusion=$13, evidence_url=$14,
+                reviewer=$15, notes=$16, updated_at=$17
+            WHERE id=$1 RETURNING *
+            """,
+            regression_id, _clean_text(merged["action_id"]), _clean_text(merged["scenario"]),
+            _as_date(merged["baseline_start_date"]), _as_date(merged["baseline_end_date"]),
+            _as_date(merged["regression_start_date"]), _as_date(merged["regression_end_date"]),
+            _clean_text(merged["metric_name"]), merged["baseline_value"], merged["regression_value"],
+            _clean_text(merged["unit"]), _clean_text(merged["status"]) or "pending",
+            _clean_text(merged["conclusion"]), _clean_text(merged["evidence_url"]),
+            _clean_text(merged["reviewer"]), _clean_text(merged["notes"]), datetime.now(timezone.utc),
+        )
+        return dict(record) if record else None
+
+    async def delete_stability_regression(self, regression_id: str) -> bool:
+        result = await self._require_pool().execute("DELETE FROM stability_regressions WHERE id=$1", regression_id)
+        return result.endswith(" 1")
+
     async def stability_events(
         self,
         start_date: str,
@@ -3790,7 +4483,7 @@ class UsageStore:
                    model_group, model_id, api_base, status, error_code, error_class,
                    error_message, scenario, request_duration_ms, ttft_ms,
                    attempted_retries, max_retries, trace_id, user_visible_failure,
-                   collected_at
+                   final_failure_source, collected_at
             FROM usage_event_attribution
             WHERE usage_date BETWEEN $1::date AND $2::date
               AND ($3='' OR model=$3)
@@ -3862,7 +4555,7 @@ class UsageStore:
                    completion_tokens, total_tokens, spend, provider, model_group,
                    model_id, api_base, status, error_code, error_class, error_message,
                    scenario, request_duration_ms, ttft_ms, attempted_retries,
-                   max_retries, trace_id, user_visible_failure, collected_at
+                   max_retries, trace_id, user_visible_failure, final_failure_source, collected_at
             FROM usage_event_attribution
             WHERE request_id=$1 AND ($2='' OR backend_id=$2)
             ORDER BY event_time DESC LIMIT 1
@@ -3943,9 +4636,55 @@ class UsageStore:
         )
         return [dict(record) for record in records]
 
-    async def list_cost_items(self) -> list[dict[str, Any]]:
-        records = await self._require_pool().fetch("SELECT * FROM cost_items ORDER BY service_start_date DESC, name")
+    async def list_cost_items(
+        self,
+        *,
+        as_of: str | date | None = None,
+        model: str = "",
+        provider: str = "",
+        account_id: str = "",
+        cost_bucket: str = "",
+        recognition_status: str = "",
+        plan_version_id: str = "",
+        actual_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        status = "actual" if actual_only else _clean_text(recognition_status)
+        pool = self._require_pool()
+        try:
+            records = await pool.fetch(
+                """
+                SELECT * FROM cost_items
+                WHERE ($1::date IS NULL OR service_start_date <= $1::date)
+                  AND ($2='' OR model=$2) AND ($3='' OR provider=$3)
+                  AND ($4='' OR account_id=$4) AND ($5='' OR cost_bucket=$5)
+                  AND ($6='' OR recognition_status=$6)
+                  AND ($7='' OR plan_version_id=$7)
+                ORDER BY service_start_date DESC, name
+                """,
+                _optional_date(as_of), _clean_text(model), _clean_text(provider),
+                _clean_text(account_id), _clean_text(cost_bucket), status,
+                _clean_text(plan_version_id),
+            )
+        except TypeError:
+            # Some lightweight adapters only implement the legacy no-argument query.
+            if any((as_of, model, provider, account_id, cost_bucket, status, plan_version_id)):
+                raise
+            records = await pool.fetch("SELECT * FROM cost_items ORDER BY service_start_date DESC, name")
         return [dict(record) for record in records]
+
+    async def list_actual_cost_items(
+        self,
+        as_of: str | date,
+        *,
+        model: str = "",
+        provider: str = "",
+        account_id: str = "",
+        cost_bucket: str = "",
+    ) -> list[dict[str, Any]]:
+        return await self.list_cost_items(
+            as_of=as_of, model=model, provider=provider, account_id=account_id,
+            cost_bucket=cost_bucket, actual_only=True,
+        )
 
     async def create_cost_item(self, item: dict[str, Any]) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
@@ -3955,9 +4694,10 @@ class UsageStore:
                 amount, currency, exchange_rate, amount_usd, service_start_date,
                 service_end_date, finance_bucket, notes, enabled, created_at, updated_at,
                 cost_bucket, source_type, provider, account_id, account_name, voucher_id,
-                voucher_no, invoice_no, recognition_status, reconciliation_status)
+                voucher_no, invoice_no, recognition_status, reconciliation_status,
+                plan_version_id, scenario, source_evidence)
             VALUES ($1,$2,$3,$4,$5,$6,$7::numeric,$8,$9::numeric,$10::numeric,$11::date,$12::date,$13,$14,$15,$16,$16,
-                $17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+                $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)
             RETURNING *
             """,
             item["id"], item["category"], item["name"], item.get("vendor", ""),
@@ -3969,6 +4709,9 @@ class UsageStore:
             item.get("provider", ""), item.get("accountId", ""), item.get("accountName", ""),
             item.get("voucherId", ""), item.get("voucherNo", ""), item.get("invoiceNo", ""),
             item.get("recognitionStatus", "actual"), item.get("reconciliationStatus", "unreconciled"),
+            _input_value(item, "planVersionId", "plan_version_id"),
+            _clean_text(item.get("scenario")),
+            _clean_text(_input_value(item, "sourceEvidence", "source_evidence")),
         )
         return dict(record)
 
@@ -3982,7 +4725,8 @@ class UsageStore:
                 finance_bucket=$13, notes=$14, enabled=$15, updated_at=$16,
                 cost_bucket=$17, source_type=$18, provider=$19, account_id=$20,
                 account_name=$21, voucher_id=$22, voucher_no=$23, invoice_no=$24,
-                recognition_status=$25, reconciliation_status=$26
+                recognition_status=$25, reconciliation_status=$26,
+                plan_version_id=$27, scenario=$28, source_evidence=$29
             WHERE id=$1 RETURNING *
             """,
             item_id, item["category"], item["name"], item.get("vendor", ""),
@@ -3995,12 +4739,149 @@ class UsageStore:
             item.get("provider", ""), item.get("accountId", ""), item.get("accountName", ""),
             item.get("voucherId", ""), item.get("voucherNo", ""), item.get("invoiceNo", ""),
             item.get("recognitionStatus", "actual"), item.get("reconciliationStatus", "unreconciled"),
+            _input_value(item, "planVersionId", "plan_version_id"),
+            _clean_text(item.get("scenario")),
+            _clean_text(_input_value(item, "sourceEvidence", "source_evidence")),
         )
         return dict(record) if record else None
 
     async def delete_cost_item(self, item_id: str) -> bool:
         result = await self._require_pool().execute("DELETE FROM cost_items WHERE id=$1", item_id)
         return result.endswith("1")
+
+    async def list_cost_plan_versions(
+        self,
+        year: int | None = None,
+        status: str = "",
+        scenario: str = "",
+    ) -> list[dict[str, Any]]:
+        records = await self._require_pool().fetch(
+            """
+            SELECT * FROM cost_plan_versions
+            WHERE ($1::integer IS NULL OR year=$1)
+              AND ($2='' OR status=$2) AND ($3='' OR scenario=$3)
+            ORDER BY year DESC, is_active DESC, updated_at DESC
+            """,
+            int(year) if year is not None else None,
+            _clean_text(status), _clean_text(scenario),
+        )
+        return [dict(record) for record in records]
+
+    async def create_cost_plan_version(self, plan: dict[str, Any]) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        actor = _clean_text(_input_value(plan, "created_by", "createdBy", "actor"))
+        record = await self._require_pool().fetchrow(
+            """
+            INSERT INTO cost_plan_versions (
+                id, year, version, scenario, as_of, status, is_active,
+                created_by, updated_by, coverage_complete, coverage_notes, notes,
+                created_at, updated_at
+            ) VALUES ($1,$2,$3,$4,$5::date,'draft',FALSE,$6,$6,$7,$8,$9,$10,$10)
+            RETURNING *
+            """,
+            _clean_text(plan.get("id")) or str(uuid.uuid4()),
+            int(_input_value(plan, "year", "plan_year", "planYear")),
+            _clean_text(plan.get("version")),
+            _clean_text(plan.get("scenario")) or "baseline",
+            _as_date(_input_value(plan, "as_of", "as_of_date", "asOfDate", "asOf")),
+            actor,
+            _as_bool(_input_value(plan, "coverage_complete", "coverageComplete", default=False)),
+            _clean_text(_input_value(plan, "coverage_notes", "coverageNotes")),
+            _clean_text(plan.get("notes")), now,
+        )
+        return dict(record)
+
+    async def update_cost_plan_version(self, plan_id: str, plan: dict[str, Any]) -> dict[str, Any] | None:
+        current = await self._require_pool().fetchrow("SELECT * FROM cost_plan_versions WHERE id=$1", plan_id)
+        if current is None:
+            return None
+        if current["status"] != "draft":
+            raise ValueError("仅草稿计划可以编辑")
+        merged = dict(current)
+        aliases = {
+            "year": ("year", "plan_year", "planYear"), "version": ("version",),
+            "scenario": ("scenario",), "as_of": ("as_of", "as_of_date", "asOfDate", "asOf"),
+            "coverage_complete": ("coverage_complete", "coverageComplete"),
+            "coverage_notes": ("coverage_notes", "coverageNotes"), "notes": ("notes",),
+            "updated_by": ("updated_by", "updatedBy", "actor"),
+        }
+        for field, names in aliases.items():
+            if any(name in plan for name in names):
+                merged[field] = _input_value(plan, *names)
+        record = await self._require_pool().fetchrow(
+            """
+            UPDATE cost_plan_versions SET year=$2, version=$3, scenario=$4,
+                as_of=$5::date, coverage_complete=$6, coverage_notes=$7,
+                notes=$8, updated_by=$9, updated_at=$10
+            WHERE id=$1 RETURNING *
+            """,
+            plan_id, int(merged["year"]), _clean_text(merged["version"]),
+            _clean_text(merged["scenario"]) or "baseline", _as_date(merged["as_of"]),
+            _as_bool(merged["coverage_complete"]),
+            _clean_text(merged["coverage_notes"]), _clean_text(merged["notes"]),
+            _clean_text(merged["updated_by"]), datetime.now(timezone.utc),
+        )
+        return dict(record) if record else None
+
+    async def approve_cost_plan_version(self, plan_id: str, actor: str) -> dict[str, Any] | None:
+        record = await self._require_pool().fetchrow(
+            """
+            UPDATE cost_plan_versions SET status='approved', is_active=FALSE,
+                approved_by=$2, approved_at=$3, updated_by=$2, updated_at=$3
+            WHERE id=$1 AND status='draft' RETURNING *
+            """,
+            plan_id, _clean_text(actor), datetime.now(timezone.utc),
+        )
+        return dict(record) if record else None
+
+    async def activate_cost_plan_version(self, plan_id: str, actor: str) -> dict[str, Any] | None:
+        pool = self._require_pool()
+        now = datetime.now(timezone.utc)
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                plan = await connection.fetchrow(
+                    "SELECT * FROM cost_plan_versions WHERE id=$1 FOR UPDATE", plan_id
+                )
+                if plan is None:
+                    return None
+                if plan["status"] != "approved" or plan["scenario"] != "baseline":
+                    raise ValueError("只有已批准的 baseline 计划可以激活")
+                if not bool(plan["coverage_complete"]):
+                    raise ValueError("计划覆盖不完整，不能作为官方预测基准")
+                await connection.execute(
+                    """
+                    UPDATE cost_plan_versions SET is_active=FALSE, updated_by=$2, updated_at=$3
+                    WHERE year=$1 AND is_active AND id<>$4
+                    """,
+                    plan["year"], _clean_text(actor), now, plan_id,
+                )
+                record = await connection.fetchrow(
+                    """
+                    UPDATE cost_plan_versions SET is_active=TRUE, activated_by=$2,
+                        activated_at=$3, updated_by=$2, updated_at=$3
+                    WHERE id=$1 RETURNING *
+                    """,
+                    plan_id, _clean_text(actor), now,
+                )
+        return dict(record) if record else None
+
+    async def archive_cost_plan_version(self, plan_id: str, actor: str) -> dict[str, Any] | None:
+        record = await self._require_pool().fetchrow(
+            """
+            UPDATE cost_plan_versions SET status='archived', is_active=FALSE,
+                archived_by=$2, archived_at=$3, updated_by=$2, updated_at=$3
+            WHERE id=$1 AND status<>'archived' RETURNING *
+            """,
+            plan_id, _clean_text(actor), datetime.now(timezone.utc),
+        )
+        return dict(record) if record else None
+
+    async def delete_cost_plan_version(self, plan_id: str) -> bool:
+        result = await self._require_pool().execute(
+            "DELETE FROM cost_plan_versions WHERE id=$1 AND status='draft' AND NOT is_active",
+            plan_id,
+        )
+        return result.endswith(" 1")
 
     async def list_cost_budgets(self) -> list[dict[str, Any]]:
         records = await self._require_pool().fetch("SELECT * FROM cost_budgets ORDER BY month DESC")
@@ -4067,3 +4948,151 @@ class UsageStore:
             action.get("evidenceUrl", ""), action.get("financeReviewer", ""),
         )
         return dict(record) if record else None
+
+    async def list_savings_measurements(
+        self,
+        *,
+        as_of: str | date | None = None,
+        year: int | None = None,
+        status: str = "",
+        action_id: str = "",
+        provider: str = "",
+        model: str = "",
+        account_id: str = "",
+        cost_bucket: str = "",
+    ) -> list[dict[str, Any]]:
+        records = await self._require_pool().fetch(
+            """
+            SELECT * FROM savings_measurements
+            WHERE ($1::date IS NULL OR measurement_end_date <= $1::date)
+              AND ($2::integer IS NULL OR EXTRACT(YEAR FROM measurement_end_date)::integer=$2)
+              AND ($3='' OR status=$3) AND ($4='' OR action_id=$4)
+              AND ($5='' OR provider=$5) AND ($6='' OR model=$6)
+              AND ($7='' OR account_id=$7) AND ($8='' OR cost_bucket=$8)
+            ORDER BY measurement_end_date DESC, updated_at DESC
+            """,
+            _optional_date(as_of), int(year) if year is not None else None,
+            _clean_text(status), _clean_text(action_id), _clean_text(provider),
+            _clean_text(model), _clean_text(account_id), _clean_text(cost_bucket),
+        )
+        return [dict(record) for record in records]
+
+    @staticmethod
+    def _savings_measurement_values(measurement: dict[str, Any], current: dict[str, Any] | None = None) -> dict[str, Any]:
+        merged = dict(current or {})
+        aliases = {
+            "action_id": ("action_id", "actionId"), "scope": ("scope", "scope_key", "scopeKey"),
+            "provider": ("provider",), "model": ("model",), "account_id": ("account_id", "accountId"),
+            "cost_bucket": ("cost_bucket", "costBucket"),
+            "baseline_start_date": ("baseline_start_date", "baselineStartDate", "baselineStart"),
+            "baseline_end_date": ("baseline_end_date", "baselineEndDate", "baselineEnd"),
+            "measurement_start_date": ("measurement_start_date", "measurementStartDate", "measurementStart"),
+            "measurement_end_date": ("measurement_end_date", "measurementEndDate", "measurementEnd"),
+            "baseline_amount_usd": ("baseline_amount_usd", "baselineAmountUsd"),
+            "actual_amount_usd": ("actual_amount_usd", "actualAmountUsd"),
+            "evidence_url": ("evidence_url", "evidenceUrl"), "status": ("status",),
+            "finance_reviewer": ("finance_reviewer", "financeReviewer"),
+            "reviewed_at": ("reviewed_at", "reviewedAt"), "notes": ("notes",),
+        }
+        for field, names in aliases.items():
+            if current is None or any(name in measurement for name in names):
+                merged[field] = _input_value(measurement, *names, default=merged.get(field))
+        merged["scope"] = _clean_text(merged.get("scope")) or "|".join(
+            _clean_text(merged.get(field)) for field in ("provider", "model", "account_id", "cost_bucket")
+        )
+        merged["status"] = _clean_text(merged.get("status")) or "pending_evidence"
+        if merged["status"] in {"reviewed", "verified", "approved"}:
+            if not _clean_text(merged.get("evidence_url")) or not _clean_text(merged.get("finance_reviewer")):
+                raise ValueError("已核验节省必须提供证据链接和财务复核人")
+            merged["reviewed_at"] = _optional_datetime(merged.get("reviewed_at")) or datetime.now(timezone.utc)
+        else:
+            merged["reviewed_at"] = _optional_datetime(merged.get("reviewed_at"))
+        return merged
+
+    @staticmethod
+    async def _assert_savings_measurement_not_overlapping(connection: Any, values: dict[str, Any], measurement_id: str) -> None:
+        if values["status"] not in {"reviewed", "verified", "approved"}:
+            return
+        overlap = await connection.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM savings_measurements
+                WHERE id<>$1 AND status IN ('reviewed', 'verified', 'approved') AND scope=$2
+                  AND measurement_start_date <= $4::date
+                  AND measurement_end_date >= $3::date
+            )
+            """,
+            measurement_id, values["scope"], _as_date(values["measurement_start_date"]),
+            _as_date(values["measurement_end_date"]),
+        )
+        if overlap:
+            raise ValueError("同一范围存在重叠的已核验节省测量")
+
+    async def create_savings_measurement(self, measurement: dict[str, Any]) -> dict[str, Any]:
+        values = self._savings_measurement_values(measurement)
+        measurement_id = _clean_text(measurement.get("id")) or str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+        async with self._require_pool().acquire() as connection:
+            async with connection.transaction():
+                await self._assert_savings_measurement_not_overlapping(connection, values, measurement_id)
+                record = await connection.fetchrow(
+                    """
+                    INSERT INTO savings_measurements (
+                        id, action_id, scope, provider, model, account_id,
+                        cost_bucket, baseline_start_date, baseline_end_date,
+                        measurement_start_date, measurement_end_date,
+                        baseline_amount_usd, actual_amount_usd, evidence_url,
+                        status, finance_reviewer, reviewed_at, notes, created_at, updated_at
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::date,$9::date,$10::date,$11::date,
+                        $12::numeric,$13::numeric,$14,$15,$16,$17,$18,$19,$19)
+                    RETURNING *
+                    """,
+                    measurement_id, _clean_text(values.get("action_id")) or None, values["scope"],
+                    _clean_text(values.get("provider")), _clean_text(values.get("model")),
+                    _clean_text(values.get("account_id")), _clean_text(values.get("cost_bucket")),
+                    _as_date(values["baseline_start_date"]), _as_date(values["baseline_end_date"]),
+                    _as_date(values["measurement_start_date"]), _as_date(values["measurement_end_date"]),
+                    str(values["baseline_amount_usd"]), str(values["actual_amount_usd"]),
+                    _clean_text(values.get("evidence_url")), values["status"],
+                    _clean_text(values.get("finance_reviewer")), values["reviewed_at"],
+                    _clean_text(values.get("notes")), now,
+                )
+        return dict(record)
+
+    async def update_savings_measurement(self, measurement_id: str, measurement: dict[str, Any]) -> dict[str, Any] | None:
+        pool = self._require_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                current = await connection.fetchrow(
+                    "SELECT * FROM savings_measurements WHERE id=$1 FOR UPDATE", measurement_id
+                )
+                if current is None:
+                    return None
+                values = self._savings_measurement_values(measurement, dict(current))
+                await self._assert_savings_measurement_not_overlapping(connection, values, measurement_id)
+                record = await connection.fetchrow(
+                    """
+                    UPDATE savings_measurements SET action_id=$2, scope=$3,
+                        provider=$4, model=$5, account_id=$6, cost_bucket=$7,
+                        baseline_start_date=$8::date, baseline_end_date=$9::date,
+                        measurement_start_date=$10::date, measurement_end_date=$11::date,
+                        baseline_amount_usd=$12::numeric, actual_amount_usd=$13::numeric,
+                        evidence_url=$14, status=$15, finance_reviewer=$16,
+                        reviewed_at=$17, notes=$18, updated_at=$19
+                    WHERE id=$1 RETURNING *
+                    """,
+                    measurement_id, _clean_text(values.get("action_id")) or None, values["scope"],
+                    _clean_text(values.get("provider")), _clean_text(values.get("model")),
+                    _clean_text(values.get("account_id")), _clean_text(values.get("cost_bucket")),
+                    _as_date(values["baseline_start_date"]), _as_date(values["baseline_end_date"]),
+                    _as_date(values["measurement_start_date"]), _as_date(values["measurement_end_date"]),
+                    str(values["baseline_amount_usd"]), str(values["actual_amount_usd"]),
+                    _clean_text(values.get("evidence_url")), values["status"],
+                    _clean_text(values.get("finance_reviewer")), values["reviewed_at"],
+                    _clean_text(values.get("notes")), datetime.now(timezone.utc),
+                )
+        return dict(record) if record else None
+
+    async def delete_savings_measurement(self, measurement_id: str) -> bool:
+        result = await self._require_pool().execute("DELETE FROM savings_measurements WHERE id=$1", measurement_id)
+        return result.endswith(" 1")

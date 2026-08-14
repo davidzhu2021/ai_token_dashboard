@@ -68,6 +68,13 @@ class UsageRealtimeWorker:
         self.directory_refresh_seconds = max(
             60, _env_int("USAGE_REALTIME_DIRECTORY_REFRESH_SECONDS", 300)
         )
+        self.live_window_seconds = max(
+            self.poll_seconds,
+            _env_int("USAGE_REALTIME_LIVE_WINDOW_SECONDS", 60),
+        )
+        self.backfill_pages_per_cycle = max(
+            1, _env_int("USAGE_REALTIME_BACKFILL_PAGES_PER_CYCLE", 5)
+        )
         self.directory: dict[str, Any] = {}
         self.token_maps: dict[str, dict[Any, Any]] = {}
         self.current_day = usage_today()
@@ -146,6 +153,9 @@ class UsageRealtimeWorker:
             last_error="",
         )
         await self.realtime.set_ready(False)
+        # Persist any stream entries left pending by a previous worker before
+        # rebuilding today's Redis aggregates from PostgreSQL.
+        await self.flush_archive()
         today = usage_today()
         self.current_day = today
         await self.realtime.clear_day(today)
@@ -167,8 +177,30 @@ class UsageRealtimeWorker:
             # The archive table spans all history. Never let an old event from
             # a previous day turn the first realtime request into a multi-day
             # scan; today's recovery is seeded from the database separately.
-            cursor = max(last_archived, today_start) if last_archived else today_start
-            await self.realtime.set_cursor(backend.id, cursor)
+            recovery_start = (
+                max(last_archived - timedelta(seconds=self.overlap_seconds), today_start)
+                if last_archived
+                else today_start
+            )
+            recovery_end = datetime.now(timezone.utc)
+            existing_cursor = await self.realtime.cursor(backend.id)
+            recent_floor = recovery_end - timedelta(seconds=self.live_window_seconds)
+            live_start = max(recovery_start, recent_floor)
+            if existing_cursor and existing_cursor >= recent_floor:
+                live_start = max(recovery_start, existing_cursor)
+            await self.realtime.set_cursor(backend.id, live_start)
+            existing_backfill = await self.realtime.backfill_checkpoint(backend.id)
+            if existing_backfill:
+                continue
+            if recovery_start < live_start:
+                await self.realtime.set_backfill_checkpoint(
+                    backend.id,
+                    start_time=recovery_start,
+                    end_time=live_start,
+                    next_page=1,
+                )
+            else:
+                await self.realtime.clear_backfill_checkpoint(backend.id)
         await self.poll_once(datetime.now(timezone.utc))
         await self.flush_archive()
         await self.publish_mirror(ready=True)
@@ -209,6 +241,71 @@ class UsageRealtimeWorker:
             inserted += int(accepted)
         if lookback_minutes is None:
             await self.realtime.set_cursor(backend.id, end_time)
+        return inserted
+
+    async def backfill_backend(self, backend: LiteLLMBackend) -> int:
+        """Advance one bounded historical batch without delaying live polling."""
+
+        checkpoint = await self.realtime.backfill_checkpoint(backend.id)
+        if not checkpoint:
+            return 0
+        next_page = int(checkpoint["nextPage"])
+        events, complete = await self.client.incremental_events_from_logs(
+            checkpoint["startTime"],
+            checkpoint["endTime"],
+            backend,
+            page_size=100,
+            start_page=next_page,
+            max_pages=self.backfill_pages_per_cycle,
+        )
+        inserted = 0
+        for event in events:
+            accepted, _revision = await self.realtime.ingest_event(
+                backend.id, self._enrich_event(backend, event)
+            )
+            inserted += int(accepted)
+        if complete:
+            live_cursor = await self.realtime.cursor(backend.id)
+            next_start = checkpoint["endTime"]
+            next_end = live_cursor or next_start
+            if (next_end - next_start).total_seconds() > self.live_window_seconds:
+                await self.realtime.set_backfill_checkpoint(
+                    backend.id,
+                    start_time=next_start,
+                    end_time=next_end,
+                    next_page=1,
+                )
+                logger.info(
+                    "realtime backfill window advanced backend=%s start=%s end=%s",
+                    backend.id,
+                    next_start.isoformat(),
+                    next_end.isoformat(),
+                )
+            else:
+                await self.realtime.clear_backfill_checkpoint(backend.id)
+                logger.info("realtime backfill complete backend=%s", backend.id)
+        else:
+            await self.realtime.set_backfill_checkpoint(
+                backend.id,
+                start_time=checkpoint["startTime"],
+                end_time=checkpoint["endTime"],
+                next_page=next_page + self.backfill_pages_per_cycle,
+            )
+            logger.info(
+                "realtime backfill checkpoint backend=%s next_page=%s batch_pages=%s",
+                backend.id,
+                next_page + self.backfill_pages_per_cycle,
+                self.backfill_pages_per_cycle,
+            )
+        return inserted
+
+    async def backfill_once(self) -> int:
+        inserted = 0
+        for backend in self.client.backends:
+            try:
+                inserted += await self.backfill_backend(backend)
+            except Exception:
+                logger.exception("realtime backfill failed backend=%s", backend.id)
         return inserted
 
     async def poll_once(self, end_time: datetime) -> int:
@@ -301,6 +398,7 @@ class UsageRealtimeWorker:
                     await self._refresh_directories()
                     last_directory_refresh = now
                 await self.poll_once(now)
+                await self.backfill_once()
                 if (now - last_reconcile).total_seconds() >= self.reconcile_seconds:
                     for backend in self.client.backends:
                         try:

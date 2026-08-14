@@ -38,7 +38,7 @@ function response(status, payload) {
 }
 
 async function runScenario(fetch, scenario, configureContext) {
-  const context = vm.createContext({ fetch, setTimeout, clearTimeout });
+  const context = vm.createContext({ fetch, setTimeout, clearTimeout, AbortController });
   configureContext?.(context);
   vm.runInContext(runtime, context);
   return vm.runInContext(`(async () => { ${scenario} })()`, context);

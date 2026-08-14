@@ -1,4 +1,5 @@
 import asyncio
+import re
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -17,7 +18,7 @@ def test_index_uses_fresh_app_asset_and_disables_html_cache() -> None:
     assert "Cache-Control" in response.headers
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["Referrer-Policy"] == "no-referrer"
-    assert "/assets/app.js?v=20260814-ranking-badges" in response.text
+    assert re.search(r'<script src="/assets/app\.js\?v=[^"]+"></script>', response.text)
     assert "20260807-personal-key-speed" not in response.text
     assert "20260805-team-member-keys" not in response.text
     assert "20260805-owner-identity" not in response.text
@@ -91,6 +92,37 @@ def test_spa_fallback_disables_html_cache() -> None:
     assert response.status_code == 200
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["Referrer-Policy"] == "no-referrer"
+
+
+def test_versioned_app_asset_uses_immutable_cache() -> None:
+    client = TestClient(main.app)
+
+    response = client.get("/assets/app.js?v=20260814-test")
+    etag = response.headers["ETag"]
+    not_modified = client.get(
+        "/assets/app.js?v=20260814-test",
+        headers={"If-None-Match": etag},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "public, max-age=31536000, immutable"
+    assert not_modified.status_code == 304
+    assert not_modified.headers["Cache-Control"] == "public, max-age=31536000, immutable"
+
+
+def test_unversioned_assets_keep_default_cache_policy() -> None:
+    client = TestClient(main.app)
+
+    unversioned = client.get("/assets/app.js")
+    unrelated_query = client.get("/assets/app.js?cache_bust=20260814")
+    other_versioned_asset = client.get("/assets/pay/README.md?v=20260814-test")
+
+    assert unversioned.status_code == 200
+    assert unrelated_query.status_code == 200
+    assert other_versioned_asset.status_code == 200
+    assert unversioned.headers.get("Cache-Control") != "public, max-age=31536000, immutable"
+    assert unrelated_query.headers.get("Cache-Control") != "public, max-age=31536000, immutable"
+    assert other_versioned_asset.headers.get("Cache-Control") != "public, max-age=31536000, immutable"
 
 
 async def _wire_response(path: str) -> tuple[int, str | None]:

@@ -128,6 +128,29 @@ class UsageSyncWorker:
             return recent_days
         return None
 
+    async def consume_refresh_requests(self) -> bool:
+        """Collapse queued reader refreshes into one bounded snapshot sync."""
+
+        claim = getattr(self.store, "claim_refresh_requests", None)
+        finish = getattr(self.store, "finish_refresh_requests", None)
+        if not callable(claim) or not callable(finish):
+            return False
+        requests = await claim(limit=max(1, _env_int("USAGE_REFRESH_QUEUE_BATCH_SIZE", 100)))
+        if not requests:
+            return False
+        request_keys = [str(item["requestKey"]) for item in requests]
+        earliest = min(date.fromisoformat(str(item["startDate"])) for item in requests)
+        days = max(1, (usage_today() - earliest).days + 1)
+        days = min(days, max(1, _env_int("USAGE_INITIAL_BACKFILL_DAYS", 90)))
+        result = await self._run_sync(days)
+        success = result.get("status") in {"ok", "partial"}
+        await finish(
+            request_keys,
+            success=success,
+            error="" if success else "; ".join(result.get("errors") or ["sync failed"]),
+        )
+        return True
+
     def _intervals(self) -> tuple[int, int, int, int]:
         recent_days = max(1, _env_int("USAGE_SYNC_RECENT_DAYS", 2))
         calibration_days = max(recent_days, _env_int("USAGE_SYNC_CALIBRATION_DAYS", 3))
@@ -193,8 +216,15 @@ class UsageSyncWorker:
                 last_refresh = await self.store.latest_success_at() or self.now()
             last_calibration = self.now()
             while not self.stop_event.is_set():
+                if await self.consume_refresh_requests():
+                    last_refresh = self.now()
+                    continue
                 wait_seconds = self.seconds_until_next_sync(
                     self.now(), last_refresh, last_calibration
+                )
+                wait_seconds = min(
+                    wait_seconds,
+                    max(5, _env_int("USAGE_REFRESH_QUEUE_POLL_SECONDS", 15)),
                 )
                 try:
                     await asyncio.wait_for(self.stop_event.wait(), timeout=wait_seconds)

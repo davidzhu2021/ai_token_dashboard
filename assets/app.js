@@ -131,10 +131,23 @@ let teamKeySearchTimer = null;
 let isTeamKeyRevoking = false;
 let isTeamKeyDeleting = false;
 let isDashboardLoading = false;
+let dashboardRequestController = null;
+let dashboardRequestId = 0;
+let dashboardRequestKey = "";
+let dashboardInFlight = null;
 let isAdminLoading = false;
+let adminUsageRequestController = null;
+let adminUsageQueryKey = "";
+let adminUsageInFlight = null;
 let isDepartmentLoading = false;
+let departmentUsageRequestController = null;
+let departmentUsageQueryKey = "";
+let departmentUsageInFlight = null;
 let isTeamLoading = false;
 let isTeamMemberLoading = false;
+let teamMemberUsageRequestController = null;
+let teamMemberUsageQueryKey = "";
+let teamMemberUsageInFlight = null;
 let usageAutoRefreshTimer = null;
 let usageAutoRefreshPromise = null;
 let lastUsageAutoRefreshAt = 0;
@@ -193,6 +206,9 @@ let billingAccount = null;
 let billingOrders = [];
 let billingOrderTotal = 0;
 let isBillingLoading = false;
+let billingRequest = null;
+let billingLoadedAt = 0;
+const BILLING_CACHE_TTL_MS = 10_000;
 let isCreatingTopup = false;
 let isSubmittingManualPay = false;
 let billingLoadError = "";
@@ -233,6 +249,10 @@ let costLedgerState = {
 };
 let stabilityFiltersOpen = false;
 let costFiltersOpen = false;
+let governanceWorkbenchTab = "stability-actions";
+let governanceWorkbenchData = { stabilityActions: [], regressions: [], planVersions: [], savingsMeasurements: [] };
+let governanceWorkbenchLoading = false;
+let governanceWorkbenchLoadError = "";
 // 登录身份落地后立即揭示已知入口；异步权限结果随后只补充团队/企业入口。
 let isNavigationRevealed = false;
 let selectedTopupAmount = 0;
@@ -247,6 +267,9 @@ let organizationBillingPage = 1;
 const organizationBillingPageSize = 20;
 let organizationBillingScopeKey = "";
 let organizationBillingRequestId = 0;
+let organizationBillingRequest = null;
+let organizationBillingLoadedAt = 0;
+const ORGANIZATION_BILLING_CACHE_TTL_MS = 10_000;
 let isOrganizationTopupSaving = false;
 let selectedOrganizationTopupAmount = 0;
 let isOrganizationCreditAdjusting = false;
@@ -391,13 +414,44 @@ async function api(path, options = {}, requestState = {}) {
   const method = String(options.method || "GET").toUpperCase();
   const isWriteRequest = !["GET", "HEAD", "OPTIONS"].includes(method);
   const requestCsrfToken = isWriteRequest ? authCsrfToken : "";
-  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  const {
+    timeoutMs = 15_000,
+    signal: callerSignal,
+    ...fetchOptions
+  } = options;
+  const headers = { "Content-Type": "application/json", ...(fetchOptions.headers || {}) };
   if (requestCsrfToken) headers["X-CSRF-Token"] = requestCsrfToken;
-  const response = await fetch(path, {
-    credentials: "same-origin",
-    ...options,
-    headers,
-  });
+  const requestController = new AbortController();
+  let timedOut = false;
+  const abortFromCaller = () => requestController.abort(callerSignal?.reason);
+  if (callerSignal?.aborted) abortFromCaller();
+  else callerSignal?.addEventListener("abort", abortFromCaller, { once: true });
+  const timeoutId = Number(timeoutMs) > 0
+    ? globalThis.setTimeout(() => {
+        timedOut = true;
+        requestController.abort();
+      }, Number(timeoutMs))
+    : null;
+  let response;
+  try {
+    response = await fetch(path, {
+      credentials: "same-origin",
+      ...fetchOptions,
+      headers,
+      signal: requestController.signal,
+    });
+  } catch (error) {
+    if (timedOut) {
+      const timeoutError = new Error("请求超时，请稍后重试");
+      timeoutError.name = "TimeoutError";
+      timeoutError.code = "REQUEST_TIMEOUT";
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    if (timeoutId !== null) globalThis.clearTimeout(timeoutId);
+    callerSignal?.removeEventListener("abort", abortFromCaller);
+  }
   if (!response.ok) {
     let message = `请求失败（${response.status}）`;
     let code = "";
@@ -2403,6 +2457,20 @@ function tooltipMarkup(date, rows) {
   return `<div class="tooltip-date">${date}</div>${rows.map((row) => `<div class="tooltip-row"><span>${row.label}</span><strong>${row.value}</strong></div>`).join("")}`;
 }
 
+function bindChartTooltipEvents(svg) {
+  if (!svg || svg.dataset.chartTooltipBound === "true") return;
+  svg.dataset.chartTooltipBound = "true";
+  svg.addEventListener("pointermove", (event) => {
+    const node = event.target.closest?.(".chart-hit");
+    if (!node || !svg.contains(node)) {
+      hideChartTooltip();
+      return;
+    }
+    showChartTooltip(event, decodeURIComponent(node.dataset.tooltip));
+  });
+  svg.addEventListener("pointerleave", hideChartTooltip);
+}
+
 function renderEmptyChart(svg, label) {
   if (!svg) return;
   svg.setAttribute("viewBox", "0 0 900 280");
@@ -2448,11 +2516,7 @@ function renderLineChart({ svg, points, valueField, color, fill, axisFormatter, 
     .join("");
 
   svg.innerHTML = `<rect width="${width}" height="${height}" rx="8" fill="#fbfdff"/>${grid}<path d="${area}" fill="${fill}"/><path d="${path}" fill="none" stroke="${color}" stroke-width="4"/>${dots}${labels}`;
-  svg.querySelectorAll(".chart-hit").forEach((node) => {
-    node.addEventListener("pointermove", (event) => showChartTooltip(event, decodeURIComponent(node.dataset.tooltip)));
-    node.addEventListener("pointerleave", hideChartTooltip);
-  });
-  svg.addEventListener("pointerleave", hideChartTooltip);
+  bindChartTooltipEvents(svg);
 }
 
 function renderTrendTo(svgId, data) {
@@ -3116,6 +3180,11 @@ function renderTeamMemberTable() {
 function resetTeamMemberSelection() {
   selectedTeamEmployee = "";
   teamMemberUsageRequestId += 1;
+  teamMemberUsageRequestController?.abort();
+  teamMemberUsageRequestController = null;
+  teamMemberUsageQueryKey = "";
+  teamMemberUsageInFlight = null;
+  isTeamMemberLoading = false;
   teamMemberUsageData = [];
   teamMemberUsageSummary = null;
   teamMemberUsageFilters = { date: "all", model: "all", status: "all", keyword: "" };
@@ -3408,7 +3477,7 @@ function renderTeamLoading() {
 }
 
 function renderPersonal() {
-  if (isDashboardLoading) {
+  if (isDashboardLoading && !usageData.length) {
     renderPersonalLoading();
     return;
   }
@@ -3423,7 +3492,7 @@ function renderPersonal() {
 }
 
 function renderAdmin() {
-  if (isAdminLoading) {
+  if (isAdminLoading && !adminUsageData.length && !adminSummaryData.length && !adminEmployees.length) {
     renderAdminLoading();
     return;
   }
@@ -3464,7 +3533,7 @@ function renderAdminDetailCard() {
 }
 
 function renderDepartment() {
-  if (isDepartmentLoading) {
+  if (isDepartmentLoading && !departmentUsageData.length && !departmentSummaryData.length && !departmentRankings.length) {
     renderDepartmentLoading();
     return;
   }
@@ -4872,6 +4941,8 @@ function resetOrganizationBillingData() {
   organizationBillingLoadError = "";
   organizationBillingPage = 1;
   organizationBillingScopeKey = "";
+  organizationBillingRequest = null;
+  organizationBillingLoadedAt = 0;
   selectedOrganizationTopupAmount = 0;
   isOrganizationTopupSaving = false;
   isOrganizationCreditAdjusting = false;
@@ -4880,29 +4951,44 @@ function resetOrganizationBillingData() {
   el("organizationCreditAdjustmentModal")?.classList.add("hidden");
 }
 
-async function loadOrganizationBillingData() {
+function loadOrganizationBillingData(forceRefresh = false) {
   const context = organizationBillingContext();
-  if (!context || organizationBillingLoading) return;
+  if (!context) return Promise.resolve();
   const scopeKey = organizationBillingContextKey();
+  const queryKey = `${scopeKey}|${organizationBillingUrl(context)}`;
+  const hasFreshData = organizationBillingData
+    && organizationBillingScopeKey === queryKey
+    && Date.now() - organizationBillingLoadedAt < ORGANIZATION_BILLING_CACHE_TTL_MS;
+  if (!forceRefresh && hasFreshData) return Promise.resolve(organizationBillingData);
+  if (organizationBillingRequest && organizationBillingScopeKey === queryKey) return organizationBillingRequest;
   const requestId = ++organizationBillingRequestId;
   organizationBillingLoading = true;
   organizationBillingLoadError = "";
-  organizationBillingScopeKey = scopeKey;
+  organizationBillingScopeKey = queryKey;
   renderOrganizationBilling();
-  try {
-    const payload = await api(organizationBillingUrl(context));
-    if (requestId !== organizationBillingRequestId || scopeKey !== organizationBillingContextKey()) return;
-    organizationBillingData = payload || null;
-  } catch (error) {
-    if (requestId !== organizationBillingRequestId || scopeKey !== organizationBillingContextKey()) return;
-    organizationBillingData = null;
-    organizationBillingLoadError = error.message || "企业额度加载失败，请稍后重试。";
-    showToast(organizationBillingLoadError);
-  } finally {
-    if (requestId !== organizationBillingRequestId) return;
-    organizationBillingLoading = false;
-    renderOrganizationBilling();
-  }
+  const request = (async () => {
+    try {
+      const payload = await api(organizationBillingUrl(context));
+      if (requestId !== organizationBillingRequestId || scopeKey !== organizationBillingContextKey()) return null;
+      organizationBillingData = payload || null;
+      organizationBillingLoadedAt = Date.now();
+      return organizationBillingData;
+    } catch (error) {
+      if (requestId !== organizationBillingRequestId || scopeKey !== organizationBillingContextKey()) return null;
+      organizationBillingData = null;
+      organizationBillingLoadedAt = 0;
+      organizationBillingLoadError = error.message || "企业额度加载失败，请稍后重试。";
+      showToast(organizationBillingLoadError);
+      return null;
+    } finally {
+      if (organizationBillingRequest === request) organizationBillingRequest = null;
+      if (requestId !== organizationBillingRequestId) return;
+      organizationBillingLoading = false;
+      renderOrganizationBilling();
+    }
+  })();
+  organizationBillingRequest = request;
+  return request;
 }
 
 async function changeOrganizationBillingPage(direction) {
@@ -4966,7 +5052,7 @@ async function submitOrganizationCreditAdjustment(event) {
       }),
     });
     closeOrganizationCreditAdjustmentModal({ force: true });
-    await loadOrganizationBillingData();
+    await loadOrganizationBillingData(true);
     showToast("企业额度已更新");
   } catch (error) {
     setFieldError("organizationCreditAdjustmentError", error.message || "企业额度调整失败，请稍后重试。");
@@ -5024,7 +5110,7 @@ async function submitOrganizationTopup(event) {
       body: JSON.stringify({ amountUsd: amount }),
     });
     closeOrganizationTopupModal({ force: true });
-    await loadOrganizationBillingData();
+    await loadOrganizationBillingData(true);
     showToast("模拟充值已完成，未发起真实付款。");
   } catch (error) {
     setFieldError("organizationTopupError", error.message || "模拟充值失败，请稍后重试。");
@@ -5076,26 +5162,39 @@ function renderBilling() {
   renderBillingOrders();
 }
 
-async function loadBillingData() {
-  if (!currentUser || isBillingLoading) return;
+function loadBillingData(forceRefresh = false) {
+  if (!currentUser) return Promise.resolve();
+  const hasFreshData = billingConfig
+    && Date.now() - billingLoadedAt < BILLING_CACHE_TTL_MS;
+  if (!forceRefresh && hasFreshData) return Promise.resolve(billingAccount);
+  if (billingRequest) return billingRequest;
   isBillingLoading = true;
   billingLoadError = "";
   renderBillingOrders();
-  try {
-    const payload = await api("/api/me/billing");
-    billingConfig = payload.config || null;
-    billingAccount = payload.account || null;
-    billingOrders = Array.isArray(payload.orders?.items) ? payload.orders.items : [];
-    billingOrderTotal = Number(payload.orders?.total || 0);
-  } catch (error) {
-    billingOrders = [];
-    billingOrderTotal = 0;
-    billingLoadError = error.message || "充值信息加载失败，请稍后重试。";
-    if (error.status !== 404) showToast(billingLoadError);
-  } finally {
-    isBillingLoading = false;
-    renderBilling();
-  }
+  const request = (async () => {
+    try {
+      const payload = await api("/api/me/billing");
+      billingConfig = payload.config || null;
+      billingAccount = payload.account || null;
+      billingOrders = Array.isArray(payload.orders?.items) ? payload.orders.items : [];
+      billingOrderTotal = Number(payload.orders?.total || 0);
+      billingLoadedAt = Date.now();
+      return billingAccount;
+    } catch (error) {
+      billingOrders = [];
+      billingOrderTotal = 0;
+      billingLoadedAt = 0;
+      billingLoadError = error.message || "充值信息加载失败，请稍后重试。";
+      if (error.status !== 404) showToast(billingLoadError);
+      return null;
+    } finally {
+      if (billingRequest === request) billingRequest = null;
+      isBillingLoading = false;
+      renderBilling();
+    }
+  })();
+  billingRequest = request;
+  return request;
 }
 
 async function refreshBillingAvailability() {
@@ -5118,6 +5217,7 @@ async function refreshBillingAvailability() {
     billingAccount = payload.account || null;
     billingOrders = Array.isArray(payload.orders?.items) ? payload.orders.items : [];
     billingOrderTotal = Number(payload.orders?.total || 0);
+    billingLoadedAt = Date.now();
     billingAvailable = Boolean(billingConfig?.enabled);
   } catch {
     billingAvailable = false;
@@ -5189,7 +5289,7 @@ async function submitManualPayment(event) {
       `已提交，管理员将在约 ${Number(payload.reviewMinutes || 30)} 分钟内确认到账`,
     );
     el("billingPayPanel")?.classList.add("hidden");
-    await loadBillingData();
+    await loadBillingData(true);
     // 保持轮询：管理员确认后前端能自动感知到账。
     startTopupPolling();
   } catch (error) {
@@ -5240,7 +5340,7 @@ async function submitTopup(event) {
       submitGatewayForm(payload.submitUrl, payload.params);
     }
     startTopupPolling();
-    await loadBillingData();
+    await loadBillingData(true);
   } catch (error) {
     setFieldError("topupError", error.message || "创建充值订单失败，请稍后重试");
   } finally {
@@ -5295,14 +5395,14 @@ function startTopupPolling() {
         pendingTopupTradeNo = "";
         el("billingPayPanel")?.classList.add("hidden");
         showToast(`充值成功，到账 ${money.format(payload.order.amountUsd || 0)}`);
-        await loadBillingData();
+        await loadBillingData(true);
         await refreshEntitlementAfterTopup();
       } else if (["failed", "expired"].includes(String(payload.order?.status || ""))) {
         stopTopupPolling();
         pendingTopupTradeNo = "";
         el("billingPayPanel")?.classList.add("hidden");
         showToast(payload.order?.reviewNote || "本次支付未完成，如已付款请联系管理员");
-        await loadBillingData();
+        await loadBillingData(true);
       }
     } catch {
       // 轮询失败不打扰用户，下一次继续尝试。
@@ -5822,8 +5922,18 @@ function organizationUsageScopeKey() {
 function resetOrganizationUsageViews() {
   // Customer selection changes the server-side tenant. Clear every derived
   // view so an in-flight or cached platform response cannot appear in it.
+  adminUsageRequestController?.abort();
+  departmentUsageRequestController?.abort();
   adminUsageRequestId += 1;
   departmentUsageRequestId += 1;
+  adminUsageRequestController = null;
+  adminUsageQueryKey = "";
+  adminUsageInFlight = null;
+  departmentUsageRequestController = null;
+  departmentUsageQueryKey = "";
+  departmentUsageInFlight = null;
+  isAdminLoading = false;
+  isDepartmentLoading = false;
   selectedAdminEmployee = "";
   selectedDepartment = "";
   resetDepartmentEmployeeSelection();
@@ -5897,6 +6007,8 @@ function syncNavigationVisibility() {
   el("billingTab")?.classList.toggle("hidden", !canUseBillingSidebar);
   el("stabilityTab")?.classList.toggle("hidden", !canViewStability());
   el("costControlTab")?.classList.toggle("hidden", !canViewCosts());
+  el("governanceWorkbenchTab")?.classList.toggle("hidden", !(canManageStability() || canManageCosts() || canReconcileCosts()));
+  syncMobileViewPicker();
   document.querySelectorAll('[data-global-page="models"]').forEach((button) => {
     button.classList.toggle("hidden", isCustomer);
   });
@@ -5912,6 +6024,7 @@ function revealNavigation() {
     tabs.classList.remove("nav-pending");
     tabs.removeAttribute("aria-busy");
   }
+  syncMobileViewPicker();
 }
 
 // 换账号或退出登录时把导航退回骨架态，避免上一个身份的可见项闪现给下一个身份。
@@ -7990,6 +8103,7 @@ function switchView(view) {
   if (view === "billing" && !canAccessBillingView()) view = "dashboard";
   if (view === "stability" && !canViewStability()) view = "dashboard";
   if (view === "cost-control" && !canViewCosts()) view = "dashboard";
+  if (view === "governance-workbench" && !(canManageStability() || canManageCosts() || canReconcileCosts())) view = "dashboard";
   if (currentView === "keys" && view !== "keys") clearRevealedKeys();
   // 离开充值页就停掉支付轮询与二维码，避免后台空转和收款码久留在页面上。
   if (currentView === "billing" && view !== "billing") {
@@ -8011,8 +8125,9 @@ function switchView(view) {
   el("billingView").classList.toggle("hidden", view !== "billing");
   el("stabilityView")?.classList.toggle("hidden", view !== "stability");
   el("costControlView")?.classList.toggle("hidden", view !== "cost-control");
+  el("governanceWorkbenchView")?.classList.toggle("hidden", view !== "governance-workbench");
   el("modelsView").classList.toggle("hidden", view !== "models");
-  el("dashboardFilters").classList.toggle("hidden", ["models", "keys", "billing", "customers", "organization", "organization-tokens", "stability", "cost-control"].includes(view));
+  el("dashboardFilters").classList.toggle("hidden", ["models", "keys", "billing", "customers", "organization", "organization-tokens", "stability", "cost-control", "governance-workbench"].includes(view));
   closeCustomRangePanel();
   renderOrganizationWorkspaceBar(view);
   const isCustomerDetailView = isViewingCustomerOrganization()
@@ -8073,6 +8188,7 @@ function switchView(view) {
       loadOrganizationTokens();
     }
   }
+  syncMobileViewPicker();
   if (view === "stability") {
     renderStabilityOverview();
     if (!isStabilityLoading) loadStabilityOverview();
@@ -8080,6 +8196,14 @@ function switchView(view) {
   if (view === "cost-control") {
     renderCostOverview();
     if (!isCostOverviewLoading) loadCostOverview();
+  }
+  if (view === "governance-workbench") {
+    renderGovernanceWorkbench();
+    if ((!stabilityOverview && canViewStability() && !isStabilityLoading) || (!costOverview && canViewCosts() && !isCostOverviewLoading)) {
+      if (!stabilityOverview && canViewStability()) loadStabilityOverview();
+      if (!costOverview && canViewCosts()) loadCostOverview();
+    }
+    if (!governanceWorkbenchLoading && !(governanceWorkbenchData.stabilityActions.length || governanceWorkbenchData.planVersions.length || governanceWorkbenchData.savingsMeasurements.length)) loadGovernanceWorkbench();
   }
 }
 
@@ -8116,6 +8240,15 @@ function canReconcileCosts() {
   return Boolean(observabilityCapabilities().costReconcile);
 }
 
+function syncMobileViewPicker() {
+  const select = el("mobileViewSelect");
+  if (!select) return;
+  const visibleTabs = [...document.querySelectorAll("#viewTabs [data-view]")].filter((button) => !button.classList.contains("hidden"));
+  select.innerHTML = visibleTabs.map((button) => `<option value="${escapeHtml(button.dataset.view || "")}">${escapeHtml(button.textContent.trim())}</option>`).join("");
+  if (visibleTabs.some((button) => button.dataset.view === currentView)) select.value = currentView;
+  select.disabled = visibleTabs.length < 2;
+}
+
 async function loadCurrentViewData(forceRefresh = false) {
   if (currentView === "customers") return loadCustomerOrganizations();
   if (currentView === "keys") {
@@ -8126,6 +8259,12 @@ async function loadCurrentViewData(forceRefresh = false) {
   if (currentView === "billing") return isOrganizationBillingView() ? loadOrganizationBillingData() : loadBillingData();
   if (currentView === "stability") return loadStabilityOverview(forceRefresh);
   if (currentView === "cost-control") return loadCostOverview(forceRefresh);
+  if (currentView === "governance-workbench") {
+    return Promise.all([
+      canViewStability() ? loadStabilityOverview(forceRefresh) : Promise.resolve(),
+      canViewCosts() ? loadCostOverview(forceRefresh) : Promise.resolve(),
+    ]);
+  }
   if (currentView === "models") return loadModels();
   if (currentView === "admin") return loadAdminData(forceRefresh);
   if (currentView === "team") return loadTeamData(forceRefresh);
@@ -8172,6 +8311,67 @@ function observabilityMoney(value) {
   return value === null || value === undefined ? "暂无数据" : `$${Number(value).toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
 }
 
+function observabilityMetricObject(candidate, fallback = {}) {
+  if (candidate && typeof candidate === "object" && !Array.isArray(candidate) && "value" in candidate) {
+    return { ...fallback, ...candidate };
+  }
+  return { ...fallback, value: candidate };
+}
+
+function observabilityMetricStatus(metric) {
+  const raw = String(metric?.status || "").toLowerCase();
+  if (["good", "stable", "observed", "available", "verified", "actual", "approved", "active"].includes(raw)) return { label: raw === "observed" ? "已观测" : raw === "verified" ? "已核验" : "可用", tone: "good" };
+  if (["danger", "failed", "error", "critical"].includes(raw)) return { label: "需处理", tone: "danger" };
+  if (["warning", "partial", "derived", "low_coverage", "pending"].includes(raw)) return { label: raw === "derived" ? "推导口径" : "需关注", tone: "warning" };
+  if (metric?.value === null || metric?.value === undefined) return { label: "暂不可用", tone: "" };
+  return { label: "已计算", tone: "" };
+}
+
+function observabilityMetricCard({ label, metric, formatter, action = "", hint = "" }) {
+  const normalized = observabilityMetricObject(metric);
+  const status = observabilityMetricStatus(normalized);
+  const value = normalized.value === null || normalized.value === undefined ? "暂无数据" : formatter(normalized.value);
+  const coverage = normalized.coverageRate ?? normalized.completeness;
+  const periodValue = normalized.period || "";
+  const period = typeof periodValue === "object" ? [periodValue.startDate || periodValue.start, periodValue.endDate || periodValue.end].filter(Boolean).join(" 至 ") : String(periodValue);
+  const asOf = normalized.asOf || normalized.as_of || "";
+  const source = normalized.source || "";
+  const sampleCount = normalized.sampleCount;
+  const definitionVersion = normalized.definitionVersion || normalized.definitionsVersion || "";
+  const metadata = [
+    period,
+    asOf ? `截至 ${asOf}` : "",
+    coverage == null ? "" : `覆盖 ${(Number(coverage) * 100).toFixed(0)}%`,
+    sampleCount == null ? "" : `样本 ${Number(sampleCount).toLocaleString("zh-CN")}`,
+    source,
+    definitionVersion ? `口径 ${definitionVersion}` : "",
+  ].filter(Boolean);
+  if (!metadata.length && Array.isArray(normalized.missingReasons) && normalized.missingReasons.length) metadata.push(`缺失：${normalized.missingReasons.join("、")}`);
+  const tag = action ? "button" : "article";
+  const actionAttrs = action ? ` type="button" data-observability-action="${escapeHtml(action)}"` : "";
+  return `<${tag} class="observability-metric${action ? " is-action" : ""}"${actionAttrs}><div class="observability-metric-label"><span>${escapeHtml(label)}</span><span class="observability-metric-status ${status.tone}">${escapeHtml(status.label)}</span></div><strong>${escapeHtml(value)}</strong><div class="observability-metric-meta">${metadata.length ? metadata.map((item) => `<span>${escapeHtml(item)}</span>`).join("") : `<span>${escapeHtml(hint || "当前接口未返回完整审计元数据")}</span>`}</div></${tag}>`;
+}
+
+function observabilityEmptyState(title, detail, actions = []) {
+  return `<div class="observability-empty-state"><strong>${escapeHtml(title)}</strong><p>${escapeHtml(detail)}</p>${actions.length ? `<div class="observability-empty-actions">${actions.map((action) => `<button class="ghost-btn" type="button" ${action.attr}>${escapeHtml(action.label)}</button>`).join("")}</div>` : ""}</div>`;
+}
+
+function observabilityPayloadMeta(payload, data = {}) {
+  const asOf = data.asOf || data.as_of || payload?.asOf || payload?.as_of || data.throughDate || data.annual?.throughDate || payload?.generatedAt?.slice?.(0, 10) || "";
+  const source = payload?.source || data.source || "";
+  const period = data.period || (data.month ? data.month : payload?.startDate && payload?.endDate ? `${payload.startDate} 至 ${payload.endDate}` : "");
+  return { asOf, source, period };
+}
+
+function renderObservabilityContext(targetId, payload, data, scope) {
+  const target = el(targetId);
+  if (!target) return;
+  const meta = observabilityPayloadMeta(payload, data);
+  const active = activeObservabilityFilters(scope).map((item) => `${item.label}：${item.selectedLabel}`);
+  const scopeText = active.length ? active.join(" · ") : "全部范围";
+  target.innerHTML = `<strong>${scope === "cost" ? "截止日与范围" : "统计期间与来源"}</strong>${meta.period ? `<span class="observability-context-chip">${escapeHtml(meta.period)}</span>` : ""}${meta.asOf ? `<span class="observability-context-chip">截至 ${escapeHtml(meta.asOf)}</span>` : ""}<span class="observability-context-chip">${escapeHtml(scopeText)}</span>${meta.source ? `<span>数据来源：${escapeHtml(meta.source)}</span>` : ""}`;
+}
+
 function observabilityFilterConfig(scope) {
   if (scope === "stability") {
     return {
@@ -8197,6 +8397,7 @@ function observabilityFilterConfig(scope) {
       { id: "costProvider", label: "供应渠道" },
       { id: "costAccount", label: "账号" },
       { id: "costReconciliation", label: "对账状态" },
+      { id: "costRecognition", label: "确认状态" },
     ],
   };
 }
@@ -8288,6 +8489,7 @@ function observabilityReasonCopy(payload, scope) {
     return { title: "费用数据加载失败", detail: costOverviewLoadError, action: "重新加载" };
   }
   const coverage = payload?.coverage || {};
+  const freshness = payload?.freshness || {};
   const reasons = Array.isArray(coverage.missingReasons) ? coverage.missingReasons : [];
   const reasonText = {
     not_synced: "尚未完成数据同步",
@@ -8302,6 +8504,13 @@ function observabilityReasonCopy(payload, scope) {
       title: scope === "stability" ? "稳定性数据覆盖提示" : "费用数据覆盖提示",
       detail: reasons.map((item) => reasonText[item] || item).join("；"),
       action: scope === "stability" ? "重新加载" : "查看明细",
+    };
+  }
+  if (["empty", "unavailable", "not_synced"].includes(String(freshness.status || "").toLowerCase()) && !payload?.data) {
+    return {
+      title: scope === "stability" ? "稳定性数据尚未接入" : "费用账本尚未同步",
+      detail: scope === "stability" ? "当前没有可审计的稳定性事件，缺失指标不会显示为 0。" : "当前没有可审计的费用记录，缺失金额不会显示为 0。",
+      action: "重新加载",
     };
   }
   if (coverage.incomplete || coverage.partial) {
@@ -8320,8 +8529,12 @@ function renderObservabilityQuality(elementId, payload, scope) {
   const target = el(elementId);
   if (!target) return;
   const state = observabilityReasonCopy(payload, scope);
+  const isError = Boolean((scope === "stability" && stabilityLoadError) || (scope === "cost" && costOverviewLoadError));
   target.classList.toggle("hidden", !state);
-  target.classList.toggle("danger", Boolean((scope === "stability" && stabilityLoadError) || (scope === "cost" && costOverviewLoadError)));
+  target.classList.toggle("danger", isError);
+  target.setAttribute("role", isError ? "alert" : "status");
+  target.setAttribute("aria-live", isError ? "assertive" : "polite");
+  target.setAttribute("aria-atomic", "true");
   if (!state) {
     target.innerHTML = "";
     return;
@@ -8334,43 +8547,88 @@ function stabilityMetricValue(overview, primary, legacy = null) {
   return value !== undefined ? value : overview?.[legacy];
 }
 
+function stabilityMetricContract(overview, data, payload, primary, legacy, defaults = {}) {
+  const contracts = overview?.metricEnvelopes || data?.metricEnvelopes || data?.metrics || data?.metricContracts || {};
+  const candidate = contracts[primary] ?? contracts[legacy] ?? stabilityMetricValue(overview, primary, legacy);
+  return observabilityMetricObject(candidate, {
+    period: payload?.startDate && payload?.endDate ? `${payload.startDate} 至 ${payload.endDate}` : "",
+    source: payload?.source || "",
+    definitionVersion: overview?.definitionsVersion || data?.definitionsVersion || "",
+    ...defaults,
+  });
+}
+
+function renderStabilityActions(data) {
+  const embeddedActions = data.actions || data.stabilityActions;
+  const actions = Array.isArray(embeddedActions) && embeddedActions.length ? embeddedActions : governanceWorkbenchData.stabilityActions || [];
+  const target = el("stabilityActions");
+  if (target) {
+    target.innerHTML = actions.slice(0, 5).map((item) => `<article class="observability-action"><div><strong>${escapeHtml(item.title || item.name || item.scenario || "未命名治理动作")}</strong><p class="hint">${escapeHtml(item.owner || "未指定负责人")} · ${escapeHtml(item.severity || "未分级")} · ${escapeHtml(item.status || "待处理")}${item.targetDate ? ` · 目标 ${escapeHtml(item.targetDate)}` : ""}</p></div><span class="chip ${String(item.severity || "").toLowerCase() === "critical" ? "red" : String(item.status || "").toLowerCase().includes("complete") ? "green" : "gold"}">${escapeHtml(item.latestRegression?.conclusion || item.regressionConclusion || "等待回归")}</span></article>`).join("") || observabilityEmptyState("暂无治理动作", "当前窗口没有关联动作。需要建单时进入治理工作台。", [{ label: "进入治理工作台", attr: 'data-open-governance-tab="stability-actions"' }]);
+  }
+  const workbench = el("governanceStabilityActions");
+  if (workbench) workbench.innerHTML = actions.map((item) => `<article class="observability-action"><div><strong>${escapeHtml(item.title || item.name || item.scenario || "未命名治理动作")}</strong><p class="hint">${escapeHtml(item.owner || "未指定负责人")} · ${escapeHtml(item.severity || "未分级")} · ${escapeHtml(item.status || "待处理")}${item.targetDate ? ` · 目标 ${escapeHtml(item.targetDate)}` : ""}${item.fixReference ? ` · ${escapeHtml(item.fixReference)}` : ""}</p></div><div class="observability-table-actions"><span>${escapeHtml(item.latestRegression?.conclusion || item.regressionConclusion || "尚无回归结论")}</span>${canManageStability() ? `<button class="ghost-btn" type="button" data-edit-stability-action="${escapeHtml(item.id || "")}">编辑</button>` : ""}</div></article>`).join("") || observabilityEmptyState("暂无稳定性治理动作", "新动作接口尚未接入或当前没有记录。", []);
+  const embeddedRegressions = data.regressions;
+  const regressions = Array.isArray(embeddedRegressions) && embeddedRegressions.length
+    ? embeddedRegressions
+    : governanceWorkbenchData.regressions?.length ? governanceWorkbenchData.regressions : actions.flatMap((item) => item.regressions || (item.latestRegression ? [item.latestRegression] : []));
+  const regressionTarget = el("governanceRegressions");
+  if (regressionTarget) regressionTarget.innerHTML = regressions.map((item) => `<article class="observability-action"><div><strong>${escapeHtml(item.metric || item.name || "回归验证")}</strong><p class="hint">基线 ${escapeHtml(item.baselineWindow || item.baselinePeriod || item.baselineStart || "暂无")} · 回归 ${escapeHtml(item.regressionWindow || item.measurementWindow || item.regressionStart || "暂无")}</p></div><div class="observability-table-actions"><span class="chip ${String(item.conclusion || "").includes("passed") || String(item.conclusion || "").includes("通过") ? "green" : "gold"}">${escapeHtml(item.conclusion || "待结论")}</span></div></article>`).join("") || observabilityEmptyState("暂无回归记录", "治理动作完成后，在这里保留基线、回归窗口与结论。", []);
+}
+
 function renderStabilityOverview() {
   const payload = stabilityOverview;
   if (!payload) {
     renderObservabilityQuality("stabilityQuality", payload, "stability");
+    if (isStabilityLoading) {
+      el("stabilityMetrics").innerHTML = observabilityEmptyState("正在读取稳定性指标", "正在汇总最终请求、尝试事件与覆盖率。", []);
+    }
     return;
   }
   const data = payload.data || {};
   const overview = data.overview || {};
-  const finalFailureRate = stabilityMetricValue(overview, "finalRequestFailureRate", "userVisibleFailureRate");
-  const retryCount = stabilityMetricValue(overview, "retryAttemptCount", "retryCount");
-  const retryRecoveryRate = stabilityMetricValue(overview, "retryRecoveryRate");
-  const ttft = stabilityMetricValue(overview, "ttftP95Ms");
+  const quality = overview.quality || data.quality || {};
+  const finalFailure = stabilityMetricContract(overview, data, payload, "finalRequestFailureRate", "userVisibleFailureRate", { coverageRate: quality.finalRequestFailure?.completeness, sampleCount: overview.requestCount, status: quality.finalRequestFailure?.status });
+  const fallbackRecovery = stabilityMetricContract(overview, data, payload, "fallbackRecoveryRate", "fallbackSuccessRate", { coverageRate: quality.fallbackRecovery?.completeness, sampleCount: overview.fallbackAttemptCount, status: quality.fallbackRecovery?.status });
+  const ttft = stabilityMetricContract(overview, data, payload, "ttftP95Ms", "ttftP95Ms", { coverageRate: overview.ttftCoverageRate ?? quality.ttft?.completeness, sampleCount: overview.ttftSampleCount ?? quality.ttft?.sampleCount, status: (overview.ttftCoverageRate ?? quality.ttft?.completeness ?? 0) < 0.8 || Number(overview.ttftSampleCount ?? quality.ttft?.sampleCount ?? 0) < 30 ? "low_coverage" : quality.ttft?.status });
+  const topScenario = (data.topScenarios || [])[0];
+  const topScenarioMetric = observabilityMetricObject(topScenario?.count, { period: finalFailure.period, source: payload.source, sampleCount: topScenario?.count, status: topScenario ? "observed" : "unavailable", definitionVersion: overview.definitionsVersion || data.definitionsVersion });
   el("stabilityMetrics").innerHTML = [
-    ["用户最终失败率", observabilityPercent(finalFailureRate)],
-    ["上游异常 / 重试", `${overview.upstreamExceptionCount == null ? "暂无数据" : overview.upstreamExceptionCount} / ${retryCount == null ? "暂无数据" : retryCount}`],
-    ["重试后最终成功率", observabilityPercent(retryRecoveryRate)],
-    ["TTFT P95", ttft == null ? "暂无数据" : `${(ttft / 1000).toFixed(2)}s`],
-  ].map(([label, value]) => `<article class="observability-metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`).join("");
+    observabilityMetricCard({ label: "用户最终失败率", metric: finalFailure, formatter: observabilityPercent, action: "stability-final-failures" }),
+    observabilityMetricCard({ label: "兜底成功率", metric: fallbackRecovery, formatter: observabilityPercent, action: "stability-fallbacks", hint: "需接入显式兜底尝试事件" }),
+    observabilityMetricCard({ label: "TTFT P95", metric: ttft, formatter: (value) => `${(Number(value) / 1000).toFixed(2)}s`, action: "stability-ttft" }),
+    observabilityMetricCard({ label: "Top 异常场景", metric: topScenarioMetric, formatter: (value) => topScenario ? `${topScenario.scenario || "未知场景"} · ${Number(value).toLocaleString("zh-CN")} 次` : `${value} 次`, action: "stability-top-scenario" }),
+  ].join("");
+  renderObservabilityContext("stabilityContext", payload, data, "stability");
   const daily = data.daily || [];
-  const max = Math.max(1, ...daily.flatMap((item) => [Number(item.upstreamExceptionCount || 0), Number(item.finalRequestFailureCount ?? item.userVisibleFailureCount ?? 0)]));
-  el("stabilityTrend").innerHTML = daily.length ? daily.map((item) => {
+  const trendValues = daily.flatMap((item) => [item.upstreamExceptionCount, item.finalRequestFailureCount ?? item.userVisibleFailureCount]).filter((value) => value !== null && value !== undefined).map(Number);
+  const hasTrendValues = trendValues.length > 0;
+  const hasNonZeroTrend = trendValues.some((value) => value > 0);
+  const max = Math.max(1, ...trendValues);
+  el("stabilityTrend").classList.toggle("is-empty", !daily.length || !hasTrendValues || !hasNonZeroTrend);
+  el("stabilityTrend").innerHTML = daily.length && hasTrendValues && hasNonZeroTrend ? daily.map((item) => {
     const upstream = item.upstreamExceptionCount;
     const failures = item.finalRequestFailureCount ?? item.userVisibleFailureCount;
-    return `<div class="observability-bar" title="${escapeHtml(item.date)} · 上游异常 ${upstream ?? "暂无数据"} · 用户最终失败 ${failures ?? "暂无数据"}"><span class="observability-bar-segment" style="height:${upstream == null ? 3 : Math.max(3, Number(upstream) / max * 150)}px"></span><span class="observability-bar-segment secondary" style="height:${failures == null ? 3 : Math.max(3, Number(failures) / max * 150)}px"></span><small>${escapeHtml(String(item.date).slice(5))}</small></div>`;
-  }).join("") : `<p class="empty">暂无可用稳定性事件</p>`;
+    return `<div class="observability-bar" title="${escapeHtml(item.date)} · 上游异常 ${upstream ?? "暂无数据"} · 用户最终失败 ${failures ?? "暂无数据"}">${upstream == null ? "" : `<span class="observability-bar-segment" style="height:${Number(upstream) > 0 ? Math.max(3, Number(upstream) / max * 150) : 0}px"></span>`}${failures == null ? "" : `<span class="observability-bar-segment secondary" style="height:${Number(failures) > 0 ? Math.max(3, Number(failures) / max * 150) : 0}px"></span>`}<small>${escapeHtml(String(item.date).slice(5))}</small></div>`;
+  }).join("") : hasTrendValues && !hasNonZeroTrend
+    ? observabilityEmptyState("本期确无异常记录", "当前统计期间内，已接入指标均为真实零值。", [{ label: "调整筛选", attr: 'data-observability-empty-action="filters" data-observability-scope="stability"' }])
+    : observabilityEmptyState("异常趋势暂不可用", "尝试事件尚未接入或当前窗口尚未同步，缺失数据不会绘制为零值。", [{ label: "重新加载", attr: 'data-observability-retry="stability"' }, { label: "进入治理工作台", attr: 'data-open-governance-tab="stability-actions"' }]);
   const stabilityRankings = data.modelRankings || [];
   el("stabilityRanking").classList.toggle("is-compact", stabilityRankings.length > 0 && stabilityRankings.length <= 4);
   el("stabilityRanking").innerHTML = stabilityRankings.map((item, index) => {
     const failureRate = item.finalRequestFailureRate ?? item.userVisibleFailureRate;
     const retryRate = item.retryAttemptRate;
     const itemTtft = item.ttftP95Ms;
-    return `<button class="observability-rank-row observability-rank-row-button" type="button" data-stability-model="${escapeHtml(item.model || "")}">${rankingBadge(index)}<div><b>${escapeHtml(item.model)}</b><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Math.max(3, 100 - Math.min(100, Number(failureRate || 0) * 1000))}%"></div></div><small class="observability-rank-meta">失败 ${escapeHtml(observabilityPercent(failureRate))} · 重试 ${escapeHtml(observabilityPercent(retryRate))} · TTFT ${itemTtft == null ? "暂无数据" : `${Math.round(itemTtft)}ms`}</small></div><span class="chip ${item.state === "稳定" ? "green" : item.state === "观察" ? "gold" : "red"}">${escapeHtml(item.state)}</span></button>`;
-  }).join("") || `<p class="empty">暂无模型样本</p>`;
+    const riskWidth = failureRate == null ? 0 : Math.max(3, Math.min(100, Number(failureRate) * 1000));
+    return `<button class="observability-rank-row observability-rank-row-button" type="button" data-stability-model="${escapeHtml(item.model || item.requestedModelGroup || "")}">${rankingBadge(index)}<div><b>${escapeHtml(item.requestedModelGroup || item.model || "未知模型")}</b><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${riskWidth}%"></div></div><small class="observability-rank-meta">失败 ${escapeHtml(observabilityPercent(failureRate))} · 重试恢复 ${escapeHtml(observabilityPercent(item.retryRecoveryRate ?? retryRate))} · TTFT ${itemTtft == null ? "暂无数据" : `${Math.round(itemTtft)}ms`} · 覆盖 ${item.ttftCoverageRate == null ? "暂无" : `${(Number(item.ttftCoverageRate) * 100).toFixed(0)}%`}</small></div><span class="chip ${item.state === "稳定" ? "green" : item.state === "观察" ? "gold" : "red"}">${escapeHtml(item.state || "待判断")}</span></button>`;
+  }).join("") || observabilityEmptyState("暂无模型排名", "当前窗口没有可比较的模型样本。", [{ label: "调整筛选", attr: 'data-observability-empty-action="filters" data-observability-scope="stability"' }]);
   el("stabilityScenarioBody").innerHTML = (data.topScenarios || []).map((item) => {
     const failureRate = item.finalRequestFailureRate ?? item.userVisibleFailureRate;
-    return `<tr><td>${escapeHtml(item.scenario)}</td><td>${escapeHtml(item.model || "-")}</td><td>${escapeHtml(item.errorCode || "-")}</td><td>${item.count}</td><td>${escapeHtml(observabilityPercent(failureRate))}</td><td><button class="ghost-btn" type="button" data-stability-scenario="${escapeHtml(item.scenario || "")}" data-stability-model="${escapeHtml(item.model || "")}" data-stability-error-code="${escapeHtml(item.errorCode || "")}">查看样本（${item.count || 0}）</button></td></tr>`;
-  }).join("") || `<tr><td colspan="6" class="empty">暂无异常场景</td></tr>`;
+    return `<tr><td>${escapeHtml(item.scenario)}</td><td>${escapeHtml(item.requestedModelGroup || item.model || "-")}</td><td>${escapeHtml(item.errorCode || "-")}</td><td>${item.count}</td><td>${escapeHtml(observabilityPercent(failureRate))}</td><td><button class="ghost-btn" type="button" data-stability-scenario="${escapeHtml(item.scenario || "")}" data-stability-model="${escapeHtml(item.requestedModelGroup || item.model || "")}" data-stability-error-code="${escapeHtml(item.errorCode || "")}">查看样本（${item.count || 0}）</button></td></tr>`;
+  }).join("") || `<tr><td colspan="6" class="empty">${hasTrendValues && !hasNonZeroTrend ? "本期确无异常场景" : "异常场景数据暂不可用"}</td></tr>`;
+  const matrix = data.scenarioMatrix || data.topScenarios || [];
+  const matrixTotal = Math.max(1, ...matrix.map((item) => Number(item.count || 0)));
+  el("stabilityScenarioMatrix").innerHTML = matrix.slice(0, 8).map((item) => `<button class="observability-composition-row" type="button" data-stability-scenario="${escapeHtml(item.scenario || "")}" data-stability-model="${escapeHtml(item.requestedModelGroup || item.model || "")}" data-stability-error-code="${escapeHtml(item.errorCode || "")}"><span>${escapeHtml(item.requestedModelGroup || item.model || "未知模型")}</span><div><strong>${escapeHtml(item.scenario || "未知场景")}</strong><small class="observability-rank-meta">${escapeHtml(item.errorCode || "无错误码")}</small></div><strong>${Number(item.count || 0).toLocaleString("zh-CN")}</strong></button>`).join("") || observabilityEmptyState("暂无场景矩阵", "有异常记录后将按模型组、场景和错误码展示。", []);
+  renderStabilityActions(data);
   renderObservabilityQuality("stabilityQuality", payload, "stability");
   const models = [...new Set((data.modelRankings || []).map((item) => item.model))];
   const select = el("stabilityModel");
@@ -8394,55 +8652,77 @@ async function loadStabilityOverview(forceRefresh = false) {
     const nextOverview = await api(`/api/admin/stability/overview?start_date=${startDate}&end_date=${endDate}&model=${encodeURIComponent(model)}${forceRefresh ? "&refresh=1" : ""}`, { signal: stabilityOverviewController.signal });
     if (requestId !== stabilityOverviewRequestId) return;
     stabilityOverview = nextOverview;
-    renderStabilityOverview();
   } catch (error) {
     if (error.name !== "AbortError" && requestId === stabilityOverviewRequestId) {
       stabilityLoadError = error.message || "稳定性看板加载失败";
-      renderObservabilityQuality("stabilityQuality", stabilityOverview, "stability");
       showToast(stabilityLoadError);
     }
   } finally {
-    if (requestId === stabilityOverviewRequestId) isStabilityLoading = false;
+    if (requestId === stabilityOverviewRequestId) {
+      isStabilityLoading = false;
+      renderStabilityOverview();
+      if (currentView === "governance-workbench") renderGovernanceWorkbench();
+    }
   }
 }
 
 function renderCostOverview() {
   if (!costOverview) {
     renderObservabilityQuality("costQuality", costOverview, "cost");
+    if (isCostOverviewLoading) el("costMetrics").innerHTML = observabilityEmptyState("正在读取费用口径", "正在汇总实际账本、计划版本、预算与节省证明。", []);
     return;
   }
   const data = costOverview.data || {};
   const metrics = data.metrics || {};
   const annual = data.annual || {};
-  document.querySelectorAll("#costControlView [data-cost-manage]").forEach((node) => node.classList.toggle("hidden", !canManageCosts()));
-  document.querySelectorAll("#costControlView input, #costControlView textarea, #costControlView select").forEach((node) => {
+  document.querySelectorAll("#governanceWorkbenchView [data-cost-manage]").forEach((node) => node.classList.toggle("hidden", !canManageCosts()));
+  document.querySelectorAll("#governanceWorkbenchView input, #governanceWorkbenchView textarea, #governanceWorkbenchView select").forEach((node) => {
     if (node.closest(".observability-filter-bar") || node.closest(".observability-filter-panel")) return;
     if (node.closest("[data-cost-manage]")) node.disabled = !canManageCosts();
   });
+  const meta = observabilityPayloadMeta(costOverview, data);
+  const contractMetrics = data.metricContracts || data.coreMetrics || metrics.metricEnvelopes || {};
+  const annualContracts = annual.metricEnvelopes || {};
+  const annualActual = observabilityMetricObject(annualContracts.actualToDate ?? contractMetrics.yearToDateActual ?? metrics.yearToDateActual ?? annual.actualToDate ?? annual.actual, { period: `${String(data.month || currentCostMonth()).slice(0, 4)} 年`, asOf: meta.asOf, source: costOverview.source, status: "actual" });
+  const activePlan = data.activePlanVersion || data.activePlan || annual.activePlanVersion || annual.activePlan || governanceWorkbenchData.planVersions.find((item) => (item.active || item.isActive || item.activatedAt) && ["approved", "active"].includes(String(item.status || "").toLowerCase()));
+  const hasOfficialForecastContract = contractMetrics.officialYearForecast !== undefined || metrics.officialYearForecast !== undefined || annual.officialForecast !== undefined;
+  const officialForecastValue = annualContracts.officialForecast ?? (hasOfficialForecastContract ? (contractMetrics.officialYearForecast ?? metrics.officialYearForecast ?? annual.officialForecast) : activePlan ? (metrics.yearForecast ?? annual.forecast) : null);
+  const officialForecast = observabilityMetricObject(officialForecastValue, { period: `${String(data.month || currentCostMonth()).slice(0, 4)} 年`, asOf: meta.asOf, source: activePlan?.name || activePlan?.version || "生效基准计划", status: officialForecastValue == null ? "unavailable" : "approved", missingReasons: officialForecastValue == null ? ["active_approved_baseline_plan_missing"] : [] });
+  const verifiedSavings = observabilityMetricObject(contractMetrics.verifiedSavings ?? metrics.verifiedSavingsToDate ?? metrics.realizedSavingsToDate ?? metrics.verifiedSavings, { period: `${String(data.month || currentCostMonth()).slice(0, 4)} 年`, asOf: meta.asOf, source: "已复核节省证明", status: "verified", sampleCount: data.savingsMeasurements?.reviewedCount ?? data.savingsMeasurements?.filter?.((item) => item.reviewedAt || item.financeReviewedAt)?.length });
+  const budgetOrTarget = observabilityMetricObject(contractMetrics.budget ?? metrics.monthBudget ?? metrics.budget ?? metrics.dailyTarget, { period: data.month || currentCostMonth(), asOf: meta.asOf, source: metrics.monthBudget != null || metrics.budget != null ? "预算账本" : "日均目标", status: "available" });
   el("costMetrics").innerHTML = [
-    ["当月实际", observabilityMoney(metrics.monthToDateActual ?? metrics.actual)],
-    ["年度累计实际", observabilityMoney(metrics.yearToDateActual ?? annual.actualToDate)],
-    ["全年预测", observabilityMoney(metrics.yearForecast ?? annual.forecast ?? metrics.forecast)],
-    ["已实现节省", observabilityMoney(metrics.realizedSavingsToDate ?? metrics.verifiedSavings)],
-    ["未来预计节省", observabilityMoney(metrics.forecastSavingsRemaining)],
-    ["日均目标", observabilityMoney(metrics.dailyTarget)],
-  ].map(([label, value]) => `<article class="observability-metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`).join("");
+    observabilityMetricCard({ label: "年度累计实际", metric: annualActual, formatter: observabilityMoney, action: "cost-actual-ledger" }),
+    observabilityMetricCard({ label: "全年官方预测", metric: officialForecast, formatter: observabilityMoney, action: "cost-plan-versions", hint: "没有生效基准计划时不提供官方预测" }),
+    observabilityMetricCard({ label: "已核验累计节省", metric: verifiedSavings, formatter: observabilityMoney, action: "cost-savings" }),
+    observabilityMetricCard({ label: metrics.monthBudget != null || metrics.budget != null ? "月度预算" : "日均目标", metric: budgetOrTarget, formatter: observabilityMoney, action: "cost-budget" }),
+  ].join("");
+  renderObservabilityContext("costContext", costOverview, data, "cost");
   const trend = data.trend || [];
-  const max = Math.max(1, ...trend.map((item) => Math.max(Number(item.actual || 0), Number(item.forecast || 0), Number(item.budget || 0))));
-  el("costTrend").innerHTML = trend.length ? trend.map((item) => {
-    const actual = Number(item.actual || 0);
-    const projected = Number(item.forecast || 0);
-    const budgetDaily = Number(item.budget || 0);
-    return `<div class="observability-bar" title="${escapeHtml(item.date)} · 实际 ${observabilityMoney(actual)} · 预测 ${observabilityMoney(projected)} · 日预算 ${observabilityMoney(budgetDaily)}"><span class="observability-bar-segment" style="height:${Math.max(3, actual / max * 150)}px"></span><span class="observability-bar-segment forecast" style="height:${Math.max(3, projected / max * 150)}px"></span><span style="position:absolute;left:0;right:0;bottom:${Math.min(150, budgetDaily / max * 150)}px;border-top:2px solid #c23b45"></span><small>${escapeHtml(String(item.date).slice(5))}</small></div>`;
-  }).join("") : `<p class="empty">本月暂无成本数据</p>`;
+  const trendValues = trend.flatMap((item) => [item.actual, item.runRateForecast ?? item.forecast, item.budget]).filter((value) => value !== null && value !== undefined).map(Number);
+  const hasTrendValues = trendValues.length > 0;
+  const hasNonZeroTrend = trendValues.some((value) => value > 0);
+  const max = Math.max(1, ...trendValues);
+  el("costTrend").classList.toggle("is-empty", !trend.length || !hasTrendValues || !hasNonZeroTrend);
+  el("costTrend").innerHTML = trend.length && hasTrendValues && hasNonZeroTrend ? trend.map((item) => {
+    const actual = item.actual;
+    const projected = item.runRateForecast ?? item.forecast;
+    const budgetDaily = item.budget;
+    return `<div class="observability-bar" title="${escapeHtml(item.date)} · 实际 ${observabilityMoney(actual)} · 运行速率 ${observabilityMoney(projected)} · 日预算 ${observabilityMoney(budgetDaily)}">${actual == null ? "" : `<span class="observability-bar-segment" style="height:${Number(actual) > 0 ? Math.max(3, Number(actual) / max * 150) : 0}px"></span>`}${projected == null ? "" : `<span class="observability-bar-segment forecast" style="height:${Number(projected) > 0 ? Math.max(3, Number(projected) / max * 150) : 0}px"></span>`}${budgetDaily == null ? "" : `<span style="position:absolute;left:0;right:0;bottom:${Math.min(150, Number(budgetDaily) / max * 150)}px;border-top:2px solid #c23b45"></span>`}<small>${escapeHtml(String(item.date).slice(5))}</small></div>`;
+  }).join("") : hasTrendValues && !hasNonZeroTrend
+    ? observabilityEmptyState("本期确无费用记录", "当前筛选范围内，已接入账本金额均为真实零值。", [{ label: "调整筛选", attr: 'data-observability-empty-action="filters" data-observability-scope="cost"' }])
+    : observabilityEmptyState("费用趋势暂不可用", "账本尚未同步或当前范围没有数据，缺失金额不会按 0 展示。", [{ label: "重新加载", attr: 'data-observability-retry="cost"' }, { label: "进入治理工作台", attr: 'data-open-governance-tab="actual-ledger"' }]);
   const legacyApi = trend.reduce((sum, item) => sum + Number(item.api || 0), 0);
   const legacyNonApi = trend.reduce((sum, item) => sum + Number(item.nonApi || 0), 0);
   const backendComposition = Array.isArray(data.composition) && data.composition.length ? data.composition : data.bucketSplit;
   const composition = Array.isArray(backendComposition) && backendComposition.length
     ? backendComposition.map((item) => ({ key: item.key || item.costBucket || "other", label: item.label || item.costBucket || "其他", amountUsd: item.amountUsd ?? item.spend }))
     : [["api_usage", "API Token", legacyApi], ["other", "非 API 成本", legacyNonApi]].map(([key, label, amountUsd]) => ({ key, label, amountUsd }));
-  const total = Math.max(1, composition.reduce((sum, item) => sum + Number(item.amountUsd || 0), 0));
-  el("costComposition").innerHTML = composition.map((item) => `<button class="observability-composition-row" type="button" data-cost-ledger-filter="${escapeHtml(item.key)}" aria-label="查看${escapeHtml(item.label)}费用明细"><span>${escapeHtml(item.label)}</span><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Number(item.amountUsd || 0) / total * 100}%"></div></div><strong>${observabilityMoney(item.amountUsd)}</strong></button>`).join("");
+  const actualComposition = data.actualComposition || composition;
+  const total = Math.max(1, actualComposition.reduce((sum, item) => sum + Number(item.amountUsd ?? item.spend ?? 0), 0));
+  el("costComposition").innerHTML = actualComposition.length ? actualComposition.map((item) => `<button class="observability-composition-row" type="button" data-cost-ledger-filter="${escapeHtml(item.key || item.costBucket || "other")}" aria-label="查看${escapeHtml(item.label || item.costBucket || "其他")}实际费用明细"><span>${escapeHtml(item.label || item.costBucket || "其他")}</span><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Number(item.amountUsd ?? item.spend ?? 0) / total * 100}%"></div></div><strong>${observabilityMoney(item.amountUsd ?? item.spend)}</strong></button>`).join("") : observabilityEmptyState("暂无实际组成", "当前范围没有已确认实际费用。", [{ label: "查看实际账本", attr: 'data-open-governance-tab="actual-ledger"' }]);
+  const forecastComposition = data.forecastComposition || annual.forecastComposition || data.planComposition || activePlan?.composition || activePlan?.items || [];
+  const forecastTotal = Math.max(1, forecastComposition.reduce((sum, item) => sum + Number(item.amountUsd ?? item.spend ?? item.amount ?? 0), 0));
+  el("costForecastComposition").innerHTML = forecastComposition.length ? forecastComposition.map((item) => `<button class="observability-composition-row" type="button" data-open-governance-tab="plans"><span>${escapeHtml(item.label || item.costBucket || item.category || "计划成本")}</span><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Number(item.amountUsd ?? item.spend ?? item.amount ?? 0) / forecastTotal * 100}%"></div></div><strong>${observabilityMoney(item.amountUsd ?? item.spend ?? item.amount)}</strong></button>`).join("") : observabilityEmptyState("暂无官方预测组成", "尚未找到生效且已批准的基准计划，运行速率外推不会混入官方预测。", [{ label: "查看计划版本", attr: 'data-open-governance-tab="plans"' }]);
   el("savingsActionList").innerHTML = (data.savingsActions || []).map((item) => `<article class="observability-action"><div><strong>${escapeHtml(item.name)}</strong><p class="hint">${escapeHtml(item.owner || "未指定负责人")} · ${escapeHtml(item.status)}${item.evidenceUrl ? " · 有证据" : " · 缺证据"}</p></div><div class="observability-table-actions"><span>${item.status === "verified" ? `${observabilityMoney(item.realizedSavingsToDate ?? Math.max(0, Number(item.baselineDailyCost) - Number(item.verifiedDailyCost || 0)))}/日` : item.forecastSavingsRemaining == null ? "尚未计入节省" : `预计 ${observabilityMoney(item.forecastSavingsRemaining)}`}</span>${canManageCosts() ? `<button class="ghost-btn" type="button" data-edit-savings-action="${escapeHtml(item.id)}">编辑</button>` : "只读"}</div></article>`).join("") || `<p class="empty">暂无降本动作</p>`;
   const split = data.modelSplit || [];
   const maxModelSpend = Math.max(1, ...split.map((item) => Number(item.spend || 0)));
@@ -8454,9 +8734,13 @@ function renderCostOverview() {
   if (el("costDailyTarget")) el("costDailyTarget").value = String(budget?.dailyTargetUsd ?? metrics.dailyTarget ?? "");
   if (el("costBudgetDelta")) el("costBudgetDelta").textContent = metrics.budgetDelta == null ? "暂无预算差额" : `预测与预算差额：${observabilityMoney(metrics.budgetDelta)}`;
   el("costItemBody").innerHTML = (data.costItems || []).map((item) => `<tr><td>${escapeHtml(item.name)}</td><td>${escapeHtml(item.costBucket || item.category)}</td><td>${escapeHtml(item.accountName || item.provider || item.vendor || item.businessScope || "-")}</td><td>${escapeHtml(item.serviceStartDate)} ～ ${escapeHtml(item.serviceEndDate)}</td><td>${observabilityMoney(item.amountUsd)} <span class="hint">${escapeHtml(item.currency)}</span></td><td>${escapeHtml(item.reconciliationStatus || (item.enabled ? "未对账" : "停用"))}</td><td>${canManageCosts() ? `<button class="ghost-btn" type="button" data-edit-cost-item="${escapeHtml(item.id)}">编辑</button><button class="danger-outline-btn" type="button" data-delete-cost-item="${escapeHtml(item.id)}">删除</button>` : "只读"}</td></tr>`).join("") || `<tr><td colspan="7" class="empty">暂无人工成本项</td></tr>`;
+  const anomalies = data.anomalies || data.anomalyMonths || [];
+  el("costAnomalies").innerHTML = anomalies.map((item) => `<article class="observability-action"><div><strong>${escapeHtml(item.title || item.month || item.date || "费用异常")}</strong><p class="hint">${escapeHtml(item.reason || item.description || item.reconciliationStatus || "需要复核")}</p></div><span>${item.amountUsd == null ? escapeHtml(item.status || "待核验") : observabilityMoney(item.amountUsd)}</span></article>`).join("") || observabilityEmptyState("暂无异常月份", "当前接口未返回预算偏差或对账异常；可在实际账本中继续核验。", [{ label: "进入实际账本", attr: 'data-open-governance-tab="actual-ledger"' }]);
+  const planVersions = data.planVersions || annual.planVersions || (governanceWorkbenchData.planVersions.length ? governanceWorkbenchData.planVersions : []) || (activePlan ? [activePlan] : []);
+  el("costPlanVersions").innerHTML = planVersions.map((item) => `<article class="observability-action"><div><strong>${escapeHtml(item.name || item.version || `${item.year || ""} 基准计划`)}</strong><p class="hint">${escapeHtml(item.scenario || "基准")} · ${escapeHtml(item.status || "未知状态")}${item.asOf ? ` · 截止 ${escapeHtml(item.asOf)}` : ""}${item.approvedBy ? ` · ${escapeHtml(item.approvedBy)} 批准` : ""}</p></div><div class="observability-table-actions"><span class="chip ${item.active || item.status === "active" || item.status === "approved" ? "green" : "gold"}">${item.active ? "生效中" : escapeHtml(item.status || "草稿")}</span>${canManageCosts() ? `<button class="ghost-btn" type="button" data-edit-cost-plan="${escapeHtml(item.id || "")}">编辑</button>${item.status === "draft" ? `<button class="ghost-btn" type="button" data-cost-plan-state="approve" data-cost-plan-id="${escapeHtml(item.id || "")}">批准</button>` : ""}${item.status === "approved" ? `<button class="ghost-btn" type="button" data-cost-plan-state="activate" data-cost-plan-id="${escapeHtml(item.id || "")}">激活</button>` : ""}${item.status !== "archived" ? `<button class="ghost-btn" type="button" data-cost-plan-state="archive" data-cost-plan-id="${escapeHtml(item.id || "")}">归档</button>` : ""}` : ""}</div></article>`).join("") || observabilityEmptyState("暂无计划版本", "创建并批准基准计划后，费用看板才会展示官方全年预测。", []);
   renderObservabilityQuality("costQuality", costOverview, "cost");
   const filters = data.filters || {};
-  [["costCategory", "全部成本项", filters.categories || []], ["costBucket", "全部成本桶", filters.costBuckets || filters.buckets || []], ["costModel", "全部模型", filters.models || []], ["costVendor", "全部来源", filters.vendors || []], ["costProvider", "全部供应渠道", filters.providers || []], ["costAccount", "全部账号", filters.accounts || []], ["costReconciliation", "全部对账状态", filters.reconciliationStatuses || []]].forEach(([id, label, options]) => {
+  [["costCategory", "全部成本项", filters.categories || []], ["costBucket", "全部成本桶", filters.costBuckets || filters.buckets || []], ["costModel", "全部模型", filters.models || []], ["costVendor", "全部来源", filters.vendors || []], ["costProvider", "全部供应渠道", filters.providers || []], ["costAccount", "全部账号", filters.accounts || []], ["costReconciliation", "全部对账状态", filters.reconciliationStatuses || []], ["costRecognition", "全部确认状态", filters.recognitionStatuses || []]].forEach(([id, label, options]) => {
     const select = el(id);
     if (!select) return;
     const selected = select.value;
@@ -8464,6 +8748,100 @@ function renderCostOverview() {
     select.value = options.includes(selected) ? selected : "";
   });
   renderObservabilityFilterState("cost");
+}
+
+function normalizeWorkbenchList(payload, ...keys) {
+  const data = payload?.data ?? payload ?? {};
+  for (const key of keys) {
+    if (Array.isArray(data?.[key])) return data[key];
+  }
+  if (Array.isArray(data)) return data;
+  return [];
+}
+
+function renderGovernanceSavings() {
+  const target = el("savingsActionList");
+  if (!target) return;
+  const measurements = governanceWorkbenchData.savingsMeasurements || [];
+  const legacyActions = costOverview?.data?.savingsActions || [];
+  const rows = measurements.length ? measurements : legacyActions;
+  target.innerHTML = rows.map((item) => {
+    const reviewed = Boolean(item.reviewedAt || item.financeReviewedAt || item.financeReviewer || item.status === "verified");
+    const evidence = item.evidenceUrl || item.evidenceLink;
+    const realized = item.savingsUsd ?? item.realizedSavings ?? item.realizedSavingsToDate;
+    return `<article class="observability-action"><div><strong>${escapeHtml(item.name || item.actionName || item.scope || "节省核验")}</strong><p class="hint">${escapeHtml(item.owner || item.financeReviewer || "未指定复核人")} · ${evidence ? "有证明" : "缺证明"} · ${reviewed ? "已复核" : "待复核"}${item.measurementWindow ? ` · ${escapeHtml(item.measurementWindow)}` : ""}</p></div><div class="observability-table-actions"><span>${realized == null ? "尚未计入正式节省" : observabilityMoney(realized)}</span>${measurements.length && canReconcileCosts() ? `<button class="ghost-btn" type="button" data-edit-savings-measurement="${escapeHtml(item.id || "")}">编辑</button>` : !measurements.length && canManageCosts() ? `<button class="ghost-btn" type="button" data-edit-savings-action="${escapeHtml(item.id || "")}">编辑</button>` : ""}</div></article>`;
+  }).join("") || observabilityEmptyState("暂无降本核验", "提交证据并完成财务复核后，节省金额才会进入主看板。", []);
+}
+
+function renderGovernanceWorkbench() {
+  const canStability = canManageStability();
+  const canCost = canManageCosts() || canReconcileCosts();
+  const allowedTabs = new Set([
+    ...(canStability ? ["stability-actions", "regressions"] : []),
+    ...(canCost ? ["actual-ledger", "plans", "savings"] : []),
+  ]);
+  if (!allowedTabs.has(governanceWorkbenchTab)) governanceWorkbenchTab = [...allowedTabs][0] || "stability-actions";
+  document.querySelectorAll("[data-governance-tab]").forEach((button) => {
+    const allowed = allowedTabs.has(button.dataset.governanceTab);
+    button.classList.toggle("hidden", !allowed);
+    button.setAttribute("aria-selected", String(allowed && button.dataset.governanceTab === governanceWorkbenchTab));
+    button.tabIndex = allowed && button.dataset.governanceTab === governanceWorkbenchTab ? 0 : -1;
+  });
+  document.querySelectorAll("[data-governance-panel]").forEach((panel) => panel.classList.toggle("hidden", panel.dataset.governancePanel !== governanceWorkbenchTab || !allowedTabs.has(panel.dataset.governancePanel)));
+  const badge = el("governancePermissionBadge");
+  if (badge) badge.textContent = canStability && canCost ? "稳定性与费用治理" : canStability ? "稳定性治理" : "费用治理";
+  const status = el("governanceWorkbenchStatus");
+  if (status) {
+    status.classList.toggle("hidden", !governanceWorkbenchLoading && !governanceWorkbenchLoadError);
+    status.classList.toggle("danger", Boolean(governanceWorkbenchLoadError));
+    status.setAttribute("role", governanceWorkbenchLoadError ? "alert" : "status");
+    status.setAttribute("aria-live", governanceWorkbenchLoadError ? "assertive" : "polite");
+    status.innerHTML = governanceWorkbenchLoadError
+      ? `<div><strong>治理数据加载不完整</strong><p>${escapeHtml(governanceWorkbenchLoadError)}</p></div><button class="ghost-btn" type="button" data-governance-retry>重新加载</button>`
+      : governanceWorkbenchLoading ? `<div><strong>正在加载治理工作台</strong><p>正在读取动作、回归、计划与节省证明。</p></div>` : "";
+  }
+  renderStabilityActions(stabilityOverview?.data || {});
+  if (costOverview) renderCostOverview();
+  renderGovernanceSavings();
+}
+
+async function optionalGovernanceEndpoint(path, keys) {
+  try {
+    const payload = await api(path);
+    return normalizeWorkbenchList(payload, ...keys);
+  } catch (error) {
+    if ([404, 405].includes(Number(error?.status))) return [];
+    throw error;
+  }
+}
+
+async function loadGovernanceWorkbench(force = false) {
+  if (!(canManageStability() || canManageCosts() || canReconcileCosts())) return;
+  if (governanceWorkbenchLoading && !force) return;
+  governanceWorkbenchLoading = true;
+  governanceWorkbenchLoadError = "";
+  renderGovernanceWorkbench();
+  const errors = [];
+  const load = async (name, promise) => {
+    try { return await promise; } catch (error) { errors.push(`${name}：${error.message || "加载失败"}`); return []; }
+  };
+  const [stabilityActions, regressions, planVersions, savingsMeasurements] = await Promise.all([
+    canManageStability() ? load("稳定性动作", optionalGovernanceEndpoint("/api/admin/stability/actions", ["items", "actions"])) : [],
+    canManageStability() ? load("回归验证", optionalGovernanceEndpoint("/api/admin/stability/regressions", ["items", "regressions"])) : [],
+    canManageCosts() ? load("计划版本", optionalGovernanceEndpoint(`/api/admin/costs/plan-versions?year=${encodeURIComponent(currentCostMonth().slice(0, 4))}`, ["items", "planVersions", "versions"])) : [],
+    canReconcileCosts() || canManageCosts() ? load("节省证明", optionalGovernanceEndpoint("/api/admin/costs/savings-measurements", ["items", "measurements"])) : [],
+  ]);
+  governanceWorkbenchData = { stabilityActions, regressions, planVersions, savingsMeasurements };
+  governanceWorkbenchLoading = false;
+  governanceWorkbenchLoadError = errors.join("；");
+  renderGovernanceWorkbench();
+}
+
+function openGovernanceWorkbench(tab) {
+  governanceWorkbenchTab = tab || governanceWorkbenchTab;
+  switchView("governance-workbench");
+  renderGovernanceWorkbench();
+  if (!governanceWorkbenchLoading && !(governanceWorkbenchData.stabilityActions.length || governanceWorkbenchData.planVersions.length || governanceWorkbenchData.savingsMeasurements.length)) loadGovernanceWorkbench();
 }
 
 async function loadCostOverview(forceRefresh = false) {
@@ -8483,26 +8861,30 @@ async function loadCostOverview(forceRefresh = false) {
     const provider = el("costProvider")?.value || "";
     const accountId = el("costAccount")?.value || "";
     const reconciliationStatus = el("costReconciliation")?.value || "";
-    const query = `month=${encodeURIComponent(month)}&category=${encodeURIComponent(category)}&cost_bucket=${encodeURIComponent(costBucket)}&model=${encodeURIComponent(model)}&vendor=${encodeURIComponent(vendor)}&provider=${encodeURIComponent(provider)}&account_id=${encodeURIComponent(accountId)}&reconciliation_status=${encodeURIComponent(reconciliationStatus)}${forceRefresh ? "&refresh=1" : ""}`;
+    const recognitionStatus = el("costRecognition")?.value || "";
+    const asOf = new Date().toISOString().slice(0, 10);
+    const query = `month=${encodeURIComponent(month)}&as_of=${encodeURIComponent(asOf)}&category=${encodeURIComponent(category)}&cost_bucket=${encodeURIComponent(costBucket)}&model=${encodeURIComponent(model)}&vendor=${encodeURIComponent(vendor)}&provider=${encodeURIComponent(provider)}&account_id=${encodeURIComponent(accountId)}&reconciliation_status=${encodeURIComponent(reconciliationStatus)}&recognition_status=${encodeURIComponent(recognitionStatus)}${forceRefresh ? "&refresh=1" : ""}`;
     const [nextOverview, nextBudgets, annualPayload] = await Promise.all([
       api(`/api/admin/costs/overview?${query}`, { signal: costOverviewController.signal }),
       api("/api/admin/costs/budgets").then((payload) => payload?.data || []),
-      api(`/api/admin/costs/annual?year=${encodeURIComponent(month.slice(0, 4))}`).catch(() => null),
+      api(`/api/admin/costs/annual?year=${encodeURIComponent(month.slice(0, 4))}&as_of=${encodeURIComponent(asOf)}&category=${encodeURIComponent(category)}&cost_bucket=${encodeURIComponent(costBucket)}&model=${encodeURIComponent(model)}&vendor=${encodeURIComponent(vendor)}&provider=${encodeURIComponent(provider)}&account_id=${encodeURIComponent(accountId)}&reconciliation_status=${encodeURIComponent(reconciliationStatus)}&recognition_status=${encodeURIComponent(recognitionStatus)}`).catch(() => null),
     ]);
     if (requestId !== costOverviewRequestId) return;
     costOverview = annualPayload?.data
       ? { ...nextOverview, data: { ...(nextOverview.data || {}), annual: annualPayload.data, metrics: { ...(nextOverview.data?.metrics || {}), yearToDateActual: nextOverview.data?.metrics?.yearToDateActual ?? annualPayload.data.actual, yearForecast: nextOverview.data?.metrics?.yearForecast ?? annualPayload.data.forecast } } }
       : nextOverview;
     costBudgets = nextBudgets;
-    renderCostOverview();
   } catch (error) {
     if (error.name !== "AbortError" && requestId === costOverviewRequestId) {
       costOverviewLoadError = error.message || "费用看板加载失败";
-      renderObservabilityQuality("costQuality", costOverview, "cost");
       showToast(costOverviewLoadError);
     }
   } finally {
-    if (requestId === costOverviewRequestId) isCostOverviewLoading = false;
+    if (requestId === costOverviewRequestId) {
+      isCostOverviewLoading = false;
+      renderCostOverview();
+      if (currentView === "governance-workbench") renderGovernanceWorkbench();
+    }
   }
 }
 
@@ -8573,6 +8955,9 @@ function openStabilityScenario(button) {
   const filters = { model: button.dataset.stabilityModel || "", scenario: button.dataset.stabilityScenario || "", errorCode: button.dataset.stabilityErrorCode || "" };
   el("stabilityDrawerTitle").textContent = `场景样本 · ${filters.scenario || "全部异常"}`;
   el("stabilityRequestDetail").innerHTML = '<p class="empty">选择左侧样本查看请求元数据。</p>';
+  el("stabilityAttemptTimeline").innerHTML = "";
+  el("stabilityRequestActions").innerHTML = "";
+  el("stabilityRequestRegression").innerHTML = "";
   focusDrawer("stabilityDrawer", button);
   loadStabilityScenarioSamples(filters, 1);
 }
@@ -8582,8 +8967,23 @@ async function openStabilityRequest(requestId, backendId = "") {
     const suffix = backendId ? `?backend_id=${encodeURIComponent(backendId)}` : "";
     const payload = await api(`/api/admin/stability/requests/${encodeURIComponent(requestId)}${suffix}`);
     const detail = payload.data || {};
-    const labels = { request_id: "请求 ID", event_time: "请求时间", model: "模型", provider: "来源", model_group: "模型组", model_id: "模型线路", status: "状态", error_code: "错误码", error_class: "错误分类", error_message: "脱敏错误信息", scenario: "异常场景", request_duration_ms: "请求时长（毫秒）", ttft_ms: "TTFT（毫秒）", prompt_tokens: "输入 Token", completion_tokens: "输出 Token", total_tokens: "总 Token", attempted_retries: "重试次数", max_retries: "最大重试次数", trace_id: "调用链标识", user_visible_failure: "用户最终失败", organization_id: "组织归属", team_id: "团队归属", principal_id: "归属主体", collected_at: "采集时间" };
-    el("stabilityRequestDetail").innerHTML = Object.entries(detail).filter(([key]) => labels[key]).map(([key, value]) => `<div class="observability-drawer-row"><dt>${labels[key]}</dt><dd>${escapeHtml(value == null || value === "" ? "暂无数据" : String(value))}</dd></div>`).join("");
+    const request = detail.request || detail.finalRequest || detail;
+    const labels = { request_id: "请求 ID", requestId: "请求 ID", event_time: "请求时间", eventTime: "请求时间", model: "模型", requestedModelGroup: "请求模型组", provider: "来源", model_group: "模型组", modelGroup: "模型组", model_id: "模型线路", modelId: "模型线路", status: "最终状态", error_code: "错误码", errorCode: "错误码", error_class: "错误分类", errorClass: "错误分类", error_message: "脱敏错误信息", errorMessage: "脱敏错误信息", scenario: "异常场景", request_duration_ms: "请求时长（毫秒）", requestDurationMs: "请求时长（毫秒）", ttft_ms: "TTFT（毫秒）", ttftMs: "TTFT（毫秒）", prompt_tokens: "输入 Token", promptTokens: "输入 Token", completion_tokens: "输出 Token", completionTokens: "输出 Token", total_tokens: "总 Token", totalTokens: "总 Token", attempted_retries: "重试次数", attemptedRetries: "重试次数", max_retries: "最大重试次数", maxRetries: "最大重试次数", trace_id: "调用链标识", traceId: "调用链标识", user_visible_failure: "用户最终失败", finalRequestFailure: "用户最终失败", finalRequestFailureSource: "最终失败口径", organization_id: "组织归属", team_id: "团队归属", principal_id: "归属主体", collected_at: "采集时间", collectedAt: "采集时间" };
+    el("stabilityRequestDetail").innerHTML = Object.entries(request).filter(([key]) => labels[key]).map(([key, value]) => `<div class="observability-drawer-row"><dt>${labels[key]}</dt><dd>${escapeHtml(value == null || value === "" ? "暂无数据" : String(value))}</dd></div>`).join("");
+    const attempts = detail.attempts || detail.timeline || request.attempts || [];
+    const timeline = el("stabilityAttemptTimeline");
+    if (timeline) timeline.innerHTML = attempts.length ? `<div class="observability-detail-section"><h4>尝试时间线</h4><div class="observability-timeline">${attempts.map((item, index) => {
+      const status = String(item.status || item.eventType || "unknown").toLowerCase();
+      const failure = status.includes("fail") || status.includes("error");
+      const label = item.eventType || item.type || (index === 0 ? "首次尝试" : item.fallbackFrom || item.fallbackTo ? "兜底尝试" : "重试");
+      return `<div class="observability-timeline-item ${failure ? "failure" : ""}"><span class="observability-timeline-dot" aria-hidden="true"></span><div class="observability-timeline-copy"><strong>${escapeHtml(label)} · ${escapeHtml(item.actualModel || item.model || item.route || "未知线路")}</strong><small>${escapeHtml(item.startedAt || item.startTime || item.eventTime || "暂无时间")} · ${escapeHtml(item.provider || "来源未知")} · ${escapeHtml(item.status || "未知状态")}${item.errorCode ? ` · ${escapeHtml(item.errorCode)}` : ""}${item.ttftMs == null ? "" : ` · TTFT ${escapeHtml(String(item.ttftMs))}ms`}</small></div></div>`;
+    }).join("")}</div></div>` : observabilityEmptyState("尝试时间线暂不可用", "历史消费日志只保留最终请求事实，不会伪造重试或兜底链路。", []);
+    const actions = detail.actions || request.actions || [];
+    const actionTarget = el("stabilityRequestActions");
+    if (actionTarget) actionTarget.innerHTML = `<h4>关联治理动作</h4>${actions.length ? actions.map((item) => `<article class="observability-action"><div><strong>${escapeHtml(item.title || item.name || "治理动作")}</strong><p class="hint">${escapeHtml(item.owner || "未指定负责人")} · ${escapeHtml(item.status || "待处理")}</p></div><span>${escapeHtml(item.targetDate || item.fixReference || "")}</span></article>`).join("") : observabilityEmptyState("暂无关联动作", "可在治理工作台按场景创建并关联治理动作。", [{ label: "进入治理工作台", attr: 'data-open-governance-tab="stability-actions"' }])}`;
+    const regression = detail.latestRegression || detail.regression || request.latestRegression;
+    const regressionTarget = el("stabilityRequestRegression");
+    if (regressionTarget) regressionTarget.innerHTML = `<h4>最近回归结论</h4>${regression ? `<article class="observability-action"><div><strong>${escapeHtml(regression.metric || regression.name || "回归验证")}</strong><p class="hint">基线 ${escapeHtml(regression.baselineWindow || regression.baselinePeriod || "暂无")} · 回归 ${escapeHtml(regression.regressionWindow || regression.measurementWindow || "暂无")}</p></div><span class="chip ${String(regression.conclusion || "").includes("通过") ? "green" : "gold"}">${escapeHtml(regression.conclusion || "待结论")}</span></article>` : observabilityEmptyState("暂无回归结果", "完成修复后需以明确窗口和指标记录回归结论。", [{ label: "进入回归验证", attr: 'data-open-governance-tab="regressions"' }])}`;
     focusDrawer("stabilityDrawer");
   } catch (error) {
     showToast(error.message || "请求样本加载失败");
@@ -8598,6 +8998,7 @@ function openCostLedger(filters = {}, returnFocus = document.activeElement) {
     ...(filters.provider ? { provider: filters.provider } : {}),
     ...(filters.accountId ? { account_id: filters.accountId } : {}),
     ...(filters.reconciliationStatus ? { reconciliation_status: filters.reconciliationStatus } : {}),
+    ...(filters.recognitionStatus ? { recognition_status: filters.recognitionStatus } : {}),
   };
   costLedgerState = { ...costLedgerState, filters: normalizedFilters, page: 1, selectedId: "" };
   el("costDetailDrawerTitle").textContent = filters.costBucket ? `费用明细 · ${filters.costBucket}` : filters.model ? `费用明细 · ${filters.model}` : "费用明细";
@@ -8617,7 +9018,8 @@ async function loadCostLedger() {
     const endDate = new Date(`${month}-01T00:00:00`);
     endDate.setMonth(endDate.getMonth() + 1);
     endDate.setDate(0);
-    const query = new URLSearchParams({ start_date: start, end_date: endDate.toISOString().slice(0, 10), page: String(costLedgerState.page), page_size: String(costLedgerState.pageSize), ...(costLedgerState.filters || {}) });
+    const asOf = costOverview?.data?.asOf || costOverview?.asOf || new Date().toISOString().slice(0, 10);
+    const query = new URLSearchParams({ start_date: start, end_date: endDate.toISOString().slice(0, 10), as_of: asOf, page: String(costLedgerState.page), page_size: String(costLedgerState.pageSize), ...(costLedgerState.filters || {}) });
     const payload = await api(`/api/admin/costs/ledger?${query.toString()}`);
     if (requestId !== costLedgerRequestId) return;
     const data = payload.data || {};
@@ -8641,7 +9043,7 @@ function renderCostLedger() {
 function showCostLedgerDetail(itemId) {
   const item = (costLedgerState.items || []).find((value) => String(value.id || value.requestId) === String(itemId));
   if (!item) return;
-  const labels = { date: "日期", sourceType: "来源类型", costBucket: "成本桶", category: "类别", name: "名称", provider: "供应渠道", vendor: "供应商", model: "模型", accountName: "账号", amountUsd: "金额（USD）", currency: "原币种", amount: "原币金额", financeBucket: "财务分类", voucherNo: "凭证号", invoiceNo: "发票号", reconciliationStatus: "对账状态", recognitionStatus: "确认状态", requestId: "请求标识", coverage: "覆盖质量" };
+  const labels = { date: "日期", asOf: "截止日", sourceType: "来源类型", costBucket: "成本桶", category: "类别", name: "名称", provider: "供应渠道", vendor: "供应商", model: "模型", accountId: "账号标识", accountName: "账号", amountUsd: "金额（USD）", currency: "原币种", amount: "原币金额", originalAmount: "原币金额", exchangeRate: "汇率快照", exchangeRateSnapshot: "汇率快照", financeBucket: "财务分类", voucherNo: "凭证号", invoiceNo: "发票号", evidenceUrl: "证明链接", planVersion: "计划版本", planVersionId: "计划版本", scenario: "计划情景", reconciliationStatus: "对账状态", recognitionStatus: "确认状态", requestId: "请求标识", coverage: "覆盖质量" };
   el("costLedgerDetail").innerHTML = Object.entries(item).filter(([key]) => labels[key]).map(([key, value]) => `<div class="observability-drawer-row"><dt>${labels[key]}</dt><dd>${escapeHtml(value == null || value === "" ? "暂无数据" : typeof value === "object" ? JSON.stringify(value) : String(value))}</dd></div>`).join("");
 }
 
@@ -8671,6 +9073,12 @@ function openCostItemModal(item = null) {
   el("costItemInvoiceNo").value = value.invoiceNo || "";
   el("costItemReconciliationStatus").value = value.reconciliationStatus || "unreconciled";
   el("costItemRecognitionStatus").value = value.recognitionStatus || "actual";
+  const planSelect = el("costItemPlanVersionId");
+  const planVersions = governanceWorkbenchData.planVersions || [];
+  planSelect.innerHTML = `<option value="">不属于计划</option>${planVersions.map((item) => `<option value="${escapeHtml(item.id || "")}">${escapeHtml(item.version || item.name || item.id || "计划版本")}</option>`).join("")}`;
+  planSelect.value = value.planVersionId || "";
+  el("costItemScenario").value = value.scenario || "";
+  el("costItemSourceEvidence").value = value.sourceEvidence || "";
   el("costItemAmount").value = value.amount ?? "";
   el("costItemCurrency").value = value.currency || "USD";
   el("costItemExchangeRate").value = value.exchangeRate ?? "7.3";
@@ -8709,11 +9117,111 @@ function openSavingsActionModal(item = null) {
   el("savingsActionModal")?.classList.remove("hidden");
 }
 
+function closeGovernanceModal(id, formId) {
+  el(id)?.classList.add("hidden");
+  el(formId)?.reset();
+}
+
+function openStabilityActionModal(item = null) {
+  const value = item || {};
+  el("stabilityActionId").value = value.id || "";
+  el("stabilityActionModalTitle").textContent = value.id ? "编辑稳定性动作" : "新增稳定性动作";
+  el("stabilityActionTitle").value = value.title || value.name || "";
+  el("stabilityActionOwner").value = value.owner || "";
+  el("stabilityActionSeverity").value = value.severity || "medium";
+  el("stabilityActionStatus").value = value.status || "open";
+  el("stabilityActionTargetDate").value = value.targetDate || "";
+  el("stabilityActionFixReference").value = value.fixReference || "";
+  el("stabilityActionModel").value = value.requestedModelGroup || value.model || "";
+  el("stabilityActionScenario").value = value.scenario || "";
+  el("stabilityActionErrorCode").value = value.errorCode || "";
+  el("stabilityActionNotes").value = value.notes || "";
+  el("stabilityActionModal")?.classList.remove("hidden");
+}
+
+function openStabilityRegressionModal() {
+  const actions = governanceWorkbenchData.stabilityActions || [];
+  el("stabilityRegressionActionId").innerHTML = actions.map((item) => `<option value="${escapeHtml(item.id || "")}">${escapeHtml(item.title || item.name || item.id || "治理动作")}</option>`).join("");
+  const today = new Date().toISOString().slice(0, 10);
+  ["stabilityBaselineStart", "stabilityBaselineEnd", "stabilityRegressionStart", "stabilityRegressionEnd"].forEach((id) => { if (!el(id).value) el(id).value = today; });
+  el("stabilityRegressionModal")?.classList.remove("hidden");
+}
+
+function openCostPlanModal(item = null) {
+  const value = item || {};
+  el("costPlanId").value = value.id || "";
+  el("costPlanModalTitle").textContent = value.id ? "编辑计划草稿" : "新增计划草稿";
+  el("costPlanYear").value = value.year || currentCostMonth().slice(0, 4);
+  el("costPlanVersion").value = value.version || value.name || "";
+  el("costPlanScenario").value = value.scenario || "baseline";
+  el("costPlanAsOf").value = value.asOf || new Date().toISOString().slice(0, 10);
+  el("costPlanCoverageComplete").value = String(value.coverageComplete || value.coverageStatus === "complete");
+  el("costPlanNotes").value = value.notes || "";
+  el("costPlanModal")?.classList.remove("hidden");
+}
+
+function openSavingsMeasurementModal(item = null) {
+  const value = item || {};
+  el("savingsMeasurementId").value = value.id || "";
+  el("savingsMeasurementModalTitle").textContent = value.id ? "编辑降本核验" : "录入降本核验";
+  el("savingsMeasurementActionId").value = value.actionId || "";
+  el("savingsMeasurementScope").value = value.scope || value.scopeKey || "";
+  el("savingsMeasurementProvider").value = value.provider || "";
+  el("savingsMeasurementModel").value = value.model || "";
+  el("savingsMeasurementBucket").value = value.costBucket || "";
+  el("savingsMeasurementBaselineStart").value = value.baselineStart || value.baselineStartDate || "";
+  el("savingsMeasurementBaselineEnd").value = value.baselineEnd || value.baselineEndDate || "";
+  el("savingsMeasurementStart").value = value.measurementStart || value.measurementStartDate || "";
+  el("savingsMeasurementEnd").value = value.measurementEnd || value.measurementEndDate || "";
+  el("savingsMeasurementBaselineAmount").value = value.baselineAmountUsd ?? "";
+  el("savingsMeasurementActualAmount").value = value.actualAmountUsd ?? "";
+  el("savingsMeasurementEvidence").value = value.evidenceUrl || "";
+  el("savingsMeasurementReviewer").value = value.financeReviewer || "";
+  el("savingsMeasurementReviewedAt").value = value.reviewedAt ? String(value.reviewedAt).slice(0, 16) : "";
+  el("savingsMeasurementStatus").value = value.status || "pending_evidence";
+  el("savingsMeasurementNotes").value = value.notes || "";
+  el("savingsMeasurementModal")?.classList.remove("hidden");
+}
+
+async function saveStabilityAction(event) {
+  event.preventDefault();
+  const id = el("stabilityActionId").value;
+  const body = { title: el("stabilityActionTitle").value.trim(), owner: el("stabilityActionOwner").value.trim(), severity: el("stabilityActionSeverity").value, status: el("stabilityActionStatus").value, targetDate: el("stabilityActionTargetDate").value || null, fixReference: el("stabilityActionFixReference").value.trim(), requestedModelGroup: el("stabilityActionModel").value.trim(), scenario: el("stabilityActionScenario").value.trim(), errorCode: el("stabilityActionErrorCode").value.trim(), notes: el("stabilityActionNotes").value.trim() };
+  try { await ensureCsrfToken(); await api(id ? `/api/admin/stability/actions/${encodeURIComponent(id)}` : "/api/admin/stability/actions", { method: id ? "PATCH" : "POST", body: JSON.stringify(body) }); closeGovernanceModal("stabilityActionModal", "stabilityActionForm"); await loadGovernanceWorkbench(true); await loadStabilityOverview(); showToast("稳定性动作已保存"); } catch (error) { showToast(error.message || "稳定性动作保存失败"); }
+}
+
+async function saveStabilityRegression(event) {
+  event.preventDefault();
+  const numberOrNull = (id) => el(id).value === "" ? null : Number(el(id).value);
+  const body = { actionId: el("stabilityRegressionActionId").value, baselineStart: el("stabilityBaselineStart").value, baselineEnd: el("stabilityBaselineEnd").value, regressionStart: el("stabilityRegressionStart").value, regressionEnd: el("stabilityRegressionEnd").value, metric: el("stabilityRegressionMetric").value.trim(), baselineValue: numberOrNull("stabilityBaselineValue"), regressionValue: numberOrNull("stabilityRegressionValue"), conclusion: el("stabilityRegressionConclusion").value, notes: el("stabilityRegressionNotes").value.trim() };
+  try { await ensureCsrfToken(); await api("/api/admin/stability/regressions", { method: "POST", body: JSON.stringify(body) }); closeGovernanceModal("stabilityRegressionModal", "stabilityRegressionForm"); await loadGovernanceWorkbench(true); await loadStabilityOverview(); showToast("回归结果已保存"); } catch (error) { showToast(error.message || "回归结果保存失败"); }
+}
+
+async function saveCostPlan(event) {
+  event.preventDefault();
+  const id = el("costPlanId").value;
+  const body = { year: Number(el("costPlanYear").value), version: el("costPlanVersion").value.trim(), scenario: el("costPlanScenario").value, asOf: el("costPlanAsOf").value, status: "draft", coverageComplete: el("costPlanCoverageComplete").value === "true", notes: el("costPlanNotes").value.trim() };
+  try { await ensureCsrfToken(); await api(id ? `/api/admin/costs/plan-versions/${encodeURIComponent(id)}` : "/api/admin/costs/plan-versions", { method: id ? "PATCH" : "POST", body: JSON.stringify(body) }); closeGovernanceModal("costPlanModal", "costPlanForm"); await loadGovernanceWorkbench(true); await loadCostOverview(); showToast("计划草稿已保存"); } catch (error) { showToast(error.message || "计划草稿保存失败"); }
+}
+
+async function changeCostPlanState(planId, operation) {
+  const copy = { approve: "批准", activate: "激活", archive: "归档" }[operation] || operation;
+  try { await ensureCsrfToken(); await api(`/api/admin/costs/plan-versions/${encodeURIComponent(planId)}/${operation}`, { method: "POST", body: JSON.stringify({}) }); await loadGovernanceWorkbench(true); await loadCostOverview(); showToast(`计划已${copy}`); } catch (error) { showToast(error.message || `计划${copy}失败`); }
+}
+
+async function saveSavingsMeasurement(event) {
+  event.preventDefault();
+  const id = el("savingsMeasurementId").value;
+  const reviewedAt = el("savingsMeasurementReviewedAt").value;
+  const body = { actionId: el("savingsMeasurementActionId").value.trim(), scope: el("savingsMeasurementScope").value.trim(), provider: el("savingsMeasurementProvider").value.trim(), model: el("savingsMeasurementModel").value.trim(), costBucket: el("savingsMeasurementBucket").value.trim(), baselineStart: el("savingsMeasurementBaselineStart").value, baselineEnd: el("savingsMeasurementBaselineEnd").value, measurementStart: el("savingsMeasurementStart").value, measurementEnd: el("savingsMeasurementEnd").value, baselineAmountUsd: Number(el("savingsMeasurementBaselineAmount").value), actualAmountUsd: Number(el("savingsMeasurementActualAmount").value), evidenceUrl: el("savingsMeasurementEvidence").value.trim(), financeReviewer: el("savingsMeasurementReviewer").value.trim(), reviewedAt: reviewedAt ? new Date(reviewedAt).toISOString() : null, status: el("savingsMeasurementStatus").value, notes: el("savingsMeasurementNotes").value.trim() };
+  try { await ensureCsrfToken(); await api(id ? `/api/admin/costs/savings-measurements/${encodeURIComponent(id)}` : "/api/admin/costs/savings-measurements", { method: id ? "PATCH" : "POST", body: JSON.stringify(body) }); closeGovernanceModal("savingsMeasurementModal", "savingsMeasurementForm"); await loadGovernanceWorkbench(true); await loadCostOverview(); showToast("降本核验已保存"); } catch (error) { showToast(error.message || "降本核验保存失败"); }
+}
+
 async function saveCostItem(event) {
   if (!canManageCosts()) return;
   event.preventDefault();
   const id = el("costItemId").value;
-  const body = { category: el("costItemCategory").value.trim(), name: el("costItemName").value.trim(), vendor: el("costItemVendor").value.trim(), model: el("costItemModel").value.trim(), businessScope: el("costItemBusinessScope").value.trim(), amount: Number(el("costItemAmount").value), currency: el("costItemCurrency").value, exchangeRate: Number(el("costItemExchangeRate").value), serviceStartDate: el("costItemStartDate").value, serviceEndDate: el("costItemEndDate").value, financeBucket: el("costItemFinanceBucket").value.trim(), costBucket: el("costItemCostBucket").value, provider: el("costItemProvider").value.trim(), accountId: el("costItemAccountId").value.trim(), accountName: el("costItemAccountName").value.trim(), voucherNo: el("costItemVoucherNo").value.trim(), invoiceNo: el("costItemInvoiceNo").value.trim(), reconciliationStatus: el("costItemReconciliationStatus").value, recognitionStatus: el("costItemRecognitionStatus").value, notes: el("costItemNotes").value.trim(), enabled: el("costItemEnabled").value === "true" };
+  const body = { category: el("costItemCategory").value.trim(), name: el("costItemName").value.trim(), vendor: el("costItemVendor").value.trim(), model: el("costItemModel").value.trim(), businessScope: el("costItemBusinessScope").value.trim(), amount: Number(el("costItemAmount").value), currency: el("costItemCurrency").value, exchangeRate: Number(el("costItemExchangeRate").value), serviceStartDate: el("costItemStartDate").value, serviceEndDate: el("costItemEndDate").value, financeBucket: el("costItemFinanceBucket").value.trim(), costBucket: el("costItemCostBucket").value, provider: el("costItemProvider").value.trim(), accountId: el("costItemAccountId").value.trim(), accountName: el("costItemAccountName").value.trim(), voucherNo: el("costItemVoucherNo").value.trim(), invoiceNo: el("costItemInvoiceNo").value.trim(), reconciliationStatus: el("costItemReconciliationStatus").value, recognitionStatus: el("costItemRecognitionStatus").value, planVersionId: el("costItemPlanVersionId").value, scenario: el("costItemScenario").value.trim(), sourceEvidence: el("costItemSourceEvidence").value.trim(), notes: el("costItemNotes").value.trim(), enabled: el("costItemEnabled").value === "true" };
   try {
     await ensureCsrfToken();
     await api(id ? `/api/admin/costs/items/${encodeURIComponent(id)}` : "/api/admin/costs/items", { method: id ? "PATCH" : "POST", body: JSON.stringify(body) });
@@ -8749,39 +9257,54 @@ async function saveCostBudget(event) {
   } catch (error) { showToast(error.message || "预算保存失败"); }
 }
 
-async function loadDashboardData(forceRefresh = false) {
-  if (!currentUser || isDashboardLoading) return;
+function loadDashboardData(forceRefresh = false) {
+  if (!currentUser) return Promise.resolve();
   if (accountAccessCopy(currentUser)) {
     renderAccountAccessState();
-    return;
+    return Promise.resolve();
   }
-  isDashboardLoading = true;
-  renderPersonal();
   const { startDate, endDate } = selectedDateRange();
   const source = el("sourceSelect").value;
-  try {
-    const payload = await api(`/api/me/usage?start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&source=${encodeURIComponent(source)}${forceRefresh ? "&refresh=1" : ""}`);
-    usageData = payload.rows || [];
-    usageSummary = payload.summary || null;
-    personalDataFreshness = payload.dataFreshness || null;
-    personalDataQuality = payload.dataQuality || null;
-    personalCoverage = payload.coverage || null;
-    lastPersonalUsageCacheHit = Boolean(payload.cache?.hit);
-  } catch (error) {
-    showToast(error.message || "用量数据加载失败");
-  } finally {
-    isDashboardLoading = false;
-    renderPersonal();
-  }
+  const queryKey = `${startDate}|${endDate}|${source}`;
+  if (dashboardInFlight && dashboardRequestKey === queryKey) return dashboardInFlight;
+  dashboardRequestController?.abort();
+  const controller = new AbortController();
+  dashboardRequestController = controller;
+  dashboardRequestKey = queryKey;
+  const requestId = ++dashboardRequestId;
+  isDashboardLoading = true;
+  renderPersonal();
+  const request = (async () => {
+    try {
+      const payload = await api(
+        `/api/me/usage?start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&source=${encodeURIComponent(source)}${forceRefresh ? "&refresh=1" : ""}`,
+        { signal: controller.signal },
+      );
+      if (requestId !== dashboardRequestId || dashboardRequestKey !== queryKey) return;
+      usageData = payload.rows || [];
+      usageSummary = payload.summary || null;
+      personalDataFreshness = payload.dataFreshness || null;
+      personalDataQuality = payload.dataQuality || null;
+      personalCoverage = payload.coverage || null;
+      lastPersonalUsageCacheHit = Boolean(payload.cache?.hit);
+    } catch (error) {
+      if (error.name !== "AbortError" && requestId === dashboardRequestId) {
+        showToast(error.message || "用量数据加载失败");
+      }
+    } finally {
+      if (dashboardInFlight === request) dashboardInFlight = null;
+      if (requestId !== dashboardRequestId) return;
+      isDashboardLoading = false;
+      renderPersonal();
+    }
+  })();
+  dashboardInFlight = request;
+  return request;
 }
 
-async function loadAdminData(forceRefresh = false) {
+function loadAdminData(forceRefresh = false) {
   const scopeKey = organizationUsageScopeKey();
-  if (!canViewAdminUsage() || (isAdminLoading && adminUsageLoadingScopeKey === scopeKey)) return;
-  const requestId = ++adminUsageRequestId;
-  isAdminLoading = true;
-  adminUsageLoadingScopeKey = scopeKey;
-  renderAdmin();
+  if (!canViewAdminUsage()) return Promise.resolve();
   const { startDate, endDate } = selectedDateRange();
   const source = el("sourceSelect").value;
   const search = el("adminEmployeeSearch").value.trim();
@@ -8789,42 +9312,54 @@ async function loadAdminData(forceRefresh = false) {
   const query = new URLSearchParams({ start_date: startDate, end_date: endDate, source });
   if (employee) query.set("employee", employee);
   if (forceRefresh) query.set("refresh", "1");
-  try {
-    const scope = organizationUsageScope();
-    const usagePath = scope?.usagePath || "/api/admin/usage";
-    const payload = await api(`${usagePath}?${query.toString()}`);
-    if (requestId !== adminUsageRequestId || scopeKey !== organizationUsageScopeKey()) return;
-    adminUsageData = payload.rows || [];
-    adminSummaryData = payload.summaryRows || adminUsageData;
-    adminEmployees = payload.employees || [];
-    adminDataFreshness = payload.dataFreshness || null;
-    adminDataQuality = payload.dataQuality || null;
-    adminCoverage = payload.coverage || null;
-    adminUsageScopeKey = scopeKey;
-    lastAdminUsageCacheHit = Boolean(payload.cache?.hit);
-    if (payload.truncated) {
-      el("adminLimitHint").textContent = `${RANKING_SORT_TIP}；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），员工排行可能不完整`;
-    } else {
-      el("adminLimitHint").textContent = `${RANKING_SORT_TIP}；已读取 ${payload.pagesRead || 0} 页日志，按当前筛选范围统计`;
+  const scope = organizationUsageScope();
+  const usagePath = scope?.usagePath || "/api/admin/usage";
+  const queryKey = `${scopeKey}|${usagePath}|${query.toString()}`;
+  if (adminUsageInFlight && adminUsageQueryKey === queryKey) return adminUsageInFlight;
+  adminUsageRequestController?.abort();
+  const controller = new AbortController();
+  adminUsageRequestController = controller;
+  adminUsageQueryKey = queryKey;
+  const requestId = ++adminUsageRequestId;
+  isAdminLoading = true;
+  adminUsageLoadingScopeKey = scopeKey;
+  renderAdmin();
+  const request = (async () => {
+    try {
+      const payload = await api(`${usagePath}?${query.toString()}`, { signal: controller.signal });
+      if (requestId !== adminUsageRequestId || scopeKey !== organizationUsageScopeKey()) return;
+      adminUsageData = payload.rows || [];
+      adminSummaryData = payload.summaryRows || adminUsageData;
+      adminEmployees = payload.employees || [];
+      adminDataFreshness = payload.dataFreshness || null;
+      adminDataQuality = payload.dataQuality || null;
+      adminCoverage = payload.coverage || null;
+      adminUsageScopeKey = scopeKey;
+      lastAdminUsageCacheHit = Boolean(payload.cache?.hit);
+      if (payload.truncated) {
+        el("adminLimitHint").textContent = `${RANKING_SORT_TIP}；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），员工排行可能不完整`;
+      } else {
+        el("adminLimitHint").textContent = `${RANKING_SORT_TIP}；已读取 ${payload.pagesRead || 0} 页日志，按当前筛选范围统计`;
+      }
+    } catch (error) {
+      if (error.name !== "AbortError" && requestId === adminUsageRequestId && scopeKey === organizationUsageScopeKey()) {
+        showToast(error.message || "全员数据加载失败");
+      }
+    } finally {
+      if (adminUsageInFlight === request) adminUsageInFlight = null;
+      if (requestId !== adminUsageRequestId) return;
+      isAdminLoading = false;
+      adminUsageLoadingScopeKey = "";
+      renderAdmin();
     }
-  } catch (error) {
-    if (requestId !== adminUsageRequestId || scopeKey !== organizationUsageScopeKey()) return;
-    showToast(error.message || "全员数据加载失败");
-  } finally {
-    if (requestId !== adminUsageRequestId) return;
-    isAdminLoading = false;
-    adminUsageLoadingScopeKey = "";
-    renderAdmin();
-  }
+  })();
+  adminUsageInFlight = request;
+  return request;
 }
 
-async function loadDepartmentData(forceRefresh = false) {
+function loadDepartmentData(forceRefresh = false) {
   const scopeKey = organizationUsageScopeKey();
-  if (!canViewDepartmentUsage() || (isDepartmentLoading && departmentUsageLoadingScopeKey === scopeKey)) return;
-  const requestId = ++departmentUsageRequestId;
-  isDepartmentLoading = true;
-  departmentUsageLoadingScopeKey = scopeKey;
-  renderDepartment();
+  if (!canViewDepartmentUsage()) return Promise.resolve();
   const { startDate, endDate } = selectedDateRange();
   const source = el("sourceSelect").value;
   const search = el("departmentEmployeeSearch").value.trim();
@@ -8832,43 +9367,59 @@ async function loadDepartmentData(forceRefresh = false) {
   const query = new URLSearchParams({ start_date: startDate, end_date: endDate, source });
   if (department) query.set("department", department);
   if (forceRefresh) query.set("refresh", "1");
-  try {
-    const scope = organizationUsageScope();
-    const usagePath = scope?.departmentsUsagePath || "/api/admin/departments/usage";
-    const payload = await api(`${usagePath}?${query.toString()}`);
-    if (requestId !== departmentUsageRequestId || scopeKey !== organizationUsageScopeKey()) return;
-    departmentUsageData = payload.rows || [];
-    departmentSummaryData = payload.summaryRows || departmentUsageData;
-    departmentRankings = payload.departments || [];
-    departmentEmployees = payload.employees || [];
-    if (selectedDepartmentEmployee) {
-      const matchedEmployee = departmentEmployees.find((item) => employeeMatchesIdentity(item, selectedDepartmentEmployeeSnapshot));
-      if (matchedEmployee) {
-        selectedDepartmentEmployee = matchedEmployee.employeeEmail || matchedEmployee.employeeId;
-        selectedDepartmentEmployeeSnapshot = { ...matchedEmployee, userIds: [...(matchedEmployee.userIds || [])] };
+  const scope = organizationUsageScope();
+  const usagePath = scope?.departmentsUsagePath || "/api/admin/departments/usage";
+  const queryKey = `${scopeKey}|${usagePath}|${query.toString()}`;
+  if (departmentUsageInFlight && departmentUsageQueryKey === queryKey) return departmentUsageInFlight;
+  departmentUsageRequestController?.abort();
+  const controller = new AbortController();
+  departmentUsageRequestController = controller;
+  departmentUsageQueryKey = queryKey;
+  const requestId = ++departmentUsageRequestId;
+  isDepartmentLoading = true;
+  departmentUsageLoadingScopeKey = scopeKey;
+  renderDepartment();
+  const request = (async () => {
+    try {
+      const payload = await api(`${usagePath}?${query.toString()}`, { signal: controller.signal });
+      if (requestId !== departmentUsageRequestId || scopeKey !== organizationUsageScopeKey()) return;
+      departmentUsageData = payload.rows || [];
+      departmentSummaryData = payload.summaryRows || departmentUsageData;
+      departmentRankings = payload.departments || [];
+      departmentEmployees = payload.employees || [];
+      if (selectedDepartmentEmployee) {
+        const matchedEmployee = departmentEmployees.find((item) => employeeMatchesIdentity(item, selectedDepartmentEmployeeSnapshot));
+        if (matchedEmployee) {
+          selectedDepartmentEmployee = matchedEmployee.employeeEmail || matchedEmployee.employeeId;
+          selectedDepartmentEmployeeSnapshot = { ...matchedEmployee, userIds: [...(matchedEmployee.userIds || [])] };
+        }
       }
+      departmentDataFreshness = payload.dataFreshness || null;
+      departmentDataQuality = payload.dataQuality || null;
+      departmentCoverage = payload.coverage || null;
+      departmentUsageScopeKey = scopeKey;
+      departmentPickerOptions = payload.departmentOptions || (department ? departmentPickerOptions : departmentRankings);
+      lastDepartmentUsageCacheHit = Boolean(payload.cache?.hit);
+      const rankingSubject = selectedDepartment ? "员工排行" : "部门排行";
+      if (payload.truncated) {
+        el("departmentLimitHint").textContent = `${rankingSubject}${RANKING_SORT_TIP}；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），排行可能不完整`;
+      } else {
+        el("departmentLimitHint").textContent = `${rankingSubject}${RANKING_SORT_TIP}；已读取 ${payload.pagesRead || 0} 页日志，按当前筛选范围统计`;
+      }
+    } catch (error) {
+      if (error.name !== "AbortError" && requestId === departmentUsageRequestId && scopeKey === organizationUsageScopeKey()) {
+        showToast(error.message || "部门数据加载失败");
+      }
+    } finally {
+      if (departmentUsageInFlight === request) departmentUsageInFlight = null;
+      if (requestId !== departmentUsageRequestId) return;
+      isDepartmentLoading = false;
+      departmentUsageLoadingScopeKey = "";
+      renderDepartment();
     }
-    departmentDataFreshness = payload.dataFreshness || null;
-    departmentDataQuality = payload.dataQuality || null;
-    departmentCoverage = payload.coverage || null;
-    departmentUsageScopeKey = scopeKey;
-    departmentPickerOptions = payload.departmentOptions || (department ? departmentPickerOptions : departmentRankings);
-    lastDepartmentUsageCacheHit = Boolean(payload.cache?.hit);
-    const rankingSubject = selectedDepartment ? "员工排行" : "部门排行";
-    if (payload.truncated) {
-      el("departmentLimitHint").textContent = `${rankingSubject}${RANKING_SORT_TIP}；日志读取达到上限（已读 ${payload.pagesRead || 0}/${payload.totalPages || "?"} 页），排行可能不完整`;
-    } else {
-      el("departmentLimitHint").textContent = `${rankingSubject}${RANKING_SORT_TIP}；已读取 ${payload.pagesRead || 0} 页日志，按当前筛选范围统计`;
-    }
-  } catch (error) {
-    if (requestId !== departmentUsageRequestId || scopeKey !== organizationUsageScopeKey()) return;
-    showToast(error.message || "部门数据加载失败");
-  } finally {
-    if (requestId !== departmentUsageRequestId) return;
-    isDepartmentLoading = false;
-    departmentUsageLoadingScopeKey = "";
-    renderDepartment();
-  }
+  })();
+  departmentUsageInFlight = request;
+  return request;
 }
 
 async function loadTeamRankingData(forceRefresh = false) {
@@ -8944,7 +9495,7 @@ async function loadTeamData(forceRefresh = false) {
     start_date: startDate,
     end_date: endDate,
     source,
-    include_member_rankings: "false",
+    include_member_rankings: "true",
   });
   if (selectedTeamRef) query.set("team_ref", selectedTeamRef);
   if (forceRefresh) query.set("refresh", "1");
@@ -8960,14 +9511,10 @@ async function loadTeamData(forceRefresh = false) {
   }
 
   try {
-    // 先加载团队摘要，再独立补齐成员排行，避免首屏被成员聚合阻塞。
     const payload = await api(`/api/team/usage?${query.toString()}`, { signal: teamUsageRequestController.signal });
     if (requestId !== teamUsageRequestId) return;
-    applyTeamUsagePayload(payload);
-    isTeamLoading = false;
-    renderTeam();
-    // 摘要请求已刷新并缓存同一批排名数据，排行请求直接复用，避免重复 SQL。
-    await loadTeamRankingData(false);
+    applyTeamUsagePayload(payload, cacheKey);
+    setTeamRankingHint(payload);
   } catch (error) {
     if (error.name === "AbortError") return;
     if (requestId !== teamUsageRequestId) return;
@@ -8975,57 +9522,61 @@ async function loadTeamData(forceRefresh = false) {
   } finally {
     if (requestId === teamUsageRequestId) {
       isTeamLoading = false;
+      teamUsageRequestController = null;
       renderTeam();
     }
   }
 }
 
-async function loadTeamMemberData(employee, forceRefresh = false, scrollToCard = true) {
-  if (!currentUser?.isTeamLeader || !leaderTeams.length) return;
+function loadTeamMemberData(employee, forceRefresh = false, scrollToCard = true) {
+  if (!currentUser?.isTeamLeader || !leaderTeams.length) return Promise.resolve();
   ensureSelectedTeamRef();
   const keepFilters = forceRefresh && selectedTeamEmployee === employee;
   selectedTeamEmployee = employee;
-  const requestId = ++teamMemberUsageRequestId;
-  teamMemberUsageData = [];
-  teamMemberUsageSummary = null;
-  teamMemberDataQuality = null;
-  teamMemberCoverage = null;
-  teamMemberDataQuality = null;
-  teamMemberCoverage = null;
-  if (!keepFilters) teamMemberUsageFilters = { date: "all", model: "all", status: "all", keyword: "" };
-  isTeamMemberLoading = true;
-  updateTeamMemberLoadingLabels();
-  renderTeam();
-  if (scrollToCard) scrollToDetailCard("teamDetailCard");
   const { startDate, endDate } = selectedDateRange();
   const source = el("sourceSelect").value;
   const query = new URLSearchParams({ start_date: startDate, end_date: endDate, source, employee });
   if (selectedTeamRef) query.set("team_ref", selectedTeamRef);
   if (forceRefresh) query.set("refresh", "1");
-  try {
-    const payload = await api(`/api/team/member/usage?${query.toString()}`);
-    if (requestId !== teamMemberUsageRequestId) return;
-    teamMemberUsageData = payload.rows || [];
-    teamMemberUsageSummary = payload.summary || null;
-    teamDataFreshness = payload.dataFreshness || null;
-    teamMemberDataQuality = payload.dataQuality || null;
-    teamMemberCoverage = payload.coverage || null;
-    const employeePayload = payload.employee || {};
-    const employeeId = employeePayload.employeeEmail || employeePayload.employeeId || employee;
-    if (employeeId && employeeId !== selectedTeamEmployee) selectedTeamEmployee = employeeId;
-  } catch (error) {
-    if (requestId !== teamMemberUsageRequestId) return;
-    showToast(error.message || "成员用量明细加载失败");
-    teamMemberUsageData = [];
-    teamMemberUsageSummary = null;
-    teamMemberDataQuality = null;
-    teamMemberCoverage = null;
-  } finally {
-    if (requestId === teamMemberUsageRequestId) {
-      isTeamMemberLoading = false;
-      renderTeam();
+  const queryKey = `${organizationUsageScopeKey()}|${selectedTeamRef}|${query.toString()}`;
+  if (teamMemberUsageInFlight && teamMemberUsageQueryKey === queryKey) return teamMemberUsageInFlight;
+  teamMemberUsageRequestController?.abort();
+  const controller = new AbortController();
+  teamMemberUsageRequestController = controller;
+  teamMemberUsageQueryKey = queryKey;
+  const requestId = ++teamMemberUsageRequestId;
+  if (!keepFilters) teamMemberUsageFilters = { date: "all", model: "all", status: "all", keyword: "" };
+  isTeamMemberLoading = true;
+  updateTeamMemberLoadingLabels();
+  renderTeam();
+  if (scrollToCard) scrollToDetailCard("teamDetailCard");
+  const request = (async () => {
+    try {
+      const payload = await api(`/api/team/member/usage?${query.toString()}`, { signal: controller.signal });
+      if (requestId !== teamMemberUsageRequestId || teamMemberUsageQueryKey !== queryKey) return;
+      teamMemberUsageData = payload.rows || [];
+      teamMemberUsageSummary = payload.summary || null;
+      teamDataFreshness = payload.dataFreshness || null;
+      teamMemberDataQuality = payload.dataQuality || null;
+      teamMemberCoverage = payload.coverage || null;
+      const employeePayload = payload.employee || {};
+      const employeeId = employeePayload.employeeEmail || employeePayload.employeeId || employee;
+      if (employeeId && employeeId !== selectedTeamEmployee) selectedTeamEmployee = employeeId;
+    } catch (error) {
+      if (error.name !== "AbortError" && requestId === teamMemberUsageRequestId) {
+        showToast(error.message || "成员用量明细加载失败");
+      }
+    } finally {
+      if (teamMemberUsageInFlight === request) teamMemberUsageInFlight = null;
+      if (requestId === teamMemberUsageRequestId) {
+        isTeamMemberLoading = false;
+        teamMemberUsageRequestController = null;
+        renderTeam();
+      }
     }
-  }
+  })();
+  teamMemberUsageInFlight = request;
+  return request;
 }
 
 function clearTeamMemberSelection() {
@@ -9187,6 +9738,10 @@ function showLogin() {
   stabilityOverview = null;
   costOverview = null;
   costBudgets = [];
+  governanceWorkbenchData = { stabilityActions: [], regressions: [], planVersions: [], savingsMeasurements: [] };
+  governanceWorkbenchLoading = false;
+  governanceWorkbenchLoadError = "";
+  governanceWorkbenchTab = "stability-actions";
   stabilityLoadError = "";
   costOverviewLoadError = "";
   isStabilityLoading = false;
@@ -9212,6 +9767,13 @@ function showLogin() {
   usageSummary = null;
   personalDataQuality = null;
   personalCoverage = null;
+  dashboardRequestController?.abort();
+  dashboardRequestId += 1;
+  dashboardRequestController = null;
+  dashboardRequestKey = "";
+  dashboardInFlight = null;
+  isDashboardLoading = false;
+  adminUsageRequestController?.abort();
   adminUsageData = [];
   adminSummaryData = [];
   adminEmployees = [];
@@ -9220,6 +9782,11 @@ function showLogin() {
   adminUsageScopeKey = "";
   adminUsageLoadingScopeKey = "";
   adminUsageRequestId += 1;
+  adminUsageRequestController = null;
+  adminUsageQueryKey = "";
+  adminUsageInFlight = null;
+  isAdminLoading = false;
+  departmentUsageRequestController?.abort();
   departmentUsageData = [];
   departmentSummaryData = [];
   departmentRankings = [];
@@ -9229,6 +9796,10 @@ function showLogin() {
   departmentUsageScopeKey = "";
   departmentUsageLoadingScopeKey = "";
   departmentUsageRequestId += 1;
+  departmentUsageRequestController = null;
+  departmentUsageQueryKey = "";
+  departmentUsageInFlight = null;
+  isDepartmentLoading = false;
   teamUsageData = [];
   teamSummaryData = [];
   teamEmployees = [];
@@ -9244,6 +9815,8 @@ function showLogin() {
   billingAccount = null;
   billingOrders = [];
   billingOrderTotal = 0;
+  billingRequest = null;
+  billingLoadedAt = 0;
   billingAvailable = false;
   billingLoadError = "";
   selectedTopupAmount = 0;
@@ -10121,7 +10694,7 @@ el("costVendor")?.addEventListener("change", () => {
   renderObservabilityFilterState("cost");
   loadCostOverview();
 });
-["costBucket", "costProvider", "costAccount", "costReconciliation"].forEach((id) => el(id)?.addEventListener("change", () => {
+["costBucket", "costProvider", "costAccount", "costReconciliation", "costRecognition"].forEach((id) => el(id)?.addEventListener("change", () => {
   renderObservabilityFilterState("cost");
   loadCostOverview();
 }));
@@ -10161,6 +10734,10 @@ el("stabilityRanking")?.addEventListener("click", (event) => {
   const button = event.target.closest("[data-stability-model]");
   if (button) openStabilityScenario({ dataset: { stabilityModel: button.dataset.stabilityModel, stabilityScenario: "", stabilityErrorCode: "" } });
 });
+el("stabilityScenarioMatrix")?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-stability-scenario]");
+  if (button) openStabilityScenario(button);
+});
 el("addCostItemButton")?.addEventListener("click", () => openCostItemModal());
 el("cancelCostItemButton")?.addEventListener("click", closeCostItemModal);
 el("costItemForm")?.addEventListener("submit", saveCostItem);
@@ -10176,6 +10753,71 @@ el("costComposition")?.addEventListener("click", (event) => {
 el("costModelSplit")?.addEventListener("click", (event) => {
   const button = event.target.closest("[data-cost-ledger-model]");
   if (button) openCostLedger({ model: button.dataset.costLedgerModel });
+});
+el("mobileViewSelect")?.addEventListener("change", (event) => switchView(event.currentTarget.value));
+el("governanceWorkbenchTabs")?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-governance-tab]");
+  if (!button) return;
+  governanceWorkbenchTab = button.dataset.governanceTab;
+  renderGovernanceWorkbench();
+});
+el("addStabilityActionButton")?.addEventListener("click", () => openStabilityActionModal());
+el("cancelStabilityActionButton")?.addEventListener("click", () => closeGovernanceModal("stabilityActionModal", "stabilityActionForm"));
+el("stabilityActionForm")?.addEventListener("submit", saveStabilityAction);
+el("addStabilityRegressionButton")?.addEventListener("click", openStabilityRegressionModal);
+el("cancelStabilityRegressionButton")?.addEventListener("click", () => closeGovernanceModal("stabilityRegressionModal", "stabilityRegressionForm"));
+el("stabilityRegressionForm")?.addEventListener("submit", saveStabilityRegression);
+el("addCostPlanButton")?.addEventListener("click", () => openCostPlanModal());
+el("cancelCostPlanButton")?.addEventListener("click", () => closeGovernanceModal("costPlanModal", "costPlanForm"));
+el("costPlanForm")?.addEventListener("submit", saveCostPlan);
+el("addSavingsMeasurementButton")?.addEventListener("click", () => openSavingsMeasurementModal());
+el("cancelSavingsMeasurementButton")?.addEventListener("click", () => closeGovernanceModal("savingsMeasurementModal", "savingsMeasurementForm"));
+el("savingsMeasurementForm")?.addEventListener("submit", saveSavingsMeasurement);
+el("governanceStabilityActions")?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-edit-stability-action]");
+  if (button) openStabilityActionModal((governanceWorkbenchData.stabilityActions || []).find((item) => String(item.id) === String(button.dataset.editStabilityAction)));
+});
+el("costPlanVersions")?.addEventListener("click", (event) => {
+  const edit = event.target.closest("[data-edit-cost-plan]");
+  if (edit) { openCostPlanModal((governanceWorkbenchData.planVersions || []).find((item) => String(item.id) === String(edit.dataset.editCostPlan))); return; }
+  const state = event.target.closest("[data-cost-plan-state]");
+  if (state) changeCostPlanState(state.dataset.costPlanId, state.dataset.costPlanState);
+});
+el("savingsActionList")?.addEventListener("click", (event) => {
+  const measurement = event.target.closest("[data-edit-savings-measurement]");
+  if (measurement) openSavingsMeasurementModal((governanceWorkbenchData.savingsMeasurements || []).find((item) => String(item.id) === String(measurement.dataset.editSavingsMeasurement)));
+});
+el("costItemPlanVersionId")?.addEventListener("focus", () => {
+  const select = el("costItemPlanVersionId");
+  if (!select || select.options.length > 1) return;
+  select.innerHTML = `<option value="">不属于计划</option>${(governanceWorkbenchData.planVersions || []).map((item) => `<option value="${escapeHtml(item.id || "")}">${escapeHtml(item.version || item.name || item.id || "计划版本")}</option>`).join("")}`;
+});
+document.addEventListener("click", (event) => {
+  const governanceButton = event.target.closest("[data-open-governance-tab]");
+  if (governanceButton) {
+    openGovernanceWorkbench(governanceButton.dataset.openGovernanceTab);
+    return;
+  }
+  const emptyAction = event.target.closest("[data-observability-empty-action='filters']");
+  if (emptyAction) {
+    setObservabilityFilterPanel(emptyAction.dataset.observabilityScope, true);
+    el(emptyAction.dataset.observabilityScope === "stability" ? "stabilityModel" : "costCategory")?.focus();
+  }
+  const metricAction = event.target.closest("[data-observability-action]");
+  if (!metricAction) return;
+  const action = metricAction.dataset.observabilityAction;
+  if (action === "stability-final-failures") openStabilityScenario({ dataset: { stabilityModel: "", stabilityScenario: "", stabilityErrorCode: "" } });
+  else if (action === "stability-fallbacks") openGovernanceWorkbench("stability-actions");
+  else if (action === "stability-ttft") el("stabilityTrend")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  else if (action === "stability-top-scenario") {
+    const scenario = stabilityOverview?.data?.topScenarios?.[0];
+    if (scenario) openStabilityScenario({ dataset: { stabilityModel: scenario.requestedModelGroup || scenario.model || "", stabilityScenario: scenario.scenario || "", stabilityErrorCode: scenario.errorCode || "" } });
+  } else if (action === "cost-actual-ledger") openCostLedger({ recognitionStatus: "actual" }, metricAction);
+  else if (action === "cost-plan-versions" || action === "cost-budget") openGovernanceWorkbench("plans");
+  else if (action === "cost-savings") openGovernanceWorkbench("savings");
+});
+el("governanceWorkbenchStatus")?.addEventListener("click", (event) => {
+  if (event.target.closest("[data-governance-retry]")) loadGovernanceWorkbench(true);
 });
 el("costLedgerList")?.addEventListener("click", (event) => {
   const retry = event.target.closest("[data-cost-ledger-retry]");

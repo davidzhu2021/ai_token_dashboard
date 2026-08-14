@@ -11,7 +11,7 @@ from backend.observability import (
     stability_metrics,
     verified_savings,
 )
-from backend.main import _cost_item_overlap_usd
+from backend.main import _cost_item_overlap_usd, _manual_cost_ledger_rows, _savings_totals
 
 
 def test_normalize_event_reads_camel_and_snake_case_fields() -> None:
@@ -161,3 +161,61 @@ def test_cost_item_is_prorated_across_months_and_disabled_items_are_ignored() ->
     assert _cost_item_overlap_usd(item, date(2026, 8, 1), date(2026, 8, 31)) == pytest.approx(150)
     item["enabled"] = False
     assert _cost_item_overlap_usd(item, date(2026, 8, 1), date(2026, 8, 31)) == 0
+
+
+def test_manual_cost_ledger_preserves_bucket_and_finance_dimensions() -> None:
+    rows = _manual_cost_ledger_rows(
+        {
+            "id": "subscription-1",
+            "enabled": True,
+            "category": "订阅",
+            "cost_bucket": "subscription",
+            "source_type": "subscription",
+            "vendor": "Vendor A",
+            "provider": "Provider A",
+            "account_id": "acct-1",
+            "account_name": "备用账号",
+            "voucher_no": "V-001",
+            "invoice_no": "I-001",
+            "reconciliation_status": "pending",
+            "recognition_status": "actual",
+            "amount": 31,
+            "amount_usd": 31,
+            "currency": "USD",
+            "service_start_date": date(2026, 8, 1),
+            "service_end_date": date(2026, 8, 31),
+        },
+        date(2026, 8, 10),
+        date(2026, 8, 12),
+    )
+    assert len(rows) == 3
+    assert rows[0]["costBucket"] == "account_procurement"
+    assert rows[0]["sourceType"] == "subscription"
+    assert rows[0]["category"] == "订阅"
+    assert rows[0]["accountId"] == "acct-1"
+    assert rows[0]["provider"] == "Provider A"
+    assert rows[0]["reconciliationStatus"] == "pending"
+    assert sum(row["amountUsd"] for row in rows) == pytest.approx(3)
+
+
+def test_savings_totals_separates_realized_and_future_expected() -> None:
+    totals = _savings_totals(
+        [
+            {
+                "status": "verified",
+                "baselineDailyCost": 100,
+                "verifiedDailyCost": 80,
+                "verifiedDate": "2026-08-01",
+            },
+            {
+                "status": "planned",
+                "baselineDailyCost": 100,
+                "expectedDailyCost": 70,
+                "expectedStartDate": "2026-08-20",
+            },
+        ],
+        date(2026, 8, 12),
+        date(2026, 8, 31),
+    )
+    assert totals["realizedSavingsToDate"] == pytest.approx(240)
+    assert totals["forecastSavingsRemaining"] == pytest.approx(360)

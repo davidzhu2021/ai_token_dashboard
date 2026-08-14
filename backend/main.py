@@ -2,6 +2,7 @@ import base64
 import math
 import asyncio
 import hashlib
+import hmac
 import inspect
 import ipaddress
 import json
@@ -29,11 +30,12 @@ import httpx
 from authlib.integrations.base_client import OAuthError
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.types import Scope
 
 from .cache import TTLCache
 from .auth import (
@@ -90,8 +92,12 @@ from .litellm_client import (
 )
 from .observability import (
     STABILITY_DEFINITIONS_VERSION,
+    metric_envelope,
     monthly_forecast,
     model_state,
+    normalize_event,
+    reviewed_savings_measurements,
+    scenario_details,
     stability_metrics,
     verified_savings,
 )
@@ -160,7 +166,26 @@ app = FastAPI(title="通衢 API", lifespan=app_lifespan)
 # 首屏要先下载 index.html 与 app.js 才能发出任何接口请求，两者合计 500KB 以上。
 # 它们是纯文本，压缩后只剩两成，是首屏可感知延迟里最便宜的一段。
 app.add_middleware(GZipMiddleware, minimum_size=1024)
-app.mount("/assets", StaticFiles(directory=ROOT_DIR / "assets"), name="assets")
+VERSIONED_APP_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+
+class VersionedAppStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        response = await super().get_response(path, scope)
+        query_string = scope.get("query_string", b"")
+        query = dict(parse_qsl(query_string.decode("latin-1"), keep_blank_values=True))
+        method = str(scope.get("method") or "GET").upper()
+        if (
+            method in {"GET", "HEAD"}
+            and path == "app.js"
+            and query.get("v")
+            and response.status_code in {200, 304}
+        ):
+            response.headers["Cache-Control"] = VERSIONED_APP_CACHE_CONTROL
+        return response
+
+
+app.mount("/assets", VersionedAppStaticFiles(directory=ROOT_DIR / "assets"), name="assets")
 
 
 @app.middleware("http")
@@ -229,6 +254,8 @@ team_usage_cache = TTLCache()
 team_member_usage_cache = TTLCache()
 _usage_singleflight: dict[str, asyncio.Task[Any]] = {}
 _usage_singleflight_lock = asyncio.Lock()
+_usage_last_good_payloads: dict[str, dict[str, Any]] = {}
+_usage_last_good_order: list[str] = []
 # Generated customer-demo boards are isolated from the production board
 # caches. Their keys are derived from the server-resolved organization scope.
 organization_usage_cache = TTLCache()
@@ -268,7 +295,34 @@ def usage_sync_role() -> str:
 
 
 def snapshot_reader_configured() -> bool:
-    return usage_store() is not None
+    return usage_sync_role() == "reader" or usage_store() is not None
+
+
+def usage_reader_config_status() -> dict[str, Any]:
+    role = usage_sync_role()
+    database_configured = bool(os.getenv("USAGE_DATABASE_URL", "").strip())
+    sync_enabled = env_bool("USAGE_SYNC_ENABLED", False) or env_bool(
+        "USAGE_REALTIME_ENABLED", False
+    )
+    realtime_requested = env_bool("USAGE_REALTIME_ENABLED", False)
+    redis_configured = bool(os.getenv("USAGE_REDIS_URL", "").strip())
+    missing: list[str] = []
+    if role == "reader":
+        if not database_configured:
+            missing.append("USAGE_DATABASE_URL")
+        if not sync_enabled:
+            missing.append("USAGE_SYNC_ENABLED_OR_USAGE_REALTIME_ENABLED")
+        if realtime_requested and not redis_configured:
+            missing.append("USAGE_REDIS_URL")
+    return {
+        "role": role,
+        "configured": not missing,
+        "databaseConfigured": database_configured,
+        "syncEnabled": sync_enabled,
+        "realtimeEnabled": realtime_requested,
+        "redisConfigured": redis_configured,
+        "missing": missing,
+    }
 
 
 def validate_runtime_auth_config() -> None:
@@ -578,12 +632,92 @@ def usage_data_freshness(last_synced: datetime | None, start_date: str, end_date
     stale = False
     if end_date >= today:
         stale = last_synced is None or (datetime.now(timezone.utc) - last_synced).total_seconds() >= max_age
+    lag_seconds = (
+        max(0, int((datetime.now(timezone.utc) - last_synced).total_seconds()))
+        if last_synced
+        else None
+    )
     return {
         "source": "database",
         "lastSyncedAt": last_synced.isoformat() if last_synced else None,
+        "lagSeconds": lag_seconds,
         "stale": stale,
+        "degraded": stale,
         "maxAgeSeconds": max_age,
     }
+
+
+def remember_usage_payload(cache_key: str, payload: dict[str, Any]) -> None:
+    """Keep a bounded last-known-good snapshot beyond the normal response TTL."""
+
+    if cache_key in _usage_last_good_payloads:
+        _usage_last_good_order.remove(cache_key)
+    _usage_last_good_payloads[cache_key] = dict(payload)
+    _usage_last_good_order.append(cache_key)
+    limit = max(20, env_int("USAGE_LAST_GOOD_CACHE_MAX_ENTRIES", 500))
+    while len(_usage_last_good_order) > limit:
+        expired = _usage_last_good_order.pop(0)
+        _usage_last_good_payloads.pop(expired, None)
+
+
+def degraded_cached_usage_payload(
+    cache_key: str,
+    *,
+    refresh_queued: bool = False,
+) -> dict[str, Any] | None:
+    cached = _usage_last_good_payloads.get(cache_key)
+    if cached is None:
+        return None
+    payload = dict(cached)
+    freshness = dict(payload.get("dataFreshness") or {})
+    freshness.update(
+        {
+            "source": "process_cache_fallback",
+            "stale": True,
+            "degraded": True,
+            "databaseAvailable": False,
+        }
+    )
+    payload["dataFreshness"] = freshness
+    payload["cache"] = {"hit": True, "ttlSeconds": 0, "stale": True}
+    if refresh_queued:
+        payload["refreshQueued"] = True
+    return payload
+
+
+def usage_payload_from_cache(
+    cache: TTLCache,
+    cache_key: str,
+    *,
+    refresh_queued: bool = False,
+) -> dict[str, Any] | None:
+    hit, value, ttl_seconds = cache.get(cache_key)
+    if not hit:
+        return None
+    payload = dict(value)
+    payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
+    if refresh_queued:
+        payload["refreshQueued"] = True
+    return payload
+
+
+def cache_usage_payload(
+    cache: TTLCache,
+    cache_key: str,
+    fallback_key: str,
+    payload: dict[str, Any],
+    ttl_seconds: int,
+) -> None:
+    cache.set(cache_key, payload, ttl_seconds)
+    remember_usage_payload(cache_key, payload)
+    remember_usage_payload(fallback_key, payload)
+
+
+def queue_usage_refresh(start_date: str, end_date: str, requested: bool) -> bool:
+    if not requested or usage_store() is None:
+        return False
+    trigger_usage_refresh(start_date, end_date, True)
+    return True
 
 
 async def snapshot_revision(start_date: str, end_date: str) -> str:
@@ -658,19 +792,23 @@ def attach_snapshot_freshness(
         freshness.update(
             {
                 "source": "realtime",
-                "degraded": False,
+                "degraded": bool(state.get("backfillActive")),
                 "realtimeRevision": state.get("revision"),
                 "latestEventAt": latest_event.isoformat()
                 if isinstance(latest_event, datetime)
                 else None,
+                "lagSeconds": state.get("latestEventLagSeconds"),
                 "stale": bool(
                     not state.get("ready")
+                    or state.get("backfillActive")
                     or (
                         state.get("latestEventLagSeconds") is not None
                         and int(state.get("latestEventLagSeconds"))
                         > max(10, env_int("USAGE_REALTIME_STALE_SECONDS", 30))
                     )
                 ),
+                "backfillActive": bool(state.get("backfillActive")),
+                "backfillBackends": state.get("backfillBackends", []),
             }
         )
     payload["dataFreshness"] = freshness
@@ -785,6 +923,12 @@ async def schedule_usage_refresh(start_date: str, end_date: str, force: bool = F
     store = usage_store()
     if store is None:
         return
+    if usage_sync_role() == "reader":
+        await store.connect()
+        enqueue = getattr(store, "enqueue_refresh_request", None)
+        if callable(enqueue):
+            await enqueue(start_date, end_date)
+        return
     today = usage_today().isoformat()
     if end_date < today:
         return
@@ -804,6 +948,8 @@ async def prepare_usage_refresh(start_date: str, end_date: str, force: bool = Fa
         end_date,
         force,
     )
+    if force and usage_store() is not None:
+        trigger_usage_refresh(start_date, end_date, True)
 
 
 def manual_refresh_database_unavailable() -> HTTPException:
@@ -3410,7 +3556,7 @@ def feishu_direct_url(casdoor_authorize_url: str) -> str:
     return urlunparse(("https", "accounts.feishu.cn", "/open-apis/authen/v1/index", "", params, ""))
 
 
-async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_date: str, source: str, refresh: bool = False) -> dict[str, Any]:
+async def _personal_usage_payload(app_user: dict[str, Any], start_date: str, end_date: str, source: str, refresh: bool = False) -> dict[str, Any]:
     account_type = str(
         app_user.get("accountType") or app_user.get("account_type") or "personal"
     )
@@ -3476,14 +3622,26 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
         return await local_personal_usage_payload(app_user, start_date, end_date, source, refresh)
     request_started = asyncio.get_running_loop().time()
     revision = "development-upstream"
+    fallback_key = personal_usage_cache_key(app_user["email"], start_date, end_date, source)
+    refresh_queued = queue_usage_refresh(start_date, end_date, refresh)
     if usage_store() is not None:
-        revision = await snapshot_revision(start_date, end_date)
+        try:
+            revision = await snapshot_revision(start_date, end_date)
+        except HTTPException as exc:
+            if exc.status_code == 503:
+                cached = degraded_cached_usage_payload(
+                    fallback_key, refresh_queued=refresh_queued
+                )
+                if cached is not None:
+                    return cached
+            raise
     cache_key = personal_usage_cache_key(app_user["email"], start_date, end_date, source, revision)
-    hit, value, ttl_seconds = personal_usage_cache.get(cache_key)
-    if hit and not refresh:
-        payload = dict(value)
-        payload["cache"] = {"hit": True, "ttlSeconds": ttl_seconds}
-        return payload
+    if cached := usage_payload_from_cache(
+        personal_usage_cache,
+        cache_key,
+        refresh_queued=refresh_queued,
+    ):
+        return cached
 
     store = usage_store()
     if store is not None:
@@ -3505,14 +3663,27 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
                     "summary": usage_summary(rows),
                     "mappingCache": {"hit": True, "ttlSeconds": 0},
                 }, stored.get("lastSyncedAt"), start_date, end_date, revision)
-                personal_usage_cache.set(cache_key, payload, env_int("PERSONAL_USAGE_CACHE_TTL_SECONDS", 300))
+                cache_usage_payload(
+                    personal_usage_cache,
+                    cache_key,
+                    fallback_key,
+                    payload,
+                    env_int("PERSONAL_USAGE_CACHE_TTL_SECONDS", 300),
+                )
                 payload["cache"] = {"hit": False, "ttlSeconds": 0}
+                if refresh_queued:
+                    payload["refreshQueued"] = True
                 return payload
         except HTTPException:
             raise
         except Exception as exc:
             logger.exception("local personal usage query failed")
             if snapshot_reader_configured():
+                cached = degraded_cached_usage_payload(
+                    fallback_key, refresh_queued=refresh_queued
+                )
+                if cached is not None:
+                    return cached
                 raise manual_refresh_database_unavailable() from exc
 
         if snapshot_reader_configured():
@@ -3521,7 +3692,7 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
                 detail="个人用量快照尚未就绪，请等待后台同步完成",
             )
 
-    if refresh:
+    if refresh and snapshot_reader_configured():
         raise manual_refresh_database_unavailable()
 
     upstream_user, mapping_cache = await cached_resolve_user(app_user["email"], app_user.get("name"), refresh)
@@ -3538,10 +3709,31 @@ async def personal_usage_payload(app_user: dict[str, Any], start_date: str, end_
         "summary": usage_summary(rows),
         "mappingCache": mapping_cache,
     }
-    personal_usage_cache.set(cache_key, payload, env_int("PERSONAL_USAGE_CACHE_TTL_SECONDS", 300))
+    cache_usage_payload(
+        personal_usage_cache,
+        cache_key,
+        fallback_key,
+        payload,
+        env_int("PERSONAL_USAGE_CACHE_TTL_SECONDS", 300),
+    )
     payload = dict(payload)
     payload["cache"] = {"hit": False, "ttlSeconds": 0}
     return payload
+
+
+async def personal_usage_payload(
+    app_user: dict[str, Any],
+    start_date: str,
+    end_date: str,
+    source: str,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    identity = str(app_user.get("id") or app_user.get("email") or "anonymous").lower()
+    key = f"personal:{identity}:{start_date}:{end_date}:{source}:{int(refresh)}"
+    return await usage_singleflight(
+        key,
+        lambda: _personal_usage_payload(app_user, start_date, end_date, source, refresh),
+    )
 
 
 async def real_organization_member_usage_payload(
@@ -4150,7 +4342,7 @@ async def user_ids_for_team_employee(employee: dict[str, Any], refresh: bool) ->
     return list(dict.fromkeys(resolved_ids))
 
 
-async def team_member_usage_payload(
+async def _team_member_usage_payload(
     app_user: dict[str, Any],
     start_date: str,
     end_date: str,
@@ -4254,6 +4446,34 @@ async def team_member_usage_payload(
     payload = dict(payload)
     payload["cache"] = {"hit": False, "ttlSeconds": 0}
     return payload
+
+
+async def team_member_usage_payload(
+    app_user: dict[str, Any],
+    start_date: str,
+    end_date: str,
+    source: str,
+    employee: str,
+    refresh: bool = False,
+    team_ref_value: str | None = None,
+) -> dict[str, Any]:
+    identity = str(app_user.get("id") or app_user.get("email") or "anonymous").lower()
+    key = (
+        f"team-member:{identity}:{team_ref_value or ''}:{employee}:"
+        f"{start_date}:{end_date}:{source}:{int(refresh)}"
+    )
+    return await usage_singleflight(
+        key,
+        lambda: _team_member_usage_payload(
+            app_user,
+            start_date,
+            end_date,
+            source,
+            employee,
+            refresh,
+            team_ref_value,
+        ),
+    )
 
 
 async def current_upstream_user(request: Request, refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -4782,6 +5002,9 @@ class CostItemRequest(BaseModel):
     invoiceNo: str = Field(default="", max_length=160)
     recognitionStatus: Literal["actual", "committed", "planned"] = "actual"
     reconciliationStatus: Literal["unreconciled", "pending", "matched", "partial", "exception", "waived"] = "unreconciled"
+    planVersionId: str = Field(default="", max_length=128)
+    scenario: str = Field(default="", max_length=80)
+    sourceEvidence: str = Field(default="", max_length=1000)
     notes: str = Field(default="", max_length=1000)
     enabled: bool = True
 
@@ -4809,6 +5032,81 @@ class SavingsActionRequest(BaseModel):
     evidenceUrl: str = Field(default="", max_length=1000)
     financeReviewer: str = Field(default="", max_length=160)
     notes: str = Field(default="", max_length=1000)
+
+
+class StabilityActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1, max_length=200)
+    owner: str = Field(default="", max_length=160)
+    severity: Literal["low", "medium", "high", "critical"] = "medium"
+    status: Literal["open", "in_progress", "resolved", "verified", "closed"] = "open"
+    targetDate: date | None = None
+    fixReference: str = Field(default="", max_length=1000)
+    requestedModelGroup: str = Field(default="", max_length=256)
+    scenario: str = Field(default="", max_length=64)
+    errorCode: str = Field(default="", max_length=120)
+    notes: str = Field(default="", max_length=2000)
+
+
+class StabilityRegressionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    actionId: str = Field(min_length=1, max_length=128)
+    baselineStart: date
+    baselineEnd: date
+    regressionStart: date
+    regressionEnd: date
+    metric: str = Field(min_length=1, max_length=120)
+    baselineValue: Decimal | None = None
+    regressionValue: Decimal | None = None
+    conclusion: Literal["passed", "failed", "inconclusive"]
+    notes: str = Field(default="", max_length=2000)
+
+    @field_validator("baselineEnd")
+    @classmethod
+    def validate_baseline_window(cls, value: date, info: Any) -> date:
+        start = info.data.get("baselineStart")
+        if start and value < start:
+            raise ValueError("baselineEnd must not be before baselineStart")
+        return value
+
+    @field_validator("regressionEnd")
+    @classmethod
+    def validate_regression_window(cls, value: date, info: Any) -> date:
+        start = info.data.get("regressionStart")
+        if start and value < start:
+            raise ValueError("regressionEnd must not be before regressionStart")
+        return value
+
+
+class CostPlanVersionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    year: int = Field(ge=2020, le=2100)
+    version: str = Field(min_length=1, max_length=80)
+    scenario: Literal["baseline", "optimistic", "conservative"] = "baseline"
+    asOf: date
+    status: Literal["draft", "approved", "archived"] = "draft"
+    notes: str = Field(default="", max_length=2000)
+    coverageComplete: bool = False
+
+
+class SavingsMeasurementRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    actionId: str = Field(min_length=1, max_length=128)
+    scope: str = Field(default="", max_length=256)
+    provider: str = Field(default="", max_length=160)
+    model: str = Field(default="", max_length=256)
+    costBucket: str = Field(default="", max_length=80)
+    baselineStart: date
+    baselineEnd: date
+    measurementStart: date
+    measurementEnd: date
+    baselineAmountUsd: Decimal = Field(ge=0)
+    actualAmountUsd: Decimal = Field(ge=0)
+    evidenceUrl: str = Field(default="", max_length=1000)
+    financeReviewer: str = Field(default="", max_length=160)
+    reviewedAt: datetime | None = None
+    status: Literal["pending_evidence", "reviewed", "rejected"] = "pending_evidence"
+    notes: str = Field(default="", max_length=2000)
 
 
 def write_key_audit(event: str, email: str, key_id: str, request: Request, result: str) -> None:
@@ -5102,7 +5400,11 @@ async def health() -> dict[str, Any]:
             lag = realtime_status.get("latestEventLagSeconds")
             stale_seconds = max(10, env_int("USAGE_REALTIME_STALE_SECONDS", 30))
             status = "ok"
-            if not realtime_status.get("ready") or (lag is not None and lag > stale_seconds):
+            if (
+                not realtime_status.get("ready")
+                or realtime_status.get("backfillActive")
+                or (lag is not None and lag > stale_seconds)
+            ):
                 status = "degraded"
             if lag is not None and lag > 120:
                 status = "unhealthy"
@@ -5117,6 +5419,8 @@ async def health() -> dict[str, Any]:
                 "latestEventLagSeconds": lag,
                 "pendingArchiveCount": realtime_status.get("pendingArchiveCount", 0),
                 "cursors": realtime_status.get("cursors", {}),
+                "backfillActive": bool(realtime_status.get("backfillActive")),
+                "backfillBackends": realtime_status.get("backfillBackends", []),
             }
             if status != "ok":
                 result["status"] = status
@@ -8426,7 +8730,10 @@ async def my_usage(
         local_user = await auth_store_call("get_user", str(app_user["id"]))
         if not local_user:
             raise auth_http_error(401, "本地登录已失效，请重新登录", "AUTH_LOGIN_REQUIRED")
-        app_user = await auth_user_payload(local_user, refresh_entitlement=True)
+        # Session hydration already resolved the entitlement for this request.
+        # Rebuilding the local profile here may read the TTL cache, but must not
+        # force another upstream user lookup on every dashboard refresh.
+        app_user = await auth_user_payload(local_user)
         require_active_local_entitlement(app_user)
     start_date, end_date = resolve_usage_range(start_date, end_date)
     return await personal_usage_payload(app_user, start_date, end_date, source, refresh)
@@ -8580,7 +8887,7 @@ async def my_usage_logs(
         local_user = await auth_store_call("get_user", str(app_user["id"]))
         if not local_user:
             raise auth_http_error(401, "本地登录已失效，请重新登录", "AUTH_LOGIN_REQUIRED")
-        app_user = await auth_user_payload(local_user, refresh_entitlement=True)
+        app_user = await auth_user_payload(local_user)
         require_active_local_entitlement(app_user)
     start_date, end_date = resolve_usage_range(start_date, end_date)
     payload = await personal_usage_payload(app_user, start_date, end_date, source)
@@ -8720,23 +9027,164 @@ def _stability_quality(metrics: dict[str, Any]) -> dict[str, Any]:
     return quality
 
 
+async def _call_store_optional(store: Any, method_names: tuple[str, ...], *args: Any, default: Any = None, **kwargs: Any) -> Any:
+    """Keep v2 routes compatible while UsageStore migrations roll out."""
+
+    for name in method_names:
+        method = getattr(store, name, None)
+        if not callable(method):
+            continue
+        try:
+            return await method(*args, **kwargs)
+        except TypeError:
+            if kwargs:
+                try:
+                    return await method(*args)
+                except TypeError:
+                    continue
+            continue
+    return default
+
+
+async def _stability_attempt_events(
+    store: Any,
+    start_date: str,
+    end_date: str,
+    *,
+    model: str = "",
+    trace_id: str = "",
+    request_id: str = "",
+) -> list[dict[str, Any]]:
+    rows = await _call_store_optional(
+        store,
+        ("stability_attempt_events", "list_stability_attempt_events"),
+        start_date,
+        end_date,
+        model=model,
+        trace_id=trace_id,
+        request_id=request_id,
+        default=[],
+    )
+    return [dict(row) for row in (rows or [])]
+
+
+def _metric_period(start_date: str, end_date: str) -> dict[str, str]:
+    return {"startDate": start_date, "endDate": end_date}
+
+
+_OBSERVABILITY_EVENT_FIELDS = {
+    "eventId", "event_id", "backendId", "backend_id", "traceId", "trace_id",
+    "requestId", "request_id", "attemptId", "attempt_id", "attemptIndex", "attempt_index",
+    "requestedModelGroup", "requested_model_group", "actualModel", "actual_model", "route",
+    "provider", "eventType", "event_type", "status", "errorCode", "error_code",
+    "errorClass", "error_class", "errorCategory", "error_category", "scenario", "scenarioVersion", "scenario_version",
+    "startedAt", "started_at", "endedAt", "ended_at", "eventTime", "event_time", "collectedAt", "collected_at",
+    "ttftMs", "ttft_ms", "durationMs", "duration_ms", "retryIndex", "retry_index", "isRetry", "is_retry", "isFallback", "is_fallback",
+    "routeName", "route_name",
+    "fallbackFrom", "fallback_from", "fallbackTo", "fallback_to",
+}
+_OBSERVABILITY_FORBIDDEN_EVENT_FIELDS = {
+    "prompt", "messages", "response", "completion", "content", "body", "choices",
+    "api_key", "apiKey", "authorization", "token", "secret", "traceback", "exception",
+}
+_OBSERVABILITY_CAMEL_TO_SNAKE = {
+    "eventId": "event_id", "backendId": "backend_id", "traceId": "trace_id",
+    "requestId": "request_id", "attemptId": "attempt_id", "attemptIndex": "attempt_index",
+    "requestedModelGroup": "requested_model_group", "actualModel": "actual_model",
+    "eventType": "event_type", "errorCode": "error_code", "errorClass": "error_class",
+    "errorCategory": "error_category", "eventTime": "event_time", "collectedAt": "collected_at",
+    "scenarioVersion": "scenario_version", "startedAt": "started_at", "endedAt": "ended_at",
+    "ttftMs": "ttft_ms", "durationMs": "duration_ms", "retryIndex": "retry_index", "isRetry": "is_retry", "isFallback": "is_fallback",
+    "routeName": "route_name", "fallbackFrom": "fallback_from", "fallbackTo": "fallback_to",
+}
+
+
+@app.post("/api/internal/observability/events")
+async def internal_observability_events(request: Request) -> dict[str, Any]:
+    secret = os.getenv("OBSERVABILITY_INGEST_HMAC_SECRET", "").strip()
+    if not secret:
+        raise HTTPException(status_code=404, detail="采集接口尚未启用")
+    max_body = max(1024, int(os.getenv("OBSERVABILITY_INGEST_MAX_BODY_BYTES", "262144")))
+    content_length = int(request.headers.get("content-length") or 0)
+    if content_length > max_body:
+        raise HTTPException(status_code=413, detail="事件批次过大")
+    body = await request.body()
+    if len(body) > max_body:
+        raise HTTPException(status_code=413, detail="事件批次过大")
+    timestamp = request.headers.get("x-observability-timestamp", "").strip()
+    signature = request.headers.get("x-observability-signature", "").strip()
+    try:
+        observed_at = int(timestamp)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="采集签名时间戳无效") from exc
+    if abs(int(datetime.now(timezone.utc).timestamp()) - observed_at) > int(os.getenv("OBSERVABILITY_INGEST_MAX_SKEW_SECONDS", "300")):
+        raise HTTPException(status_code=401, detail="采集签名已过期")
+    digest = hashlib.sha256(body).hexdigest()
+    expected = hmac.new(secret.encode("utf-8"), f"{timestamp}.{digest}".encode("ascii"), hashlib.sha256).hexdigest()
+    supplied = signature.removeprefix("sha256=").lower()
+    if not supplied or not hmac.compare_digest(expected, supplied):
+        raise HTTPException(status_code=401, detail="采集签名无效")
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="事件批次必须是 JSON") from exc
+    raw_events = payload.get("events") if isinstance(payload, dict) else payload
+    if not isinstance(raw_events, list) or not raw_events or len(raw_events) > 500:
+        raise HTTPException(status_code=400, detail="events 必须是 1-500 条事件的数组")
+    normalized_events: list[dict[str, Any]] = []
+    for raw in raw_events:
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail="每条事件必须是对象")
+        forbidden = _OBSERVABILITY_FORBIDDEN_EVENT_FIELDS.intersection(raw)
+        unknown = set(raw).difference(_OBSERVABILITY_EVENT_FIELDS)
+        if forbidden:
+            raise HTTPException(status_code=400, detail=f"事件包含禁止字段: {sorted(forbidden)[0]}")
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"事件包含未知字段: {sorted(unknown)[0]}")
+        event = {_OBSERVABILITY_CAMEL_TO_SNAKE.get(key, key): value for key, value in raw.items()}
+        if not str(event.get("event_id") or "").strip() or not str(event.get("backend_id") or "").strip():
+            raise HTTPException(status_code=400, detail="eventId 和 backendId 必填")
+        event["scenario"] = scenario_details(event)["scenario"]
+        event["scenario_version"] = scenario_details(event)["version"]
+        event["collected_at"] = datetime.now(timezone.utc).isoformat()
+        normalized_events.append(event)
+    store = usage_store()
+    if store is None:
+        raise HTTPException(status_code=503, detail="尝试事件存储暂不可用")
+    result = await _call_store_optional(store, ("insert_stability_attempt_events",), normalized_events, default=None)
+    if result is None:
+        raise HTTPException(status_code=503, detail="尝试事件存储尚未就绪")
+    if isinstance(result, int):
+        result = {"inserted": result, "received": len(normalized_events), "duplicates": len(normalized_events) - result}
+    return _observability_envelope(result, coverage={"partial": False, "incomplete": False}, source="upstream attempt events")
+
+
 async def _admin_stability_events(start_date: str, end_date: str, model: str = "") -> list[dict[str, Any]]:
     rows = await _admin_observability_store().stability_events(start_date, end_date, model)
     output: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
         status = item.get("status")
-        final_failure = item.get("final_request_failure")
-        if final_failure is None:
-            final_failure = item.get("finalRequestFailure")
-        if final_failure is None:
-            final_failure = item.get("user_visible_failure")
+        explicit_final_failure = item.get("final_request_failure")
+        if explicit_final_failure is None:
+            explicit_final_failure = item.get("finalRequestFailure")
+        stored_failure = item.get("user_visible_failure")
+        final_failure = explicit_final_failure if explicit_final_failure is not None else stored_failure
+        if final_failure is None and status in {"success", "failure"}:
+            final_failure = status == "failure"
+        final_failure_source = str(item.get("final_failure_source") or item.get("finalRequestFailureSource") or "").lower() or None
+        if final_failure_source not in {"explicit", "derived"}:
+            final_failure_source = "explicit" if explicit_final_failure is not None else ("derived" if final_failure is not None else None)
+        classified = scenario_details(item)
         item.update({
             # Do not default missing state to successful: older logs may have
             # no status and must remain excluded from final-failure metrics.
             "status": status or "unknown",
-            "scenario": item.get("scenario") or "unknown",
+            "scenario": classified["scenario"],
+            "scenarioSource": classified["source"],
+            "scenarioVersion": classified["version"],
             "finalRequestFailure": final_failure,
+            "finalRequestFailureSource": final_failure_source,
             "userVisibleFailure": final_failure,
             "attemptedRetries": item.get("attempted_retries"),
             "ttftMs": item.get("ttft_ms"),
@@ -8757,15 +9205,19 @@ async def admin_stability_overview(
         raise HTTPException(status_code=404, detail="看板尚未开放")
     start_date, end_date = resolve_usage_range(start_date, end_date)
     events = await _admin_stability_events(start_date, end_date, model)
-    sync_states = await _admin_observability_store().stability_sync_states()
-    overview = stability_metrics(events)
+    store = _admin_observability_store()
+    sync_states = await store.stability_sync_states()
+    attempt_events = await _stability_attempt_events(store, start_date, end_date, model=model)
+    metric_period = _metric_period(start_date, end_date)
+    overview = stability_metrics(events, attempt_events, period=metric_period, as_of=end_date)
     by_day: dict[str, list[dict[str, Any]]] = {}
     by_model: dict[str, list[dict[str, Any]]] = {}
-    by_scenario: dict[str, list[dict[str, Any]]] = {}
+    by_scenario: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for event in events:
         day = str(event.get("usage_date") or event.get("event_time") or "")[:10]
         by_day.setdefault(day, []).append(event)
-        by_model.setdefault(str(event.get("model") or "unknown"), []).append(event)
+        requested_model = str(event.get("model_group") or event.get("model") or "unknown")
+        by_model.setdefault(requested_model, []).append(event)
         attempted_retries = event.get("attemptedRetries")
         is_exception_sample = bool(
             event.get("userVisibleFailure")
@@ -8775,11 +9227,12 @@ async def admin_stability_overview(
         )
         scenario_name = str(event.get("scenario") or "unknown")
         if is_exception_sample or scenario_name != "unknown":
-            by_scenario.setdefault(scenario_name, []).append(event)
-    daily = [{"date": day, **stability_metrics(items)} for day, items in sorted(by_day.items())]
+            by_scenario.setdefault((requested_model, scenario_name, str(event.get("error_code") or "")), []).append(event)
+    daily = [{"date": day, **stability_metrics(items, [item for item in attempt_events if str(item.get("started_at") or item.get("event_time") or "")[:10] == day], period=metric_period, as_of=end_date)} for day, items in sorted(by_day.items())]
     rankings = []
     for name, items in by_model.items():
-        metrics = stability_metrics(items)
+        model_attempts = [item for item in attempt_events if str(item.get("requested_model_group") or item.get("requestedModelGroup") or item.get("actual_model") or item.get("actualModel") or "unknown") == name]
+        metrics = stability_metrics(items, model_attempts, period=metric_period, as_of=end_date)
         rankings.append({
             "model": name,
             **metrics,
@@ -8790,28 +9243,35 @@ async def admin_stability_overview(
                 env_float("STABILITY_FAILURE_OBSERVE_THRESHOLD", 0.03),
                 env_float("STABILITY_TTFT_STABLE_MS", 2000),
                 env_float("STABILITY_TTFT_OBSERVE_MS", 4000),
+                ttft_coverage_rate=metrics.get("ttftCoverageRate"),
+                ttft_sample_count=metrics.get("ttftSampleCount"),
+                minimum_ttft_coverage=env_float("STABILITY_TTFT_MIN_COVERAGE", 0.8),
+                minimum_ttft_samples=int(env_float("STABILITY_TTFT_MIN_SAMPLES", 30)),
             ),
         })
     scenarios = []
-    for name, items in sorted(by_scenario.items(), key=lambda pair: len(pair[1]), reverse=True)[:10]:
-        model_counts: dict[str, int] = defaultdict(int)
-        error_counts: dict[str, int] = defaultdict(int)
-        for item in items:
-            model_counts[str(item.get("model") or "unknown")] += 1
-            if item.get("error_code"):
-                error_counts[str(item["error_code"])] += 1
+    for (requested_model, name, error_code), items in sorted(by_scenario.items(), key=lambda pair: len(pair[1]), reverse=True)[:10]:
+        scenario_attempts = [
+            item for item in attempt_events
+            if str(item.get("requested_model_group") or item.get("requestedModelGroup") or "unknown") == requested_model
+            and str(item.get("scenario") or "unknown") == name
+            and str(item.get("error_code") or item.get("errorCode") or "") == error_code
+        ]
         scenarios.append({
             "scenario": name,
             "count": len(items),
-            "model": max(model_counts, key=model_counts.get),
-            "errorCode": max(error_counts, key=error_counts.get) if error_counts else None,
+            "model": requested_model,
+            "requestedModelGroup": requested_model,
+            "errorCode": error_code or None,
             "sampleRequestIds": [item.get("request_id") for item in items[:5]],
             "sampleRequests": [
                 {"requestId": item.get("request_id"), "backendId": item.get("backend_id")}
                 for item in items[:5]
             ],
-            **stability_metrics(items),
+            **stability_metrics(items, scenario_attempts, period=metric_period, as_of=end_date),
         })
+    actions = await _call_store_optional(store, ("list_stability_actions",), model=model, default=[])
+    regressions = await _call_store_optional(store, ("list_stability_regressions",), default=[])
     window_covered, missing_reasons = _stability_missing_reasons(
         sync_states,
         start_date=start_date,
@@ -8841,6 +9301,9 @@ async def admin_stability_overview(
                 ),
             ),
             "topScenarios": scenarios,
+            "actions": actions or [],
+            "regressions": regressions or [],
+            "attemptEventsAvailableFrom": min((str(item.get("started_at") or item.get("event_time") or "") for item in attempt_events), default=None),
             "quality": _stability_quality(overview),
             "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
         },
@@ -8870,24 +9333,25 @@ async def admin_stability_scenarios(request: Request, start_date: str | None = N
         raw_items, total = filtered[start:start + page_size], len(filtered)
     samples = []
     for item in raw_items:
-        final_failure = item.get("final_request_failure")
-        if final_failure is None:
-            final_failure = item.get("finalRequestFailure")
-        if final_failure is None:
-            final_failure = item.get("user_visible_failure")
+        normalized = normalize_event(dict(item))
+        final_failure = normalized.get("finalRequestFailure")
         samples.append({
             "requestId": item.get("request_id"),
             "backendId": item.get("backend_id"),
             "eventTime": item.get("event_time"),
             "model": item.get("model"),
-            "scenario": item.get("scenario") or "unknown",
+            "requestedModelGroup": item.get("model_group") or item.get("model") or "unknown",
+            "scenario": scenario_details(dict(item))["scenario"],
+            "scenarioVersion": scenario_details(dict(item))["version"],
             "errorCode": item.get("error_code"),
             "status": item.get("status") or "unknown",
             "finalRequestFailure": final_failure,
+            "finalRequestFailureSource": item.get("final_failure_source") or normalized.get("finalRequestFailureSource"),
             "userVisibleFailure": final_failure,
             "attemptedRetries": item.get("attempted_retries"),
             "maxRetries": item.get("max_retries"),
             "ttftMs": item.get("ttft_ms"),
+            "actions": await _call_store_optional(store, ("list_stability_actions",), model=str(item.get("model_group") or item.get("model") or ""), scenario=str(item.get("scenario") or ""), default=[]),
         })
     sync_states = await store.stability_sync_states()
     window_covered, missing_reasons = _stability_missing_reasons(
@@ -8923,7 +9387,138 @@ async def admin_stability_request(request: Request, request_id: str, backend_id:
     if record is None:
         raise HTTPException(status_code=404, detail="请求样本不存在")
     safe_fields = {key: record.get(key) for key in ("backend_id", "request_id", "event_time", "model", "provider", "model_group", "model_id", "source", "status", "error_code", "error_class", "error_message", "scenario", "request_duration_ms", "ttft_ms", "prompt_tokens", "completion_tokens", "total_tokens", "attempted_retries", "max_retries", "trace_id", "user_visible_failure", "organization_id", "team_id", "principal_id", "collected_at")}
-    return _observability_envelope(safe_fields, coverage={"partial": False, "incomplete": False}, source="稳定性事件快照")
+    timeline = await _call_store_optional(store, ("stability_attempt_timeline",), request_id, backend_id, default=None)
+    if timeline is None:
+        event_day = str(record.get("event_time") or date.today().isoformat())[:10]
+        timeline = await _stability_attempt_events(store, event_day, event_day, trace_id=str(record.get("trace_id") or ""), request_id=request_id)
+    action_list = await _call_store_optional(store, ("list_stability_actions",), request_id=request_id, scenario=str(record.get("scenario") or ""), default=[])
+    action_ids = {str(item.get("id") or "") for item in (action_list or [])}
+    regressions = await _call_store_optional(store, ("list_stability_regressions",), default=[])
+    normalized = normalize_event(record)
+    return _observability_envelope(
+        {
+            **safe_fields,
+            "finalRequestFailure": normalized.get("finalRequestFailure"),
+            "finalRequestFailureSource": normalized.get("finalRequestFailureSource"),
+            "timeline": timeline or [],
+            "actions": action_list or [],
+            "regressions": [item for item in (regressions or []) if str(item.get("action_id") or item.get("actionId") or "") in action_ids],
+        },
+        coverage={"partial": False, "incomplete": not bool(timeline), "missingReasons": [] if timeline else ["upstream_attempt_logs_unavailable"]},
+        source="stability events and attempt timeline",
+    )
+
+
+def _stability_action_input(data: StabilityActionRequest, action_id: str | None = None) -> dict[str, Any]:
+    return {
+        "id": action_id or uuid.uuid4().hex,
+        "title": data.title.strip(),
+        "description": data.notes.strip(),
+        "owner": data.owner.strip(),
+        "severity": data.severity,
+        "status": data.status,
+        "targetDate": data.targetDate.isoformat() if data.targetDate else None,
+        "fixReference": data.fixReference.strip(),
+        "requestedModelGroup": data.requestedModelGroup.strip(),
+        "scenario": data.scenario.strip(),
+        "errorCode": data.errorCode.strip(),
+        "notes": data.notes.strip(),
+    }
+
+
+def _stability_regression_input(data: StabilityRegressionRequest, regression_id: str | None = None) -> dict[str, Any]:
+    return {
+        "id": regression_id or uuid.uuid4().hex,
+        "actionId": data.actionId.strip(),
+        "baselineStartDate": data.baselineStart.isoformat(),
+        "baselineEndDate": data.baselineEnd.isoformat(),
+        "regressionStartDate": data.regressionStart.isoformat(),
+        "regressionEndDate": data.regressionEnd.isoformat(),
+        "metricName": data.metric.strip(),
+        "baselineValue": data.baselineValue,
+        "regressionValue": data.regressionValue,
+        "status": "verified",
+        "conclusion": data.conclusion,
+        "notes": data.notes.strip(),
+        "notes": data.notes.strip(),
+    }
+
+
+@app.get("/api/admin/stability/actions")
+async def admin_stability_actions(request: Request, status: str = "", owner: str = "", scenario: str = "") -> dict[str, Any]:
+    require_platform_admin(request)
+    store = _admin_observability_store()
+    items = await _call_store_optional(store, ("list_stability_actions",), status=status, owner=owner, scenario=scenario, default=[])
+    return _observability_envelope(items or [], source="stability governance")
+
+
+@app.post("/api/admin/stability/actions")
+async def admin_create_stability_action(data: StabilityActionRequest, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    await enforce_csrf(request)
+    store = _admin_observability_store()
+    item = await _call_store_optional(store, ("create_stability_action",), _stability_action_input(data), default=None)
+    if item is None:
+        raise HTTPException(status_code=503, detail="稳定性治理存储尚未就绪")
+    return _observability_envelope(item, source="stability governance")
+
+
+@app.patch("/api/admin/stability/actions/{action_id}")
+async def admin_update_stability_action(action_id: str, data: StabilityActionRequest, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    await enforce_csrf(request)
+    store = _admin_observability_store()
+    item = await _call_store_optional(store, ("update_stability_action",), action_id, _stability_action_input(data, action_id), default=None)
+    if item is None:
+        raise HTTPException(status_code=404, detail="稳定性治理动作不存在")
+    return _observability_envelope(item, source="stability governance")
+
+
+@app.delete("/api/admin/stability/actions/{action_id}")
+async def admin_delete_stability_action(action_id: str, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    await enforce_csrf(request)
+    deleted = await _call_store_optional(_admin_observability_store(), ("delete_stability_action",), action_id, default=False)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="稳定性治理动作不存在")
+    return _observability_envelope({"deleted": True}, source="stability governance")
+
+
+@app.get("/api/admin/stability/regressions")
+async def admin_stability_regressions(request: Request, action_id: str = "", scenario: str = "") -> dict[str, Any]:
+    require_platform_admin(request)
+    items = await _call_store_optional(_admin_observability_store(), ("list_stability_regressions",), action_id=action_id, scenario=scenario, default=[])
+    return _observability_envelope(items or [], source="stability governance")
+
+
+@app.post("/api/admin/stability/regressions")
+async def admin_create_stability_regression(data: StabilityRegressionRequest, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    await enforce_csrf(request)
+    item = await _call_store_optional(_admin_observability_store(), ("create_stability_regression",), _stability_regression_input(data), default=None)
+    if item is None:
+        raise HTTPException(status_code=503, detail="回归验证存储尚未就绪")
+    return _observability_envelope(item, source="stability governance")
+
+
+@app.patch("/api/admin/stability/regressions/{regression_id}")
+async def admin_update_stability_regression(regression_id: str, data: StabilityRegressionRequest, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    await enforce_csrf(request)
+    item = await _call_store_optional(_admin_observability_store(), ("update_stability_regression",), regression_id, _stability_regression_input(data, regression_id), default=None)
+    if item is None:
+        raise HTTPException(status_code=404, detail="回归验证记录不存在")
+    return _observability_envelope(item, source="stability governance")
+
+
+@app.delete("/api/admin/stability/regressions/{regression_id}")
+async def admin_delete_stability_regression(regression_id: str, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    await enforce_csrf(request)
+    deleted = await _call_store_optional(_admin_observability_store(), ("delete_stability_regression",), regression_id, default=False)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="回归验证记录不存在")
+    return _observability_envelope({"deleted": True}, source="stability governance")
 
 
 def _cost_item_payload(item: dict[str, Any]) -> dict[str, Any]:
@@ -8954,6 +9549,9 @@ def _cost_item_payload(item: dict[str, Any]) -> dict[str, Any]:
         "invoiceNo": item.get("invoice_no") or None,
         "recognitionStatus": item.get("recognition_status") or "actual",
         "reconciliationStatus": item.get("reconciliation_status") or "unreconciled",
+        "planVersionId": item.get("plan_version_id") or item.get("planVersionId") or None,
+        "scenario": item.get("scenario") or None,
+        "sourceEvidence": item.get("source_evidence") or item.get("sourceEvidence") or None,
         "notes": item.get("notes"),
         "enabled": bool(item.get("enabled")),
     }
@@ -8971,6 +9569,72 @@ def _cost_item_overlap_usd(item: dict[str, Any], start: date, end: date) -> floa
     service_days = max(1, (service_end - service_start).days + 1)
     overlap_days = (overlap_end - overlap_start).days + 1
     return float(item.get("amount_usd") or 0) / service_days * overlap_days
+
+
+def _recognition_status(item: dict[str, Any]) -> str:
+    return str(item.get("recognition_status") or item.get("recognitionStatus") or "actual").strip().lower()
+
+
+def _actual_cost_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [item for item in items if _recognition_status(item) == "actual"]
+
+
+def _plan_version_payload(item: dict[str, Any]) -> dict[str, Any]:
+    coverage_status = str(item.get("coverage_status") or item.get("coverageStatus") or "")
+    return {
+        "id": str(item.get("id") or ""),
+        "year": int(item.get("year") or item.get("plan_year") or item.get("planYear") or 0),
+        "version": item.get("version"),
+        "scenario": item.get("scenario") or "baseline",
+        "asOf": str(item.get("as_of") or item.get("as_of_date") or item.get("asOfDate") or item.get("asOf") or "")[:10] or None,
+        "status": item.get("status") or "draft",
+        "coverageComplete": coverage_status == "complete" or bool(item.get("coverage_complete") if item.get("coverage_complete") is not None else item.get("coverageComplete")),
+        "approvedBy": item.get("approved_by") or item.get("approvedBy") or None,
+        "approvedAt": str(item.get("approved_at") or item.get("approvedAt") or "") or None,
+        "activatedAt": str(item.get("activated_at") or item.get("activatedAt") or "") or None,
+        "notes": item.get("notes") or "",
+    }
+
+
+def _active_baseline_plan(plans: list[dict[str, Any]], year: int) -> dict[str, Any] | None:
+    candidates = [
+        item for item in plans
+        if int(item.get("year") or item.get("plan_year") or item.get("planYear") or 0) == year
+        and str(item.get("scenario") or "baseline") == "baseline"
+        and str(item.get("status") or "").lower() == "approved"
+        and bool(item.get("active") if item.get("active") is not None else item.get("is_active") if item.get("is_active") is not None else item.get("activated_at") or item.get("activatedAt"))
+    ]
+    return max(candidates, key=lambda item: str(item.get("activated_at") or item.get("activatedAt") or item.get("approved_at") or item.get("approvedAt") or ""), default=None)
+
+
+def _official_plan_rows(items: list[dict[str, Any]], plan: dict[str, Any] | None, start: date, end: date) -> list[dict[str, Any]]:
+    coverage_complete = bool(plan and (str(plan.get("coverage_status") or plan.get("coverageStatus") or "") == "complete" or (plan.get("coverage_complete") if plan.get("coverage_complete") is not None else plan.get("coverageComplete"))))
+    if not plan or not coverage_complete:
+        return []
+    plan_id = str(plan.get("id") or "")
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        if str(item.get("plan_version_id") or item.get("planVersionId") or "") != plan_id:
+            continue
+        if _recognition_status(item) not in {"committed", "planned"}:
+            continue
+        rows.extend(_manual_cost_ledger_rows(item, start, end))
+    return rows
+
+
+async def _official_plan_items(store: Any, plan: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not plan:
+        return []
+    plan_id = str(plan.get("id") or "")
+    rows = await _call_store_optional(
+        store,
+        ("list_cost_items",),
+        plan_version_id=plan_id,
+        default=None,
+    )
+    if rows is None:
+        rows = await store.list_cost_items()
+    return [dict(item) for item in rows if bool(item.get("enabled")) and str(item.get("plan_version_id") or item.get("planVersionId") or "") == plan_id]
 
 
 _COST_BUCKET_LABELS = {
@@ -9017,9 +9681,13 @@ def _cost_account_id(row: dict[str, Any]) -> str:
     return str(
         row.get("account_id")
         or row.get("accountId")
-        or row.get("key_id")
-        or row.get("principal_id")
         or row.get("user_id")
+        or row.get("raw_user_id")
+        or row.get("principal_id")
+        # A key id is only a last-resort legacy dimension. Prefer the
+        # billable account identity so the cost drawer never promotes a
+        # credential identifier to the primary account label.
+        or row.get("key_id")
         or ""
     ).strip()
 
@@ -9290,6 +9958,30 @@ async def _cost_api_rows(
     return rows, False
 
 
+async def _cost_actual_items(
+    store: Any,
+    as_of: date,
+    *,
+    model: str = "",
+    provider: str = "",
+    account_id: str = "",
+    cost_bucket: str = "",
+) -> list[dict[str, Any]]:
+    rows = await _call_store_optional(
+        store,
+        ("list_actual_cost_items",),
+        as_of.isoformat(),
+        model=model,
+        provider=provider,
+        account_id=account_id,
+        cost_bucket=cost_bucket,
+        default=None,
+    )
+    if rows is None:
+        rows = await store.list_cost_items()
+    return _actual_cost_items([dict(item) for item in rows if bool(item.get("enabled"))])
+
+
 def _cost_summary_splits(ledger_rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Stable P1 aggregates across the unified finance-facing ledger."""
 
@@ -9353,6 +10045,9 @@ def _cost_item_input(data: CostItemRequest, item_id: str | None = None) -> dict[
         "invoiceNo": data.invoiceNo.strip(),
         "recognitionStatus": data.recognitionStatus,
         "reconciliationStatus": data.reconciliationStatus,
+        "planVersionId": data.planVersionId.strip(),
+        "scenario": data.scenario.strip(),
+        "sourceEvidence": data.sourceEvidence.strip(),
         "notes": data.notes.strip(),
         "enabled": data.enabled,
     }
@@ -9423,6 +10118,131 @@ def _savings_payload(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _cost_plan_input(data: CostPlanVersionRequest, plan_id: str | None = None) -> dict[str, Any]:
+    return {
+        "id": plan_id or uuid.uuid4().hex,
+        "year": data.year,
+        "version": data.version.strip(),
+        "scenario": data.scenario,
+        "asOf": data.asOf.isoformat(),
+        "status": data.status,
+        "coverageComplete": data.coverageComplete,
+        "notes": data.notes.strip(),
+    }
+
+
+@app.get("/api/admin/costs/plan-versions")
+async def admin_cost_plan_versions(request: Request, year: int | None = None, status: str = "", scenario: str = "") -> dict[str, Any]:
+    require_platform_admin(request)
+    items = await _call_store_optional(_admin_observability_store(), ("list_cost_plan_versions",), year=year, status=status, scenario=scenario, default=[])
+    return _observability_envelope([_plan_version_payload(dict(item)) for item in (items or [])], source="cost plan ledger")
+
+
+@app.post("/api/admin/costs/plan-versions")
+async def admin_create_cost_plan_version(data: CostPlanVersionRequest, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    await enforce_csrf(request)
+    item = await _call_store_optional(_admin_observability_store(), ("create_cost_plan_version",), _cost_plan_input(data), default=None)
+    if item is None:
+        raise HTTPException(status_code=503, detail="费用计划存储尚未就绪")
+    return _observability_envelope(_plan_version_payload(dict(item)), source="cost plan ledger")
+
+
+@app.patch("/api/admin/costs/plan-versions/{plan_id}")
+async def admin_update_cost_plan_version(plan_id: str, data: CostPlanVersionRequest, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    await enforce_csrf(request)
+    item = await _call_store_optional(_admin_observability_store(), ("update_cost_plan_version",), plan_id, _cost_plan_input(data, plan_id), default=None)
+    if item is None:
+        raise HTTPException(status_code=404, detail="费用计划版本不存在")
+    return _observability_envelope(_plan_version_payload(dict(item)), source="cost plan ledger")
+
+
+async def _change_cost_plan_state(plan_id: str, request: Request, operation: str) -> dict[str, Any]:
+    admin = require_platform_admin(request)
+    await enforce_csrf(request)
+    item = await _call_store_optional(
+        _admin_observability_store(),
+        (f"{operation}_cost_plan_version", f"cost_plan_version_{operation}"),
+        plan_id,
+        str(admin.get("email") or admin.get("name") or "platform-admin"),
+        default=None,
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="费用计划版本不存在或状态不可变更")
+    return _observability_envelope(_plan_version_payload(dict(item)), source="cost plan ledger")
+
+
+@app.post("/api/admin/costs/plan-versions/{plan_id}/approve")
+async def admin_approve_cost_plan_version(plan_id: str, request: Request) -> dict[str, Any]:
+    return await _change_cost_plan_state(plan_id, request, "approve")
+
+
+@app.post("/api/admin/costs/plan-versions/{plan_id}/activate")
+async def admin_activate_cost_plan_version(plan_id: str, request: Request) -> dict[str, Any]:
+    return await _change_cost_plan_state(plan_id, request, "activate")
+
+
+@app.post("/api/admin/costs/plan-versions/{plan_id}/archive")
+async def admin_archive_cost_plan_version(plan_id: str, request: Request) -> dict[str, Any]:
+    return await _change_cost_plan_state(plan_id, request, "archive")
+
+
+def _savings_measurement_input(data: SavingsMeasurementRequest, measurement_id: str | None = None) -> dict[str, Any]:
+    return {
+        "id": measurement_id or uuid.uuid4().hex,
+        "actionId": data.actionId.strip(), "scopeKey": data.scope.strip(),
+        "provider": data.provider.strip(), "model": data.model.strip(), "costBucket": data.costBucket.strip(),
+        "baselineStartDate": data.baselineStart.isoformat(), "baselineEndDate": data.baselineEnd.isoformat(),
+        "measurementStartDate": data.measurementStart.isoformat(), "measurementEndDate": data.measurementEnd.isoformat(),
+        "baselineAmountUsd": data.baselineAmountUsd, "actualAmountUsd": data.actualAmountUsd,
+        "evidenceUrl": data.evidenceUrl.strip(), "financeReviewer": data.financeReviewer.strip(),
+        "reviewedAt": data.reviewedAt.isoformat() if data.reviewedAt else None,
+        "status": data.status, "notes": data.notes.strip(),
+    }
+
+
+@app.get("/api/admin/costs/savings-measurements")
+async def admin_savings_measurements(request: Request, as_of: str | None = None, year: int | None = None) -> dict[str, Any]:
+    require_platform_admin(request)
+    try:
+        cutoff = date.fromisoformat(as_of) if as_of else date.today()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="as_of 格式应为 YYYY-MM-DD") from exc
+    items = await _call_store_optional(_admin_observability_store(), ("list_savings_measurements",), as_of=cutoff.isoformat(), year=year, default=[])
+    return _observability_envelope(reviewed_savings_measurements([dict(item) for item in (items or [])], cutoff), source="reviewed savings measurements")
+
+
+@app.post("/api/admin/costs/savings-measurements")
+async def admin_create_savings_measurement(data: SavingsMeasurementRequest, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    await enforce_csrf(request)
+    item = await _call_store_optional(_admin_observability_store(), ("create_savings_measurement",), _savings_measurement_input(data), default=None)
+    if item is None:
+        raise HTTPException(status_code=503, detail="节省核验存储尚未就绪")
+    return _observability_envelope(item, source="reviewed savings measurements")
+
+
+@app.patch("/api/admin/costs/savings-measurements/{measurement_id}")
+async def admin_update_savings_measurement(measurement_id: str, data: SavingsMeasurementRequest, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    await enforce_csrf(request)
+    item = await _call_store_optional(_admin_observability_store(), ("update_savings_measurement",), measurement_id, _savings_measurement_input(data, measurement_id), default=None)
+    if item is None:
+        raise HTTPException(status_code=404, detail="节省核验记录不存在")
+    return _observability_envelope(item, source="reviewed savings measurements")
+
+
+@app.delete("/api/admin/costs/savings-measurements/{measurement_id}")
+async def admin_delete_savings_measurement(measurement_id: str, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    await enforce_csrf(request)
+    deleted = await _call_store_optional(_admin_observability_store(), ("delete_savings_measurement",), measurement_id, default=False)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="节省核验记录不存在")
+    return _observability_envelope({"deleted": True}, source="reviewed savings measurements")
+
+
 @app.get("/api/admin/costs/savings-actions")
 async def admin_savings_actions(request: Request) -> dict[str, Any]:
     require_platform_admin(request)
@@ -9485,6 +10305,7 @@ async def admin_costs_overview(
     account_id: str = "",
     reconciliation_status: str = "",
     recognition_status: str = "",
+    as_of: str | None = None,
     refresh: int = 0,
 ) -> dict[str, Any]:
     require_platform_admin(request)
@@ -9495,12 +10316,17 @@ async def admin_costs_overview(
         raise HTTPException(status_code=400, detail="月份格式应为 YYYY-MM") from exc
     next_month = date(start.year + 1, 1, 1) if start.month == 12 else date(start.year, start.month + 1, 1)
     end = next_month - timedelta(days=1)
-    today = min(date.today(), end)
+    try:
+        cutoff = date.fromisoformat(as_of) if as_of else date.today()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="as_of 格式应为 YYYY-MM-DD") from exc
+    today = min(cutoff, end)
     store = _admin_observability_store()
     api_rows, api_dimensions_complete = await _cost_api_rows(
         store, start, today, model=model, provider=provider, account_id=account_id
     )
-    items = [item for item in await store.list_cost_items() if bool(item.get("enabled"))]
+    all_items = [item for item in await store.list_cost_items() if bool(item.get("enabled"))]
+    items = await _cost_actual_items(store, today, model=model, provider=provider, account_id=account_id, cost_bucket=cost_bucket)
     has_api_costs = bool(api_rows)
     has_manual_costs = bool(items)
     available_models = sorted({str(item.get("model") or "") for item in api_rows + items if item.get("model")})
@@ -9559,6 +10385,8 @@ async def admin_costs_overview(
         else env_float("COST_DEFAULT_DAILY_TARGET_USD", 2000)
     )
     actions = [_savings_payload(item) for item in await store.list_savings_actions()]
+    measurements = await _call_store_optional(store, ("list_savings_measurements",), as_of=today.isoformat(), default=[])
+    audited_savings = reviewed_savings_measurements([dict(item) for item in (measurements or [])], today)
     savings = _savings_totals(actions, today, end)
     forecast = monthly_forecast(actual, start, today, budget)
     model_split: dict[str, float] = defaultdict(float)
@@ -9578,7 +10406,7 @@ async def admin_costs_overview(
             "metrics": {
                 **forecast,
                 "dailyTarget": daily_target,
-                "verifiedSavings": verified_savings(actions, today),
+                "verifiedSavings": audited_savings["realizedSavingsUsd"],
                 **savings,
                 "monthToDateActual": round(actual, 2),
                 "monthForecast": round(float(forecast.get("forecast") or 0), 2),
@@ -9589,6 +10417,12 @@ async def admin_costs_overview(
                     else None
                 ),
                 "dailyAverage": round(float(forecast.get("dailyAverage") or 0), 2),
+                "metricEnvelopes": {
+                    "monthToDateActual": metric_envelope(round(actual, 2), "USD", period=_metric_period(start.isoformat(), today.isoformat()), as_of=today, source="actual ledger", coverage_rate=1.0, sample_count=len(ledger_rows)),
+                    "forecast": metric_envelope(round(float(forecast.get("forecast") or 0), 2), "USD", period=_metric_period(start.isoformat(), end.isoformat()), as_of=today, source="actual ledger run-rate", coverage_rate=1.0 if ledger_rows else 0.0, sample_count=len(ledger_rows), status="derived" if ledger_rows else "unavailable", missing_reasons=[] if ledger_rows else ["actual_ledger_missing"]),
+                    "verifiedSavings": metric_envelope(audited_savings["realizedSavingsUsd"], "USD", period=_metric_period(start.isoformat(), today.isoformat()), as_of=today, source="reviewed savings measurements", coverage_rate=1.0 if measurements else 0.0, sample_count=audited_savings["reviewedCount"], status="observed" if audited_savings["reviewedCount"] else "unavailable", missing_reasons=[] if audited_savings["reviewedCount"] else ["reviewed_savings_measurements_missing"]),
+                    "dailyTarget": metric_envelope(daily_target, "USD/day", period=_metric_period(start.isoformat(), end.isoformat()), as_of=today, source="approved budget" if budget_record else "environment default", coverage_rate=1.0 if budget_record else 0.0, sample_count=1, status="observed" if budget_record else "default", missing_reasons=[] if budget_record else ["budget_record_missing"]),
+                },
             },
             "trend": [
                 {
@@ -9624,6 +10458,8 @@ async def admin_costs_overview(
             "ledger": {"rows": ledger_rows, "total": len(ledger_rows)},
             "costItems": [_cost_item_payload(item) for item in items],
             "savingsActions": actions,
+            "savingsMeasurements": audited_savings,
+            "asOf": today.isoformat(),
             "composition": [
                 {
                     "key": key,
@@ -9671,23 +10507,27 @@ async def admin_costs_ledger(
     account_id: str = "",
     reconciliation_status: str = "",
     recognition_status: str = "",
+    as_of: str | None = None,
     page: int = 1,
     page_size: int = 100,
 ) -> dict[str, Any]:
     require_platform_admin(request)
     try:
-        end = date.fromisoformat(end_date) if end_date else date.today()
+        cutoff = date.fromisoformat(as_of) if as_of else date.today()
+        end = date.fromisoformat(end_date) if end_date else cutoff
         start = date.fromisoformat(start_date) if start_date else end.replace(day=1)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="日期格式应为 YYYY-MM-DD") from exc
     if end < start:
         raise HTTPException(status_code=400, detail="结束日期不能早于开始日期")
-    today = min(date.today(), end)
+    if cutoff < start:
+        raise HTTPException(status_code=400, detail="as_of 不能早于查询开始日期")
+    today = min(cutoff, end)
     store = _admin_observability_store()
     api_rows, api_dimensions_complete = await _cost_api_rows(
         store, start, today, model=model, provider=provider, account_id=account_id
     )
-    items = [item for item in await store.list_cost_items() if bool(item.get("enabled"))]
+    items = await _cost_actual_items(store, today, model=model, provider=provider, account_id=account_id, cost_bucket=cost_bucket)
     api_rows, items = _filter_cost_sources(
         api_rows,
         items,
@@ -9716,6 +10556,7 @@ async def admin_costs_ledger(
             "totalPages": total_pages,
             "startDate": start.isoformat(),
             "endDate": end.isoformat(),
+            "asOf": today.isoformat(),
         },
         coverage={
             "partial": False,
@@ -9727,19 +10568,42 @@ async def admin_costs_ledger(
 
 
 @app.get("/api/admin/costs/annual")
-async def admin_costs_annual(request: Request, year: int | None = None) -> dict[str, Any]:
+async def admin_costs_annual(
+    request: Request,
+    year: int | None = None,
+    as_of: str | None = None,
+    category: str = "",
+    cost_bucket: str = "",
+    model: str = "",
+    vendor: str = "",
+    provider: str = "",
+    account_id: str = "",
+    reconciliation_status: str = "",
+    recognition_status: str = "",
+) -> dict[str, Any]:
     require_platform_admin(request)
     target_year = year or date.today().year
     start = date(target_year, 1, 1)
     end = date(target_year, 12, 31)
-    today = min(date.today(), end)
+    try:
+        cutoff = date.fromisoformat(as_of) if as_of else date.today()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="as_of 格式应为 YYYY-MM-DD") from exc
+    today = min(cutoff, end)
     store = _admin_observability_store()
-    api_rows, api_dimensions_complete = await _cost_api_rows(store, start, today)
-    items = [item for item in await store.list_cost_items() if bool(item.get("enabled"))]
+    api_rows, api_dimensions_complete = await _cost_api_rows(store, start, today, model=model, provider=provider, account_id=account_id)
+    all_items = [item for item in await store.list_cost_items() if bool(item.get("enabled"))]
+    actual_items = await _cost_actual_items(store, today, model=model, provider=provider, account_id=account_id, cost_bucket=cost_bucket)
+    api_rows, actual_items = _filter_cost_sources(
+        api_rows, actual_items, category=category, cost_bucket=cost_bucket, model=model,
+        vendor=vendor, provider=provider, account_id=account_id,
+        reconciliation_status=reconciliation_status,
+        recognition_status="actual" if recognition_status in {"", "actual"} else recognition_status,
+    )
     monthly: dict[str, float] = defaultdict(float)
     for row in api_rows:
         monthly[str(row.get("usage_date"))[:7]] += float(row.get("spend") or 0)
-    for item in items:
+    for item in actual_items:
         for row in _manual_cost_ledger_rows(item, start, today):
             monthly[str(row.get("date") or "")[:7]] += float(row.get("amountUsd") or 0)
     months: list[dict[str, Any]] = []
@@ -9764,7 +10628,22 @@ async def admin_costs_annual(request: Request, year: int | None = None) -> dict[
             "budgetUsd": None,
         })
     actual_total = sum(float(item["actual"]) for item in months)
-    forecast_total = sum(float(item["forecast"] or item["actual"]) for item in months)
+    run_rate_total = sum(float(item["forecast"] or item["actual"]) for item in months)
+    plans = await _call_store_optional(store, ("list_cost_plan_versions",), year=target_year, default=[])
+    active_plan = _active_baseline_plan([dict(item) for item in (plans or [])], target_year)
+    plan_items = await _official_plan_items(store, active_plan)
+    future_plan_rows = _official_plan_rows(plan_items or all_items, active_plan, today + timedelta(days=1), end)
+    future_plan_rows = [row for row in future_plan_rows if (
+        (not category or str(row.get("category") or "") == category)
+        and (not cost_bucket or str(row.get("costBucket") or "") == cost_bucket)
+        and (not model or str(row.get("model") or "") == model)
+        and (not vendor or str(row.get("vendor") or "") == vendor)
+        and (not provider or str(row.get("provider") or "") == provider)
+        and (not account_id or str(row.get("accountId") or "") == account_id)
+        and (not reconciliation_status or str(row.get("reconciliationStatus") or "") == reconciliation_status)
+        and (not recognition_status or str(row.get("recognitionStatus") or "") == recognition_status)
+    )]
+    official_forecast = round(actual_total + sum(float(row.get("amountUsd") or 0) for row in future_plan_rows), 2) if active_plan else None
     budgets = await store.list_cost_budgets()
     for month_item in months:
         budget_record = next(
@@ -9791,11 +10670,19 @@ async def admin_costs_annual(request: Request, year: int | None = None) -> dict[
             "year": target_year,
             "months": months,
             "actual": round(actual_total, 2),
-            "forecast": round(forecast_total, 2),
+            "forecast": official_forecast,
             "actualToDate": round(actual_total, 2),
-            "yearToDateForecast": round(forecast_total, 2),
+            "yearToDateForecast": official_forecast,
+            "officialForecast": official_forecast,
+            "runRateScenario": round(run_rate_total, 2),
+            "activePlan": _plan_version_payload(active_plan) if active_plan else None,
             "budget": year_budget,
-            "budgetDelta": round(forecast_total - year_budget, 2) if year_budget is not None else None,
+            "budgetDelta": round(official_forecast - year_budget, 2) if year_budget is not None and official_forecast is not None else None,
+            "metricEnvelopes": {
+                "actualToDate": metric_envelope(round(actual_total, 2), "USD", period=_metric_period(start.isoformat(), today.isoformat()), as_of=today, source="actual ledger", coverage_rate=1.0, sample_count=len(api_rows) + len(actual_items)),
+                "officialForecast": metric_envelope(official_forecast, "USD", period=_metric_period(start.isoformat(), end.isoformat()), as_of=today, status="observed" if official_forecast is not None else "unavailable", source="actual ledger + active approved baseline plan", coverage_rate=1.0 if official_forecast is not None else 0.0, sample_count=len(future_plan_rows), missing_reasons=[] if official_forecast is not None else ["active_approved_plan_missing_or_incomplete"]),
+                "runRateScenario": metric_envelope(round(run_rate_total, 2), "USD", period=_metric_period(start.isoformat(), end.isoformat()), as_of=today, status="derived", source="daily run-rate scenario", coverage_rate=1.0, sample_count=len(api_rows) + len(actual_items)),
+            },
             "annualTrend": [
                 {
                     "month": item["month"],
@@ -9806,10 +10693,11 @@ async def admin_costs_annual(request: Request, year: int | None = None) -> dict[
                 for item in months
             ],
             "throughDate": today.isoformat(),
+            "asOf": today.isoformat(),
         },
         coverage={
             "partial": False,
-            "incomplete": not bool(api_rows or items) or not api_dimensions_complete,
+            "incomplete": not bool(api_rows or actual_items) or not api_dimensions_complete,
             "missingDimensions": [] if api_dimensions_complete else ["provider"],
         },
         source="cost ledger",
@@ -9817,13 +10705,29 @@ async def admin_costs_annual(request: Request, year: int | None = None) -> dict[
 
 
 @app.get("/api/admin/costs/savings/overview")
-async def admin_costs_savings_overview(request: Request) -> dict[str, Any]:
+async def admin_costs_savings_overview(request: Request, as_of: str | None = None) -> dict[str, Any]:
     require_platform_admin(request)
-    today = date.today()
+    try:
+        today = date.fromisoformat(as_of) if as_of else date.today()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="as_of 格式应为 YYYY-MM-DD") from exc
     store = _admin_observability_store()
     actions = [_savings_payload(item) for item in await store.list_savings_actions()]
+    measurements = await _call_store_optional(store, ("list_savings_measurements",), as_of=today.isoformat(), default=[])
+    audited = reviewed_savings_measurements([dict(item) for item in (measurements or [])], today)
     return _observability_envelope(
-        {"metrics": _savings_totals(actions, today, date(today.year, 12, 31)), "actions": actions},
+        {
+            "metrics": {
+                **_savings_totals(actions, today, date(today.year, 12, 31)),
+                "realizedSavingsToDate": audited["realizedSavingsUsd"],
+                "metricEnvelopes": {
+                    "realizedSavingsToDate": metric_envelope(audited["realizedSavingsUsd"], "USD", period=_metric_period(date(today.year, 1, 1).isoformat(), today.isoformat()), as_of=today, source="reviewed savings measurements", coverage_rate=1.0 if measurements else 0.0, sample_count=audited["reviewedCount"], status="observed" if audited["reviewedCount"] else "unavailable", missing_reasons=[] if audited["reviewedCount"] else ["reviewed_savings_measurements_missing"]),
+                },
+            },
+            "actions": actions,
+            "measurements": audited,
+            "asOf": today.isoformat(),
+        },
         coverage={"partial": False, "incomplete": False},
         source="cost ledger",
     )

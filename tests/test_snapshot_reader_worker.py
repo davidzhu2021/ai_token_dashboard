@@ -24,6 +24,30 @@ def test_reader_role_does_not_start_usage_sync(monkeypatch) -> None:
     assert main._usage_sync_task is None
 
 
+def test_worker_consumes_reader_refresh_queue(monkeypatch) -> None:
+    class Store:
+        async def claim_refresh_requests(self, **_kwargs):
+            return [{"requestKey": "r1", "startDate": "2026-08-10", "endDate": "2026-08-14"}]
+
+        async def finish_refresh_requests(self, keys, *, success, error=""):
+            self.finished = (keys, success, error)
+
+    now = datetime(2026, 8, 14, tzinfo=timezone.utc)
+    client = type("Client", (), {"backends": [type("Backend", (), {"id": "primary"})()]})()
+    store = Store()
+    worker = UsageSyncWorker(client, store, now=lambda: now)
+    calls = []
+
+    async def fake_sync(days):
+        calls.append(days)
+        return {"status": "ok"}
+
+    worker._run_sync = fake_sync
+    assert asyncio.run(worker.consume_refresh_requests()) is True
+    assert calls == [5]
+    assert store.finished == (["r1"], True, "")
+
+
 def test_snapshot_revision_is_part_of_usage_cache_keys() -> None:
     first = main.personal_usage_cache_key(
         "user@example.com", "2026-08-01", "2026-08-05", "all", "revision-a"
@@ -58,6 +82,58 @@ def test_usage_singleflight_shares_one_cold_query() -> None:
 
     assert calls == 1
     assert first == second == {"rows": [1]}
+
+
+def test_personal_payload_uses_singleflight(monkeypatch) -> None:
+    calls = 0
+
+    async def load(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0)
+        return {"rows": []}
+
+    monkeypatch.setattr(main, "_personal_usage_payload", load)
+    main._usage_singleflight.clear()
+
+    async def run():
+        user = {"id": "user-1", "email": "user@example.com"}
+        return await asyncio.gather(
+            main.personal_usage_payload(user, "2026-08-01", "2026-08-05", "all"),
+            main.personal_usage_payload(user, "2026-08-01", "2026-08-05", "all"),
+        )
+
+    first, second = asyncio.run(run())
+    assert calls == 1
+    assert first == second == {"rows": []}
+
+
+def test_team_member_payload_uses_singleflight(monkeypatch) -> None:
+    calls = 0
+
+    async def load(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0)
+        return {"rows": []}
+
+    monkeypatch.setattr(main, "_team_member_usage_payload", load)
+    main._usage_singleflight.clear()
+
+    async def run():
+        user = {"id": "leader-1", "email": "leader@example.com"}
+        return await asyncio.gather(
+            main.team_member_usage_payload(
+                user, "2026-08-01", "2026-08-05", "all", "employee-1", team_ref_value="team-1"
+            ),
+            main.team_member_usage_payload(
+                user, "2026-08-01", "2026-08-05", "all", "employee-1", team_ref_value="team-1"
+            ),
+        )
+
+    first, second = asyncio.run(run())
+    assert calls == 1
+    assert first == second == {"rows": []}
 
 
 def test_personal_rows_by_user_ids_uses_snapshot_identity() -> None:

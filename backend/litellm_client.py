@@ -1713,17 +1713,34 @@ class LiteLLMClient:
         headers.setdefault("Accept", "application/json")
         url = f"{backend.base_url}{path}"
         started = time.perf_counter()
+        acquired_at = started
+        request_finished_at = started
         try:
             async with self._semaphore:
+                acquired_at = time.perf_counter()
                 response = await self.http_client.request(method, url, headers=headers, **kwargs)
+                request_finished_at = time.perf_counter()
         except httpx.TimeoutException as exc:
+            request_finished_at = time.perf_counter()
             raise HTTPException(status_code=504, detail="上游服务响应超时，请稍后重试") from exc
         except httpx.HTTPError as exc:
+            request_finished_at = time.perf_counter()
             raise HTTPException(status_code=502, detail=f"无法连接 {backend.label}：{exc}") from exc
         finally:
-            duration_ms = round((time.perf_counter() - started) * 1000)
+            finished_at = time.perf_counter()
+            queue_ms = round(max(0.0, acquired_at - started) * 1000)
+            upstream_ms = round(max(0.0, request_finished_at - acquired_at) * 1000)
+            duration_ms = round((finished_at - started) * 1000)
             if duration_ms >= _env_int("LITELLM_SLOW_REQUEST_MS", 800):
-                logger.info("litellm request %s %s %s took %sms", backend.id, method, path, duration_ms)
+                logger.info(
+                    "litellm request backend=%s method=%s endpoint=%s queue_ms=%s upstream_ms=%s total_ms=%s",
+                    backend.id,
+                    method,
+                    path,
+                    queue_ms,
+                    upstream_ms,
+                    duration_ms,
+                )
 
         if response.status_code >= 400:
             detail = self._error_detail(response)
@@ -2644,7 +2661,9 @@ class LiteLLMClient:
             params["api_key"] = api_key
         try:
             payload = await self.request_backend(backend, "GET", "/user/daily/activity/aggregated", params=params)
-        except HTTPException:
+        except HTTPException as exc:
+            if exc.status_code not in {404, 405, 501}:
+                raise
             payload = await self.request_backend(backend, "GET", "/user/daily/activity", params=params)
         rows = []
         for item in _records(payload):
@@ -3637,18 +3656,28 @@ class LiteLLMClient:
         backend: LiteLLMBackend | None = None,
         *,
         page_size: int = 100,
+        start_page: int = 1,
+        max_pages: int | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
-        """Read one small UTC window and return normalized request events."""
+        """Read a bounded slice of one UTC window and return request events.
+
+        ``complete`` is true only when the final upstream page was consumed. A
+        caller can persist ``start_page + consumed_pages`` as a checkpoint and
+        resume a large recovery window without rescanning earlier pages.
+        """
 
         backend = backend or self.backends[0]
         await self._ensure_deployment_model_map(backend)
         page_size = max(1, min(100, page_size))
         start_text = start_time.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         end_text = end_time.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        page = 1
-        total_pages = 1
+        page = max(1, int(start_page))
+        first_page = page
+        page_limit = max(1, int(max_pages)) if max_pages is not None else None
+        total_pages = page
         events: list[dict[str, Any]] = []
-        while page <= total_pages:
+        consumed_pages = 0
+        while page <= total_pages and (page_limit is None or consumed_pages < page_limit):
             payload = await self.request_backend(
                 backend,
                 "GET",
@@ -3662,9 +3691,9 @@ class LiteLLMClient:
                     "sort_order": "asc",
                 },
             )
-            if page == 1:
+            if page == first_page:
                 total_pages = max(
-                    1,
+                    page,
                     _as_int(_first(payload, "total_pages", "totalPages", default=1)),
                 )
             logs = _records(payload)
@@ -3723,7 +3752,8 @@ class LiteLLMClient:
                 self._add_log_to_row(event, log)
                 events.append(event)
             page += 1
-        return events, page - 1 == total_pages
+            consumed_pages += 1
+        return events, page > total_pages
 
     async def stability_rows_from_logs(
         self,

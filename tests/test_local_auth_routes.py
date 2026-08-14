@@ -726,6 +726,63 @@ def test_managed_enterprise_account_without_active_membership_has_no_personal_us
     assert payload["organizationAccessStatus"] == "provisioning"
 
 
+def test_personal_usage_route_reuses_cached_entitlement(monkeypatch) -> None:
+    app_user = {
+        "id": "local-user-1",
+        "email": "person@example.com",
+        "name": "Person",
+        "accountStatus": "provisioned",
+        "entitlementStatus": "active",
+    }
+    request = type("RequestStub", (), {"session": {"user": dict(app_user)}})()
+    refresh_values: list[bool] = []
+
+    async def false_demo(_user):
+        return False
+
+    async def no_inactive_membership(_user):
+        return None
+
+    async def auth_call(method, *_args, **_kwargs):
+        assert method == "get_user"
+        return {
+            "id": "local-user-1",
+            "email": "person@example.com",
+            "name": "Person",
+            "status": "active",
+            "account_type": "personal",
+        }
+
+    async def user_payload(_user, *, refresh_entitlement=False):
+        refresh_values.append(refresh_entitlement)
+        return dict(app_user)
+
+    async def usage_payload(user, start_date, end_date, source, refresh=False):
+        assert user == app_user
+        return {"rows": [], "summary": {}, "cache": {"hit": False}}
+
+    monkeypatch.setattr(main, "organization_real_enabled", lambda: False)
+    monkeypatch.setattr(main, "is_demo_customer_user", false_demo)
+    monkeypatch.setattr(
+        main, "require_non_inactive_demo_identity", no_inactive_membership
+    )
+    monkeypatch.setattr(main, "auth_store_call", auth_call)
+    monkeypatch.setattr(main, "auth_user_payload", user_payload)
+    monkeypatch.setattr(main, "personal_usage_payload", usage_payload)
+
+    payload = asyncio.run(
+        main.my_usage(
+            request,
+            start_date="2026-08-01",
+            end_date="2026-08-03",
+            source="all",
+        )
+    )
+
+    assert payload["rows"] == []
+    assert refresh_values == [False]
+
+
 def test_forgot_password_delivery_failure_keeps_previous_reset_token(tmp_path, monkeypatch) -> None:
     client, store, _ = auth_client(tmp_path, monkeypatch)
     user = store.create_user("person@example.com", "Person", "old-hash", email_verified=True)
