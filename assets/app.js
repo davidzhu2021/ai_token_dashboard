@@ -8713,24 +8713,14 @@ function renderCostOverview() {
   const trendValues = trend.flatMap((item) => [item.actual, item.runRateForecast ?? item.forecast, item.budget]).filter((value) => value !== null && value !== undefined).map(Number);
   const hasTrendValues = trendValues.length > 0;
   const hasNonZeroTrend = trendValues.some((value) => value > 0);
+  const max = Math.max(1, ...trendValues);
   el("costTrend").classList.toggle("is-empty", !trend.length || !hasTrendValues || !hasNonZeroTrend);
-  const sumAvailable = (key) => {
-    const values = trend.map(key).filter((value) => value !== null && value !== undefined).map(Number).filter(Number.isFinite);
-    return values.length ? values.reduce((sum, value) => sum + value, 0) : null;
-  };
-  const actualTotal = sumAvailable((item) => item.actual);
-  const runRateFromAnnual = annual.runRateScenario ?? annualContracts.runRateScenario?.value ?? contractMetrics.runRateScenario?.value ?? metrics.runRateScenario;
-  const runRateTotal = runRateFromAnnual == null ? sumAvailable((item) => item.runRateForecast ?? item.forecast) : Number(runRateFromAnnual);
-  const budgetTotal = sumAvailable((item) => item.budget);
-  const runRateDelta = actualTotal == null || runRateTotal == null ? null : runRateTotal - actualTotal;
-  const runRateDeltaPercent = actualTotal > 0 && runRateDelta != null ? runRateDelta / actualTotal * 100 : null;
-  const runRateComparison = runRateDelta == null
-    ? "暂无可比实际数据"
-    : `${runRateDelta >= 0 ? "较实际高" : "较实际低"} ${observabilityMoney(Math.abs(runRateDelta))}${runRateDeltaPercent == null ? "" : `（${Math.abs(runRateDeltaPercent).toFixed(1)}%）`}`;
-  el("costTrend").innerHTML = trend.length && hasTrendValues && hasNonZeroTrend ? `
-    <div class="cost-scenario-item"><span>当前范围累计实际</span><strong>${observabilityMoney(actualTotal)}</strong><small>仅包含已发生费用与确认状态为 actual 的人工账本。</small></div>
-    <div class="cost-scenario-item run-rate"><span>运行速率情景</span><strong>${observabilityMoney(runRateTotal)}</strong><small>${runRateComparison}，仅作日均外推参考。</small></div>
-    <div class="cost-scenario-item budget"><span>当前范围预算参考</span><strong>${observabilityMoney(budgetTotal)}</strong><small>${budgetTotal == null ? "当前范围尚未配置预算。" : runRateTotal == null ? "暂无运行速率可用于比较。" : `运行速率${runRateTotal > budgetTotal ? "高于" : "低于或等于"}预算 ${observabilityMoney(Math.abs(runRateTotal - budgetTotal))}。`}</small></div>` : hasTrendValues && !hasNonZeroTrend
+  el("costTrend").innerHTML = trend.length && hasTrendValues && hasNonZeroTrend ? trend.map((item) => {
+    const actual = item.actual;
+    const projected = item.runRateForecast ?? item.forecast;
+    const budgetDaily = item.budget;
+    return `<div class="observability-bar" title="${escapeHtml(item.date)} · 实际 ${observabilityMoney(actual)} · 运行速率 ${observabilityMoney(projected)} · 日预算 ${observabilityMoney(budgetDaily)}">${actual == null ? "" : `<span class="observability-bar-segment" style="height:${Number(actual) > 0 ? Math.max(3, Number(actual) / max * 150) : 0}px"></span>`}${projected == null ? "" : `<span class="observability-bar-segment forecast" style="height:${Number(projected) > 0 ? Math.max(3, Number(projected) / max * 150) : 0}px"></span>`}${budgetDaily == null ? "" : `<span style="position:absolute;left:0;right:0;bottom:${Math.min(150, Number(budgetDaily) / max * 150)}px;border-top:2px solid #c23b45"></span>`}<small>${escapeHtml(String(item.date).slice(5))}</small></div>`;
+  }).join("") : hasTrendValues && !hasNonZeroTrend
     ? observabilityEmptyState("本期确无费用记录", "当前筛选范围内，已接入账本金额均为真实零值。", [{ label: "调整筛选", attr: 'data-observability-empty-action="filters" data-observability-scope="cost"' }])
     : observabilityEmptyState("费用趋势暂不可用", "账本尚未同步或当前范围没有数据，缺失金额不会按 0 展示。", [{ label: "重新加载", attr: 'data-observability-retry="cost"' }, { label: "进入治理工作台", attr: 'data-open-governance-tab="actual-ledger"' }]);
   const legacyApi = trend.reduce((sum, item) => sum + Number(item.api || 0), 0);
