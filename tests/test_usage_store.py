@@ -1025,6 +1025,38 @@ def test_team_rows_uses_one_cross_backend_query_and_merges_email_identity() -> N
     assert len(result["employees"]) == 1
     assert result["employees"][0]["totalTokens"] == 30
     assert result["dataQuality"]["backends"] == ["her", "primary"]
+    assert result["dataQuality"]["teamAttribution"] == "usage_event_team_id"
+    assert result["dataQuality"]["memberDirectory"] == "latest_snapshot_on_or_before_end_date"
+
+
+def test_team_member_rows_uses_event_team_scope_and_latest_member_snapshot() -> None:
+    class Record(dict):
+        pass
+
+    class FakePool:
+        async def fetch(self, query, *args):
+            if "FROM usage_sync_coverage" in query:
+                return [{"backend_id": "primary"}]
+            assert "m.snapshot_date <= $4::date" in query
+            assert "m.snapshot_date=u.usage_date" not in query
+            assert "sc.team_id=u.team_id" in query
+            assert "FROM selected s" in query
+            return [
+                Record(kind="member", backend_id="primary", team_id="team-a", team_name="Team A", user_id="alice", employee_email="alice@example.com", employee_name="Alice", team_role="admin", usage_date=None, source=None, model_name=None, prompt_tokens=0, completion_tokens=0, total_tokens=0, request_count=0, success_count=0, failure_count=0, spend=0),
+                Record(kind="usage", backend_id="primary", team_id=None, team_name=None, user_id="alice", employee_email="alice@example.com", employee_name="Alice", team_role=None, usage_date=date(2026, 7, 22), source="Codex", model_name="gpt-5", prompt_tokens=4, completion_tokens=6, total_tokens=10, request_count=1, success_count=1, failure_count=0, spend=0.1),
+            ]
+
+        async def fetchval(self, *_args):
+            return datetime(2026, 7, 22, tzinfo=timezone.utc)
+
+    store = UsageStore("postgresql://unused")
+    store.pool = FakePool()
+    result = asyncio.run(store.team_member_rows([{"backend": "primary", "id": "team-a", "name": "Team A"}], "alice", "2026-07-22", "2026-07-22", "all"))
+
+    assert result is not None
+    assert result["summary"]["rangeTotal"]["totalTokens"] == 10
+    assert result["dataQuality"]["teamAttribution"] == "usage_event_team_id"
+    assert result["dataQuality"]["memberDirectory"] == "latest_snapshot_on_or_before_end_date"
 
 
 def test_model_usage_counts_returns_none_when_any_backend_lacks_coverage() -> None:

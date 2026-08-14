@@ -1154,7 +1154,7 @@ class UsageStore:
         summary_rows = self._group_rows(rows, ("date", "source", "model"))
         anchor = team_scopes[0]
         team_name = anchor.get("name") or (member_records[0]["team_name"] if member_records else "") or anchor["id"]
-        return {"rows": self._public_rows(rows), "summaryRows": summary_rows, "employees": employees, "team": {"id": anchor["id"], "name": team_name, "memberCount": len(employees), "backend": anchor["backend"]}, "pageLimit": 0, "pageSize": 0, "pagesRead": 0, "totalPages": 0, "totalRecords": len(rows), "truncated": False, "dataQuality": {"summarySource": "database", "rankingSource": "database", "backends": covered, "scopeCount": len(team_scopes), "memberIdentityMatch": "normalized_email_or_backend_user_id", "teamAttribution": "usage_event_team_id"}, "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered)}
+        return {"rows": self._public_rows(rows), "summaryRows": summary_rows, "employees": employees, "team": {"id": anchor["id"], "name": team_name, "memberCount": len(employees), "backend": anchor["backend"]}, "pageLimit": 0, "pageSize": 0, "pagesRead": 0, "totalPages": 0, "totalRecords": len(rows), "truncated": False, "dataQuality": {"summarySource": "database", "rankingSource": "database", "backends": covered, "scopeCount": len(team_scopes), "memberIdentityMatch": "normalized_email_or_backend_user_id", "teamAttribution": "usage_event_team_id", "memberDirectory": "latest_snapshot_on_or_before_end_date"}, "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered)}
 
     @staticmethod
     def _usage_record(backend_id: str, row: dict[str, Any], collected_at: datetime) -> tuple[Any, ...]:
@@ -3734,7 +3734,7 @@ class UsageStore:
                 "employee": None,
                 "team": {"id": anchor["id"], "name": anchor.get("name") or anchor["id"], "memberCount": 0, "backend": anchor["backend"]},
                 "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered),
-                "dataQuality": {"backends": covered, "scopeCount": len(team_scopes), "memberIdentityMatch": "normalized_email_or_backend_user_id"},
+                "dataQuality": {"backends": covered, "scopeCount": len(team_scopes), "memberIdentityMatch": "normalized_email_or_backend_user_id", "teamAttribution": "usage_event_team_id", "memberDirectory": "latest_snapshot_on_or_before_end_date"},
             }
         rows = []
         for record in records:
@@ -3765,7 +3765,7 @@ class UsageStore:
         }
         selected.update(summarize(rows)["rangeTotal"])
         anchor = team_scopes[0]
-        return {"rows": rows, "summary": summarize(rows), "employee": selected, "team": {"id": anchor["id"], "name": anchor.get("name") or first["team_name"] or anchor["id"], "memberCount": len(members), "backend": anchor["backend"]}, "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered), "dataQuality": {"backends": covered, "scopeCount": len(team_scopes), "memberIdentityMatch": "normalized_email_or_backend_user_id", "teamAttribution": "usage_event_team_id"}}
+        return {"rows": rows, "summary": summarize(rows), "employee": selected, "team": {"id": anchor["id"], "name": anchor.get("name") or first["team_name"] or anchor["id"], "memberCount": len(members), "backend": anchor["backend"]}, "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered), "dataQuality": {"backends": covered, "scopeCount": len(team_scopes), "memberIdentityMatch": "normalized_email_or_backend_user_id", "teamAttribution": "usage_event_team_id", "memberDirectory": "latest_snapshot_on_or_before_end_date"}}
 
     async def health(self) -> dict[str, Any]:
         if self.pool is None:
