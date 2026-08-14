@@ -24,6 +24,8 @@ def test_trustworthy_observability_statuses_and_loading_lifecycle() -> None:
     assert 'isCostOverviewLoading = false;\n      renderCostOverview();' in source
     assert 'upstream == null ? ""' in source
     assert 'actual == null ? ""' in source
+    assert '#costTrend { overflow-x:hidden; }' in markup
+    assert '#costTrend .observability-bar { min-width:0; }' in markup
     assert "本期确无异常记录" in source
     assert "异常趋势暂不可用" in source
     assert "本期确无费用记录" in source
