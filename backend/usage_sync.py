@@ -53,6 +53,26 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def team_rename_map() -> dict[str, str]:
+    """Parse ``USAGE_TEAM_RENAME_MAP`` into an ``old_team_id -> new_team_id`` dict.
+
+    部门改名后，上游目录里往往旧团队（如 ``AI技术院``）仍保持 active 并与新团队
+    （如 ``AI Infra部``）并存，同一成员会同时出现在两个团队里。同步归因回填先用
+    这份映射把旧团队折叠到新团队，才能把「唯一归属」判定做对。格式为逗号分隔的
+    ``旧team_id=新team_id`` 对。
+    """
+
+    mapping: dict[str, str] = {}
+    for part in os.getenv("USAGE_TEAM_RENAME_MAP", "").split(","):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        old_id, new_id = (item.strip() for item in part.split("=", 1))
+        if old_id and new_id:
+            mapping[old_id] = new_id
+    return mapping
+
+
 def _text(value: Any) -> str:
     return str(value or "").strip()
 
@@ -601,6 +621,114 @@ class UsageSynchronizer:
             row["billingEligible"] = bool(mapping.get("billingEligible", True))
 
     @staticmethod
+    def _latest_team_by_user(
+        memberships: list[dict[str, Any]],
+    ) -> dict[tuple[str, str], tuple[str, str]]:
+        """Map each ``(backend_id, user_id)`` to its single latest team.
+
+        只在成员快照的最新日期唯一归属一个团队（应用重命名映射之后）时返回；同一
+        用户最新快照横跨多个团队（例如部门改名后旧团队未清理）时视为有歧义，返回
+        空结果让调用方保持未归因，避免把跨部门成员算进错误团队。
+        """
+
+        rename = team_rename_map()
+        by_user: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in memberships:
+            backend_id = _text(item.get("backendId") or item.get("backend_id"))
+            user_id = _text(item.get("userId") or item.get("user_id"))
+            team_id = _text(item.get("teamId") or item.get("team_id"))
+            snapshot_date = _text(
+                item.get("snapshotDate") or item.get("snapshot_date")
+            )[:10]
+            if not backend_id or not user_id or not team_id or not snapshot_date:
+                continue
+            resolved_team_id = rename.get(team_id, team_id)
+            team_name = _text(
+                item.get("teamName") or item.get("team_name") or resolved_team_id
+            )
+            state = by_user.setdefault((backend_id, user_id), {})
+            current_date = state.get("date") or ""
+            if snapshot_date > current_date:
+                state["date"] = snapshot_date
+                state["teams"] = {resolved_team_id: team_name}
+            elif snapshot_date == current_date:
+                state["teams"] = {
+                    **(state.get("teams") or {}),
+                    resolved_team_id: team_name,
+                }
+        result: dict[tuple[str, str], tuple[str, str]] = {}
+        for key, state in by_user.items():
+            teams = state.get("teams") or {}
+            if len(teams) == 1:
+                team_id, team_name = next(iter(teams.items()))
+                result[key] = (team_id, team_name)
+        return result
+
+    def _backfill_team_from_membership(
+        self,
+        backend_id: str,
+        rows: list[dict[str, Any]],
+        memberships: list[dict[str, Any]],
+    ) -> int:
+        """给没有租户证据的用量行按团队目录回填 team_id。
+
+        个人直接调用（个人 key 未注册组织令牌、上游用户元数据缺 team_id）产生的行
+        归因后仍是 ``unattributed`` 且 team_id 为空，导致团队/部门看板看不到这部分
+        用量，而「我的用量 / 全员看板」按邮箱可见。这里只对「最新成员快照唯一归属
+        一个团队」的用户回填 team_id，仅用于团队/部门看板的归属展示：organization_id
+        保持为空、billing_eligible 保持 False，不会自动计费。
+        """
+
+        if not rows or not memberships:
+            return 0
+        team_by_user = self._latest_team_by_user(memberships)
+        if not team_by_user:
+            return 0
+        backfilled = 0
+        for row in rows:
+            user_id = _text(
+                row.get("_userId")
+                or row.get("userId")
+                or row.get("user_id")
+                or row.get("user")
+            )
+            if not user_id:
+                continue
+            team = team_by_user.get((backend_id, user_id))
+            if team is None:
+                continue
+            # 已有租户/团队证据的行不回填：客户组织用量不能算进内部团队。
+            if _text(
+                row.get("organizationId")
+                or row.get("organization_id")
+                or row.get("orgId")
+                or row.get("org_id")
+                or row.get("userOrganizationId")
+                or row.get("user_organization_id")
+            ):
+                continue
+            if _text(
+                row.get("teamId")
+                or row.get("team_id")
+                or row.get("tokenTeamId")
+                or row.get("token_team_id")
+                or row.get("userTeamId")
+                or row.get("user_team_id")
+            ):
+                continue
+            row["teamId"] = team[0]
+            row["attributionSource"] = "team_membership_backfill"
+            row["billingEligible"] = False
+            backfilled += 1
+        if backfilled:
+            logger.info(
+                "team membership backfill backend=%s rows=%s",
+                backend_id,
+                backfilled,
+            )
+        return backfilled
+
+    @staticmethod
     def date_range(days: int, end: date | None = None) -> tuple[str, str]:
         end = end or usage_today()
         start = end - timedelta(days=max(1, days) - 1)
@@ -954,6 +1082,7 @@ class UsageSynchronizer:
             reclassified_events,
         )
         memberships = await self.collect_memberships(backend, users, start_date, end_date, account_index, directory)
+        self._backfill_team_from_membership(backend.id, rows, memberships)
         directory_teams = getattr(self, "_directory_teams", {}).get(backend.id)
         if directory_teams is None:
             try:

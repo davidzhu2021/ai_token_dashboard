@@ -77,6 +77,7 @@ class UsageRealtimeWorker:
         )
         self.directory: dict[str, Any] = {}
         self.token_maps: dict[str, dict[Any, Any]] = {}
+        self.team_by_user: dict[tuple[str, str], tuple[str, str]] = {}
         self.current_day = usage_today()
         self._lock_renew_task: asyncio.Task[None] | None = None
         self._lock_lost = asyncio.Event()
@@ -161,6 +162,7 @@ class UsageRealtimeWorker:
             backend.id: await self.synchronizer._token_attribution_map(backend.id)
             for backend in self.client.backends
         }
+        self.team_by_user = await self._load_team_by_user()
         if refresh_departments:
             try:
                 await self.synchronizer.sync_department_directories()
@@ -168,6 +170,20 @@ class UsageRealtimeWorker:
                 # Usage ingestion can continue with the last durable directory;
                 # the next five-minute refresh will retry upstream department names.
                 logger.exception("realtime department directory refresh failed")
+
+    async def _load_team_by_user(self) -> dict[tuple[str, str], tuple[str, str]]:
+        """Load each member's single latest team for realtime attribution backfill."""
+
+        store = getattr(self, "store", None)
+        loader = getattr(store, "latest_membership_teams", None) if store is not None else None
+        if not callable(loader):
+            return {}
+        try:
+            rows = await loader([backend.id for backend in self.client.backends])
+        except Exception:
+            logger.exception("latest membership teams load failed")
+            return {}
+        return UsageSynchronizer._latest_team_by_user(rows)
 
     def _enrich_event(
         self, backend: LiteLLMBackend, event: dict[str, Any]
@@ -188,6 +204,31 @@ class UsageRealtimeWorker:
         mapping = self.token_maps.get(backend.id) or {}
         if mapping:
             self.synchronizer._apply_token_attribution([enriched], mapping)
+        # 个人直接调用没有组织令牌与上游团队信息时仍是 unattributed；按团队目录
+        # 唯一归属回填 team_id，仅用于团队/部门看板展示，不计费。
+        if (
+            not str(
+                enriched.get("organizationId")
+                or enriched.get("organization_id")
+                or enriched.get("orgId")
+                or enriched.get("org_id")
+                or ""
+            ).strip()
+            and not str(
+                enriched.get("teamId")
+                or enriched.get("team_id")
+                or enriched.get("tokenTeamId")
+                or enriched.get("token_team_id")
+                or enriched.get("userTeamId")
+                or enriched.get("user_team_id")
+                or ""
+            ).strip()
+        ):
+            team = self.team_by_user.get((backend.id, user_id))
+            if team is not None:
+                enriched["teamId"] = team[0]
+                enriched["attributionSource"] = "team_membership_backfill"
+                enriched["billingEligible"] = False
         return enriched
 
     async def recover(self) -> None:

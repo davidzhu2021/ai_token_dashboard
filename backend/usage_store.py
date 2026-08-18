@@ -3171,6 +3171,52 @@ class UsageStore:
             "leaderTeams": leader_teams,
         }
 
+    async def latest_membership_teams(
+        self,
+        backend_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return each member's most recent membership rows.
+
+        一个用户在同一最新快照日期横跨多个团队时（部门改名后旧团队未清理），每行
+        返回一次，由调用方按重命名映射折叠后判定唯一归属。供实时事件归因按团队
+        目录回填 team_id。
+        """
+
+        args: list[Any] = []
+        backend_filter = ""
+        if backend_ids:
+            backend_filter = "WHERE backend_id = ANY($1::text[])"
+            args.append(backend_ids)
+        records = await self._require_pool().fetch(
+            f"""
+            WITH ranked AS (
+                SELECT backend_id, user_id, team_id, team_name, snapshot_date,
+                       RANK() OVER (
+                           PARTITION BY backend_id, user_id
+                           ORDER BY snapshot_date DESC
+                       ) AS rank
+                FROM usage_team_membership_daily
+                {backend_filter}
+            )
+            SELECT backend_id, user_id, team_id, team_name, snapshot_date
+            FROM ranked
+            WHERE rank = 1
+            """,
+            *args,
+        )
+        return [
+            {
+                "backendId": str(row["backend_id"]),
+                "userId": str(row["user_id"]),
+                "teamId": str(row["team_id"]),
+                "teamName": str(row["team_name"] or ""),
+                "snapshotDate": row["snapshot_date"].isoformat()
+                if row["snapshot_date"]
+                else "",
+            }
+            for row in records
+        ]
+
     async def team_member_directory(self, team_scopes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """列出团队的最新成员名册，不受用量日期范围限制。
 
