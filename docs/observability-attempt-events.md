@@ -63,9 +63,28 @@ python scripts/observability_ingest_check.py \
 
 交付文件：`integrations/litellm/observability_attempt_pusher.py`（`CustomLogger` 子类）。
 
-1. 把该文件放到 LiteLLM Proxy 能导入的位置。生产已有自定义 callbacks 挂载机制
-   （`litellm-callbacks` 等 configmap），沿用同样的挂载方式；或放在 config.yaml
-   同目录（LiteLLM `get_instance_fn` 会按 config 文件目录加载 `<module>.py`）。
+> **生产集群挂载机制（重要）**：`litellm-product` 的 `litellm-callbacks` configmap 采用
+> **逐文件挂载**——deployment 里每个模块一个 volumeMount，`subPath` 指到
+> `/app/<module>.py`。**只 patch configmap 增加键不会出现在 pod 里**，必须同步给
+> deployment 增加对应 volumeMount，否则 proxy 启动报
+> `ImportError: Could not import attempt_pusher_instance from observability_attempt_pusher`。
+> 参考现有挂载：
+>
+> ```yaml
+> volumeMounts:
+>   - name: callbacks
+>     mountPath: /app/log_truncate.py
+>     readOnly: true
+>     subPath: log_truncate.py
+>   # 新增：
+>   - name: callbacks
+>     mountPath: /app/observability_attempt_pusher.py
+>     readOnly: true
+>     subPath: observability_attempt_pusher.py
+> ```
+
+1. 把该文件加入 `litellm-callbacks` configmap（`kubectl patch cm litellm-callbacks --type merge`），
+   并按上面说明给 deployment 增加 volumeMount。
 
 2. 在 config.yaml（或 DB 配置）注册 callback：
 
@@ -110,4 +129,7 @@ python scripts/observability_ingest_check.py \
   `x-litellm-attempted-fallbacks` 头，或推送方标记 `isFallback`），
   分子 = 其中最终成功的请求；
 - spend-log 推导的 `final_request` 事件 `is_fallback=False`，**不会**混入兜底统计；
-- 重试计数直接使用 Router 写入 metadata 的 `attempted_retries`（首次尝试为 0）。
+- 重试计数直接使用 Router 写入 metadata 的 `attempted_retries`（首次尝试为 0）；
+- 路由前错误（如虚拟 Key 预算超限 `BudgetExceededError`）发生时 `litellm_params`
+  尚未建立，事件**没有 model_group/provider**——此类事件按状态计入异常，
+  但模型维度排名看不到它；如需单独归类请在看板侧按 `error_class` 处理。
