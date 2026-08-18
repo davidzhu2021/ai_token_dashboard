@@ -297,6 +297,8 @@ let revokingOrganizationTokenId = "";
 let deletingOrganizationTokenId = "";
 let authConfig = {
   devLoginEnabled: false,
+  remoteDemoReadOnly: false,
+  remoteDemoUsageSnapshotOnly: false,
   oidcConfigured: false,
   providerName: "飞书扫码登录",
   passwordLoginEnabled: false,
@@ -5985,6 +5987,7 @@ function syncNavigationVisibility() {
   const canUseBillingSidebar = isCustomer
     ? canViewOrganizationBilling()
     : Boolean(billingAvailable);
+  const remoteDemoSnapshotOnly = Boolean(authConfig.remoteDemoUsageSnapshotOnly || authConfig.remoteDemoReadOnly);
   el("customersTab").classList.toggle("hidden", !canBrowseCustomers);
   el("resetCustomerOrganizationsDemoButton")?.classList.toggle("hidden", !isDemoOrganizationMode());
   el("organizationTab")?.classList.toggle("hidden", !canManageCurrentOrganization);
@@ -6002,15 +6005,15 @@ function syncNavigationVisibility() {
   // Customer identities use their tenant-scoped views only; never expose
   // seller account functions that lack a customer-local contract.
   document.querySelectorAll('[data-view="keys"]').forEach((button) => {
-    button.classList.toggle("hidden", isCustomer);
+    button.classList.toggle("hidden", isCustomer || remoteDemoSnapshotOnly);
   });
   el("billingTab")?.classList.toggle("hidden", !canUseBillingSidebar);
-  el("stabilityTab")?.classList.toggle("hidden", !canViewStability());
-  el("costControlTab")?.classList.toggle("hidden", !canViewCosts());
-  el("governanceWorkbenchTab")?.classList.toggle("hidden", !(canManageStability() || canManageCosts() || canReconcileCosts()));
+  el("stabilityTab")?.classList.toggle("hidden", !canViewStability() || remoteDemoSnapshotOnly);
+  el("costControlTab")?.classList.toggle("hidden", !canViewCosts() || remoteDemoSnapshotOnly);
+  el("governanceWorkbenchTab")?.classList.toggle("hidden", !(canManageStability() || canManageCosts() || canReconcileCosts()) || remoteDemoSnapshotOnly);
   syncMobileViewPicker();
   document.querySelectorAll('[data-global-page="models"]').forEach((button) => {
-    button.classList.toggle("hidden", isCustomer);
+    button.classList.toggle("hidden", isCustomer || remoteDemoSnapshotOnly);
   });
 }
 
@@ -11555,6 +11558,8 @@ async function init() {
     configError = error;
     authConfig = {
       devLoginEnabled: false,
+      remoteDemoReadOnly: false,
+      remoteDemoUsageSnapshotOnly: false,
       oidcConfigured: false,
       providerName: "飞书扫码登录",
       passwordLoginEnabled: false,

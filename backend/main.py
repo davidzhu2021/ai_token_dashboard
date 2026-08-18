@@ -141,6 +141,14 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 SESSION_COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "ai_token_dashboard_session")
 OIDC_STATE_PREFIX = "_state_company_"
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+REMOTE_DEMO_USAGE_PATHS = frozenset({
+    "/api/me/usage",
+    "/api/team/usage",
+    "/api/team/member/usage",
+    "/api/admin/usage",
+    "/api/admin/users",
+    "/api/admin/departments/usage",
+})
 
 
 def session_cookie_max_age() -> int:
@@ -250,6 +258,28 @@ async def protect_secret_bearing_urls(request: Request, call_next):
         response.headers["Pragma"] = "no-cache"
         response.headers["Referrer-Policy"] = "no-referrer"
     return response
+
+
+@app.middleware("http")
+async def enforce_remote_demo_read_only(request: Request, call_next):
+    """Deny writes before handlers can touch the upstream or shared snapshot DB."""
+
+    path = request.url.path
+    method = request.method.upper()
+    refresh_requested = str(request.query_params.get("refresh") or "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if remote_demo_read_only() and refresh_requested and path in REMOTE_DEMO_USAGE_PATHS:
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "远端演示环境为只读，不能刷新用量快照", "code": "REMOTE_DEMO_READ_ONLY"},
+        )
+    if remote_demo_read_only() and path.startswith("/api/") and not remote_demo_request_allowed(method, path):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "远端演示环境为只读，不能执行此操作", "code": "REMOTE_DEMO_READ_ONLY"},
+        )
+    return await call_next(request)
 
 
 app.add_middleware(
@@ -510,6 +540,38 @@ async def _invalidate_observability_dashboard(dashboard_type: str) -> None:
 def usage_sync_role() -> str:
     role = os.getenv("USAGE_SYNC_ROLE", "combined").strip().lower()
     return role if role in {"reader", "worker", "combined"} else "combined"
+
+
+def remote_demo_read_only() -> bool:
+    """Keep the remote demonstration instance outside every production write path."""
+
+    return env_bool("REMOTE_DEMO_READ_ONLY", False)
+
+
+def remote_demo_get_allowed(path: str) -> bool:
+    """Allow only authentication, health, and committed usage snapshot reads."""
+
+    if not remote_demo_read_only():
+        return True
+    return (
+        path == "/api/health"
+        or path.startswith("/api/auth/")
+        or path.startswith("/api/me/usage")
+        or path.startswith("/api/team/usage")
+        or path.startswith("/api/team/member/usage")
+        or path.startswith("/api/admin/usage")
+        or path.startswith("/api/admin/users")
+        or path.startswith("/api/admin/departments/usage")
+    )
+
+
+def remote_demo_request_allowed(method: str, path: str) -> bool:
+    """Keep auth navigation working without granting local-account write paths."""
+
+    if method in {"GET", "HEAD", "OPTIONS"}:
+        return remote_demo_get_allowed(path)
+    # Logout only clears the demonstration instance's independently stored session.
+    return method == "POST" and path == "/api/auth/logout"
 
 
 def snapshot_reader_configured() -> bool:
@@ -817,6 +879,15 @@ async def auth_store_call(method: str, *args: Any, **kwargs: Any) -> Any:
 
 
 def usage_backend_ids() -> list[str]:
+    if remote_demo_read_only():
+        configured = os.getenv("USAGE_SNAPSHOT_BACKEND_IDS", "").split(",")
+        backend_ids = list(dict.fromkeys(item.strip() for item in configured if item.strip()))
+        if not backend_ids:
+            raise HTTPException(
+                status_code=503,
+                detail="远端演示环境缺少 USAGE_SNAPSHOT_BACKEND_IDS 快照配置",
+            )
+        return backend_ids
     return [backend.id for backend in client().backends]
 
 
@@ -932,7 +1003,7 @@ def cache_usage_payload(
 
 
 def queue_usage_refresh(start_date: str, end_date: str, requested: bool) -> bool:
-    if not requested or usage_store() is None:
+    if remote_demo_read_only() or not requested or usage_store() is None:
         return False
     trigger_usage_refresh(start_date, end_date, True)
     return True
@@ -1052,6 +1123,8 @@ async def usage_singleflight(key: str, factory: Any) -> Any:
 
 
 async def run_usage_sync(days: int) -> dict[str, Any]:
+    if remote_demo_read_only():
+        return {"status": "read_only", "rowCount": 0, "backendCount": 0}
     store = usage_store()
     if store is None:
         return {"status": "disabled", "rowCount": 0, "backendCount": 0}
@@ -1138,6 +1211,8 @@ async def usage_sync_loop() -> None:
 
 
 async def schedule_usage_refresh(start_date: str, end_date: str, force: bool = False) -> None:
+    if remote_demo_read_only():
+        return
     store = usage_store()
     if store is None:
         return
@@ -1166,6 +1241,8 @@ async def prepare_usage_refresh(start_date: str, end_date: str, force: bool = Fa
         end_date,
         force,
     )
+    if force and remote_demo_read_only():
+        raise HTTPException(status_code=403, detail="远端演示环境为只读，不能刷新用量快照")
     if force and usage_store() is not None:
         trigger_usage_refresh(start_date, end_date, True)
 
@@ -1194,6 +1271,8 @@ async def start_usage_sync() -> None:
     if store is None:
         return
     await store.connect()
+    if remote_demo_read_only():
+        return
     if realtime_enabled():
         if usage_sync_role() == "reader" or (_usage_realtime_task is not None and not _usage_realtime_task.done()):
             return
@@ -5559,6 +5638,10 @@ async def health() -> dict[str, Any]:
         result["status"] = "degraded"
     else:
         result["authDatabase"] = {"enabled": False, "status": "disabled"}
+    result["remoteDemo"] = {
+        "readOnly": remote_demo_read_only(),
+        "usageSnapshotOnly": remote_demo_read_only(),
+    }
     store = usage_store()
     if store is not None:
         result["usageDatabase"] = await store.health()
@@ -5710,6 +5793,8 @@ async def auth_config() -> dict[str, Any]:
     recovery_ready = password_recovery_configured()
     return {
         "devLoginEnabled": env_bool("DEV_LOGIN_ENABLED", False),
+        "remoteDemoReadOnly": remote_demo_read_only(),
+        "remoteDemoUsageSnapshotOnly": remote_demo_read_only(),
         "oidcConfigured": oidc_configured(),
         "providerName": safe_provider_name(),
         "allowedEmailDomain": allowed_email_domain(),

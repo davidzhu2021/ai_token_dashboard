@@ -1,0 +1,30 @@
+services:
+  ai-token-dashboard-remote-demo:
+    build:
+      context: .
+    image: ai-token-dashboard:remote-demo
+    container_name: ai-token-dashboard-remote-demo
+    env_file:
+      - .env.remote-demo
+    environment:
+      REMOTE_DEMO_READ_ONLY: "true"
+      USAGE_SYNC_ROLE: reader
+      USAGE_SYNC_ENABLED: "true"
+      USAGE_REALTIME_ENABLED: "false"
+      ORGANIZATION_MODE: disabled
+      BILLING_ENABLED: "false"
+      ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED: "false"
+      LITELLM_BASE_URL: ""
+      LITELLM_ADMIN_KEY: ""
+      HER_LITELLM_BASE_URL: ""
+      HER_LITELLM_ADMIN_KEY: ""
+    volumes:
+      # This volume is intentionally separate from production's key-vault-data.
+      - remote-demo-key-vault-data:/app/.data
+    ports:
+      # Set REMOTE_DEMO_BIND_ADDRESS to an internal interface, never 0.0.0.0.
+      - "${REMOTE_DEMO_BIND_ADDRESS:?Set an internal/VPN bind address}:8010:8000"
+    restart: unless-stopped
+
+volumes:
+  remote-demo-key-vault-data:

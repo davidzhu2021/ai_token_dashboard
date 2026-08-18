@@ -850,10 +850,17 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
 class UsageStore:
     """Small PostgreSQL adapter for aggregated usage snapshots only."""
 
-    def __init__(self, dsn: str, min_size: int = 1, max_size: int = 5) -> None:
+    def __init__(
+        self,
+        dsn: str,
+        min_size: int = 1,
+        max_size: int = 5,
+        read_only: bool = False,
+    ) -> None:
         self.dsn = dsn
         self.min_size = min_size
         self.max_size = max_size
+        self.read_only = read_only
         self.pool: Any = None
         self._connect_lock = asyncio.Lock()
 
@@ -876,7 +883,8 @@ class UsageStore:
             max_size = max(min_size, int(os.getenv("USAGE_DB_POOL_MAX_SIZE", "5")))
         except ValueError:
             max_size = max(5, min_size)
-        return cls(dsn, min_size=min_size, max_size=max_size)
+        read_only = os.getenv("REMOTE_DEMO_READ_ONLY", "false").strip().lower() in {"1", "true", "yes", "on"}
+        return cls(dsn, min_size=min_size, max_size=max_size, read_only=read_only)
 
     async def connect(self) -> None:
         if self.pool is not None:
@@ -886,12 +894,20 @@ class UsageStore:
         async with self._connect_lock:
             if self.pool is not None:
                 return
-            pool = await asyncpg.create_pool(self.dsn, min_size=self.min_size, max_size=self.max_size, command_timeout=30)
-            try:
-                await pool.execute(USAGE_SCHEMA)
-            except Exception:
-                await pool.close()
-                raise
+            server_settings = {"default_transaction_read_only": "on"} if self.read_only else None
+            pool = await asyncpg.create_pool(
+                self.dsn,
+                min_size=self.min_size,
+                max_size=self.max_size,
+                command_timeout=30,
+                server_settings=server_settings,
+            )
+            if not self.read_only:
+                try:
+                    await pool.execute(USAGE_SCHEMA)
+                except Exception:
+                    await pool.close()
+                    raise
             self.pool = pool
 
     async def close(self) -> None:

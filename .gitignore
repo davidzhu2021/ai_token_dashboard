@@ -1,4 +1,5 @@
 .env
+.env.remote-demo
 .venv/
 .venv_linux/
 __pycache__/
