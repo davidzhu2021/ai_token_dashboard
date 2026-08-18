@@ -109,6 +109,24 @@ def test_build_failure_event_redacts_and_never_leaks_sensitive_fields() -> None:
         assert key in _OBSERVABILITY_EVENT_FIELDS, key
 
 
+def test_build_attempt_model_group_falls_back_to_litellm_params() -> None:
+    """生产 proxy kwargs：litellm_params 无 model 键但有 model_group + metadata.actual_model。"""
+    pusher = _pusher()
+    kwargs = _kwargs()
+    kwargs["litellm_params"] = {
+        "model_group": "gpt-4o",
+        "custom_llm_provider": "openai",
+        "metadata": {"actual_model": "gpt-4o-2024-08", "attempted_retries": 0},
+    }
+    kwargs.pop("model", None)
+    event = pusher._build_attempt(
+        kwargs, None, "2026-08-10T03:04:00Z", "2026-08-10T03:04:02Z", status="success"
+    )
+    assert event["requestedModelGroup"] == "gpt-4o"
+    assert event["actualModel"] == "gpt-4o-2024-08"
+    assert event["routeName"] == "gpt-4o"
+
+
 def test_build_success_event_reads_fallback_header() -> None:
     pusher = _pusher()
     response = types.SimpleNamespace(

@@ -236,7 +236,12 @@ class ObservabilityAttemptPusher(CustomLogger):
             or call_id
         )
         trace_id = _text(metadata.get("trace_id") or metadata.get("traceId") or call_id or request_id)
-        model_group = _text(metadata.get("model_group") or kwargs.get("model") or litellm_params.get("model"))
+        model_group = _text(
+            metadata.get("model_group")
+            or kwargs.get("model")
+            or litellm_params.get("model")
+            or litellm_params.get("model_group")
+        )
         actual_model = _text(litellm_params.get("model") or metadata.get("actual_model") or model_group)
         provider = _text(
             litellm_params.get("custom_llm_provider")

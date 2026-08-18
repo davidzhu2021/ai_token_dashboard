@@ -442,6 +442,7 @@ CREATE TABLE IF NOT EXISTS stability_attempt_events (
     error_code TEXT NOT NULL DEFAULT '',
     error_class TEXT NOT NULL DEFAULT '',
     error_category TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
     scenario TEXT NOT NULL DEFAULT 'unknown',
     scenario_version TEXT NOT NULL DEFAULT '',
     event_time TIMESTAMPTZ NOT NULL,
@@ -466,6 +467,7 @@ CREATE INDEX IF NOT EXISTS stability_attempt_events_trace_idx
     ON stability_attempt_events (trace_id, event_time) WHERE trace_id <> '';
 ALTER TABLE stability_attempt_events ADD COLUMN IF NOT EXISTS retry_index INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE stability_attempt_events ADD COLUMN IF NOT EXISTS error_category TEXT NOT NULL DEFAULT '';
+ALTER TABLE stability_attempt_events ADD COLUMN IF NOT EXISTS error_message TEXT NOT NULL DEFAULT '';
 ALTER TABLE stability_attempt_events ADD COLUMN IF NOT EXISTS event_time TIMESTAMPTZ;
 ALTER TABLE stability_attempt_events ADD COLUMN IF NOT EXISTS event_date DATE;
 ALTER TABLE stability_attempt_events ADD COLUMN IF NOT EXISTS duration_ms DOUBLE PRECISION;
@@ -2094,13 +2096,13 @@ class UsageStore:
                             backend_id, event_id, request_id, trace_id, attempt_id,
                             attempt_index, retry_index, requested_model_group,
                             actual_model, route_name, provider, event_type, status,
-                            error_code, error_class, error_category, scenario,
+                            error_code, error_class, error_category, error_message, scenario,
                             scenario_version, event_time, event_date, started_at,
                             ended_at, ttft_ms, duration_ms, fallback_from, fallback_to,
                             is_retry, is_fallback, collected_at, received_at
                         ) VALUES (
                             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
-                            $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30
+                            $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31
                         ) ON CONFLICT (backend_id, event_id) DO NOTHING
                         """,
                         final_attempt_records,
@@ -4314,6 +4316,7 @@ class UsageStore:
             _clean_text(_input_value(event, "error_code", "errorCode"))[:120],
             _clean_text(_input_value(event, "error_class", "errorClass"))[:160],
             "",
+            _clean_text(_input_value(event, "error_message", "errorMessage"))[:1000],
             (_clean_text(event.get("scenario")) or "unknown")[:64],
             _clean_text(_input_value(event, "scenario_version", "scenarioVersion"))[:64],
             event_time,
@@ -4369,6 +4372,7 @@ class UsageStore:
             _clean_text(_input_value(event, "error_code", "errorCode"))[:120],
             _clean_text(_input_value(event, "error_class", "errorClass"))[:160],
             _clean_text(_input_value(event, "error_category", "errorCategory"))[:120],
+            _clean_text(_input_value(event, "error_message", "errorMessage"))[:1000],
             (_clean_text(event.get("scenario")) or "unknown")[:64],
             _clean_text(_input_value(event, "scenario_version", "scenarioVersion"))[:64],
             event_time,
@@ -4400,13 +4404,13 @@ class UsageStore:
                             backend_id, event_id, request_id, trace_id, attempt_id,
                             attempt_index, retry_index, requested_model_group,
                             actual_model, route_name, provider, event_type, status,
-                            error_code, error_class, error_category, scenario,
+                            error_code, error_class, error_category, error_message, scenario,
                             scenario_version, event_time, event_date, started_at,
                             ended_at, ttft_ms, duration_ms, fallback_from, fallback_to,
                             is_retry, is_fallback, collected_at, received_at
                         ) VALUES (
                             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
-                            $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30
+                            $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31
                         ) ON CONFLICT (backend_id, event_id) DO NOTHING
                         """,
                         *record,
