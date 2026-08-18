@@ -9459,6 +9459,7 @@ _OBSERVABILITY_EVENT_FIELDS = {
     "ttftMs", "ttft_ms", "durationMs", "duration_ms", "retryIndex", "retry_index", "isRetry", "is_retry", "isFallback", "is_fallback",
     "routeName", "route_name",
     "fallbackFrom", "fallback_from", "fallbackTo", "fallback_to",
+    "errorMessage", "error_message",
 }
 _OBSERVABILITY_FORBIDDEN_EVENT_FIELDS = {
     "prompt", "messages", "response", "completion", "content", "body", "choices",
@@ -9473,6 +9474,7 @@ _OBSERVABILITY_CAMEL_TO_SNAKE = {
     "scenarioVersion": "scenario_version", "startedAt": "started_at", "endedAt": "ended_at",
     "ttftMs": "ttft_ms", "durationMs": "duration_ms", "retryIndex": "retry_index", "isRetry": "is_retry", "isFallback": "is_fallback",
     "routeName": "route_name", "fallbackFrom": "fallback_from", "fallbackTo": "fallback_to",
+    "errorMessage": "error_message",
 }
 
 

@@ -2018,6 +2018,14 @@ class UsageStore:
             for row in events
             if (record := self._event_record(backend_id, row, collected_at)) is not None
         ]
+        # 同批 spend-log 事件也补写为 final_request 尝试事件：让「上游异常率」
+        # 「重试恢复率」在外部 attempt 推送尚未接入时也能从原始日志推导，兜底
+        # 恢复率仍只依赖推送方（spend log 不含 fallback 过程信息）。
+        final_attempt_records = [
+            record
+            for row in events
+            if (record := self._stability_final_request_record(backend_id, row, collected_at)) is not None
+        ]
         async with pool.acquire() as connection:
             async with connection.transaction():
                 await connection.execute(
@@ -2068,6 +2076,34 @@ class UsageStore:
                             collected_at=EXCLUDED.collected_at
                         """,
                         records,
+                    )
+                # 窗口内由 spend log 生成的 final_request 尝试事件整体替换；
+                # event_type='final_request' 过滤保证外部推送的 attempt 事件不被清掉。
+                await connection.execute(
+                    "DELETE FROM stability_attempt_events WHERE backend_id=$1 "
+                    "AND event_date BETWEEN $2::date AND $3::date "
+                    "AND event_type='final_request'",
+                    backend_id,
+                    _as_date(replace_start_date),
+                    _as_date(replace_end_date),
+                )
+                if final_attempt_records:
+                    await connection.executemany(
+                        """
+                        INSERT INTO stability_attempt_events (
+                            backend_id, event_id, request_id, trace_id, attempt_id,
+                            attempt_index, retry_index, requested_model_group,
+                            actual_model, route_name, provider, event_type, status,
+                            error_code, error_class, error_category, scenario,
+                            scenario_version, event_time, event_date, started_at,
+                            ended_at, ttft_ms, duration_ms, fallback_from, fallback_to,
+                            is_retry, is_fallback, collected_at, received_at
+                        ) VALUES (
+                            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+                            $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30
+                        ) ON CONFLICT (backend_id, event_id) DO NOTHING
+                        """,
+                        final_attempt_records,
                     )
                 event_count = int(
                     await connection.fetchval(
@@ -4228,6 +4264,71 @@ class UsageStore:
         except Exception as exc:  # pragma: no cover - depends on database
             return {"enabled": True, "connected": False, "status": "error", "error": exc.__class__.__name__}
         return {"enabled": True, "connected": True, "status": "ok"}
+
+    @staticmethod
+    def _stability_final_request_record(event: dict[str, Any], received_at: datetime) -> tuple[Any, ...] | None:
+        """把 spend-log 拉取的一条最终请求事件转成 final_request 尝试事件。
+
+        上游 /spend/logs/v2 只有每条请求的最终状态（含 attempted_retries /
+        status / error），没有 fallback 过程，因此 fallback 相关字段固定为空、
+        is_fallback=False；重试信息从 attemptedRetries 还原，供「上游异常率」
+        「重试恢复率」在外部 attempt 推送接入前先行计算。
+        """
+        request_id = _clean_text(_input_value(event, "request_id", "requestId"))
+        event_time = _optional_datetime(_input_value(event, "event_time", "eventTime"))
+        if not request_id or event_time is None:
+            return None
+        usage_date = _input_value(event, "usage_date", "usageDate")
+        try:
+            event_date = (
+                event_time.date()
+                if usage_date in (None, "")
+                else _as_date(str(usage_date)[:10])
+            )
+        except (TypeError, ValueError):
+            event_date = event_time.date()
+        started_at = _optional_datetime(_input_value(event, "start_time", "startTime"))
+        ended_at = _optional_datetime(_input_value(event, "end_time", "endTime"))
+        raw_duration = _input_value(event, "request_duration_ms", "durationMs")
+        duration_ms = None if raw_duration in (None, "") else _as_float(raw_duration)
+        if duration_ms is None and started_at is not None and ended_at is not None:
+            duration_ms = max(0.0, (ended_at - started_at).total_seconds() * 1000)
+        raw_ttft = _input_value(event, "ttft_ms", "ttftMs")
+        ttft_ms = None if raw_ttft in (None, "") else _as_float(raw_ttft)
+        attempted_retries = max(0, _as_int(_input_value(event, "attempted_retries", "attemptedRetries")))
+        model_group = _clean_text(_input_value(event, "model_group", "modelGroup")) or _clean_text(event.get("model"))
+        return (
+            _clean_text(event.get("backend_id")) or "",
+            request_id[:256],
+            request_id[:512],
+            _clean_text(_input_value(event, "trace_id", "traceId"))[:512],
+            request_id[:256],
+            attempted_retries,
+            attempted_retries,
+            model_group[:256],
+            model_group[:256],
+            "",
+            _clean_text(event.get("provider"))[:160],
+            "final_request",
+            (_clean_text(event.get("status")) or "unknown")[:64],
+            _clean_text(_input_value(event, "error_code", "errorCode"))[:120],
+            _clean_text(_input_value(event, "error_class", "errorClass"))[:160],
+            "",
+            (_clean_text(event.get("scenario")) or "unknown")[:64],
+            _clean_text(_input_value(event, "scenario_version", "scenarioVersion"))[:64],
+            event_time,
+            event_date,
+            started_at,
+            ended_at,
+            ttft_ms,
+            duration_ms,
+            "",
+            "",
+            attempted_retries > 0,
+            False,
+            received_at,
+            received_at,
+        )
 
     @staticmethod
     def _stability_attempt_record(event: dict[str, Any], received_at: datetime) -> tuple[Any, ...]:
