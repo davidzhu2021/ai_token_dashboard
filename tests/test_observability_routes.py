@@ -145,14 +145,18 @@ def _client(monkeypatch, *, platform_admin: bool = True) -> TestClient:
     monkeypatch.setattr(main, "client", lambda: fake_client)
     client = TestClient(main.app)
     if platform_admin:
-        monkeypatch.setattr(main, "require_platform_admin", lambda request: {"email": "admin@auto-link.com.cn"})
+        monkeypatch.setattr(
+            main,
+            "require_observability_dashboard",
+            lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True},
+        )
     else:
         from fastapi import HTTPException
 
         def reject(request):
             raise HTTPException(status_code=403, detail="forbidden")
 
-        monkeypatch.setattr(main, "require_platform_admin", reject)
+        monkeypatch.setattr(main, "require_observability_dashboard", reject)
     return client
 
 
@@ -193,7 +197,7 @@ def test_cost_overview_filters_api_and_manual_costs_consistently(monkeypatch) ->
     monkeypatch.setenv("ADMIN_EMAILS", "admin@auto-link.com.cn")
     monkeypatch.setenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "true")
     monkeypatch.setattr(main, "usage_store", lambda: FakeCostFilterStore())
-    monkeypatch.setattr(main, "require_platform_admin", lambda request: {"email": "admin@auto-link.com.cn"})
+    monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True})
     client = TestClient(main.app)
 
     by_model = client.get("/api/admin/costs/overview?month=2026-08&model=model-a&as_of=2026-08-12").json()["data"]
@@ -212,7 +216,7 @@ def test_cost_overview_filters_api_and_manual_costs_consistently(monkeypatch) ->
 
 def test_cost_overview_adds_full_bucket_and_savings_metrics(monkeypatch) -> None:
     monkeypatch.setattr(main, "usage_store", lambda: FakeCostLedgerStore())
-    monkeypatch.setattr(main, "require_platform_admin", lambda request: {"email": "admin@auto-link.com.cn"})
+    monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True})
     monkeypatch.setenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "true")
     response = TestClient(main.app).get("/api/admin/costs/overview?month=2026-08&as_of=2026-08-12")
     assert response.status_code == 200
@@ -230,7 +234,7 @@ def test_cost_overview_adds_full_bucket_and_savings_metrics(monkeypatch) -> None
 
 def test_cost_ledger_is_paginated_and_filters_reconciliation(monkeypatch) -> None:
     monkeypatch.setattr(main, "usage_store", lambda: FakeCostLedgerStore())
-    monkeypatch.setattr(main, "require_platform_admin", lambda request: {"email": "admin@auto-link.com.cn"})
+    monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True})
     monkeypatch.setenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "true")
     client = TestClient(main.app)
     response = client.get(
@@ -250,7 +254,7 @@ def test_cost_ledger_is_paginated_and_filters_reconciliation(monkeypatch) -> Non
 
 def test_cost_annual_returns_twelve_months(monkeypatch) -> None:
     monkeypatch.setattr(main, "usage_store", lambda: FakeCostLedgerStore())
-    monkeypatch.setattr(main, "require_platform_admin", lambda request: {"email": "admin@auto-link.com.cn"})
+    monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True})
     monkeypatch.setenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "true")
     response = TestClient(main.app).get("/api/admin/costs/annual?year=2026&as_of=2026-08-12")
     assert response.status_code == 200

@@ -44,7 +44,7 @@ def _client(monkeypatch, store: V2Store) -> TestClient:
     monkeypatch.setenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "true")
     monkeypatch.setenv("OBSERVABILITY_INGEST_HMAC_SECRET", "test-secret")
     monkeypatch.setattr(main, "usage_store", lambda: store)
-    monkeypatch.setattr(main, "require_platform_admin", lambda request: {"email": "admin@example.test"})
+    monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@example.test", "isPlatformAdmin": True})
     return TestClient(main.app)
 
 

@@ -1803,6 +1803,47 @@ def auth_http_error(status_code: int, detail: str, code: str, headers: dict[str,
     return HTTPException(status_code=status_code, detail={"error": detail, "code": code}, headers=headers)
 
 
+def observability_allowed_emails() -> set[str]:
+    """Return the preview allowlist for the platform observability dashboards.
+
+    An empty allowlist means every platform admin may open the stability /
+    cost / governance dashboards (historical behavior).  When set, only the
+    listed admin emails may open them; clear the variable to re-open the
+    dashboards to all platform admins after the features are fully developed.
+    """
+
+    raw = os.getenv("ADMIN_OBSERVABILITY_ALLOWED_EMAILS", "")
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
+def observability_dashboards_enabled_for(user: dict[str, Any]) -> bool:
+    """Return whether this user may open the platform observability dashboards.
+
+    ``ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED`` remains the master switch.
+    ``ADMIN_OBSERVABILITY_ALLOWED_EMAILS`` narrows early-access boards to a
+    specific platform-admin preview list; an empty allowlist keeps every
+    platform admin enabled.
+    """
+
+    if not env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False):
+        return False
+    if not user.get("isPlatformAdmin"):
+        return False
+    allowed = observability_allowed_emails()
+    if not allowed:
+        return True
+    return str(user.get("email") or "").strip().lower() in allowed
+
+
+def require_observability_dashboard(request: Request) -> dict[str, Any]:
+    """Require a platform admin that is allowed to open the observability dashboards."""
+
+    user = require_platform_admin(request)
+    if not observability_dashboards_enabled_for(user):
+        raise HTTPException(status_code=404, detail="看板尚未开放")
+    return user
+
+
 def organization_access_fields(
     user: dict[str, Any],
     membership: dict[str, Any] | None = None,
@@ -1834,10 +1875,7 @@ def organization_access_fields(
     # Enterprise administrators own the complete customer-scoped workspace.
     can_view_usage = role == "admin"
     can_view_billing = role == "admin"
-    observability_enabled = bool(
-        user.get("isPlatformAdmin")
-        and env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False)
-    )
+    observability_enabled = bool(observability_dashboards_enabled_for(user))
     return {
         "organizationEnabled": enabled,
         "organizationMode": organization_mode(),
@@ -9789,9 +9827,7 @@ async def admin_stability_overview(
     model: str = "",
     refresh: int = 0,
 ) -> JSONResponse:
-    require_platform_admin(request)
-    if not env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False):
-        raise HTTPException(status_code=404, detail="看板尚未开放")
+    require_observability_dashboard(request)
     start_date, end_date = resolve_usage_range(start_date, end_date)
     payload = await _cached_observability_dashboard(
         "stability",
@@ -9804,9 +9840,7 @@ async def admin_stability_overview(
 
 @app.get("/api/admin/stability/scenarios")
 async def admin_stability_scenarios(request: Request, start_date: str | None = None, end_date: str | None = None, model: str = "", scenario: str = "", error_code: str = "", page: int = 1, page_size: int = 20) -> dict[str, Any]:
-    require_platform_admin(request)
-    if not env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False):
-        raise HTTPException(status_code=404, detail="看板尚未开放")
+    require_observability_dashboard(request)
     start_date, end_date = resolve_usage_range(start_date, end_date)
     page = max(1, page)
     page_size = max(1, min(100, page_size))
@@ -9865,9 +9899,7 @@ async def admin_stability_scenarios(request: Request, start_date: str | None = N
 
 @app.get("/api/admin/stability/requests/{request_id}")
 async def admin_stability_request(request: Request, request_id: str, backend_id: str = "") -> dict[str, Any]:
-    require_platform_admin(request)
-    if not env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False):
-        raise HTTPException(status_code=404, detail="看板尚未开放")
+    require_observability_dashboard(request)
     store = _admin_observability_store()
     try:
         record = await store.stability_request(request_id, backend_id)
@@ -9935,7 +9967,7 @@ def _stability_regression_input(data: StabilityRegressionRequest, regression_id:
 
 @app.get("/api/admin/stability/actions")
 async def admin_stability_actions(request: Request, status: str = "", owner: str = "", scenario: str = "") -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     store = _admin_observability_store()
     items = await _call_store_optional(store, ("list_stability_actions",), status=status, owner=owner, scenario=scenario, default=[])
     return _observability_envelope(items or [], source="stability governance")
@@ -9943,7 +9975,7 @@ async def admin_stability_actions(request: Request, status: str = "", owner: str
 
 @app.post("/api/admin/stability/actions")
 async def admin_create_stability_action(data: StabilityActionRequest, request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     await enforce_csrf(request)
     store = _admin_observability_store()
     item = await _call_store_optional(store, ("create_stability_action",), _stability_action_input(data), default=None)
@@ -9955,7 +9987,7 @@ async def admin_create_stability_action(data: StabilityActionRequest, request: R
 
 @app.patch("/api/admin/stability/actions/{action_id}")
 async def admin_update_stability_action(action_id: str, data: StabilityActionRequest, request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     await enforce_csrf(request)
     store = _admin_observability_store()
     item = await _call_store_optional(store, ("update_stability_action",), action_id, _stability_action_input(data, action_id), default=None)
@@ -9967,7 +9999,7 @@ async def admin_update_stability_action(action_id: str, data: StabilityActionReq
 
 @app.delete("/api/admin/stability/actions/{action_id}")
 async def admin_delete_stability_action(action_id: str, request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     await enforce_csrf(request)
     deleted = await _call_store_optional(_admin_observability_store(), ("delete_stability_action",), action_id, default=False)
     if not deleted:
@@ -9978,14 +10010,14 @@ async def admin_delete_stability_action(action_id: str, request: Request) -> dic
 
 @app.get("/api/admin/stability/regressions")
 async def admin_stability_regressions(request: Request, action_id: str = "", scenario: str = "") -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     items = await _call_store_optional(_admin_observability_store(), ("list_stability_regressions",), action_id=action_id, scenario=scenario, default=[])
     return _observability_envelope(items or [], source="stability governance")
 
 
 @app.post("/api/admin/stability/regressions")
 async def admin_create_stability_regression(data: StabilityRegressionRequest, request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     await enforce_csrf(request)
     item = await _call_store_optional(_admin_observability_store(), ("create_stability_regression",), _stability_regression_input(data), default=None)
     if item is None:
@@ -9996,7 +10028,7 @@ async def admin_create_stability_regression(data: StabilityRegressionRequest, re
 
 @app.patch("/api/admin/stability/regressions/{regression_id}")
 async def admin_update_stability_regression(regression_id: str, data: StabilityRegressionRequest, request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     await enforce_csrf(request)
     item = await _call_store_optional(_admin_observability_store(), ("update_stability_regression",), regression_id, _stability_regression_input(data, regression_id), default=None)
     if item is None:
@@ -10007,7 +10039,7 @@ async def admin_update_stability_regression(regression_id: str, data: StabilityR
 
 @app.delete("/api/admin/stability/regressions/{regression_id}")
 async def admin_delete_stability_regression(regression_id: str, request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     await enforce_csrf(request)
     deleted = await _call_store_optional(_admin_observability_store(), ("delete_stability_regression",), regression_id, default=False)
     if not deleted:
@@ -10508,7 +10540,7 @@ def _cost_summary_splits(ledger_rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 @app.get("/api/admin/costs/items")
 async def admin_cost_items(request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     return _observability_envelope([_cost_item_payload(item) for item in await _admin_observability_store().list_cost_items()], source="费用控制账本")
 
 
@@ -10550,7 +10582,7 @@ def _cost_item_input(data: CostItemRequest, item_id: str | None = None) -> dict[
 
 @app.post("/api/admin/costs/items")
 async def admin_create_cost_item(data: CostItemRequest, request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     await enforce_csrf(request)
     item = _cost_item_payload(await _admin_observability_store().create_cost_item(_cost_item_input(data)))
     await _invalidate_observability_dashboard("cost")
@@ -10559,7 +10591,7 @@ async def admin_create_cost_item(data: CostItemRequest, request: Request) -> dic
 
 @app.patch("/api/admin/costs/items/{item_id}")
 async def admin_update_cost_item(item_id: str, data: CostItemRequest, request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     await enforce_csrf(request)
     record = await _admin_observability_store().update_cost_item(item_id, _cost_item_input(data, item_id))
     if not record:
@@ -10570,7 +10602,7 @@ async def admin_update_cost_item(item_id: str, data: CostItemRequest, request: R
 
 @app.delete("/api/admin/costs/items/{item_id}")
 async def admin_delete_cost_item(item_id: str, request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     await enforce_csrf(request)
     if not await _admin_observability_store().delete_cost_item(item_id):
         raise HTTPException(status_code=404, detail="成本项不存在")
@@ -10580,13 +10612,13 @@ async def admin_delete_cost_item(item_id: str, request: Request) -> dict[str, An
 
 @app.get("/api/admin/costs/budgets")
 async def admin_cost_budgets(request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     return _observability_envelope([{ "month": str(item.get("month")), "budgetUsd": float(item.get("budget_usd") or 0), "dailyTargetUsd": float(item.get("daily_target_usd") or 0)} for item in await _admin_observability_store().list_cost_budgets()], source="费用控制账本")
 
 
 @app.put("/api/admin/costs/budgets/{month}")
 async def admin_update_cost_budget(month: str, data: CostBudgetRequest, request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     await enforce_csrf(request)
     try:
         date.fromisoformat(f"{month}-01")
@@ -10633,14 +10665,14 @@ def _cost_plan_input(data: CostPlanVersionRequest, plan_id: str | None = None) -
 
 @app.get("/api/admin/costs/plan-versions")
 async def admin_cost_plan_versions(request: Request, year: int | None = None, status: str = "", scenario: str = "") -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     items = await _call_store_optional(_admin_observability_store(), ("list_cost_plan_versions",), year=year, status=status, scenario=scenario, default=[])
     return _observability_envelope([_plan_version_payload(dict(item)) for item in (items or [])], source="cost plan ledger")
 
 
 @app.post("/api/admin/costs/plan-versions")
 async def admin_create_cost_plan_version(data: CostPlanVersionRequest, request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     await enforce_csrf(request)
     item = await _call_store_optional(_admin_observability_store(), ("create_cost_plan_version",), _cost_plan_input(data), default=None)
     if item is None:
@@ -10651,7 +10683,7 @@ async def admin_create_cost_plan_version(data: CostPlanVersionRequest, request: 
 
 @app.patch("/api/admin/costs/plan-versions/{plan_id}")
 async def admin_update_cost_plan_version(plan_id: str, data: CostPlanVersionRequest, request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     await enforce_csrf(request)
     item = await _call_store_optional(_admin_observability_store(), ("update_cost_plan_version",), plan_id, _cost_plan_input(data, plan_id), default=None)
     if item is None:
@@ -10661,7 +10693,7 @@ async def admin_update_cost_plan_version(plan_id: str, data: CostPlanVersionRequ
 
 
 async def _change_cost_plan_state(plan_id: str, request: Request, operation: str) -> dict[str, Any]:
-    admin = require_platform_admin(request)
+    admin = require_observability_dashboard(request)
     await enforce_csrf(request)
     item = await _call_store_optional(
         _admin_observability_store(),
@@ -10707,7 +10739,7 @@ def _savings_measurement_input(data: SavingsMeasurementRequest, measurement_id: 
 
 @app.get("/api/admin/costs/savings-measurements")
 async def admin_savings_measurements(request: Request, as_of: str | None = None, year: int | None = None) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     try:
         cutoff = date.fromisoformat(as_of) if as_of else date.today()
     except ValueError as exc:
@@ -10718,7 +10750,7 @@ async def admin_savings_measurements(request: Request, as_of: str | None = None,
 
 @app.post("/api/admin/costs/savings-measurements")
 async def admin_create_savings_measurement(data: SavingsMeasurementRequest, request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     await enforce_csrf(request)
     item = await _call_store_optional(_admin_observability_store(), ("create_savings_measurement",), _savings_measurement_input(data), default=None)
     if item is None:
@@ -10729,7 +10761,7 @@ async def admin_create_savings_measurement(data: SavingsMeasurementRequest, requ
 
 @app.patch("/api/admin/costs/savings-measurements/{measurement_id}")
 async def admin_update_savings_measurement(measurement_id: str, data: SavingsMeasurementRequest, request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     await enforce_csrf(request)
     item = await _call_store_optional(_admin_observability_store(), ("update_savings_measurement",), measurement_id, _savings_measurement_input(data, measurement_id), default=None)
     if item is None:
@@ -10740,7 +10772,7 @@ async def admin_update_savings_measurement(measurement_id: str, data: SavingsMea
 
 @app.delete("/api/admin/costs/savings-measurements/{measurement_id}")
 async def admin_delete_savings_measurement(measurement_id: str, request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     await enforce_csrf(request)
     deleted = await _call_store_optional(_admin_observability_store(), ("delete_savings_measurement",), measurement_id, default=False)
     if not deleted:
@@ -10751,7 +10783,7 @@ async def admin_delete_savings_measurement(measurement_id: str, request: Request
 
 @app.get("/api/admin/costs/savings-actions")
 async def admin_savings_actions(request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     return _observability_envelope([_savings_payload(item) for item in await _admin_observability_store().list_savings_actions()], source="费用控制账本")
 
 
@@ -10784,14 +10816,14 @@ def _savings_input(data: SavingsActionRequest, action_id: str | None = None) -> 
 
 @app.post("/api/admin/costs/savings-actions")
 async def admin_create_savings_action(data: SavingsActionRequest, request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     await enforce_csrf(request)
     return _observability_envelope(_savings_payload(await _admin_observability_store().create_savings_action(_savings_input(data))), source="费用控制账本")
 
 
 @app.patch("/api/admin/costs/savings-actions/{action_id}")
 async def admin_update_savings_action(action_id: str, data: SavingsActionRequest, request: Request) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     await enforce_csrf(request)
     item = await _admin_observability_store().update_savings_action(action_id, _savings_input(data, action_id))
     if not item:
@@ -11021,7 +11053,7 @@ async def admin_costs_overview(
     provider: str = "", account_id: str = "", reconciliation_status: str = "",
     recognition_status: str = "", as_of: str | None = None, refresh: int = 0,
 ) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     target = month or date.today().strftime("%Y-%m")
     cutoff = as_of or date.today().isoformat()
     key = {"month": target, "asOf": cutoff, "category": category, "costBucket": cost_bucket, "model": model, "vendor": vendor, "provider": provider, "accountId": account_id, "reconciliation": reconciliation_status, "recognition": recognition_status, "definition": "cost-v2"}
@@ -11049,7 +11081,7 @@ async def admin_costs_ledger(
     page: int = 1,
     page_size: int = 100,
 ) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     try:
         cutoff = date.fromisoformat(as_of) if as_of else date.today()
         end = date.fromisoformat(end_date) if end_date else cutoff
@@ -11253,7 +11285,7 @@ async def admin_costs_annual(
     reconciliation_status: str = "",
     recognition_status: str = "",
 ) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     return await _build_costs_annual(
         year=year,
         as_of=as_of,
@@ -11270,7 +11302,7 @@ async def admin_costs_annual(
 
 @app.get("/api/admin/costs/savings/overview")
 async def admin_costs_savings_overview(request: Request, as_of: str | None = None) -> dict[str, Any]:
-    require_platform_admin(request)
+    require_observability_dashboard(request)
     try:
         today = date.fromisoformat(as_of) if as_of else date.today()
     except ValueError as exc:
