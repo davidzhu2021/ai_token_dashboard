@@ -247,7 +247,6 @@ let costLedgerState = {
   error: "",
   selectedId: "",
 };
-let stabilityFiltersOpen = false;
 let costFiltersOpen = false;
 let governanceWorkbenchTab = "stability-actions";
 let governanceWorkbenchData = { stabilityActions: [], regressions: [], planVersions: [], savingsMeasurements: [] };
@@ -8374,9 +8373,6 @@ function renderObservabilityContext(targetId, payload, data, scope) {
 function observabilityFilterConfig(scope) {
   if (scope === "stability") {
     return {
-      buttonId: "stabilityFiltersButton",
-      panelId: "stabilityFilterPanel",
-      countId: "stabilityFilterCount",
       resetId: "stabilityResetFiltersButton",
       activeId: "stabilityActiveFilters",
       filters: [{ id: "stabilityModel", label: "模型" }],
@@ -8415,8 +8411,7 @@ function setObservabilityFilterPanel(scope, open) {
   const button = el(config.buttonId);
   const panel = el(config.panelId);
   if (!button || !panel) return;
-  if (scope === "stability") stabilityFiltersOpen = open;
-  else costFiltersOpen = open;
+  costFiltersOpen = open;
   button.classList.toggle("is-open", open);
   button.setAttribute("aria-expanded", String(open));
   panel.classList.toggle("is-open", open);
@@ -10712,7 +10707,6 @@ el("costVendor")?.addEventListener("change", () => {
   renderObservabilityFilterState("cost");
   loadCostOverview();
 }));
-el("stabilityFiltersButton")?.addEventListener("click", () => setObservabilityFilterPanel("stability", !stabilityFiltersOpen));
 el("costFiltersButton")?.addEventListener("click", () => setObservabilityFilterPanel("cost", !costFiltersOpen));
 el("stabilityResetFiltersButton")?.addEventListener("click", () => resetObservabilityFilters("stability"));
 el("costResetFiltersButton")?.addEventListener("click", () => resetObservabilityFilters("cost"));
