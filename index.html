@@ -1535,6 +1535,11 @@
         pointer-events: none;
       }
 
+      .filter-zone > .dashboard-filters.hidden {
+        display: none !important;
+        visibility: visible;
+      }
+
       .range-picker {
         position: relative;
         min-width: 0;
@@ -7125,6 +7130,14 @@
                   <option value="其他">其他</option>
                 </select>
               </div>
+              <div id="stabilityTopFilters" class="dashboard-filters hidden" aria-label="稳定性筛选">
+                <select id="stabilityRange" class="select" aria-label="稳定性时间范围"><option value="1">最近 24 小时</option><option value="7" selected>最近 7 天</option><option value="30">最近 30 天</option></select>
+                <select id="stabilityModel" class="select" aria-label="稳定性模型筛选"><option value="">全部模型</option></select>
+              </div>
+              <div id="costTopFilters" class="dashboard-filters hidden" aria-label="费用筛选">
+                <input id="costMonth" class="input" type="month" aria-label="费用月份" />
+                <select id="costModel" class="select" aria-label="费用模型筛选"><option value="">全部模型</option></select>
+              </div>
             </div>
             <nav class="global-nav app-global-nav" aria-label="全局导航">
               <button class="global-nav-item" type="button" data-global-page="home">首页</button>
@@ -8804,11 +8817,7 @@
         <section id="stabilityView" class="view-section hidden" aria-labelledby="stabilityTitle">
           <div class="observability-head">
             <div><span class="eyebrow">平台治理</span><h2 id="stabilityTitle">稳定性看板</h2><p>从模型风险下钻到异常场景、请求链路、治理动作与回归结果。</p></div>
-            <div class="observability-filter-bar">
-              <select id="stabilityRange" class="select observability-primary-filter" aria-label="稳定性时间范围"><option value="1">最近 24 小时</option><option value="7" selected>最近 7 天</option><option value="30">最近 30 天</option></select>
-              <select id="stabilityModel" class="select observability-primary-filter" aria-label="稳定性模型筛选"><option value="">全部模型</option></select>
-              <button id="stabilityResetFiltersButton" class="observability-filter-button" type="button" disabled><span class="app-icon" aria-hidden="true"><svg><use href="#icon-refresh"></use></svg></span><span>重置</span></button>
-            </div>
+            <div class="observability-filter-bar"><button id="stabilityResetFiltersButton" class="observability-filter-button" type="button" disabled><span class="app-icon" aria-hidden="true"><svg><use href="#icon-refresh"></use></svg></span><span>重置</span></button></div>
           <div id="stabilityContext" class="observability-context" aria-live="polite"></div>
           <div id="stabilityActiveFilters" class="observability-active-filters hidden" aria-label="当前稳定性筛选条件"></div>
           <div id="stabilityQuality" class="operational-status hidden" role="status" aria-live="polite" aria-atomic="true"></div>
@@ -8829,8 +8838,6 @@
           <div class="observability-head">
             <div><span class="eyebrow">平台治理</span><h2 id="costControlTitle">费用看板</h2><p>实际、计划、预测与节省分轨展示，每个金额均可追溯到期间和账本来源。</p></div>
             <div class="observability-filter-bar">
-              <input id="costMonth" class="input observability-primary-filter" type="month" aria-label="费用月份" />
-              <select id="costModel" class="select observability-primary-filter" aria-label="费用模型筛选"><option value="">全部模型</option></select>
               <button id="costFiltersButton" class="observability-filter-button" type="button" aria-expanded="false" aria-controls="costFilterPanel"><span class="app-icon" aria-hidden="true"><svg><use href="#icon-filter"></use></svg></span><span>更多筛选</span><span id="costFilterCount" class="observability-filter-count hidden" aria-label="0 个筛选条件">0</span></button>
               <button id="costResetFiltersButton" class="observability-filter-button" type="button" disabled><span class="app-icon" aria-hidden="true"><svg><use href="#icon-refresh"></use></svg></span><span>重置</span></button>
             </div>

@@ -8129,7 +8129,10 @@ function switchView(view) {
   el("costControlView")?.classList.toggle("hidden", view !== "cost-control");
   el("governanceWorkbenchView")?.classList.toggle("hidden", view !== "governance-workbench");
   el("modelsView").classList.toggle("hidden", view !== "models");
-  el("dashboardFilters").classList.toggle("hidden", ["models", "keys", "billing", "customers", "organization", "organization-tokens", "stability", "cost-control", "governance-workbench"].includes(view));
+  const topFilterMode = view === "stability" ? "stability" : view === "cost-control" ? "cost" : "default";
+  el("dashboardFilters").classList.toggle("hidden", topFilterMode !== "default");
+  el("stabilityTopFilters")?.classList.toggle("hidden", topFilterMode !== "stability");
+  el("costTopFilters")?.classList.toggle("hidden", topFilterMode !== "cost");
   closeCustomRangePanel();
   renderOrganizationWorkspaceBar(view);
   const isCustomerDetailView = isViewingCustomerOrganization()
