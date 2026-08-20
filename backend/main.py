@@ -11290,6 +11290,39 @@ async def admin_costs_ledger(
 
     async def build() -> dict[str, Any]:
         store = _admin_observability_store()
+        ledger_query = getattr(store, "cost_ledger_page", None)
+        if callable(ledger_query):
+            page_data = await ledger_query(
+                start.isoformat(), today.isoformat(), page=page, page_size=page_size,
+                cost_bucket=cost_bucket, category=category, provider=provider, vendor=vendor,
+                model=model, canonical_model=canonical_model, account_id=account_id, reconciliation_status=reconciliation_status,
+                recognition_status=recognition_status,
+            )
+            raw_items = page_data.get("items") or []
+            items = []
+            for row in raw_items:
+                item = dict(row)
+                item.pop("total_count", None)
+                item.update({
+                    "id": item.get("id") or (
+                        "api:" + ":".join(str(item.get(value) or "-") for value in ("backend_id", "ledger_date", "account_id", "source", "provider", "model", "organization_id", "team_id", "key_id", "request_id"))
+                        if item.get("source_type") == "api_usage"
+                        else f"manual:{item.get('source_item_id')}:{item.get('ledger_date')}"
+                    ),
+                    "date": str(item.get("ledger_date")), "sourceType": item.get("source_type"),
+                    "costBucket": item.get("cost_bucket"), "amountUsd": float(item.get("amount_usd") or 0),
+                    "amount": float(item.get("original_amount") or item.get("amount_usd") or 0), "requestId": item.get("request_id"),
+                    "accountId": item.get("account_id") or None, "provider": item.get("provider") or None,
+                    "vendor": item.get("vendor") or None, "model": item.get("model") or None,
+                    "source": item.get("source") or None,
+                    "organizationId": item.get("organization_id") or None, "teamId": item.get("team_id") or None,
+                    "principalId": item.get("principal_id") or None,
+                    "recognitionStatus": item.get("recognition_status") or "actual",
+                    "reconciliationStatus": item.get("reconciliation_status"),
+                    "sourceItemId": item.get("source_item_id"),
+                })
+                items.append(item)
+            return _observability_envelope({**page_data, "items": items, "startDate": start.isoformat(), "endDate": end.isoformat(), "asOf": today.isoformat()}, coverage={"partial": False, "incomplete": not bool(items)}, source="cost ledger")
         api_rows, api_dimensions_complete = await _cost_api_rows(store, start, today, model=model, provider=provider, account_id=account_id)
         items = await _cost_actual_items(store, today, model=model, provider=provider, account_id=account_id, cost_bucket=cost_bucket)
         api_rows, items = _filter_cost_sources(api_rows, items, category=category, cost_bucket=cost_bucket, model=model, canonical_model=canonical_model, vendor=vendor, provider=provider, account_id=account_id, reconciliation_status=reconciliation_status, recognition_status=recognition_status)

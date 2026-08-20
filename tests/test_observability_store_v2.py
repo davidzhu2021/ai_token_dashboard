@@ -118,6 +118,37 @@ def test_actual_cost_items_force_actual_status_and_as_of_cutoff() -> None:
     assert connection.args[5] == "actual"
 
 
+def test_cost_ledger_page_paginates_in_sql() -> None:
+    class Connection:
+        async def fetch(self, sql, *args):
+            self.sql = sql
+            self.args = args
+            return [{"total_count": 3, "usage_date": date(2026, 8, 12), "source_type": "api_usage"}]
+
+    connection = Connection()
+    store = UsageStore("postgresql://unused")
+    store.pool = _Pool(connection)
+    result = run(store.cost_ledger_page("2026-08-01", "2026-08-12", page=2, page_size=1))
+    assert "COUNT(*)" in connection.sql
+    assert "LIMIT $" in connection.sql and "OFFSET $" in connection.sql
+    assert result["total"] == 3
+    assert result["page"] == 2
+
+
+def test_cost_ledger_page_prefers_request_level_attribution() -> None:
+    class Connection:
+        async def fetch(self, sql, *args):
+            self.sql = sql
+            return []
+
+    connection = Connection()
+    store = UsageStore("postgresql://unused")
+    store.pool = _Pool(connection)
+    run(store.cost_ledger_page("2026-08-01", "2026-08-12"))
+    assert "FROM usage_event_attribution" in connection.sql
+    assert "request_id" in connection.sql
+
+
 def test_activate_plan_rejects_non_approved_or_incomplete_plan() -> None:
     class Connection:
         def transaction(self):

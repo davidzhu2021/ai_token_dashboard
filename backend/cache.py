@@ -130,5 +130,7 @@ class AsyncJSONCache:
 
         for key in list(self._tasks):
             if key.startswith("observability:drilldown:"):
-                self._tasks.pop(key, None)
+                task = self._tasks.pop(key, None)
+                if task and not task.done():
+                    task.cancel()
         self._local.clear()

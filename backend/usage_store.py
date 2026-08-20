@@ -5338,6 +5338,84 @@ class UsageStore:
         )
         return [dict(record) for record in records]
 
+    async def cost_ledger_page(
+        self, start_date: str, end_date: str, *, page: int = 1, page_size: int = 100,
+        cost_bucket: str = "", category: str = "", provider: str = "", vendor: str = "",
+        model: str = "", canonical_model: str = "", account_id: str = "", reconciliation_status: str = "",
+        recognition_status: str = "",
+    ) -> dict[str, Any]:
+        """Return a unified, already paginated ledger page from PostgreSQL."""
+
+        page = max(1, int(page))
+        page_size = max(1, min(500, int(page_size)))
+        offset = (page - 1) * page_size
+        rows = await self._require_pool().fetch(
+            """
+            WITH ledger AS (
+                SELECT usage_date AS ledger_date, spend::double precision AS amount_usd,
+                       'api_usage' AS source_type, 'api_usage' AS cost_bucket,
+                       'API Token' AS category, model AS name, model, provider,
+                       source AS vendor, account_id, organization_id, team_id, principal_id, source,
+                       'actual' AS recognition_status, NULL::text AS reconciliation_status,
+                       backend_id, key_id, NULL::text AS source_item_id, NULL::text AS request_id
+                FROM cost_api_daily
+                WHERE usage_date BETWEEN $1::date AND $2::date
+                  AND NOT EXISTS (SELECT 1 FROM usage_event_attribution e WHERE e.usage_date=cost_api_daily.usage_date AND NULLIF(e.request_id,'') IS NOT NULL)
+                  AND ($3='' OR model=$3 OR model_group=$3)
+                  AND ($4='' OR COALESCE(NULLIF(model_group,''), NULLIF(model,''), '未知模型')=$4)
+                  AND ($5='' OR provider=$5)
+                  AND ($6='' OR account_id=$6 OR key_id=$6 OR principal_id=$6)
+                  AND ($7='' OR $7='API Token') AND ($8='' OR $8='api_usage')
+                  AND ($9='' OR $9='actual')
+                  AND ($10='' OR source=$10)
+                UNION ALL
+                SELECT usage_date, spend::double precision, 'api_usage', 'api_usage', 'API Token',
+                       COALESCE(NULLIF(model_group,''), model), model, provider, source, raw_user_id,
+                       organization_id, team_id, principal_id, source, 'actual', NULL,
+                       backend_id, key_id, NULL, request_id
+                FROM usage_event_attribution
+                WHERE usage_date BETWEEN $1::date AND $2::date
+                  AND NULLIF(request_id,'') IS NOT NULL
+                  AND ($3='' OR model=$3 OR model_group=$3)
+                  AND ($4='' OR COALESCE(NULLIF(model_group,''), NULLIF(model,''), '未知模型')=$4)
+                  AND ($5='' OR provider=$5) AND ($6='' OR raw_user_id=$6 OR key_id=$6 OR principal_id=$6)
+                  AND ($7='' OR $7='API Token') AND ($8='' OR $8='api_usage') AND ($9='' OR $9='actual') AND ($10='' OR source=$10)
+                UNION ALL
+                SELECT day::date, (amount_usd / GREATEST(1, service_end_date-service_start_date+1))::double precision,
+                       COALESCE(source_type,'manual'), CASE COALESCE(NULLIF(cost_bucket,''), category)
+                           WHEN 'subscription' THEN 'account_procurement' WHEN 'account_purchase' THEN 'account_procurement'
+                           WHEN 'fallback' THEN 'fallback_channel' WHEN 'backup_api' THEN 'fallback_channel'
+                           WHEN 'feishu' THEN 'feishu_surrounding' WHEN 'surrounding' THEN 'feishu_surrounding'
+                           WHEN 'infra' THEN 'infrastructure' WHEN 'labor' THEN 'other' WHEN 'support' THEN 'other'
+                           ELSE COALESCE(NULLIF(cost_bucket,''), category) END, category, name, model,
+                       COALESCE(NULLIF(provider,''), vendor), vendor, account_id, '' AS organization_id, '' AS team_id, '' AS principal_id,
+                       COALESCE(recognition_status,'actual'), COALESCE(reconciliation_status,'unreconciled'),
+                       NULL, NULL, id, NULL, '' AS source
+                FROM cost_items, generate_series(GREATEST(service_start_date,$1::date), LEAST(service_end_date,$2::date), interval '1 day') day
+                WHERE enabled AND service_start_date <= $2::date AND service_end_date >= $1::date
+                  AND ($3='' OR model=$3) AND ($5='' OR COALESCE(NULLIF(provider,''),vendor)=$5)
+                  AND ($6='' OR account_id=$6) AND ($7='' AND $8='' OR ($7<>'API Token' AND ($7='' OR category=$7)) AND ($8='' OR CASE COALESCE(NULLIF(cost_bucket,''), category) WHEN 'subscription' THEN 'account_procurement' WHEN 'account_purchase' THEN 'account_procurement' WHEN 'fallback' THEN 'fallback_channel' WHEN 'backup_api' THEN 'fallback_channel' WHEN 'feishu' THEN 'feishu_surrounding' WHEN 'surrounding' THEN 'feishu_surrounding' WHEN 'infra' THEN 'infrastructure' WHEN 'labor' THEN 'other' WHEN 'support' THEN 'other' ELSE COALESCE(NULLIF(cost_bucket,''),category) END=$8))
+                  AND ($9='' OR COALESCE(recognition_status,'actual')=$9) AND ($10='' OR vendor=$10)
+            ),
+            paged AS (
+                SELECT ledger_date, amount_usd, source_type, cost_bucket, category, name, model, provider, vendor,
+                       account_id, organization_id, team_id, principal_id, recognition_status, reconciliation_status,
+                       backend_id, key_id, source_item_id, request_id, source
+                FROM ledger ORDER BY ledger_date DESC, amount_usd DESC, name LIMIT $11 OFFSET $12
+            )
+            SELECT (SELECT COUNT(*) FROM ledger) AS total_count, paged.* FROM paged
+            UNION ALL SELECT (SELECT COUNT(*) FROM ledger), NULL::date, NULL::double precision, NULL::text, NULL::text,
+                NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text,
+                NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text
+            WHERE NOT EXISTS (SELECT 1 FROM paged)
+            """,
+            _as_date(start_date), _as_date(end_date), _clean_text(model), _clean_text(canonical_model), _clean_text(provider), _clean_text(account_id),
+            _clean_text(category), _clean_text(cost_bucket), _clean_text(recognition_status or "actual"), _clean_text(vendor), page_size, offset,
+        )
+        total = int(rows[0]["total_count"] or 0) if rows else 0
+        items = [dict(row) for row in rows if row.get("ledger_date", row.get("usage_date")) is not None]
+        return {"items": items, "total": total, "page": page, "pageSize": page_size, "totalPages": (total + page_size - 1) // page_size if total else 0}
+
     async def rebuild_cost_api_daily(self, start_date: str | date, end_date: str | date) -> int:
         """Replace only the affected daily cost aggregates."""
 
