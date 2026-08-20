@@ -8484,7 +8484,7 @@ function selectedObservabilityRange(scope) {
   const select = el(`${scope}RangeSelect`);
   const custom = scope === "stability" ? stabilityCustomDateRange : costCustomDateRange;
   if (select?.value === "custom" && custom) return { ...custom, days: daysBetween(custom.startDate, custom.endDate) };
-  const days = Number(select?.value || 1);
+  const days = Number(select?.value || 7);
   const end = new Date();
   const start = new Date(end);
   start.setDate(end.getDate() - days + 1);
@@ -11093,7 +11093,7 @@ function openObservabilityRangePanel(scope) {
 function closeObservabilityRangePanel(scope, revert = false) {
   const ids = observabilityRangeIds(scope);
   el(ids.panel)?.classList.add("hidden");
-  if (revert && !observabilityRangeState(scope)) el(ids.select).value = "1";
+  if (revert && !observabilityRangeState(scope)) el(ids.select).value = "7";
 }
 
 async function handleObservabilityRangeChange(scope) {
