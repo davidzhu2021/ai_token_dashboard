@@ -177,7 +177,7 @@ app = FastAPI(title="通衢 API", lifespan=app_lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 VERSIONED_APP_CACHE_CONTROL = "public, max-age=31536000, immutable"
 APP_JS_VERSION_PLACEHOLDER = "__APP_JS_VERSION__"
-STABILITY_RANKING_AGGREGATION_VERSION = "2026-08-20.v1"
+STABILITY_RANKING_AGGREGATION_VERSION = "2026-08-20.v2"
 
 
 def app_js_version() -> str:
@@ -9444,6 +9444,17 @@ def _stability_metrics_from_aggregate(
     return result
 
 
+def _stability_ttft_diagnostics(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Expose the collected TTFT sample state without estimating missing values."""
+
+    sample_count = int(metrics.get("ttftSampleCount") or 0)
+    return {
+        "sampleCount": sample_count,
+        "latestSampleAt": metrics.get("ttftLatestSampleAt"),
+        "status": "observed" if sample_count else "unavailable",
+    }
+
+
 async def _call_store_optional(store: Any, method_names: tuple[str, ...], *args: Any, default: Any = None, **kwargs: Any) -> Any:
     """Keep v2 routes compatible while UsageStore migrations roll out."""
 
@@ -9812,6 +9823,7 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
                 "actions": [dict(item) for item in (actions or [])[:5]],
                 "regressions": [dict(item) for item in (regressions or [])[:5]],
                 "attemptEventsAvailableFrom": attempts.get("available_from"),
+                "ttftDiagnostics": _stability_ttft_diagnostics(overview),
                 "quality": _stability_quality(overview),
                 "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
             },
@@ -9915,6 +9927,7 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
             "actions": actions or [],
             "regressions": regressions or [],
             "attemptEventsAvailableFrom": min((str(item.get("started_at") or item.get("event_time") or "") for item in attempt_events), default=None),
+            "ttftDiagnostics": _stability_ttft_diagnostics(overview),
             "quality": _stability_quality(overview),
             "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
         },

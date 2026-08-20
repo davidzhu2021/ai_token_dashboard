@@ -126,3 +126,38 @@ def test_aggregate_metrics_report_latest_ttft_sample_time() -> None:
 
     assert metrics["ttftLatestSampleAt"] == "2026-08-20T04:00:00Z"
     assert metrics["quality"]["ttft"]["latestSampleAt"] == "2026-08-20T04:00:00Z"
+
+
+def test_stability_overview_exposes_ttft_sync_diagnostics() -> None:
+    store = _FakeAggregateStore()
+    store.aggregate = {
+        "overall": {
+            "request_count": 2,
+            "status_count": 2,
+            "failure_known_count": 2,
+            "failure_count": 0,
+            "ttft_sample_count": 1,
+            "ttft_latest_at": "2026-08-20T04:00:00Z",
+        },
+        "daily": [],
+        "models": [],
+        "modelAttempts": [],
+        "scenarios": [],
+        "attempts": {},
+        "dailyAttempts": [],
+    }
+
+    async def aggregates(start_date: str, end_date: str, model: str = ""):
+        return store.aggregate
+
+    store.stability_overview_aggregates = aggregates
+    with mock.patch.object(main, "_admin_observability_store", return_value=store), \
+         mock.patch.object(main, "usage_backend_ids", return_value=set()):
+        payload = asyncio.run(_build_stability_overview("2026-08-13", "2026-08-19", ""))
+
+    diagnostics = payload["data"]["ttftDiagnostics"]
+    assert diagnostics == {
+        "sampleCount": 1,
+        "latestSampleAt": "2026-08-20T04:00:00Z",
+        "status": "observed",
+    }
