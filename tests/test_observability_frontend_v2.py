@@ -138,7 +138,7 @@ def test_stability_model_ranking_distinguishes_fallback_statuses() -> None:
 
 def test_cost_dashboard_separates_actual_forecast_and_auditable_metrics() -> None:
     markup, source = sources()
-    for label in ("年度累计实际", "全年官方预测", "已核验累计节省", "月度预算"):
+    for label in ("年度累计实际", "全年官方预测", "已核验累计节省", "区间预算", "日均目标"):
         assert label in source
     assert 'id="costContext"' in markup
     assert "active_approved_baseline_plan_missing" in source

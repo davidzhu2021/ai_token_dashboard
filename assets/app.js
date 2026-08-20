@@ -2542,7 +2542,7 @@ function renderLineChart({ svg, points, valueField, color, fill, axisFormatter, 
   bindChartTooltipEvents(svg);
 }
 
-function renderMultiLineChart({ svg, points, series, axisFormatter }) {
+function renderMultiLineChart({ svg, points, series, axisFormatter, tooltipRows, pointMarkers }) {
   if (!svg) return;
   if (!points.length) {
     renderEmptyChart(svg, "当前筛选范围暂无数据");
@@ -2551,7 +2551,8 @@ function renderMultiLineChart({ svg, points, series, axisFormatter }) {
   const width = 900;
   const height = 280;
   const pad = { left: 64, right: 18, top: 20, bottom: 42 };
-  const numericValues = points.flatMap((point) => series.map((item) => Number(point[item.valueField])).filter(Number.isFinite));
+  const chartValue = (value) => value === null || value === undefined || value === "" || !Number.isFinite(Number(value)) ? null : Number(value);
+  const numericValues = points.flatMap((point) => series.map((item) => chartValue(point[item.valueField])).filter((value) => value !== null));
   const max = Math.max(1, ...numericValues);
   const xStep = points.length > 1 ? (width - pad.left - pad.right) / (points.length - 1) : 1;
   const x = (index) => (points.length > 1 ? pad.left + index * xStep : width / 2);
@@ -2564,8 +2565,8 @@ function renderMultiLineChart({ svg, points, series, axisFormatter }) {
     let path = "";
     let segmentOpen = false;
     points.forEach((point, index) => {
-      const value = Number(point[item.valueField]);
-      if (!Number.isFinite(value)) {
+      const value = chartValue(point[item.valueField]);
+      if (value === null) {
         segmentOpen = false;
         return;
       }
@@ -2574,19 +2575,29 @@ function renderMultiLineChart({ svg, points, series, axisFormatter }) {
     });
     return path ? `<path d="${path}" fill="none" stroke="${item.color}" stroke-width="${item.width || 4}" stroke-linecap="round" stroke-linejoin="round"${item.dash ? ` stroke-dasharray="${item.dash}"` : ""}/>` : "";
   }).join("");
+  const markers = points.map((point, index) => {
+    const marker = pointMarkers?.(point, index);
+    const markerValue = chartValue(marker?.value);
+    if (!marker || markerValue === null) return "";
+    const cx = x(index);
+    const cy = y(markerValue);
+    return `<circle class="cost-trend-anomaly-marker" aria-hidden="true" cx="${cx}" cy="${cy}" r="6" fill="${marker.color || "#c94a43"}" stroke="#fff" stroke-width="3"/>`;
+  }).join("");
   const hits = points.map((point, index) => {
-    const rows = series.map((item) => {
-      const value = Number(point[item.valueField]);
-      return { label: item.label, value: Number.isFinite(value) ? axisFormatter(value) : "无数据" };
-    });
+    const rows = tooltipRows
+      ? tooltipRows(point, series)
+      : series.map((item) => {
+        const value = chartValue(point[item.valueField]);
+        return { label: item.label, value: value === null ? "无数据" : axisFormatter(value) };
+      });
     const hitLeft = index === 0 ? pad.left : (x(index - 1) + x(index)) / 2;
     const hitRight = index === points.length - 1 ? width - pad.right : (x(index) + x(index + 1)) / 2;
-    return `<rect class="chart-hit" x="${hitLeft}" y="${pad.top}" width="${Math.max(1, hitRight - hitLeft)}" height="${height - pad.top - pad.bottom}" fill="transparent" data-tooltip="${encodeURIComponent(tooltipMarkup(point.date, rows))}"/>`;
+    return `<rect class="chart-hit" x="${hitLeft}" y="${pad.top}" width="${Math.max(1, hitRight - hitLeft)}" height="${height - pad.top - pad.bottom}" fill="transparent" tabindex="0" role="button" aria-label="查看 ${escapeHtml(point.date || "所选日期")} 费用明细" data-cost-trend-day="${escapeHtml(point.date || "")}" data-tooltip="${encodeURIComponent(tooltipMarkup(point.date, rows))}"/>`;
   }).join("");
   const labelEvery = Math.max(1, Math.ceil(points.length / 5));
   const labels = points.map((point, index) => ({ point, index })).filter(({ index }) => index === 0 || index === points.length - 1 || index % labelEvery === 0).map(({ point, index }, labelIndex, labelsToShow) => `<text x="${x(index)}" y="${height - 16}" fill="#66748a" font-size="12" text-anchor="${labelIndex === labelsToShow.length - 1 ? "end" : labelIndex === 0 ? "start" : "middle"}">${String(point.date || "").slice(5)}</text>`).join("");
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-  svg.innerHTML = `<rect width="${width}" height="${height}" rx="8" fill="#fbfdff"/>${grid}${paths}${hits}${labels}`;
+  svg.innerHTML = `<rect width="${width}" height="${height}" rx="8" fill="#fbfdff"/>${grid}${paths}${markers}${hits}${labels}`;
   bindChartTooltipEvents(svg);
 }
 
@@ -8909,41 +8920,85 @@ function renderCostOverview() {
 
 function buildCostTrendBreakdownPoints(data) {
   const trend = Array.isArray(data?.trend) ? data.trend : [];
-  const opportunityByDate = new Map();
+  const asOf = String(data?.asOf || currentCostWindow().endDate || "");
+  const anomalyByDate = new Map();
   for (const item of Array.isArray(data?.modelCostShare) ? data.modelCostShare : []) {
     for (const point of Array.isArray(item?.daily) ? item.daily : []) {
       const date = String(point?.date || "");
       if (!date) continue;
-      opportunityByDate.set(date, (opportunityByDate.get(date) || 0) + Math.max(0, Number(point?.opportunity || 0)));
+      const opportunity = Number(point?.opportunity);
+      if (!Number.isFinite(opportunity) || opportunity <= 0) continue;
+      anomalyByDate.set(date, (anomalyByDate.get(date) || 0) + opportunity);
     }
   }
-  let cumulativeVolatility = 0;
   return trend.map((point) => {
     const date = String(point?.date || "");
-    const dailyOpportunity = opportunityByDate.get(date) || 0;
-    cumulativeVolatility += dailyOpportunity;
     const actual = point?.actual;
     const forecast = point?.forecast;
+    const budget = point?.budget;
     return {
       date,
-      actualSpend: actual !== null && actual !== undefined && Number.isFinite(Number(actual)) ? Number(actual) : null,
+      actualSpend: date <= asOf && actual !== null && actual !== undefined && Number.isFinite(Number(actual)) ? Number(actual) : null,
       forecastSpend: forecast !== null && forecast !== undefined && Number.isFinite(Number(forecast)) ? Number(forecast) : null,
-      cumulativeVolatility,
+      budgetSpend: budget !== null && budget !== undefined && Number.isFinite(Number(budget)) ? Number(budget) : null,
+      anomalySpend: roundMoney(anomalyByDate.get(date) || 0),
     };
   });
 }
 
+function roundMoney(value) {
+  const amount = Number(value);
+  return Number.isFinite(amount) ? Math.round(amount * 100) / 100 : 0;
+}
+
+function renderCostTrendSummary(points, asOf) {
+  const target = el("costTrendSummary");
+  if (!target) return;
+  const cutoffDate = String(asOf || currentCostWindow().endDate || "");
+  const actualPoints = points.filter((point) => (!cutoffDate || point.date <= cutoffDate) && point.actualSpend !== null && Number.isFinite(Number(point.actualSpend)));
+  const budgetPoints = points.filter((point) => point.budgetSpend !== null && Number.isFinite(Number(point.budgetSpend)) && Number(point.budgetSpend) > 0);
+  const dailyAverageSpend = actualPoints.length
+    ? actualPoints.reduce((total, point) => total + Number(point.actualSpend || 0), 0) / actualPoints.length
+    : null;
+  const dailyBudget = budgetPoints.length
+    ? budgetPoints.reduce((total, point) => total + Number(point.budgetSpend || 0), 0) / budgetPoints.length
+    : null;
+  const overBudgetDays = actualPoints.filter((point) => point.budgetSpend !== null && Number.isFinite(Number(point.budgetSpend)) && Number(point.actualSpend || 0) > Number(point.budgetSpend || 0)).length;
+  target.innerHTML = [
+    `<span><small>当前日均</small><strong>${observabilityMoney(dailyAverageSpend)}</strong></span>`,
+    `<span><small>日均预算</small><strong>${observabilityMoney(dailyBudget)}</strong></span>`,
+    `<span><small>超预算天数</small><strong>${dailyBudget === null ? "暂无预算" : `${overBudgetDays} 天`}</strong></span>`,
+  ].join("");
+}
+
 function renderCostTrendBreakdown(data) {
   const points = buildCostTrendBreakdownPoints(data);
+  renderCostTrendSummary(points, String(data?.asOf || currentCostWindow().endDate || ""));
   renderMultiLineChart({
     svg: el("costTrendBreakdownChart"),
     points,
     axisFormatter: observabilityMoney,
     series: [
-      { valueField: "actualSpend", label: "实际支出", color: "#2d6cdf" },
       { valueField: "forecastSpend", label: "预测支出", color: "#d94a45", dash: "9 7" },
-      { valueField: "cumulativeVolatility", label: "累计高支出波动", color: "#199b55" },
+      { valueField: "actualSpend", label: "实际支出", color: "#2d6cdf" },
+      { valueField: "budgetSpend", label: "日均预算", color: "#c88a20", dash: "6 5", width: 3 },
     ],
+    tooltipRows: (point) => [
+      { label: "实际支出", value: point.actualSpend !== null && Number.isFinite(Number(point.actualSpend)) ? observabilityMoney(point.actualSpend) : "无数据" },
+      { label: "预测支出", value: point.forecastSpend !== null && Number.isFinite(Number(point.forecastSpend)) ? observabilityMoney(point.forecastSpend) : "无数据" },
+      { label: "日均预算", value: point.budgetSpend !== null && Number.isFinite(Number(point.budgetSpend)) && Number(point.budgetSpend) > 0 ? observabilityMoney(point.budgetSpend) : "暂无预算" },
+      ...(Number(point.anomalySpend || 0) > 0 ? [{ label: "异常高峰金额", value: observabilityMoney(point.anomalySpend) }] : []),
+    ],
+    pointMarkers: (point) => {
+      const anomalySpend = Number(point.anomalySpend || 0);
+      if (anomalySpend <= 0) return null;
+      const markerValue = point.actualSpend !== null && Number.isFinite(Number(point.actualSpend))
+        ? Number(point.actualSpend)
+        : point.forecastSpend !== null && Number.isFinite(Number(point.forecastSpend))
+          ? Number(point.forecastSpend)
+          : Number(point.budgetSpend);
+      return { value: markerValue, color: "#c94a43" };
+    },
   });
 }
 
@@ -8958,11 +9013,16 @@ function renderCostModelShare(items) {
   }
   const rows = series.map((item, index) => {
     const share = Math.max(0, Math.min(1, Number(item.share || 0)));
-    const opportunity = Number(item.optimizationSpace || 0);
-    const opportunityLabel = opportunity > 0 ? `波动 ${observabilityMoney(opportunity)}` : "支出平稳";
-    return `<div class="bar-row" role="button" tabindex="0" data-cost-model-series="${escapeHtml(item.model || "")}" aria-label="查看 ${escapeHtml(item.model || "模型系列")} 高支出波动与每日支出">${rankingBadge(index)}<strong>${escapeHtml(item.model || "未知模型")}</strong><div class="bar-track" aria-hidden="true"><div class="bar-fill" style="width:${Math.max(share ? 3 : 0, share * 100)}%"></div></div><span class="num"><strong class="cost-model-opportunity ${opportunity > 0 ? "is-positive" : "is-none"}">${opportunityLabel}</strong><small>支出 ${observabilityMoney(item.spend)} · ${(share * 100).toFixed(1)}%</small></span></div>`;
+    const daily = Array.isArray(item.daily) ? item.daily : [];
+    const anomalyDays = daily.filter((point) => Number(point?.opportunity || 0) > 0);
+    const anomalySpend = anomalyDays.reduce((total, point) => total + Math.max(0, Number(point?.opportunity || 0)), 0);
+    const anomalyLabel = anomalySpend > 0
+      ? `异常 ${observabilityMoney(anomalySpend)} · ${anomalyDays.length} 天`
+      : "未发现明显高峰";
+    const anomalyAria = anomalySpend > 0 ? `异常高峰 ${observabilityMoney(anomalySpend)}，异常天数 ${anomalyDays.length} 天` : "未发现明显高峰";
+    return `<div class="bar-row" role="button" tabindex="0" data-cost-model-series="${escapeHtml(item.model || "")}" aria-label="查看 ${escapeHtml(item.model || "模型系列")} 的每日支出；${anomalyAria}">${rankingBadge(index)}<strong>${escapeHtml(item.model || "未知模型")}</strong><span class="cost-model-spend">${observabilityMoney(item.spend)}</span><span class="cost-model-share-cell"><span class="bar-track" aria-hidden="true"><span class="bar-fill" style="width:${Math.max(share ? 3 : 0, share * 100)}%"></span></span><small>${(share * 100).toFixed(1)}%</small></span><span class="num"><strong class="cost-model-opportunity ${anomalySpend > 0 ? "is-positive" : "is-none"}">${anomalyLabel}</strong></span></div>`;
   }).join("");
-  target.innerHTML = `<div class="cost-model-share-head" aria-hidden="true"><span>排名</span><span>模型系列</span><span>占比</span><span>高支出波动</span></div><div class="cost-model-share-rows${series.length <= 4 ? " is-compact" : ""}">${rows}</div>`;
+  target.innerHTML = `<div class="cost-model-share-head" aria-hidden="true"><span>排名</span><span>模型系列</span><span>期间支出</span><span>成本占比</span><span>异常高峰</span></div><div class="cost-model-share-rows${series.length <= 4 ? " is-compact" : ""}">${rows}</div>`;
   if (selectedCostModelSeries) openCostModelShareModal(series.find((item) => item.model === selectedCostModelSeries));
 }
 
@@ -8970,9 +9030,11 @@ function openCostModelShareModal(item, returnFocus = document.activeElement) {
   if (!item) return;
   selectedCostModelSeries = item.model || "";
   costModelShareReturnFocus = returnFocus;
-  el("costModelShareModalTitle").textContent = `${item.model || "未知模型"}成本详情`;
-  const opportunity = Number(item.optimizationSpace || 0);
-  el("costModelShareModalSubtitle").textContent = `所选范围支出 ${observabilityMoney(item.spend)} · 占比 ${(Number(item.share || 0) * 100).toFixed(1)}%${opportunity > 0 ? ` · 高支出波动 ${observabilityMoney(opportunity)}` : " · 支出平稳"}`;
+  el("costModelShareModalTitle").textContent = `${item.model || "未知模型"}支出详情`;
+  const daily = Array.isArray(item.daily) ? item.daily : [];
+  const anomalyDays = daily.filter((point) => Number(point?.opportunity || 0) > 0);
+  const anomalySpend = anomalyDays.reduce((total, point) => total + Math.max(0, Number(point?.opportunity || 0)), 0);
+  el("costModelShareModalSubtitle").textContent = `所选范围支出 ${observabilityMoney(item.spend)} · 占比 ${(Number(item.share || 0) * 100).toFixed(1)}%${anomalySpend > 0 ? ` · 异常高峰 ${observabilityMoney(anomalySpend)} · ${anomalyDays.length} 天` : " · 未发现明显高峰"}`;
   el("costModelShareModalBody").innerHTML = renderCostModelShareDetail(item);
   const modal = el("costModelShareModal");
   modal.classList.remove("hidden");
@@ -8986,7 +9048,7 @@ function openCostModelShareModal(item, returnFocus = document.activeElement) {
     color: "#0673d2",
     fill: "rgba(6,115,210,.13)",
     axisFormatter: observabilityMoney,
-    tooltipRows: (point) => [{ label: "支出", value: observabilityMoney(point.spend) }, ...(Number(point.opportunity || 0) > 0 ? [{ label: "高支出波动", value: observabilityMoney(point.opportunity) }] : [])],
+    tooltipRows: (point) => [{ label: "支出", value: observabilityMoney(point.spend) }, ...(Number(point.opportunity || 0) > 0 ? [{ label: "异常高峰金额", value: observabilityMoney(point.opportunity) }] : [])],
   });
 }
 
@@ -9002,7 +9064,7 @@ function closeCostModelShareModal() {
 function renderCostModelShareDetail(item) {
   if (!item) return "";
   const daily = Array.isArray(item.daily) ? item.daily : [];
-  return `<section class="cost-model-share-detail" aria-label="${escapeHtml(item.model || "模型系列")}每日支出与高支出波动"><div class="cost-model-share-detail-head"><div><h4>${escapeHtml(item.model || "未知模型")}每日支出与高支出波动</h4><p>点击日期可查看当天费用明细；高支出波动表示高于该模型典型日支出的金额，仅用于定位值得排查的高峰。</p></div></div><svg id="costModelShareChart" class="cost-model-share-chart" role="img" aria-label="${escapeHtml(item.model || "模型系列")}每日支出与高支出波动折线图"></svg><div class="cost-model-share-daily">${daily.map((point) => { const opportunity = Number(point.opportunity || 0); return `<button class="cost-model-share-daily-row" type="button" data-cost-model-series-day="${escapeHtml(point.date || "")}" data-cost-model-series-name="${escapeHtml(item.model || "")}"><span>${escapeHtml(point.date || "")}</span><span class="daily-values"><strong>支出 ${observabilityMoney(point.spend)}</strong><small class="opportunity ${opportunity > 0 ? "is-positive" : "is-none"}">${opportunity > 0 ? `波动 ${observabilityMoney(opportunity)}` : "支出平稳"}</small></span></button>`; }).join("")}</div></section>`;
+  return `<section class="cost-model-share-detail" aria-label="${escapeHtml(item.model || "模型系列")}每日支出与异常高峰"><div class="cost-model-share-detail-head"><div><h4>${escapeHtml(item.model || "未知模型")}每日支出与异常高峰</h4><p>点击日期可查看当天费用明细；异常高峰表示高于该模型典型日支出的金额，仅用于定位排查，不代表可直接节省。</p></div></div><svg id="costModelShareChart" class="cost-model-share-chart" role="img" aria-label="${escapeHtml(item.model || "模型系列")}每日支出与异常高峰折线图"></svg><div class="cost-model-share-daily">${daily.map((point) => { const opportunity = Number(point.opportunity || 0); return `<button class="cost-model-share-daily-row" type="button" data-cost-model-series-day="${escapeHtml(point.date || "")}" data-cost-model-series-name="${escapeHtml(item.model || "")}"><span>${escapeHtml(point.date || "")}</span><span class="daily-values"><strong>支出 ${observabilityMoney(point.spend)}</strong><small class="opportunity ${opportunity > 0 ? "is-positive" : "is-none"}">${opportunity > 0 ? `异常 ${observabilityMoney(opportunity)}` : "未发现明显高峰"}</small></span></button>`; }).join("")}</div></section>`;
 }
 
 function normalizeWorkbenchList(payload, ...keys) {
@@ -9109,7 +9171,7 @@ async function loadCostOverview(forceRefresh = false) {
     const accountId = el("costAccount")?.value || "";
     const reconciliationStatus = el("costReconciliation")?.value || "";
     const recognitionStatus = el("costRecognition")?.value || "";
-    const asOf = new Date().toISOString().slice(0, 10);
+    const asOf = localDate(new Date());
     const query = `start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&as_of=${encodeURIComponent(asOf)}&category=${encodeURIComponent(category)}&cost_bucket=${encodeURIComponent(costBucket)}&model=${encodeURIComponent(model)}&vendor=${encodeURIComponent(vendor)}&provider=${encodeURIComponent(provider)}&account_id=${encodeURIComponent(accountId)}&reconciliation_status=${encodeURIComponent(reconciliationStatus)}&recognition_status=${encodeURIComponent(recognitionStatus)}${forceRefresh ? "&refresh=1" : ""}`;
     const nextOverview = await api(`/api/admin/costs/overview?${query}`, { signal: costOverviewController.signal });
     if (requestId !== costOverviewRequestId) return;
@@ -9324,7 +9386,7 @@ async function loadCostLedger() {
   if (list) list.innerHTML = '<p class="empty">正在加载费用明细…</p>';
   try {
     const { startDate, endDate } = currentCostWindow();
-    const asOf = costOverview?.data?.asOf || costOverview?.asOf || new Date().toISOString().slice(0, 10);
+    const asOf = costOverview?.data?.asOf || costOverview?.asOf || localDate(new Date());
     const query = new URLSearchParams({ start_date: startDate, end_date: endDate, as_of: asOf, page: String(costLedgerState.page), page_size: String(costLedgerState.pageSize), ...(costLedgerState.filters || {}) });
     const cacheKey = `cost-ledger:${query.toString()}`;
     const payload = observabilityDetailCache.get(cacheKey) || await api(`/api/admin/costs/ledger?${query.toString()}`, { timeoutMs: 45_000 });
@@ -11044,6 +11106,19 @@ el("costModelShare")?.addEventListener("keydown", (event) => {
   if (!row) return;
   event.preventDefault();
   openCostModelShareModal((costOverview?.data?.modelCostShare || []).find((item) => item.model === row.dataset.costModelSeries), row);
+});
+function openCostTrendDay(target) {
+  const day = target?.dataset?.costTrendDay;
+  if (!day) return;
+  openCostLedger(currentCostLedgerFilters({ startDate: day, endDate: day }), target);
+}
+el("costTrendBreakdownChart")?.addEventListener("click", (event) => openCostTrendDay(event.target.closest("[data-cost-trend-day]")));
+el("costTrendBreakdownChart")?.addEventListener("keydown", (event) => {
+  if (!['Enter', ' '].includes(event.key)) return;
+  const target = event.target.closest("[data-cost-trend-day]");
+  if (!target) return;
+  event.preventDefault();
+  openCostTrendDay(target);
 });
 el("costModelShareModalBody")?.addEventListener("click", (event) => {
   const day = event.target.closest("[data-cost-model-series-day]");

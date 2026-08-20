@@ -223,19 +223,59 @@ def test_stability_dashboard_no_longer_contains_governance_actions_panel() -> No
     assert "排障动作" not in markup
 
 
-def test_cost_dashboard_trend_breakdown_exposes_three_daily_series() -> None:
-    """Prevent the cost trend panel from losing its shared daily comparison."""
+def test_cost_dashboard_trend_breakdown_uses_comparable_budget_series() -> None:
+    """The cost trend keeps all three plotted values on a daily-money basis."""
     markup = (ROOT / "index.html").read_text(encoding="utf-8")
     source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
 
     assert 'id="costTrendBreakdown"' in markup
-    for label in ("实际支出", "预测支出", "累计高支出波动"):
+    for label in ("实际支出", "预测支出", "日均预算"):
         assert label in markup
+    assert "累计高支出波动" not in markup
+    assert "累计高支出波动" not in source
+    assert "异常高峰金额" in source
+    assert "超预算天数" in source
     assert 'class="cost-dashboard-grid"' in markup
     assert 'function buildCostTrendBreakdownPoints' in source
     assert 'function renderMultiLineChart' in source
     assert 'renderCostTrendBreakdown(data)' in source
-    assert 'cumulativeVolatility' in source
+    assert 'budgetSpend' in source
+    assert 'anomalySpend' in source
+    assert 'dailyAverageSpend' in source
+    assert 'data-cost-trend-day=' in source
+    assert 'el("costTrendBreakdownChart")?.addEventListener("click"' in source
+    assert 'el("costTrendBreakdownChart")?.addEventListener("keydown"' in source
+    assert 'openCostLedger(currentCostLedgerFilters({ startDate: day, endDate: day })' in source
     cost_view = markup[markup.index('id="costControlView"'):markup.index('id="governanceWorkbenchView"')]
     for misleading_copy in ("可省", "可优化金额", "可优化空间"):
         assert misleading_copy not in cost_view
+
+
+def test_cost_model_share_calls_out_anomaly_peaks_without_claiming_savings() -> None:
+    markup = (ROOT / "index.html").read_text(encoding="utf-8")
+    source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
+
+    assert "模型支出构成" in markup
+    assert "占比回答钱花在哪；异常高峰回答哪几天值得看" in markup
+    assert "异常高峰" in markup
+    assert "异常天数" in source
+    assert "未发现明显高峰" in source
+    assert "仅用于定位排查，不代表可直接节省" in source
+    assert "高支出波动" not in source
+
+
+def test_cost_trend_uses_data_as_of_for_summary_cutoff() -> None:
+    source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
+
+    assert 'function renderCostTrendSummary(points, asOf)' in source
+    assert 'renderCostTrendSummary(points, String(data?.asOf || currentCostWindow().endDate || ""))' in source
+    assert 'const today = new Date().toISOString().slice(0, 10)' not in source
+    assert 'const asOf = localDate(new Date())' in source
+
+
+def test_cost_trend_chart_marks_focusable_hits_and_decorative_anomalies() -> None:
+    markup = (ROOT / "index.html").read_text(encoding="utf-8")
+    source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
+
+    assert ".chart-hit:focus-visible" in markup
+    assert 'class="cost-trend-anomaly-marker" aria-hidden="true"' in source
