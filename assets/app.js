@@ -8707,13 +8707,25 @@ function renderStabilityOverview() {
     if (value == null || !Number.isFinite(Number(value))) return "暂无数据";
     return Number(value) >= 1000 ? `${(Number(value) / 1000).toFixed(1)}s` : `${Math.round(Number(value))}ms`;
   };
+  const formatStabilityFallback = (item) => {
+    if (item.fallbackRecoveryStatus === "not_triggered") return "未触发";
+    if (item.fallbackRecoveryStatus !== "observed") return "暂无数据";
+    return observabilityPercent(item.fallbackRecoveryRate);
+  };
   const stabilityRankingStateClass = (state) => ({ "稳定": "stable", "观察": "observe", "需治理": "repair" }[state] || "unknown");
-  stabilityRanking.innerHTML = visibleStabilityRankings.length ? `<div class="observability-ranking-head" aria-hidden="true"><span>模型</span><span>失败</span><span>兜底</span><span>TTFT</span><span>状态</span></div>${visibleStabilityRankings.map((item) => {
+  const stabilityScore = (item) => {
+    const failureRate = Number(item.finalRequestFailureRate ?? item.userVisibleFailureRate);
+    const stateWeight = { "稳定": 100, "观察": 64, "需治理": 28 }[item.state] ?? 44;
+    if (!Number.isFinite(failureRate)) return stateWeight;
+    return Math.max(8, Math.min(100, Math.round(stateWeight - failureRate * 100)));
+  };
+  stabilityRanking.innerHTML = visibleStabilityRankings.length ? `<div class="observability-ranking-list">${visibleStabilityRankings.map((item, index) => {
     const failureRate = item.finalRequestFailureRate ?? item.userVisibleFailureRate;
     const modelName = item.requestedModelGroup || item.model || "未知模型";
     const state = item.state || "暂无数据";
-    return `<button class="observability-rank-row observability-rank-row-button is-${stabilityRankingStateClass(state)}" type="button" title="${escapeHtml(modelName)}" data-stability-model="${escapeHtml(item.model || item.requestedModelGroup || "")}"><strong class="observability-rank-model">${escapeHtml(modelName)}</strong><span>${escapeHtml(observabilityPercent(failureRate))}</span><span>${escapeHtml(observabilityPercent(item.fallbackRecoveryRate))}</span><span>${escapeHtml(formatStabilityTtft(item.ttftP95Ms))}</span><span class="observability-rank-state">${escapeHtml(state)}</span></button>`;
-  }).join("")}` : observabilityEmptyState("暂无模型排名", "当前窗口没有可比较的模型样本。", [{ label: "调整筛选", attr: 'data-observability-empty-action="filters" data-observability-scope="stability"' }]);
+    const score = stabilityScore(item);
+    return `<button class="observability-rank-card is-${stabilityRankingStateClass(state)}" type="button" title="查看 ${escapeHtml(modelName)} 的稳定性详情" data-stability-model="${escapeHtml(item.model || item.requestedModelGroup || "")}">${rankingBadge(index)}<div class="observability-rank-identity"><strong class="observability-rank-model">${escapeHtml(modelName)}</strong><div class="observability-rank-score"><span>综合稳定度</span><div class="observability-rank-track" aria-hidden="true"><div class="observability-rank-fill" style="width:${score}%"></div></div><strong>${score}</strong></div></div><div class="observability-rank-metrics"><span class="observability-rank-metric"><span>失败</span><strong>${escapeHtml(observabilityPercent(failureRate))}</strong></span><span class="observability-rank-metric"><span>兜底</span><strong>${escapeHtml(formatStabilityFallback(item))}</strong></span><span class="observability-rank-metric"><span>TTFT</span><strong>${escapeHtml(formatStabilityTtft(item.ttftP95Ms))}</strong></span></div><span class="observability-rank-status">${escapeHtml(state)}</span></button>`;
+  }).join("")}</div>` : observabilityEmptyState("暂无模型排名", "当前窗口没有可比较的模型样本。", [{ label: "调整筛选", attr: 'data-observability-empty-action="filters" data-observability-scope="stability"' }]);
   el("stabilityScenarioBody").innerHTML = (data.topScenarios || []).map((item) => {
     const failureRate = item.finalRequestFailureRate ?? item.userVisibleFailureRate;
     return `<tr><td>${escapeHtml(item.scenario)}</td><td>${escapeHtml(item.requestedModelGroup || item.model || "-")}</td><td>${escapeHtml(item.errorCode || "-")}</td><td>${item.count}</td><td>${escapeHtml(observabilityPercent(failureRate))}</td><td><button class="ghost-btn" type="button" data-stability-scenario="${escapeHtml(item.scenario || "")}" data-stability-model="${escapeHtml(item.requestedModelGroup || item.model || "")}" data-stability-error-code="${escapeHtml(item.errorCode || "")}">查看样本（${item.count || 0}）</button></td></tr>`;

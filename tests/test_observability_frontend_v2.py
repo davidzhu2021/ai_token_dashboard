@@ -49,18 +49,33 @@ def test_stability_dashboard_has_four_primary_metrics_and_governance_drilldown()
     assert "低覆盖 TTFT 不参与稳定判定" in markup
 
 
-def test_stability_model_ranking_uses_compact_metric_columns() -> None:
+def test_stability_model_ranking_uses_ranked_stability_cards() -> None:
     markup, source = sources()
 
     assert "<h3 class=\"panel-title\">模型排名</h3>" in markup
     assert "按综合稳定度排序；低覆盖 TTFT 不参与稳定判定。" in markup
-    assert "observability-ranking-head" in markup
-    for label in ("模型", "失败", "兜底", "TTFT", "状态"):
+    for css_class in (
+        "observability-ranking-list",
+        "observability-rank-card",
+        "observability-rank-badge",
+        "observability-rank-track",
+        "observability-rank-status",
+    ):
+        assert css_class in markup
+    for css_class in (
+        "observability-ranking-list",
+        "observability-rank-card",
+        "observability-rank-track",
+        "observability-rank-status",
+    ):
+        assert css_class in source
+    for label in ("综合稳定度", "失败", "兜底", "TTFT"):
         assert f">{label}<" in source
     assert "fallbackRecoveryRate" in source
     assert "formatStabilityTtft" in source
     assert "Number(value) >= 1000" in source
     assert "is-${stabilityRankingStateClass(state)}" in source
+    assert "rankingBadge(index)" in source
     assert "data-stability-model=" in source
 
 

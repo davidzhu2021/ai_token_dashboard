@@ -3159,20 +3159,34 @@
       .observability-legend .forecast { background:#dce6f5; border:1px dashed #87a5ca; }
       .observability-legend .missing { height:3px; width:14px; border-radius:2px; background:repeating-linear-gradient(90deg, rgba(104,117,138,.55) 0 4px, transparent 4px 8px); }
       .observability-legend .budget { height:2px; border-radius:0; background:#c23b45; }
-      .observability-ranking { display:grid; gap:8px; padding:4px 0; }
+      .observability-ranking { display:grid; gap:10px; padding:4px 0; }
       .observability-stability-grid .observability-ranking { flex:1 1 auto; min-height:0; align-content:start; overflow:auto; padding:4px 8px 4px 0; scrollbar-gutter:stable; overscroll-behavior:contain; }
-      .observability-ranking-head,.observability-rank-row { display:grid; min-width:580px; grid-template-columns:minmax(144px,1.65fr) repeat(3,minmax(66px,.72fr)) minmax(58px,.58fr); gap:10px; align-items:center; }
-      .observability-ranking-head { position:sticky; top:0; z-index:1; padding:2px 10px 8px; background:var(--surface,#fff); color:var(--muted-text,#68758a); font-size:12px; font-weight:750; }
-      .observability-ranking-head span:not(:first-child),.observability-rank-row > span { text-align:center; }
-      .observability-rank-row-button { width:100%; min-height:44px; padding:9px 10px; border:0; border-radius:10px; background:#f4f6f9; color:inherit; text-align:left; font-weight:700; }
-      .observability-rank-row-button.is-stable { background:#edfaf1; }
-      .observability-rank-row-button.is-observe { background:#fff7e9; }
-      .observability-rank-row-button.is-repair { background:#fff0ef; }
-      .observability-rank-row-button.is-unknown { background:#f3f5f8; color:var(--muted-text,#68758a); }
-      .observability-rank-row-button:hover { filter:brightness(.98); }
+      .observability-ranking-list { display:grid; gap:9px; }
+      .observability-rank-card { --rank-tone:#8aa0b7; width:100%; display:grid; grid-template-columns:34px minmax(154px,1fr) minmax(220px,1.25fr) auto; gap:12px; align-items:center; padding:10px 12px; border:1px solid #e1e8ef; border-left:4px solid var(--rank-tone); border-radius:12px; background:#fff; color:inherit; text-align:left; box-shadow:0 1px 2px rgba(20,36,58,.025); transition:border-color .16s ease,box-shadow .16s ease,transform .16s ease; }
+      .observability-rank-card.is-stable { --rank-tone:#279768; }
+      .observability-rank-card.is-observe { --rank-tone:#d5902e; }
+      .observability-rank-card.is-repair { --rank-tone:#cf5b54; }
+      .observability-rank-card.is-unknown { --rank-tone:#91a0af; color:var(--muted-text,#68758a); }
+      .observability-rank-card:hover { border-color:#b9d0e7; box-shadow:0 7px 18px rgba(39,81,124,.10); transform:translateY(-1px); }
+      .observability-rank-badge { width:28px; height:28px; display:grid; place-items:center; border-radius:9px; background:#edf2f7; color:#577087; font-size:12px; font-weight:850; font-variant-numeric:tabular-nums; }
+      .observability-rank-badge.is-leading { background:linear-gradient(135deg,#f6cf69,#d69625); color:#6b4604; box-shadow:inset 0 0 0 1px rgba(140,92,7,.12); }
+      .observability-rank-card:nth-child(2) .observability-rank-badge.is-leading { background:linear-gradient(135deg,#e7edf3,#9aaaba); color:#435565; }
+      .observability-rank-card:nth-child(3) .observability-rank-badge.is-leading { background:linear-gradient(135deg,#f3d5b4,#bd7941); color:#6d3d17; }
+      .observability-rank-identity { min-width:0; display:grid; gap:7px; }
+      .observability-rank-model { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:800; }
+      .observability-rank-score { display:grid; grid-template-columns:auto 1fr auto; gap:7px; align-items:center; color:var(--muted-text,#68758a); font-size:11px; font-weight:700; }
+      .observability-rank-track { height:6px; overflow:hidden; border-radius:999px; background:#e8eef4; }
+      .observability-rank-fill { height:100%; min-width:4px; border-radius:inherit; background:var(--rank-tone); }
+      .observability-rank-metrics { display:grid; grid-template-columns:repeat(3,minmax(54px,1fr)); gap:8px; }
+      .observability-rank-metric { display:grid; gap:3px; min-width:0; }
+      .observability-rank-metric span { color:var(--muted-text,#68758a); font-size:11px; font-weight:700; }
+      .observability-rank-metric strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ink,#14243a); font-size:13px; font-variant-numeric:tabular-nums; }
+      .observability-rank-status { justify-self:end; padding:5px 8px; border-radius:999px; background:#f1f4f7; color:#63758a; font-size:12px; font-weight:800; white-space:nowrap; }
+      .observability-rank-card.is-stable .observability-rank-status { background:#e8f7ee; color:#19734c; }
+      .observability-rank-card.is-observe .observability-rank-status { background:#fff3dd; color:#97620a; }
+      .observability-rank-card.is-repair .observability-rank-status { background:#ffebe9; color:#a4403b; }
       .observability-rank-row-button:focus-visible,.observability-composition-row:focus-visible,.observability-model-row:focus-visible,.observability-sample-row:focus-visible { outline:2px solid var(--brand,#0673d2); outline-offset:2px; }
       .observability-rank-model { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-      .observability-rank-state { font-weight:800; }
       .observability-composition { display:grid; gap:12px; padding:10px 0; }
       .observability-composition-row { display:grid; width:100%; min-height:44px; grid-template-columns:120px 1fr 96px; gap:10px; align-items:center; padding:6px 8px; border:0; border-radius:10px; background:transparent; color:inherit; text-align:left; }
       .observability-composition-row:hover,.observability-model-row:hover { background:#f3f7fc; }
@@ -3209,8 +3223,8 @@
       .observability-sample-row small { margin-top:4px; color:var(--muted-text,#68758a); }
       .observability-pagination { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:14px; color:var(--muted-text,#68758a); font-size:12px; }
       @media (max-width: 1200px) { .observability-metric-grid { grid-template-columns:repeat(3,minmax(0,1fr)); } }
-      @media (max-width: 900px) { .observability-metric-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .observability-grid { grid-template-columns:1fr; } .observability-stability-grid { grid-template-columns:1fr; } .observability-stability-grid > .panel.stability-trend-panel { height:auto; min-height:auto; } .observability-stability-grid .observability-trend-chart { height:auto; } .observability-stability-grid > .panel { height:320px; min-height:320px; } .observability-ranking-panel { height:320px; min-height:320px; } .observability-head { grid-template-columns:1fr; align-items:start; gap:16px; } .observability-filter-bar { justify-content:start; } .observability-filter-fields { grid-template-columns:repeat(2,minmax(180px,1fr)); } .observability-budget-strip { grid-template-columns:repeat(2,minmax(0,1fr)); } .observability-drawer-layout { grid-template-columns:1fr; } }
-      @media (max-width: 560px) { .observability-metric-grid { grid-template-columns:1fr; } .observability-composition-row { grid-template-columns:96px 1fr 72px; } .observability-stability-grid > .panel { height:300px; min-height:300px; } .observability-ranking-panel { height:300px; min-height:300px; } .model-rank-group { height:100%; min-height:0; } .ranking-list-panel { height:360px; min-height:360px; } .ranking-table-panel > .table-wrap { max-height:360px; } .observability-filter-bar { grid-template-columns:repeat(2,minmax(0,1fr)); width:100%; } .observability-filter-button { padding:0 11px; } .observability-filter-fields,.observability-filter-fields.single { grid-template-columns:1fr; } .observability-drawer { padding:18px; } .observability-pagination { align-items:stretch; flex-direction:column; } }
+      @media (max-width: 900px) { .observability-metric-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .observability-grid { grid-template-columns:1fr; } .observability-stability-grid { grid-template-columns:1fr; } .observability-stability-grid > .panel.stability-trend-panel { height:auto; min-height:auto; } .observability-stability-grid .observability-trend-chart { height:auto; } .observability-stability-grid > .panel { height:320px; min-height:320px; } .observability-ranking-panel { height:320px; min-height:320px; } .observability-rank-card { grid-template-columns:34px minmax(150px,1fr) minmax(190px,1.15fr) auto; gap:10px; } .observability-head { grid-template-columns:1fr; align-items:start; gap:16px; } .observability-filter-bar { justify-content:start; } .observability-filter-fields { grid-template-columns:repeat(2,minmax(180px,1fr)); } .observability-budget-strip { grid-template-columns:repeat(2,minmax(0,1fr)); } .observability-drawer-layout { grid-template-columns:1fr; } }
+      @media (max-width: 560px) { .observability-metric-grid { grid-template-columns:1fr; } .observability-composition-row { grid-template-columns:96px 1fr 72px; } .observability-stability-grid > .panel { height:300px; min-height:300px; } .observability-ranking-panel { height:300px; min-height:300px; } .observability-rank-card { grid-template-columns:30px minmax(0,1fr) auto; gap:9px; padding:10px; } .observability-rank-badge { width:26px; height:26px; border-radius:8px; } .observability-rank-metrics { grid-column:2 / -1; grid-template-columns:repeat(3,minmax(0,1fr)); } .observability-rank-status { grid-column:3; grid-row:1; } .model-rank-group { height:100%; min-height:0; } .ranking-list-panel { height:360px; min-height:360px; } .ranking-table-panel > .table-wrap { max-height:360px; } .observability-filter-bar { grid-template-columns:repeat(2,minmax(0,1fr)); width:100%; } .observability-filter-button { padding:0 11px; } .observability-filter-fields,.observability-filter-fields.single { grid-template-columns:1fr; } .observability-drawer { padding:18px; } .observability-pagination { align-items:stretch; flex-direction:column; } }
       @media (prefers-reduced-motion: reduce) { .observability-filter-button,.observability-filter-panel { transition:none; } }
 
       /* Governance dashboards favor auditability over decorative density. */
