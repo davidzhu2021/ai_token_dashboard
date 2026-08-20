@@ -5343,9 +5343,9 @@ class UsageStore:
                 SELECT usage_date AS ledger_date, spend::double precision AS amount_usd,
                        'api_usage' AS source_type, 'api_usage' AS cost_bucket,
                        'API Token' AS category, model AS name, model, provider,
-                       source AS vendor, account_id, organization_id, team_id, principal_id, source,
+                       source AS vendor, account_id, organization_id, team_id, principal_id,
                        'actual' AS recognition_status, NULL::text AS reconciliation_status,
-                       backend_id, key_id, NULL::text AS source_item_id, NULL::text AS request_id, source AS source
+                       backend_id, key_id, NULL::text AS source_item_id, NULL::text AS request_id, source
                 FROM cost_api_daily
                 WHERE usage_date BETWEEN $1::date AND $2::date
                   AND NOT EXISTS (SELECT 1 FROM usage_event_attribution e WHERE e.usage_date=cost_api_daily.usage_date AND NULLIF(e.request_id,'') IS NOT NULL)
@@ -5359,7 +5359,7 @@ class UsageStore:
                 UNION ALL
                 SELECT usage_date, spend::double precision, 'api_usage', 'api_usage', 'API Token',
                        COALESCE(NULLIF(model_group,''), model), model, provider, source, raw_user_id,
-                       organization_id, team_id, principal_id, source, 'actual', NULL,
+                       organization_id, team_id, principal_id, 'actual', NULL,
                        backend_id, key_id, NULL, request_id, source
                 FROM usage_event_attribution
                 WHERE usage_date BETWEEN $1::date AND $2::date
@@ -5378,7 +5378,7 @@ class UsageStore:
                            ELSE COALESCE(NULLIF(cost_bucket,''), category) END, category, name, model,
                        COALESCE(NULLIF(provider,''), vendor), vendor, account_id, '' AS organization_id, '' AS team_id, '' AS principal_id,
                        COALESCE(recognition_status,'actual'), COALESCE(reconciliation_status,'unreconciled'),
-                       NULL, NULL, id, NULL, '' AS ledger_source
+                       NULL, NULL, id, NULL, '' AS source
                 FROM cost_items, generate_series(GREATEST(service_start_date,$1::date), LEAST(service_end_date,$2::date), interval '1 day') day
                 WHERE enabled AND service_start_date <= $2::date AND service_end_date >= $1::date
                   AND ($3='' OR model=$3) AND ($5='' OR COALESCE(NULLIF(provider,''),vendor)=$5)

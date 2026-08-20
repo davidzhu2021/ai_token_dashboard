@@ -160,7 +160,8 @@ def test_cost_ledger_union_keeps_api_and_manual_rows_same_shape() -> None:
     store.pool = _Pool(connection)
     run(store.cost_ledger_page("2026-08-01", "2026-08-12"))
     manual = connection.sql[connection.sql.index("SELECT day::date") : connection.sql.index("FROM cost_items")]
-    assert "NULL, NULL, id, NULL, '' AS source" not in manual
+    assert "NULL, NULL, id, NULL, '' AS source" in manual
+    assert "principal_id, source, 'actual'" not in connection.sql
 
 
 def test_stability_samples_use_one_filtered_cte_and_partial_index() -> None:
