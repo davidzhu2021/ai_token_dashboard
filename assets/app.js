@@ -9012,6 +9012,14 @@ function closeStabilityDrawer() {
   stabilityDrawerReturnFocus = null;
 }
 
+function setStabilityDrawerMode(mode) {
+  const drawer = el("stabilityDrawer");
+  if (!drawer) return;
+  const detailMode = mode === "detail";
+  drawer.dataset.stabilityDrawerMode = detailMode ? "detail" : "samples";
+  el("stabilityDrawerBackToSamples")?.classList.toggle("hidden", !detailMode);
+}
+
 function updateStabilityScenarioTitle(filters) {
   const parts = [filters.scenario || "全部异常"];
   if (filters.model) parts.push(filters.model);
@@ -9042,7 +9050,7 @@ function renderStabilityScenarioSamples() {
   }
   const items = stabilityScenarioState.items || [];
   const pageCount = Math.max(1, Math.ceil(stabilityScenarioState.total / stabilityScenarioState.pageSize));
-  list.innerHTML = `${items.length ? `<div class="observability-sample-list">${items.map((item) => `<button class="observability-sample-row" type="button" data-stability-request="${escapeHtml(item.requestId || "")}" data-stability-backend="${escapeHtml(item.backendId || "")}"><span><strong>${escapeHtml(item.requestId || "暂无 ID")}</strong><small>${escapeHtml(item.eventTime || "暂无时间")} · ${escapeHtml(item.model || "-")}</small></span><span>${escapeHtml(item.status || "unknown")} · ${item.userVisibleFailure == null ? "最终失败暂无" : item.userVisibleFailure ? "最终失败" : "已成功"}</span></button>`).join(" ")}</div>` : '<p class="empty">当前筛选没有样本</p>'}<div class="observability-pagination"><button class="ghost-btn" type="button" data-stability-page="prev" ${stabilityScenarioState.page <= 1 ? "disabled" : ""}>上一页</button><span>第 ${stabilityScenarioState.page} / ${pageCount} 页 · 共 ${stabilityScenarioState.total} 条</span><button class="ghost-btn" type="button" data-stability-page="next" ${stabilityScenarioState.page >= pageCount ? "disabled" : ""}>下一页</button></div>`;
+  list.innerHTML = `${items.length ? `<div class="observability-sample-list">${items.map((item) => `<button class="observability-sample-row" type="button" data-stability-request="${escapeHtml(item.requestId || "")}" data-stability-backend="${escapeHtml(item.backendId || "")}"><span><strong>${escapeHtml(item.requestId || "暂无 ID")}</strong><small>${escapeHtml(item.eventTime || "暂无时间")} · ${escapeHtml(item.model || "-")}</small></span><span class="observability-sample-state"><strong>${escapeHtml(item.status || "unknown")}</strong><span>${item.userVisibleFailure == null ? "最终失败暂无" : item.userVisibleFailure ? "最终失败" : "已成功"}</span></span></button>`).join("")}</div>` : '<p class="empty">当前筛选没有样本</p>'}<div class="observability-pagination"><button class="ghost-btn" type="button" data-stability-page="prev" ${stabilityScenarioState.page <= 1 ? "disabled" : ""}>上一页</button><span>第 ${stabilityScenarioState.page} / ${pageCount} 页 · 共 ${stabilityScenarioState.total} 条</span><button class="ghost-btn" type="button" data-stability-page="next" ${stabilityScenarioState.page >= pageCount ? "disabled" : ""}>下一页</button></div>`;
 }
 
 async function loadStabilityScenarioSamples(filters = stabilityScenarioState.filters, page = 1) {
@@ -9074,12 +9082,14 @@ function openStabilityScenario(button) {
   el("stabilityAttemptTimeline").innerHTML = "";
   el("stabilityRequestActions").innerHTML = "";
   el("stabilityRequestRegression").innerHTML = "";
+  setStabilityDrawerMode("samples");
   focusDrawer("stabilityDrawer", button);
   loadStabilityScenarioSamples(filters, 1);
 }
 
 async function openStabilityRequest(requestId, backendId = "") {
   try {
+    setStabilityDrawerMode("detail");
     const suffix = backendId ? `?backend_id=${encodeURIComponent(backendId)}` : "";
     const payload = await api(`/api/admin/stability/requests/${encodeURIComponent(requestId)}${suffix}`);
     const detail = payload.data || {};
@@ -10822,6 +10832,7 @@ document.querySelectorAll(".observability-active-filters").forEach((container) =
   if (button) clearObservabilityFilter(button.dataset.observabilityScope, button.dataset.observabilityClear);
 }));
 el("stabilityDrawerClose")?.addEventListener("click", closeStabilityDrawer);
+el("stabilityDrawerBackToSamples")?.addEventListener("click", () => setStabilityDrawerMode("samples"));
 el("stabilityScenarioModel")?.addEventListener("change", (event) => {
   const filters = { ...stabilityScenarioState.filters, model: event.target.value || "" };
   updateStabilityScenarioTitle(filters);

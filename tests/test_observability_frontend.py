@@ -107,6 +107,19 @@ def test_stability_drawer_has_model_filter_toolbar() -> None:
     assert 'updateStabilityScenarioTitle' in source
 
 
+def test_stability_drawer_switches_between_full_width_browsing_and_request_detail() -> None:
+    markup = (ROOT / "index.html").read_text(encoding="utf-8")
+    source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
+    assert 'id="stabilityDrawerBackToSamples"' in markup
+    assert 'data-stability-drawer-mode="samples"' in markup
+    assert '.observability-drawer[data-stability-drawer-mode="samples"] .observability-drawer-layout' in markup
+    assert '.observability-sample-row strong { overflow-wrap:anywhere; word-break:break-word; }' in markup
+    assert 'function setStabilityDrawerMode(mode)' in source
+    assert 'setStabilityDrawerMode("samples")' in source
+    assert 'setStabilityDrawerMode("detail")' in source
+    assert 'el("stabilityDrawerBackToSamples")?.addEventListener("click", () => setStabilityDrawerMode("samples"))' in source
+
+
 def test_observability_state_is_latest_wins_and_cleared_on_login_change() -> None:
     source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
     assert 'stabilityOverviewController?.abort()' in source
