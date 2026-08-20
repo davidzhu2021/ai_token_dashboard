@@ -10882,7 +10882,7 @@ el("costModelShare")?.addEventListener("click", (event) => {
   }
   const day = event.target.closest("[data-cost-model-series-day]");
   if (day) {
-    openCostLedger({ model: day.dataset.costModelSeriesName }, day);
+    openCostLedger(currentCostLedgerFilters({ model: day.dataset.costModelSeriesName, startDate: day.dataset.costModelSeriesDay, endDate: day.dataset.costModelSeriesDay }), day);
     return;
   }
   const row = event.target.closest("[data-cost-model-series]");
