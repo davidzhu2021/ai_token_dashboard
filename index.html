@@ -3239,6 +3239,13 @@
       .cost-model-share-daily { margin-top:12px; max-height:220px; overflow:auto; }
       .cost-model-share-daily-row { display:flex; width:100%; justify-content:space-between; gap:16px; padding:9px 0; border:0; border-top:1px solid #e5ebf2; background:transparent; color:inherit; text-align:left; }
       .cost-model-share-daily-row:hover { color:var(--brand,#0673d2); }
+      .cost-model-share-modal { width:min(100%, 820px); max-height:min(760px, 92vh); padding:0; overflow:hidden; }
+      .cost-model-share-modal-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:22px 24px 14px; border-bottom:1px solid var(--line); }
+      .cost-model-share-modal-head h3 { margin:0; font-size:22px; }
+      .cost-model-share-modal-head p { margin:6px 0 0; color:var(--muted); font-size:13px; }
+      .cost-model-share-modal-body { max-height:calc(min(760px, 92vh) - 88px); overflow:auto; padding:18px 24px 24px; }
+      .cost-model-share-modal-body .cost-model-share-detail { margin:0; border:0; padding:0; background:transparent; }
+      @media (max-width:560px) { .cost-model-share-modal { width:100%; max-height:94vh; } .cost-model-share-modal-head { padding:18px 18px 12px; } .cost-model-share-modal-body { max-height:calc(94vh - 78px); padding:14px 18px 18px; } }
       .observability-drawer-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:18px; }
       .observability-drawer-head h3 { margin:0; }
       .observability-drawer-head p { margin:5px 0 0; color:var(--muted-text,#68758a); font-size:12px; line-height:1.5; }
@@ -7207,11 +7214,11 @@
                 </select>
               </div>
               <div id="stabilityTopFilters" class="dashboard-filters hidden" aria-label="稳定性筛选">
-                <select id="stabilityRange" class="select" aria-label="稳定性时间范围"><option value="1">最近 24 小时</option><option value="7" selected>最近 7 天</option><option value="30">最近 30 天</option></select>
+                <div class="range-picker"><select id="stabilityRangeSelect" class="select" aria-label="稳定性时间范围"><option value="1" selected>近 1 天</option><option value="7">近 7 天</option><option value="14">近 14 天</option><option value="30">近 30 天</option><option value="custom">自定义…</option></select><div id="stabilityRangePanel" class="range-panel hidden" role="dialog" aria-label="稳定性自定义时间范围"><div class="range-panel-field"><label for="stabilityRangeStart">开始日期</label><input id="stabilityRangeStart" class="input" type="date" /></div><div class="range-panel-field"><label for="stabilityRangeEnd">结束日期</label><input id="stabilityRangeEnd" class="input" type="date" /></div><p id="stabilityRangeHint" class="range-panel-hint"></p><div class="range-panel-actions"><button id="stabilityRangeCancel" class="ghost-btn" type="button">取消</button><button id="stabilityRangeApply" class="primary-btn" type="button">应用</button></div></div></div>
                 <select id="stabilityModel" class="select" aria-label="稳定性模型筛选"><option value="">全部模型</option></select>
               </div>
               <div id="costTopFilters" class="dashboard-filters hidden" aria-label="费用筛选">
-                <input id="costMonth" class="input" type="month" aria-label="费用月份" />
+                <div class="range-picker"><select id="costRangeSelect" class="select" aria-label="费用时间范围"><option value="1" selected>近 1 天</option><option value="7">近 7 天</option><option value="14">近 14 天</option><option value="30">近 30 天</option><option value="custom">自定义…</option></select><div id="costRangePanel" class="range-panel hidden" role="dialog" aria-label="费用自定义时间范围"><div class="range-panel-field"><label for="costRangeStart">开始日期</label><input id="costRangeStart" class="input" type="date" /></div><div class="range-panel-field"><label for="costRangeEnd">结束日期</label><input id="costRangeEnd" class="input" type="date" /></div><p id="costRangeHint" class="range-panel-hint"></p><div class="range-panel-actions"><button id="costRangeCancel" class="ghost-btn" type="button">取消</button><button id="costRangeApply" class="primary-btn" type="button">应用</button></div></div></div>
                 <select id="costModel" class="select" aria-label="费用模型筛选"><option value="">全部模型</option></select>
               </div>
             </div>
@@ -8988,6 +8995,13 @@
 
     <div id="toast" class="toast">已完成</div>
     <div id="chartTooltip" class="chart-tooltip" role="tooltip"></div>
+
+    <div id="costModelShareModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="costModelShareModalTitle" aria-hidden="true">
+      <section class="modal cost-model-share-modal">
+        <div class="cost-model-share-modal-head"><div><h3 id="costModelShareModalTitle">模型成本详情</h3><p id="costModelShareModalSubtitle">每日支出趋势</p></div><button id="costModelShareModalClose" class="ghost-btn" type="button">关闭</button></div>
+        <div id="costModelShareModalBody" class="cost-model-share-modal-body"></div>
+      </section>
+    </div>
 
     <div id="costItemModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="costItemModalTitle">
       <form id="costItemForm" class="modal">

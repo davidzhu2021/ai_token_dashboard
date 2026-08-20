@@ -227,6 +227,7 @@ let costOverviewController = null;
 let stabilityScenarioRequestId = 0;
 let costLedgerRequestId = 0;
 let selectedCostModelSeries = "";
+let costModelShareReturnFocus = null;
 let stabilityDrawerReturnFocus = null;
 let costDrawerReturnFocus = null;
 let stabilityScenarioState = {
@@ -754,6 +755,8 @@ function localDate(date) {
 const CUSTOM_RANGE_MAX_DAYS = 90;
 let customDateRange = null;
 let lastPresetRangeValue = "1";
+let stabilityCustomDateRange = null;
+let costCustomDateRange = null;
 
 function daysBetween(startDate, endDate) {
   // 用 UTC 解析 YYYY-MM-DD 求含首尾天数，绕开本地时区与夏令时带来的偏移。
@@ -8474,16 +8477,26 @@ function clearObservabilityFilter(scope, id) {
 }
 
 function currentStabilityWindow() {
-  const days = Number(el("stabilityRange")?.value || 7);
+  return selectedObservabilityRange("stability");
+}
+
+function selectedObservabilityRange(scope) {
+  const select = el(`${scope}RangeSelect`);
+  const custom = scope === "stability" ? stabilityCustomDateRange : costCustomDateRange;
+  if (select?.value === "custom" && custom) return { ...custom, days: daysBetween(custom.startDate, custom.endDate) };
+  const days = Number(select?.value || 1);
   const end = new Date();
   const start = new Date(end);
   start.setDate(end.getDate() - days + 1);
-  const day = (value) => value.toISOString().slice(0, 10);
-  return { startDate: day(start), endDate: day(end) };
+  return { startDate: localDate(start), endDate: localDate(end), days };
+}
+
+function currentCostWindow() {
+  return selectedObservabilityRange("cost");
 }
 
 function currentCostMonth() {
-  return el("costMonth")?.value || new Date().toISOString().slice(0, 7);
+  return currentCostWindow().endDate.slice(0, 7);
 }
 
 function observabilityReasonCopy(payload, scope) {
@@ -8796,17 +8809,17 @@ function renderCostOverview() {
   const officialForecastValue = annualContracts.officialForecast ?? (hasOfficialForecastContract ? (contractMetrics.officialYearForecast ?? metrics.officialYearForecast ?? annual.officialForecast) : activePlan ? (metrics.yearForecast ?? annual.forecast) : null);
   const officialForecast = observabilityMetricObject(officialForecastValue, { period: `${String(data.month || currentCostMonth()).slice(0, 4)} 年`, asOf: meta.asOf, source: activePlan?.name || activePlan?.version || "生效基准计划", status: officialForecastValue == null ? "unavailable" : "approved", missingReasons: officialForecastValue == null ? ["active_approved_baseline_plan_missing"] : [] });
   const verifiedSavings = observabilityMetricObject(contractMetrics.verifiedSavings ?? metrics.verifiedSavingsToDate ?? metrics.realizedSavingsToDate ?? metrics.verifiedSavings, { period: `${String(data.month || currentCostMonth()).slice(0, 4)} 年`, asOf: meta.asOf, source: "已复核节省证明", status: "verified", sampleCount: data.savingsMeasurements?.reviewedCount ?? data.savingsMeasurements?.filter?.((item) => item.reviewedAt || item.financeReviewedAt)?.length });
-  const budgetOrTarget = observabilityMetricObject(contractMetrics.budget ?? metrics.monthBudget ?? metrics.budget ?? metrics.dailyTarget, { period: data.month || currentCostMonth(), asOf: meta.asOf, source: metrics.monthBudget != null || metrics.budget != null ? "预算账本" : "日均目标", status: "available" });
+  const budgetOrTarget = observabilityMetricObject(contractMetrics.budget ?? metrics.intervalBudget ?? metrics.monthBudget ?? metrics.budget ?? metrics.dailyTarget, { period: meta.period || `${data.startDate || ""} ～ ${data.endDate || ""}`, asOf: meta.asOf, source: metrics.intervalBudget != null || metrics.monthBudget != null || metrics.budget != null ? "预算账本" : "日均目标", status: "available" });
   el("costMetrics").innerHTML = [
     observabilityMetricCard({ label: "年度累计实际", metric: annualActual, formatter: observabilityMoney, action: "cost-actual-ledger" }),
     observabilityMetricCard({ label: "全年官方预测", metric: officialForecast, formatter: observabilityMoney, action: "cost-plan-versions", hint: "没有生效基准计划时不提供官方预测" }),
     observabilityMetricCard({ label: "已核验累计节省", metric: verifiedSavings, formatter: observabilityMoney, action: "cost-savings" }),
-    observabilityMetricCard({ label: metrics.monthBudget != null || metrics.budget != null ? "月度预算" : "日均目标", metric: budgetOrTarget, formatter: observabilityMoney, action: "cost-budget" }),
+    observabilityMetricCard({ label: metrics.intervalBudget != null || metrics.monthBudget != null || metrics.budget != null ? "区间预算" : "日均目标", metric: budgetOrTarget, formatter: observabilityMoney, action: "cost-budget" }),
   ].join("");
   renderObservabilityContext("costContext", costOverview, data, "cost");
   el("savingsActionList").innerHTML = (data.savingsActions || []).map((item) => `<article class="observability-action"><div><strong>${escapeHtml(item.name)}</strong><p class="hint">${escapeHtml(item.owner || "未指定负责人")} · ${escapeHtml(item.status)}${item.evidenceUrl ? " · 有证据" : " · 缺证据"}</p></div><div class="observability-table-actions"><span>${item.status === "verified" ? `${observabilityMoney(item.realizedSavingsToDate ?? Math.max(0, Number(item.baselineDailyCost) - Number(item.verifiedDailyCost || 0)))}/日` : item.forecastSavingsRemaining == null ? "尚未计入节省" : `预计 ${observabilityMoney(item.forecastSavingsRemaining)}`}</span>${canManageCosts() ? `<button class="ghost-btn" type="button" data-edit-savings-action="${escapeHtml(item.id)}">编辑</button>` : "只读"}</div></article>`).join("") || `<p class="empty">暂无降本动作</p>`;
   renderCostModelShare(data.modelCostShare || data.modelSplit || []);
-  const targetMonth = String(data.month || el("costMonth")?.value || "").slice(0, 7);
+  const targetMonth = String(data.month || currentCostMonth()).slice(0, 7);
   const budget = costBudgets.find((item) => String(item.month).slice(0, 7) === targetMonth);
   if (el("costBudgetAmount")) el("costBudgetAmount").value = String(budget?.budgetUsd ?? metrics.budget ?? "");
   if (el("costDailyTarget")) el("costDailyTarget").value = String(budget?.dailyTargetUsd ?? metrics.dailyTarget ?? "");
@@ -8830,20 +8843,33 @@ function renderCostModelShare(items) {
   const target = el("costModelShare");
   if (!target) return;
   const series = Array.isArray(items) ? items : [];
-  if (selectedCostModelSeries && !series.some((item) => item.model === selectedCostModelSeries)) selectedCostModelSeries = "";
+  if (selectedCostModelSeries && !series.some((item) => item.model === selectedCostModelSeries)) closeCostModelShareModal();
   if (!series.length) {
     target.innerHTML = '<p class="empty">当前筛选范围暂无 API 模型成本</p>';
     return;
   }
   target.innerHTML = `<div class="cost-model-share-table-wrap"><table class="cost-model-share-table"><thead><tr><th>模型系列</th><th class="num">所选范围支出</th><th class="num">占比</th><th>每日支出</th></tr></thead><tbody>${series.map((item) => {
-    const selected = item.model === selectedCostModelSeries;
     const share = Math.max(0, Math.min(1, Number(item.share || 0)));
-    return `<tr class="cost-model-share-row" tabindex="0" role="button" data-cost-model-series="${escapeHtml(item.model || "")}" aria-expanded="${selected}" aria-label="${escapeHtml(selected ? "收起" : "展开")} ${escapeHtml(item.model || "模型系列")} 每日支出"><td><strong>${escapeHtml(item.model || "未知模型")}</strong></td><td class="num">${observabilityMoney(item.spend)}</td><td class="num">${(share * 100).toFixed(1)}%</td><td><div class="cost-model-share-bar"><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Math.max(share ? 3 : 0, share * 100)}%"></div></div><span>${selected ? "收起" : "查看趋势"}</span></div></td></tr>`;
-  }).join("")}</tbody></table></div>${selectedCostModelSeries ? renderCostModelShareDetail(series.find((item) => item.model === selectedCostModelSeries)) : ""}`;
+    return `<tr class="cost-model-share-row" tabindex="0" role="button" data-cost-model-series="${escapeHtml(item.model || "")}" aria-label="查看 ${escapeHtml(item.model || "模型系列")} 每日支出"><td><strong>${escapeHtml(item.model || "未知模型")}</strong></td><td class="num">${observabilityMoney(item.spend)}</td><td class="num">${(share * 100).toFixed(1)}%</td><td><div class="cost-model-share-bar"><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Math.max(share ? 3 : 0, share * 100)}%"></div></div><span>查看趋势</span></div></td></tr>`;
+  }).join("")}</tbody></table></div>`;
+  if (selectedCostModelSeries) openCostModelShareModal(series.find((item) => item.model === selectedCostModelSeries));
+}
+
+function openCostModelShareModal(item, returnFocus = document.activeElement) {
+  if (!item) return;
+  selectedCostModelSeries = item.model || "";
+  costModelShareReturnFocus = returnFocus;
+  el("costModelShareModalTitle").textContent = `${item.model || "未知模型"}成本详情`;
+  el("costModelShareModalSubtitle").textContent = `所选范围支出 ${observabilityMoney(item.spend)} · 占比 ${(Number(item.share || 0) * 100).toFixed(1)}%`;
+  el("costModelShareModalBody").innerHTML = renderCostModelShareDetail(item);
+  const modal = el("costModelShareModal");
+  modal.classList.remove("hidden");
+  modal.setAttribute("aria-hidden", "false");
+  el("costModelShareModalClose")?.focus();
   const chart = el("costModelShareChart");
   if (chart) renderLineChart({
     svg: chart,
-    points: series.find((item) => item.model === selectedCostModelSeries)?.daily || [],
+    points: item.daily || [],
     valueField: "spend",
     color: "#0673d2",
     fill: "rgba(6,115,210,.13)",
@@ -8852,10 +8878,19 @@ function renderCostModelShare(items) {
   });
 }
 
+function closeCostModelShareModal() {
+  selectedCostModelSeries = "";
+  const modal = el("costModelShareModal");
+  modal?.classList.add("hidden");
+  modal?.setAttribute("aria-hidden", "true");
+  costModelShareReturnFocus?.focus?.();
+  costModelShareReturnFocus = null;
+}
+
 function renderCostModelShareDetail(item) {
   if (!item) return "";
   const daily = Array.isArray(item.daily) ? item.daily : [];
-  return `<section class="cost-model-share-detail" aria-label="${escapeHtml(item.model || "模型系列")}每日支出"><div class="cost-model-share-detail-head"><div><h4>${escapeHtml(item.model || "未知模型")}每日支出</h4><p>所选范围支出 ${observabilityMoney(item.spend)} · 占比 ${(Number(item.share || 0) * 100).toFixed(1)}%</p></div><button class="ghost-btn" type="button" data-close-cost-model-series>收起</button></div><svg id="costModelShareChart" class="cost-model-share-chart" role="img" aria-label="${escapeHtml(item.model || "模型系列")}每日支出折线图"></svg><div class="cost-model-share-daily">${daily.map((point) => `<button class="cost-model-share-daily-row" type="button" data-cost-model-series-day="${escapeHtml(point.date || "")}" data-cost-model-series-name="${escapeHtml(item.model || "")}"><span>${escapeHtml(point.date || "")}</span><strong>${observabilityMoney(point.spend)}</strong></button>`).join("")}</div></section>`;
+  return `<section class="cost-model-share-detail" aria-label="${escapeHtml(item.model || "模型系列")}每日支出"><div class="cost-model-share-detail-head"><div><h4>${escapeHtml(item.model || "未知模型")}每日支出</h4><p>点击日期可查看当天费用明细。</p></div></div><svg id="costModelShareChart" class="cost-model-share-chart" role="img" aria-label="${escapeHtml(item.model || "模型系列")}每日支出折线图"></svg><div class="cost-model-share-daily">${daily.map((point) => `<button class="cost-model-share-daily-row" type="button" data-cost-model-series-day="${escapeHtml(point.date || "")}" data-cost-model-series-name="${escapeHtml(item.model || "")}"><span>${escapeHtml(point.date || "")}</span><strong>${observabilityMoney(point.spend)}</strong></button>`).join("")}</div></section>`;
 }
 
 function normalizeWorkbenchList(payload, ...keys) {
@@ -8953,8 +8988,7 @@ async function loadCostOverview(forceRefresh = false) {
   isCostOverviewLoading = true;
   costOverviewLoadError = "";
   try {
-    const month = currentCostMonth();
-    if (el("costMonth") && !el("costMonth").value) el("costMonth").value = month;
+    const { startDate, endDate } = currentCostWindow();
     const category = el("costCategory")?.value || "";
     const costBucket = el("costBucket")?.value || "";
     const model = el("costModel")?.value || "";
@@ -8964,7 +8998,7 @@ async function loadCostOverview(forceRefresh = false) {
     const reconciliationStatus = el("costReconciliation")?.value || "";
     const recognitionStatus = el("costRecognition")?.value || "";
     const asOf = new Date().toISOString().slice(0, 10);
-    const query = `month=${encodeURIComponent(month)}&as_of=${encodeURIComponent(asOf)}&category=${encodeURIComponent(category)}&cost_bucket=${encodeURIComponent(costBucket)}&model=${encodeURIComponent(model)}&vendor=${encodeURIComponent(vendor)}&provider=${encodeURIComponent(provider)}&account_id=${encodeURIComponent(accountId)}&reconciliation_status=${encodeURIComponent(reconciliationStatus)}&recognition_status=${encodeURIComponent(recognitionStatus)}${forceRefresh ? "&refresh=1" : ""}`;
+    const query = `start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&as_of=${encodeURIComponent(asOf)}&category=${encodeURIComponent(category)}&cost_bucket=${encodeURIComponent(costBucket)}&model=${encodeURIComponent(model)}&vendor=${encodeURIComponent(vendor)}&provider=${encodeURIComponent(provider)}&account_id=${encodeURIComponent(accountId)}&reconciliation_status=${encodeURIComponent(reconciliationStatus)}&recognition_status=${encodeURIComponent(recognitionStatus)}${forceRefresh ? "&refresh=1" : ""}`;
     const nextOverview = await api(`/api/admin/costs/overview?${query}`, { signal: costOverviewController.signal });
     if (requestId !== costOverviewRequestId) return;
     costOverview = nextOverview;
@@ -9155,13 +9189,9 @@ async function loadCostLedger() {
   const list = el("costLedgerList");
   if (list) list.innerHTML = '<p class="empty">正在加载费用明细…</p>';
   try {
-    const month = currentCostMonth();
-    const start = `${month}-01`;
-    const endDate = new Date(`${month}-01T00:00:00`);
-    endDate.setMonth(endDate.getMonth() + 1);
-    endDate.setDate(0);
+    const { startDate, endDate } = currentCostWindow();
     const asOf = costOverview?.data?.asOf || costOverview?.asOf || new Date().toISOString().slice(0, 10);
-    const query = new URLSearchParams({ start_date: start, end_date: endDate.toISOString().slice(0, 10), as_of: asOf, page: String(costLedgerState.page), page_size: String(costLedgerState.pageSize), ...(costLedgerState.filters || {}) });
+    const query = new URLSearchParams({ start_date: startDate, end_date: endDate, as_of: asOf, page: String(costLedgerState.page), page_size: String(costLedgerState.pageSize), ...(costLedgerState.filters || {}) });
     const payload = await api(`/api/admin/costs/ledger?${query.toString()}`);
     if (requestId !== costLedgerRequestId) return;
     const data = payload.data || {};
@@ -9352,7 +9382,7 @@ async function saveSavingsAction(event) {
 async function saveCostBudget(event) {
   if (!canManageCosts()) return;
   event.preventDefault();
-  const month = el("costMonth").value;
+  const month = currentCostMonth();
   try {
     await ensureCsrfToken();
     await api(`/api/admin/costs/budgets/${encodeURIComponent(month)}`, { method: "PUT", body: JSON.stringify({ budgetUsd: Number(el("costBudgetAmount").value), dailyTargetUsd: Number(el("costDailyTarget").value) }) });
@@ -10780,12 +10810,23 @@ document.querySelectorAll("[data-view]").forEach((button) => button.addEventList
   }
   switchView(button.dataset.view);
 }));
-el("stabilityRange")?.addEventListener("change", loadStabilityOverview);
+el("stabilityRangeSelect")?.addEventListener("change", () => handleObservabilityRangeChange("stability"));
 el("stabilityModel")?.addEventListener("change", () => {
   renderObservabilityFilterState("stability");
   loadStabilityOverview();
 });
-el("costMonth")?.addEventListener("change", loadCostOverview);
+el("costRangeSelect")?.addEventListener("change", () => handleObservabilityRangeChange("cost"));
+["stability", "cost"].forEach((scope) => {
+  el(`${scope}RangeSelect`)?.addEventListener("mousedown", (event) => {
+    const ids = observabilityRangeIds(scope);
+    if (el(ids.select).value !== "custom") return;
+    event.preventDefault();
+    if (el(ids.panel).classList.contains("hidden")) openObservabilityRangePanel(scope);
+    else closeObservabilityRangePanel(scope);
+  });
+  el(`${scope}RangeApply`)?.addEventListener("click", () => applyObservabilityCustomRange(scope));
+  el(`${scope}RangeCancel`)?.addEventListener("click", () => closeObservabilityRangePanel(scope, true));
+});
 el("costCategory")?.addEventListener("change", () => {
   renderObservabilityFilterState("cost");
   loadCostOverview();
@@ -10864,21 +10905,20 @@ el("costModelShare")?.addEventListener("click", (event) => {
   }
   const day = event.target.closest("[data-cost-model-series-day]");
   if (day) {
+    closeCostModelShareModal();
     openCostLedger(currentCostLedgerFilters({ model: day.dataset.costModelSeriesName, startDate: day.dataset.costModelSeriesDay, endDate: day.dataset.costModelSeriesDay }), day);
     return;
   }
   const row = event.target.closest("[data-cost-model-series]");
   if (!row) return;
-  selectedCostModelSeries = selectedCostModelSeries === row.dataset.costModelSeries ? "" : row.dataset.costModelSeries;
-  renderCostOverview();
+  openCostModelShareModal((costOverview?.data?.modelCostShare || []).find((item) => item.model === row.dataset.costModelSeries), row);
 });
 el("costModelShare")?.addEventListener("keydown", (event) => {
   if (!['Enter', ' '].includes(event.key)) return;
   const row = event.target.closest("[data-cost-model-series]");
   if (!row) return;
   event.preventDefault();
-  selectedCostModelSeries = selectedCostModelSeries === row.dataset.costModelSeries ? "" : row.dataset.costModelSeries;
-  renderCostOverview();
+  openCostModelShareModal((costOverview?.data?.modelCostShare || []).find((item) => item.model === row.dataset.costModelSeries), row);
 });
 el("mobileViewSelect")?.addEventListener("change", (event) => switchView(event.currentTarget.value));
 el("governanceWorkbenchTabs")?.addEventListener("click", (event) => {
@@ -11028,6 +11068,72 @@ async function reloadForFilterChange() {
   await loadCurrentViewData();
 }
 
+function observabilityRangeState(scope) {
+  return scope === "stability" ? stabilityCustomDateRange : costCustomDateRange;
+}
+
+function setObservabilityRangeState(scope, value) {
+  if (scope === "stability") stabilityCustomDateRange = value;
+  else costCustomDateRange = value;
+}
+
+function observabilityRangeIds(scope) {
+  return { panel: `${scope}RangePanel`, select: `${scope}RangeSelect`, start: `${scope}RangeStart`, end: `${scope}RangeEnd`, hint: `${scope}RangeHint` };
+}
+
+function openObservabilityRangePanel(scope) {
+  const ids = observabilityRangeIds(scope);
+  const bounds = customRangeBounds();
+  const current = observabilityRangeState(scope) || selectedObservabilityRange(scope);
+  for (const id of [ids.start, ids.end]) {
+    el(id).min = bounds.min;
+    el(id).max = bounds.max;
+  }
+  el(ids.start).value = current.startDate;
+  el(ids.end).value = current.endDate;
+  el(ids.hint).textContent = `最多可查询最近 ${CUSTOM_RANGE_MAX_DAYS} 天，且不能选择未来日期。`;
+  el(ids.hint).classList.remove("is-error");
+  el(ids.panel).classList.remove("hidden");
+}
+
+function closeObservabilityRangePanel(scope, revert = false) {
+  const ids = observabilityRangeIds(scope);
+  el(ids.panel)?.classList.add("hidden");
+  if (revert && !observabilityRangeState(scope)) el(ids.select).value = "1";
+}
+
+async function handleObservabilityRangeChange(scope) {
+  const ids = observabilityRangeIds(scope);
+  if (el(ids.select).value === "custom") {
+    openObservabilityRangePanel(scope);
+    return;
+  }
+  setObservabilityRangeState(scope, null);
+  el(ids.select).querySelector('option[value="custom"]').textContent = "自定义…";
+  closeObservabilityRangePanel(scope);
+  if (scope === "stability") await loadStabilityOverview();
+  else await loadCostOverview();
+}
+
+async function applyObservabilityCustomRange(scope) {
+  const ids = observabilityRangeIds(scope);
+  const startDate = el(ids.start).value;
+  const endDate = el(ids.end).value;
+  const error = customRangeError(startDate, endDate);
+  if (error) {
+    el(ids.hint).textContent = error.message;
+    el(ids.hint).classList.add("is-error");
+    showToast(error.message);
+    return;
+  }
+  setObservabilityRangeState(scope, { startDate, endDate });
+  el(ids.select).value = "custom";
+  el(ids.select).querySelector('option[value="custom"]').textContent = `${startDate} ～ ${endDate}`;
+  closeObservabilityRangePanel(scope);
+  if (scope === "stability") await loadStabilityOverview();
+  else await loadCostOverview();
+}
+
 function setCustomRangeHint(message, isError = false) {
   const hint = el("customRangeHint");
   if (!hint) return;
@@ -11138,6 +11244,15 @@ document.addEventListener("mousedown", (event) => {
   if (el("customRangePanel").classList.contains("hidden")) return;
   if (event.target.closest("#customRangePanel") || event.target.closest("#rangeSelect")) return;
   closeCustomRangePanel(true);
+});
+
+document.addEventListener("mousedown", (event) => {
+  ["stability", "cost"].forEach((scope) => {
+    const ids = observabilityRangeIds(scope);
+    if (el(ids.panel)?.classList.contains("hidden")) return;
+    if (event.target.closest(`#${ids.panel}`) || event.target.closest(`#${ids.select}`)) return;
+    closeObservabilityRangePanel(scope, true);
+  });
 });
 
 el("sourceSelect").addEventListener("change", reloadForFilterChange);
@@ -11570,6 +11685,7 @@ el("confirmRegenerateKey").addEventListener("click", async () => {
 el("copyNewKey").addEventListener("click", () => {
   if (currentPlainKey) copyText(currentPlainKey, "完整密钥已复制");
 });
+el("costModelShareModalClose")?.addEventListener("click", closeCostModelShareModal);
 el("retryDisableOldKey").addEventListener("click", () => {
   if (!currentPlainKeyCleanup) {
     showToast("未找到需要停用的旧密钥，请刷新列表后重试");
@@ -11592,11 +11708,16 @@ document.querySelectorAll(".modal-backdrop").forEach((backdrop) => {
     if (backdrop.id === "organizationMemberIdentityModal") closeOrganizationMemberIdentityModal();
     if (backdrop.id === "organizationTopupModal") closeOrganizationTopupModal();
     if (backdrop.id === "organizationCreditAdjustmentModal") closeOrganizationCreditAdjustmentModal();
+    if (backdrop.id === "costModelShareModal") closeCostModelShareModal();
   });
 });
 
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
+  if (!el("costModelShareModal")?.classList.contains("hidden")) {
+    closeCostModelShareModal();
+    return;
+  }
   if (!el("stabilityDrawer")?.classList.contains("hidden")) {
     closeStabilityDrawer();
     return;

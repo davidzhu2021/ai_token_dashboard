@@ -10784,6 +10784,8 @@ async def admin_update_savings_action(action_id: str, data: SavingsActionRequest
 
 async def _build_costs_overview(
     month: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
     category: str = "",
     cost_bucket: str = "",
     model: str = "",
@@ -10794,17 +10796,31 @@ async def _build_costs_overview(
     recognition_status: str = "",
     as_of: str | None = None,
 ) -> dict[str, Any]:
-    target = month or date.today().strftime("%Y-%m")
-    try:
-        start = date.fromisoformat(f"{target}-01")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="月份格式应为 YYYY-MM") from exc
-    next_month = date(start.year + 1, 1, 1) if start.month == 12 else date(start.year, start.month + 1, 1)
-    end = next_month - timedelta(days=1)
+    if bool(start_date) != bool(end_date):
+        raise HTTPException(status_code=400, detail="开始日期和结束日期必须同时提供")
+    if start_date and end_date:
+        try:
+            start = date.fromisoformat(start_date)
+            end = date.fromisoformat(end_date)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="日期格式应为 YYYY-MM-DD") from exc
+        if start > end:
+            raise HTTPException(status_code=400, detail="开始日期不能晚于结束日期")
+        target = end.strftime("%Y-%m")
+    else:
+        target = month or date.today().strftime("%Y-%m")
+        try:
+            start = date.fromisoformat(f"{target}-01")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="月份格式应为 YYYY-MM") from exc
+        next_month = date(start.year + 1, 1, 1) if start.month == 12 else date(start.year, start.month + 1, 1)
+        end = next_month - timedelta(days=1)
     try:
         cutoff = date.fromisoformat(as_of) if as_of else date.today()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="as_of 格式应为 YYYY-MM-DD") from exc
+    if cutoff < start:
+        raise HTTPException(status_code=400, detail="as_of 不能早于查询开始日期")
     today = min(cutoff, end)
     store = _admin_observability_store()
     api_rows, api_dimensions_complete = await _cost_api_rows(
@@ -10873,7 +10889,17 @@ async def _build_costs_overview(
     measurements = await _call_store_optional(store, ("list_savings_measurements",), as_of=today.isoformat(), default=[])
     audited_savings = reviewed_savings_measurements([dict(item) for item in (measurements or [])], today)
     savings = _savings_totals(actions, today, end)
-    forecast = monthly_forecast(actual, start, today, budget)
+    budget_daily_by_day: dict[str, float] = {}
+    for day_offset in range((end - start).days + 1):
+        day = start + timedelta(days=day_offset)
+        month_start = day.replace(day=1)
+        next_start = date(day.year + 1, 1, 1) if day.month == 12 else date(day.year, day.month + 1, 1)
+        days_in_month = (next_start - month_start).days
+        month_record = next((item for item in budgets if str(item.get("month"))[:7] == day.strftime("%Y-%m")), None)
+        monthly_budget = float(month_record.get("budget_usd") or 0) if month_record else env_float("COST_DEFAULT_MONTHLY_BUDGET_USD", 60000)
+        budget_daily_by_day[day.isoformat()] = monthly_budget / days_in_month
+    interval_budget = sum(budget_daily_by_day.values())
+    forecast = monthly_forecast(actual, start, today, interval_budget)
     model_split: dict[str, float] = defaultdict(float)
     for row in ledger_rows:
         if str(row.get("costBucket") or "other") == "api_usage" and row.get("model"):
@@ -10904,13 +10930,13 @@ async def _build_costs_overview(
                 ],
             }
         )
-    month_days = (end - start).days + 1
-    budget_daily = budget / month_days if budget is not None else None
     elapsed_days = max(1, (today - start).days + 1)
     projected_daily = actual / elapsed_days if elapsed_days else 0.0
     response = _observability_envelope(
         {
             "month": target,
+            "startDate": start.isoformat(),
+            "endDate": end.isoformat(),
             "summary": summary,
             "metrics": {
                 **forecast,
@@ -10919,7 +10945,8 @@ async def _build_costs_overview(
                 **savings,
                 "monthToDateActual": round(actual, 2),
                 "monthForecast": round(float(forecast.get("forecast") or 0), 2),
-                "monthBudget": round(budget, 2) if budget is not None else None,
+                "monthBudget": round(interval_budget, 2),
+                "intervalBudget": round(interval_budget, 2),
                 "monthVariance": (
                     round(float(forecast.get("budgetDelta") or 0), 2)
                     if forecast.get("budgetDelta") is not None
@@ -10938,7 +10965,7 @@ async def _build_costs_overview(
                     "date": day.isoformat(),
                     "actual": sum(value.values()),
                     "forecast": sum(value.values()) if day <= today else projected_daily,
-                    "budget": budget_daily,
+                    "budget": budget_daily_by_day[day.isoformat()],
                     "api": value["api"],
                     "nonApi": value["nonApi"],
                     "costBuckets": dict(bucket_daily.get(day.isoformat(), {})),
@@ -11005,7 +11032,7 @@ async def _build_costs_overview(
     )
     annual, all_budgets = await asyncio.gather(
         _build_costs_annual(
-            year=start.year, as_of=today.isoformat(), category=category,
+            year=end.year, as_of=today.isoformat(), category=category,
             cost_bucket=cost_bucket, model=model, vendor=vendor, provider=provider,
             account_id=account_id, reconciliation_status=reconciliation_status,
             recognition_status=recognition_status,
@@ -11025,17 +11052,31 @@ async def _build_costs_overview(
 async def admin_costs_overview(
     request: Request,
     month: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
     category: str = "", cost_bucket: str = "", model: str = "", vendor: str = "",
     provider: str = "", account_id: str = "", reconciliation_status: str = "",
     recognition_status: str = "", as_of: str | None = None, refresh: int = 0,
 ) -> dict[str, Any]:
     require_observability_dashboard(request)
-    target = month or date.today().strftime("%Y-%m")
+    if bool(start_date) != bool(end_date):
+        raise HTTPException(status_code=400, detail="开始日期和结束日期必须同时提供")
+    if start_date and end_date:
+        try:
+            start = date.fromisoformat(start_date)
+            end = date.fromisoformat(end_date)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="日期格式应为 YYYY-MM-DD") from exc
+        if start > end:
+            raise HTTPException(status_code=400, detail="开始日期不能晚于结束日期")
+        target = end.strftime("%Y-%m")
+    else:
+        target = month or date.today().strftime("%Y-%m")
     cutoff = as_of or date.today().isoformat()
-    key = {"month": target, "asOf": cutoff, "category": category, "costBucket": cost_bucket, "model": model, "vendor": vendor, "provider": provider, "accountId": account_id, "reconciliation": reconciliation_status, "recognition": recognition_status, "definition": "cost-v2"}
+    key = {"month": target, "startDate": start_date, "endDate": end_date, "asOf": cutoff, "category": category, "costBucket": cost_bucket, "model": model, "vendor": vendor, "provider": provider, "accountId": account_id, "reconciliation": reconciliation_status, "recognition": recognition_status, "definition": "cost-v2"}
     return await _cached_observability_dashboard(
         "cost", key,
-        lambda: _build_costs_overview(target, category, cost_bucket, model, vendor, provider, account_id, reconciliation_status, recognition_status, cutoff),
+        lambda: _build_costs_overview(month=target, start_date=start_date, end_date=end_date, category=category, cost_bucket=cost_bucket, model=model, vendor=vendor, provider=provider, account_id=account_id, reconciliation_status=reconciliation_status, recognition_status=recognition_status, as_of=cutoff),
         refresh=bool(refresh),
     )
 

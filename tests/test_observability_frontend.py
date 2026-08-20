@@ -60,18 +60,31 @@ def test_cost_observability_filters_use_expandable_toolbar() -> None:
 def test_observability_filter_controls_and_reset_scope() -> None:
     markup = (ROOT / "index.html").read_text(encoding="utf-8")
     source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
-    for element_id in ("stabilityRange", "stabilityModel", "costMonth", "costCategory", "costModel", "costVendor"):
+    for element_id in ("stabilityRangeSelect", "stabilityModel", "costRangeSelect", "costCategory", "costModel", "costVendor"):
         assert f'id="{element_id}"' in markup
     reset_start = source.index("function resetObservabilityFilters")
     reset_end = source.index("function clearObservabilityFilter", reset_start)
     reset_source = source[reset_start:reset_end]
     assert 'id: "stabilityModel"' not in reset_source
-    assert 'stabilityRange' not in reset_source
-    assert 'costMonth' not in reset_source
+    assert 'stabilityRangeSelect' not in reset_source
+    assert 'costRangeSelect' not in reset_source
     assert 'observabilityFilterConfig(scope).filters' in reset_source
     assert "currentStabilityWindow" in source
     assert "start_date=${startDate}&end_date=${endDate}&model=${encodeURIComponent(model)}" in source
     assert "cost_bucket=${encodeURIComponent(costBucket)}" in source
+
+
+def test_stability_and_cost_use_shared_date_range_controls() -> None:
+    markup = (ROOT / "index.html").read_text(encoding="utf-8")
+    source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
+    for control_id in ("stabilityRangeSelect", "costRangeSelect"):
+        assert f'id="{control_id}"' in markup
+    for value, label in (("1", "近 1 天"), ("7", "近 7 天"), ("14", "近 14 天"), ("30", "近 30 天"), ("custom", "自定义")):
+        assert f'value="{value}"' in markup
+        assert label in markup
+    assert 'function currentCostWindow()' in source
+    assert 'start_date=${startDate}&end_date=${endDate}' in source
+    assert 'const { startDate, endDate } = currentCostWindow();' in source
 
 
 def test_observability_drawers_support_paginated_safe_drilldowns() -> None:
@@ -87,6 +100,21 @@ def test_observability_drawers_support_paginated_safe_drilldowns() -> None:
     assert 'data-cost-model-series-day=' in source
     assert 'renderCostModelShare' in source
     assert 'messages' not in source[source.index('function openStabilityRequest'):source.index('function closeCostItemModal')]
+
+
+def test_model_cost_share_drilldown_uses_modal_overlay() -> None:
+    markup = (ROOT / "index.html").read_text(encoding="utf-8")
+    source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
+    assert 'id="costModelShareModal"' in markup
+    assert 'role="dialog"' in markup[markup.index('id="costModelShareModal"'):]
+    assert 'aria-modal="true"' in markup[markup.index('id="costModelShareModal"'):]
+    assert 'aria-labelledby="costModelShareModalTitle"' in markup
+    assert 'function openCostModelShareModal' in source
+    assert 'function closeCostModelShareModal' in source
+    assert 'data-close-cost-model-series' not in source
+    render_start = source.index("function renderCostModelShare(items)")
+    render_end = source.index("function openCostModelShareModal", render_start)
+    assert "renderCostModelShareDetail" not in source[render_start:render_end]
 
 
 def test_stability_drawer_has_model_filter_toolbar() -> None:

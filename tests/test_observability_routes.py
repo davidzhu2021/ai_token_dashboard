@@ -265,6 +265,39 @@ def test_cost_overview_uses_configured_defaults(monkeypatch) -> None:
     assert response.json()["coverage"]["incomplete"] is True
 
 
+def test_cost_overview_accepts_explicit_date_range_and_rejects_partial_or_invalid_ranges(monkeypatch) -> None:
+    monkeypatch.setenv("ADMIN_EMAILS", "admin@auto-link.com.cn")
+    monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True})
+    client = _client(monkeypatch)
+    response = client.get("/api/admin/costs/overview?start_date=2026-07-30&end_date=2026-08-02&as_of=2026-08-02")
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["startDate"] == "2026-07-30"
+    assert data["endDate"] == "2026-08-02"
+    assert client.get("/api/admin/costs/overview?start_date=2026-08-01").status_code == 400
+    assert client.get("/api/admin/costs/overview?start_date=bad&end_date=2026-08-01").status_code == 400
+    assert client.get("/api/admin/costs/overview?start_date=2026-08-02&end_date=2026-08-01").status_code == 400
+
+
+def test_cost_overview_prorates_cross_month_budget_and_anchors_annual_data_to_end_date(monkeypatch) -> None:
+    class CrossMonthStore(FakeObservabilityStore):
+        async def list_cost_budgets(self):
+            return [
+                {"month": "2026-07-01", "budget_usd": 3100, "daily_target_usd": 100},
+                {"month": "2026-08-01", "budget_usd": 6200, "daily_target_usd": 200},
+            ]
+
+    monkeypatch.setattr(main, "usage_store", lambda: CrossMonthStore())
+    monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True})
+    monkeypatch.setenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "true")
+    payload = TestClient(main.app).get(
+        "/api/admin/costs/overview?start_date=2026-07-31&end_date=2026-08-02&as_of=2026-08-02"
+    ).json()["data"]
+    assert payload["metrics"]["intervalBudget"] == 500
+    assert [item["budget"] for item in payload["trend"]] == [100, 200, 200]
+    assert payload["annual"]["year"] == 2026
+
+
 def test_cost_overview_returns_model_cost_share_and_daily_zero_fill(monkeypatch) -> None:
     monkeypatch.setattr(main, "usage_store", lambda: FakeModelCostShareStore())
     monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True})
