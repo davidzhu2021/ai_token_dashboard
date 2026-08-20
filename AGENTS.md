@@ -1,5 +1,9 @@
 # Repository Guidelines
 
+## 语言规范
+
+Agent 与用户交流时永远使用中文回答，包括对话回复、解释、总结、报告以及提交信息与 PR 说明（代码、命令、专有名词、标识符除外）。
+
 ## Concurrent User Edits Are Normal
 
 Agent 工作期间，用户可能会同时手动修改仓库中的文件。这是正常协作方式，不是异常情况：
