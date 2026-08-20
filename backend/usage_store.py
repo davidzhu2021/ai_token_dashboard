@@ -280,6 +280,9 @@ CREATE INDEX IF NOT EXISTS usage_event_attribution_drilldown_idx
     ON usage_event_attribution (usage_date, scenario, error_code, event_time DESC);
 CREATE INDEX IF NOT EXISTS usage_event_attribution_model_group_drilldown_idx
     ON usage_event_attribution (usage_date, model_group, scenario, error_code, event_time DESC);
+CREATE INDEX IF NOT EXISTS usage_event_attribution_stability_samples_idx
+    ON usage_event_attribution (usage_date, event_time DESC)
+    WHERE user_visible_failure IS TRUE OR attempted_retries > 0 OR error_code <> '' OR error_class <> '' OR scenario <> 'unknown';
 
 CREATE TABLE IF NOT EXISTS usage_realtime_daily (
     LIKE usage_daily INCLUDING DEFAULTS INCLUDING CONSTRAINTS
@@ -5189,20 +5192,19 @@ class UsageStore:
             _clean_text(scenario),
             _clean_text(error_code),
         )
-        total_query = pool.fetchval(f"SELECT COUNT(*) FROM usage_event_attribution WHERE {filters}", *args)
-        records_query = pool.fetch(
-            """
+        filtered_cte = """
+            WITH filtered AS MATERIALIZED (
+                SELECT request_id, backend_id, event_time, model, model_group, scenario, error_code,
+                       status, user_visible_failure, attempted_retries, ttft_ms
+                FROM usage_event_attribution WHERE """ + filters + """
+            )
+        """
+        total_query = pool.fetchval(filtered_cte + "SELECT COUNT(*) FROM filtered", *args)
+        records_query = pool.fetch(filtered_cte + """
             SELECT request_id, backend_id, event_time, model, scenario, error_code,
                    status, user_visible_failure, attempted_retries, ttft_ms
-            FROM usage_event_attribution
-            WHERE """ + filters + """
-            ORDER BY event_time DESC
-            LIMIT $6 OFFSET $7
-            """,
-            *args,
-            page_size,
-            offset,
-        )
+            FROM filtered ORDER BY event_time DESC LIMIT $6 OFFSET $7
+            """, *args, page_size, offset)
         # 模型选项与样本同口径（窗口 + 场景 + 错误码 + 异常条件），但不受 model
         # 筛选约束；合并 model 与 model_group 的 distinct 值，按出现次数降序。
         option_filters = """
@@ -5223,29 +5225,15 @@ class UsageStore:
             _clean_text(scenario),
             _clean_text(error_code),
         )
-        option_rows_query = pool.fetch(
-            """
-            SELECT name, SUM(n)::bigint AS n
-            FROM (
-                SELECT model AS name, COUNT(*)::bigint AS n
-                FROM usage_event_attribution
-                WHERE """ + option_filters + """
-                  AND NULLIF(model, '') IS NOT NULL
-                GROUP BY model
-                UNION ALL
-                SELECT model_group AS name, COUNT(*)::bigint AS n
-                FROM usage_event_attribution
-                WHERE """ + option_filters + """
-                  AND NULLIF(model_group, '') IS NOT NULL
-                GROUP BY model_group
-            ) merged
-            GROUP BY name
-            ORDER BY n DESC, name
-            LIMIT $5
-            """,
-            *option_args,
-            100,
-        )
+        option_rows_query = pool.fetch("""
+            WITH filtered AS MATERIALIZED (
+                SELECT model, model_group FROM usage_event_attribution WHERE """ + option_filters + """
+            )
+            SELECT name, COUNT(*)::bigint AS n FROM (
+                SELECT NULLIF(model, '') AS name FROM filtered
+                UNION ALL SELECT NULLIF(model_group, '') AS name FROM filtered
+            ) names WHERE name IS NOT NULL GROUP BY name ORDER BY n DESC, name LIMIT $5
+            """, *option_args, 100)
         total, records, option_rows = await asyncio.gather(total_query, records_query, option_rows_query)
         return {
             "items": [dict(record) for record in records],

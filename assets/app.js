@@ -9206,7 +9206,7 @@ async function loadStabilityScenarioSamples(filters = stabilityScenarioState.fil
   try {
     const query = new URLSearchParams({ start_date: startDate, end_date: endDate, model: filters.model || "", scenario: filters.scenario || "", error_code: filters.errorCode || "", page: String(page), page_size: String(stabilityScenarioState.pageSize) });
     const cacheKey = `stability-scenarios:${query.toString()}`;
-    const payload = observabilityDetailCache.get(cacheKey) || await api(`/api/admin/stability/scenarios?${query.toString()}`);
+    const payload = observabilityDetailCache.get(cacheKey) || await api(`/api/admin/stability/scenarios?${query.toString()}`, { timeoutMs: 45_000 });
     observabilityDetailCache.set(cacheKey, payload);
     if (requestId !== stabilityScenarioRequestId) return;
     const data = payload.data || {};
@@ -9236,7 +9236,7 @@ async function openStabilityRequest(requestId, backendId = "") {
     setStabilityDrawerMode("detail");
     const suffix = backendId ? `?backend_id=${encodeURIComponent(backendId)}` : "";
     const cacheKey = `stability-request:${requestId}:${backendId}`;
-    const payload = observabilityDetailCache.get(cacheKey) || await api(`/api/admin/stability/requests/${encodeURIComponent(requestId)}${suffix}`);
+    const payload = observabilityDetailCache.get(cacheKey) || await api(`/api/admin/stability/requests/${encodeURIComponent(requestId)}${suffix}`, { timeoutMs: 45_000 });
     observabilityDetailCache.set(cacheKey, payload);
     const detail = payload.data || {};
     const request = detail.request || detail.finalRequest || detail;
@@ -9310,7 +9310,7 @@ async function loadCostLedger() {
     const asOf = costOverview?.data?.asOf || costOverview?.asOf || new Date().toISOString().slice(0, 10);
     const query = new URLSearchParams({ start_date: startDate, end_date: endDate, as_of: asOf, page: String(costLedgerState.page), page_size: String(costLedgerState.pageSize), ...(costLedgerState.filters || {}) });
     const cacheKey = `cost-ledger:${query.toString()}`;
-    const payload = observabilityDetailCache.get(cacheKey) || await api(`/api/admin/costs/ledger?${query.toString()}`);
+    const payload = observabilityDetailCache.get(cacheKey) || await api(`/api/admin/costs/ledger?${query.toString()}`, { timeoutMs: 45_000 });
     observabilityDetailCache.set(cacheKey, payload);
     if (requestId !== costLedgerRequestId) return;
     const data = payload.data || {};

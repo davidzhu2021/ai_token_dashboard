@@ -149,6 +149,14 @@ def test_cost_ledger_page_prefers_request_level_attribution() -> None:
     assert "request_id" in connection.sql
 
 
+def test_stability_samples_use_one_filtered_cte_and_partial_index() -> None:
+    source = Path("backend/usage_store.py").read_text(encoding="utf-8")
+    start = source.index("async def stability_scenario_samples")
+    fragment = source[start : start + 7000]
+    assert "WITH filtered AS MATERIALIZED" in fragment
+    assert "usage_event_attribution_stability_samples_idx" in source
+
+
 def test_activate_plan_rejects_non_approved_or_incomplete_plan() -> None:
     class Connection:
         def transaction(self):
