@@ -78,6 +78,31 @@ def test_stability_model_ranking_uses_ranked_stability_cards() -> None:
     assert "data-stability-model=" in source
 
 
+def test_top_stability_scenarios_use_ranked_drilldown_cards() -> None:
+    markup, source = sources()
+
+    assert 'id="stabilityScenarioRanking"' in markup
+    for css_class in (
+        "stability-scenario-ranking",
+        "stability-scenario-card",
+        "stability-scenario-identity",
+        "stability-scenario-metrics",
+    ):
+        assert css_class in markup
+    for css_class in (
+        "stability-scenario-card",
+        "stability-scenario-identity",
+        "stability-scenario-metrics",
+    ):
+        assert css_class in source
+    for label in ("异常次数", "最终失败率", "模型组", "错误码"):
+        assert f">{label}<" in source
+    assert "rankingBadge(index)" in source
+    assert "data-stability-scenario=" in source
+    assert "data-stability-model=" in source
+    assert "data-stability-error-code=" in source
+
+
 def test_stability_model_ranking_hides_zero_and_full_failure_rates() -> None:
     source = Path("assets/app.js").read_text(encoding="utf-8")
 

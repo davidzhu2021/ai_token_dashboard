@@ -30,11 +30,17 @@ def test_all_ranking_surfaces_use_internal_scroll_regions() -> None:
 def test_ranking_panels_are_marked_without_affecting_regular_tables() -> None:
     markup = (ROOT / "index.html").read_text(encoding="utf-8")
 
-    for tbody_id in ("adminUserTable", "teamUserTable", "departmentUserTable", "stabilityScenarioBody"):
+    for tbody_id in ("adminUserTable", "teamUserTable", "departmentUserTable"):
         tbody_at = markup.index(f'id="{tbody_id}"')
         section_at = markup.rindex("<section", 0, tbody_at)
         section_tag = markup[section_at : markup.index(">", section_at)]
         assert "ranking-table-panel" in section_tag
+
+    scenario_ranking_at = markup.index('id="stabilityScenarioRanking"')
+    scenario_section_at = markup.rindex("<section", 0, scenario_ranking_at)
+    scenario_section = markup[scenario_section_at : markup.index(">", scenario_section_at)]
+    assert 'class="panel"' in scenario_section
+    assert "ranking-table-panel" not in scenario_section
 
     assert 'id="departmentBars" class="bars"' in markup
     department_bars_at = markup.index('id="departmentBars"')
@@ -83,7 +89,7 @@ def test_ranking_tables_keep_headers_visible_and_mobile_heights_bounded() -> Non
     assert "align-content: safe center" in team_bars_rule
     assert 'container.classList.toggle("is-compact", sorted.length > 0 && sorted.length <= 4);' in source
     assert 'const stabilityRanking = el("stabilityRanking");' in source
-    assert 'stabilityRanking.classList.toggle("is-compact", stabilityRankings.length > 0 && stabilityRankings.length <= 4);' in source
+    assert 'stabilityRanking.classList.toggle("is-compact", visibleStabilityRankings.length > 0 && visibleStabilityRankings.length <= 4);' in source
     assert 'el("costModelSplit").classList.toggle("is-compact", split.length > 0 && split.length <= 4);' in source
     assert '.filter((row) => row.value > 0)' in source
     model_renderer_start = source.index("function renderModelBarsTo")

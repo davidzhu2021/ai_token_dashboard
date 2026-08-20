@@ -164,3 +164,9 @@ def test_stability_middle_panels_have_equal_layout_and_scrollable_ranking() -> N
     assert "overscroll-behavior:contain" in markup
     assert "@media (max-width: 900px)" in markup and ".observability-stability-grid { grid-template-columns:1fr; }" in markup
     assert "@media (max-width: 560px)" in markup and ".observability-stability-grid > .panel { height:300px; min-height:300px; }" in markup
+
+
+def test_stability_actions_panel_spans_the_dashboard_row() -> None:
+    markup = (ROOT / "index.html").read_text(encoding="utf-8")
+    assert ".observability-grid:has(> .panel > #stabilityActions)" in markup
+    assert "grid-template-columns:1fr" in markup

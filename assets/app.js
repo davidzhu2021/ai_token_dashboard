@@ -8727,10 +8727,16 @@ function renderStabilityOverview() {
     const score = stabilityScore(item);
     return `<button class="observability-rank-card is-${stabilityRankingStateClass(state)}" type="button" title="查看 ${escapeHtml(modelName)} 的稳定性详情" data-stability-model="${escapeHtml(item.model || item.requestedModelGroup || "")}">${rankingBadge(index)}<div class="observability-rank-identity"><strong class="observability-rank-model">${escapeHtml(modelName)}</strong><div class="observability-rank-score"><span>综合稳定度</span><div class="observability-rank-track" aria-hidden="true"><div class="observability-rank-fill" style="width:${score}%"></div></div><strong>${score}</strong></div></div><div class="observability-rank-metrics"><span class="observability-rank-metric"><span>失败</span><strong>${escapeHtml(observabilityPercent(failureRate))}</strong></span><span class="observability-rank-metric"><span>兜底</span><strong>${escapeHtml(formatStabilityFallback(item))}</strong></span><span class="observability-rank-metric"><span>TTFT</span><strong>${escapeHtml(formatStabilityTtft(item.ttftP95Ms))}</strong></span></div><span class="observability-rank-status">${escapeHtml(state)}</span></button>`;
   }).join("")}</div>` : observabilityEmptyState("暂无模型排名", "当前窗口没有可比较的模型样本。", [{ label: "调整筛选", attr: 'data-observability-empty-action="filters" data-observability-scope="stability"' }]);
-  el("stabilityScenarioBody").innerHTML = (data.topScenarios || []).map((item) => {
+  const topScenarios = data.topScenarios || [];
+  const maxScenarioCount = Math.max(1, ...topScenarios.map((item) => Number(item.count) || 0));
+  el("stabilityScenarioRanking").innerHTML = topScenarios.length ? topScenarios.map((item, index) => {
     const failureRate = item.finalRequestFailureRate ?? item.userVisibleFailureRate;
-    return `<tr><td>${escapeHtml(item.scenario)}</td><td>${escapeHtml(item.requestedModelGroup || item.model || "-")}</td><td>${escapeHtml(item.errorCode || "-")}</td><td>${item.count}</td><td>${escapeHtml(observabilityPercent(failureRate))}</td><td><button class="ghost-btn" type="button" data-stability-scenario="${escapeHtml(item.scenario || "")}" data-stability-model="${escapeHtml(item.requestedModelGroup || item.model || "")}" data-stability-error-code="${escapeHtml(item.errorCode || "")}">查看样本（${item.count || 0}）</button></td></tr>`;
-  }).join("") || `<tr><td colspan="6" class="empty">${hasTrendValues && !hasNonZeroTrend ? "本期确无异常场景" : "异常场景数据暂不可用"}</td></tr>`;
+    const count = Number(item.count) || 0;
+    const modelName = item.requestedModelGroup || item.model || "-";
+    const errorCode = item.errorCode || "-";
+    const countPercent = Math.max(3, count / maxScenarioCount * 100);
+    return `<button class="stability-scenario-card" type="button" title="查看 ${escapeHtml(item.scenario || "未知场景")} 的异常样本" data-stability-scenario="${escapeHtml(item.scenario || "")}" data-stability-model="${escapeHtml(item.requestedModelGroup || item.model || "")}" data-stability-error-code="${escapeHtml(item.errorCode || "")}">${rankingBadge(index)}<div class="stability-scenario-identity"><strong class="stability-scenario-name">${escapeHtml(item.scenario || "未知场景")}</strong><div class="stability-scenario-count"><span>异常次数</span><div class="stability-scenario-track" aria-hidden="true"><div class="stability-scenario-fill" style="width:${countPercent}%"></div></div><strong>${count.toLocaleString("zh-CN")}</strong></div></div><div class="stability-scenario-metrics"><span class="stability-scenario-metric"><span>最终失败率</span><strong>${escapeHtml(observabilityPercent(failureRate))}</strong></span><span class="stability-scenario-metric"><span>模型组</span><strong title="${escapeHtml(modelName)}">${escapeHtml(modelName)}</strong></span><span class="stability-scenario-metric"><span>错误码</span><strong title="${escapeHtml(errorCode)}">${escapeHtml(errorCode)}</strong></span></div><span class="stability-scenario-action">查看样本</span></button>`;
+  }).join("") : observabilityEmptyState(hasTrendValues && !hasNonZeroTrend ? "本期确无异常场景" : "异常场景数据暂不可用", hasTrendValues && !hasNonZeroTrend ? "当前窗口没有需要下钻的异常请求。" : "请稍后刷新，或调整筛选范围后重试。", [{ label: "调整筛选", attr: 'data-observability-empty-action="filters" data-observability-scope="stability"' }]);
   renderStabilityActions(data);
   renderObservabilityQuality("stabilityQuality", payload, "stability");
   const models = [...new Set((data.modelRankings || []).map((item) => item.model))];
@@ -10843,7 +10849,7 @@ el("stabilityScenarioResetButton")?.addEventListener("click", () => {
   updateStabilityScenarioTitle(filters);
   loadStabilityScenarioSamples(filters, 1);
 });
-el("stabilityScenarioBody")?.addEventListener("click", (event) => {
+el("stabilityScenarioRanking")?.addEventListener("click", (event) => {
   const scenarioButton = event.target.closest("[data-stability-scenario]");
   if (scenarioButton) {
     openStabilityScenario(scenarioButton);
