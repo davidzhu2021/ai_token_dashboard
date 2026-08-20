@@ -316,6 +316,15 @@ return {1, revision}
             f"{self.prefix}:cursors", backend_id, value.astimezone(timezone.utc).isoformat()
         )
 
+    async def set_verified_through(self, backend_id: str, value: datetime) -> None:
+        await self.client.hset(
+            f"{self.prefix}:settlements", backend_id, value.astimezone(timezone.utc).isoformat()
+        )
+
+    async def set_settlement_status(self, backend_id: str, status: str, error: str = "") -> None:
+        payload = json.dumps({"status": status, "error": error[:500]}, ensure_ascii=False)
+        await self.client.hset(f"{self.prefix}:settlement-status", backend_id, payload)
+
     async def cursor(self, backend_id: str) -> datetime | None:
         value = await self.client.hget(f"{self.prefix}:cursors", backend_id)
         if not value:
@@ -460,9 +469,17 @@ return {1, revision}
                 latest_dt = None
         pending = await self.client.xpending(self.stream_key, self.consumer_group)
         cursors = await self.client.hgetall(f"{self.prefix}:cursors")
+        settlements = await self.client.hgetall(f"{self.prefix}:settlements")
+        settlement_statuses = await self.client.hgetall(f"{self.prefix}:settlement-status")
         backfill_checkpoints = await self.client.hgetall(
             f"{self.prefix}:backfill-checkpoints"
         )
+        parsed_statuses: dict[str, Any] = {}
+        for backend_id, value in settlement_statuses.items():
+            try:
+                parsed_statuses[backend_id] = json.loads(value) if isinstance(value, str) else value
+            except (TypeError, ValueError):
+                parsed_statuses[backend_id] = {"status": "verifying", "error": "invalid settlement status"}
         return {
             "connected": True,
             "ready": await self.ready(),
@@ -475,6 +492,8 @@ return {1, revision}
             ),
             "pendingArchiveCount": int((pending or {}).get("pending") or 0),
             "cursors": cursors,
+            "verifiedThrough": settlements,
+            "settlementStatuses": parsed_statuses,
             "backfillActive": bool(backfill_checkpoints),
             "backfillBackends": sorted(backfill_checkpoints),
             "backfillCheckpoints": backfill_checkpoints,

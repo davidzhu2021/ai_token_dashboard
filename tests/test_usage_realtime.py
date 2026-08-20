@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from backend.litellm_client import LiteLLMBackend, LiteLLMClient
 from backend.usage_realtime import UsageRealtimeStore
@@ -96,6 +96,258 @@ def test_incremental_spend_logs_resume_from_bounded_page_checkpoint() -> None:
     assert events == []
     assert complete is False
     assert [request["page"] for request in client.requests] == [2, 3]
+
+
+def test_settled_spend_window_rejects_a_page_count_above_its_safety_limit() -> None:
+    client = IncrementalClient([[], [], []])
+
+    events, complete = asyncio.run(
+        client.settled_events_from_logs(
+            datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 13, 2, 1, tzinfo=timezone.utc),
+            BACKEND,
+            max_pages=2,
+        )
+    )
+
+    assert events == []
+    assert complete is False
+    assert [request["page"] for request in client.requests] == [1]
+
+
+def test_settled_spend_window_rejects_inconsistent_page_shape() -> None:
+    class Client(IncrementalClient):
+        async def request_backend(self, backend, method, path, **kwargs):
+            self.requests.append(kwargs["params"])
+            page = int(kwargs["params"]["page"])
+            if page == 1:
+                return {"data": [{"request_id": "req-1"}], "total_pages": 2, "page": 1}
+            # The upstream changed its snapshot while the scan was in flight.
+            return {"data": [], "total_pages": 2, "page": 2}
+
+    client = Client([])
+    events, complete = asyncio.run(
+        client.settled_events_from_logs(
+            datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 13, 2, 1, tzinfo=timezone.utc),
+            BACKEND,
+            max_pages=2,
+        )
+    )
+
+    assert events == []
+    assert complete is False
+
+
+def test_failed_settlement_records_segment_error_without_advancing_watermark() -> None:
+    errors = []
+    advances = []
+
+    class Client:
+        async def settled_events_from_logs(self, *_args, **_kwargs):
+            return [], False
+
+    class Store:
+        async def record_realtime_settlement_segment(self, **kwargs):
+            errors.append(kwargs)
+
+        async def advance_realtime_settlement(self, *args, **kwargs):
+            advances.append((args, kwargs))
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.client = Client()
+    worker.store = Store()
+    worker.realtime = None
+    worker.settlement_min_window_seconds = 60
+    worker.settlement_max_pages = 2
+    worker._enrich_event = lambda _backend, event: event
+
+    complete = asyncio.run(
+        worker.settle_and_advance(
+            BACKEND,
+            datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 13, 2, 1, tzinfo=timezone.utc),
+        )
+    )
+
+    assert complete is False
+    assert advances == []
+    assert errors and errors[-1]["status"] == "incomplete"
+
+
+def test_settlement_target_stops_at_the_last_closed_minute() -> None:
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.settlement_delay_seconds = 180
+
+    target = worker.settlement_target(
+        datetime(2026, 8, 13, 2, 5, 42, tzinfo=timezone.utc)
+    )
+
+    assert target == datetime(2026, 8, 13, 2, 2, tzinfo=timezone.utc)
+
+
+def test_dense_settlement_window_is_split_without_advancing_the_watermark() -> None:
+    calls = []
+
+    class Client:
+        async def settled_events_from_logs(self, start, end, *_args, **_kwargs):
+            calls.append((start, end))
+            if (end - start).total_seconds() > 30:
+                return [], False
+            return [{"requestId": f"{start.timestamp()}"}], True
+
+    class Store:
+        async def archive_realtime_events(self, _events):
+            return 1
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.client = Client()
+    worker.store = Store()
+    worker.settlement_min_window_seconds = 15
+    worker.settlement_max_pages = 2
+    worker._enrich_event = lambda _backend, event: event
+
+    complete = asyncio.run(
+        worker.settle_window(
+            BACKEND,
+            datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 13, 2, 1, tzinfo=timezone.utc),
+        )
+    )
+
+    assert complete is True
+    assert calls[0] == (
+        datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc),
+        datetime(2026, 8, 13, 2, 1, tzinfo=timezone.utc),
+    )
+    assert len(calls) == 3
+
+
+def test_closed_settlement_advances_only_after_a_complete_window() -> None:
+    advances = []
+
+    class Client:
+        async def settled_events_from_logs(self, *_args, **_kwargs):
+            return [{"requestId": "req-1"}], True
+
+    class Store:
+        async def archive_realtime_events(self, _events):
+            return 1
+
+        async def advance_realtime_settlement(self, backend_id, end_time, **_kwargs):
+            advances.append((backend_id, end_time))
+
+    class Realtime:
+        async def ingest_event(self, *_args, **_kwargs):
+            return True, 1
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.client = Client()
+    worker.store = Store()
+    worker.realtime = Realtime()
+    worker.settlement_min_window_seconds = 5
+    worker.settlement_max_pages = 2
+    worker._enrich_event = lambda _backend, event: event
+
+    end = datetime(2026, 8, 13, 2, 1, tzinfo=timezone.utc)
+    assert asyncio.run(worker.settle_and_advance(BACKEND, end - timedelta(minutes=1), end)) is True
+    assert advances == [("primary", end)]
+
+
+def test_realtime_status_exposes_unsettled_backend_state() -> None:
+    values = {
+        "usage:realtime:settlement-status": {
+            "primary": '{"status":"verifying","error":"page drift"}',
+        },
+        "usage:realtime:settlements": {},
+    }
+
+    class Client:
+        async def ping(self):
+            return True
+
+        async def get(self, _key):
+            return None
+
+        async def xpending(self, *_args):
+            return {"pending": 0}
+
+        async def hgetall(self, key):
+            return values.get(key, {})
+
+    store = UsageRealtimeStore.__new__(UsageRealtimeStore)
+    store.client = Client()
+    store.prefix = "usage:realtime"
+    store.stream_key = "usage:realtime:archive"
+    store.consumer_group = "workers"
+
+    status = asyncio.run(store.status())
+    assert status["settlementStatuses"]["primary"]["status"] == "verifying"
+
+
+def test_publish_mirror_uses_the_durable_request_audit_rows() -> None:
+    published = []
+
+    class Store:
+        async def realtime_event_rows(self, day):
+            assert day == date(2026, 8, 13)
+            return [{"backendId": "primary", "date": day.isoformat(), "spend": 9.5}]
+
+        async def replace_realtime_aggregates(self, day, rows):
+            published.append((day, rows))
+
+        async def publish_realtime_state(self, *_args, **_kwargs):
+            return None
+
+    class Realtime:
+        async def status(self):
+            return {"revision": 1, "latestEventAt": None}
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.store = Store()
+    worker.realtime = Realtime()
+    worker.current_day = date(2026, 8, 13)
+
+    asyncio.run(worker.publish_mirror())
+
+    assert published == [(date(2026, 8, 13), [{"backendId": "primary", "date": "2026-08-13", "spend": 9.5}])]
+
+
+def test_recovery_discards_legacy_page_backfill_checkpoints() -> None:
+    cleared = []
+
+    class Realtime:
+        async def set_ready(self, *_args): return None
+        async def clear_day(self, *_args): return None
+        async def seed_aggregate(self, *_args): return None
+        async def seed_request_ids(self, *_args): return None
+        async def clear_backfill_checkpoint(self, backend_id): cleared.append(backend_id)
+        async def set_cursor(self, *_args): return None
+        async def revision(self): return 1
+        async def status(self): return {"revision": 1, "latestEventAt": None}
+        async def set_verified_through(self, *_args): return None
+
+    class Store:
+        async def update_worker_state(self, **_kwargs): return None
+        async def realtime_recovery_rows(self, *_args): return []
+        async def realtime_request_ids(self, *_args): return []
+        async def latest_archived_event_at(self, *_args): return None
+        async def realtime_event_rows(self, *_args): return []
+        async def replace_realtime_aggregates(self, *_args): return None
+        async def publish_realtime_state(self, *_args, **_kwargs): return None
+        async def publish_realtime_coverage(self, *_args): return None
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.realtime = Realtime(); worker.store = Store(); worker.client = type("Client", (), {"backends": [BACKEND]})()
+    worker.worker_id = "test"; worker.overlap_seconds = 60; worker.live_window_seconds = 60; worker.current_day = date(2026, 8, 13)
+    worker.resettle_today = lambda *_args: asyncio.sleep(0)
+    worker.settle_pending_windows = lambda *_args: asyncio.sleep(0)
+    worker.flush_archive = lambda: asyncio.sleep(0)
+    worker.publish_mirror = lambda **_kwargs: asyncio.sleep(0)
+
+    asyncio.run(worker.recover())
+
+    assert cleared == ["primary"]
 
 
 def test_publish_snapshot_date_parameters_are_date_objects() -> None:

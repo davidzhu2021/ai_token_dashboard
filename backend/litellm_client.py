@@ -3761,6 +3761,93 @@ class LiteLLMClient:
             consumed_pages += 1
         return events, page > total_pages
 
+    async def settled_events_from_logs(
+        self,
+        start_time: datetime,
+        end_time: datetime,
+        backend: LiteLLMBackend | None = None,
+        *,
+        max_pages: int,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Read one closed time window without accepting a partial page set.
+
+        Callers must keep the window closed to new writes.  A page-count limit
+        turns a dense window into an explicit retry/split signal instead of
+        silently advancing a cursor with an incomplete result.
+        """
+        backend = backend or self.backends[0]
+        await self._ensure_deployment_model_map(backend)
+        start_text = start_time.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        end_text = end_time.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        payload = await self.request_backend(
+            backend,
+            "GET",
+            "/spend/logs/v2",
+            params={
+                "start_date": start_text,
+                "end_date": end_text,
+                "page": 1,
+                "page_size": 100,
+                "sort_by": "startTime",
+                "sort_order": "asc",
+            },
+        )
+        total_pages = max(1, _as_int(_first(payload, "total_pages", "totalPages", default=1)))
+        if total_pages > max(1, max_pages):
+            return [], False
+        pages = [_records(payload)]
+        first_page_number = _as_int(_first(payload, "page", default=1))
+        if first_page_number != 1:
+            return [], False
+        for page in range(2, total_pages + 1):
+            response = await self.request_backend(
+                backend,
+                "GET",
+                "/spend/logs/v2",
+                params={
+                    "start_date": start_text,
+                    "end_date": end_text,
+                    "page": page,
+                    "page_size": 100,
+                    "sort_by": "startTime",
+                    "sort_order": "asc",
+                },
+            )
+            # The closed interval should have a stable shape. Treat any
+            # discrepancy as incomplete and retry this interval later.
+            if _as_int(_first(response, "total_pages", "totalPages", default=total_pages)) != total_pages:
+                return [], False
+            if _as_int(_first(response, "page", default=page)) != page:
+                return [], False
+            # A non-final page must be full. A short/empty page here means the
+            # upstream result changed while the scan was in flight.
+            records = _records(response)
+            if page < total_pages and len(records) < 100:
+                return [], False
+            pages.append(records)
+
+        if total_pages > 1 and len(pages[0]) < 100:
+            return [], False
+
+        events: list[dict[str, Any]] = []
+        for logs in pages:
+            for log in logs:
+                event_time = str(_first(log, "startTime", "start_time", "created_at", default="") or "")
+                event = self._empty_usage_row(
+                    _date_text_in_usage_timezone(event_time), backend.source or detect_source(log), self._usage_model_name(log, backend=backend)
+                )
+                event.update(self._log_usage_attribution(log))
+                event.update({
+                    "requestId": _clean_text(_first(log, "request_id", "requestId", "litellm_call_id", "id", default="")),
+                    "eventTime": event_time,
+                    "_userId": self._log_raw_user(log) or "unattributed",
+                })
+                if not event["requestId"]:
+                    return [], False
+                self._add_log_to_row(event, log)
+                events.append(event)
+        return events, True
+
     async def stability_rows_from_logs(
         self,
         start_date: str,

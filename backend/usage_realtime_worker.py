@@ -75,6 +75,11 @@ class UsageRealtimeWorker:
         self.backfill_pages_per_cycle = max(
             1, _env_int("USAGE_REALTIME_BACKFILL_PAGES_PER_CYCLE", 5)
         )
+        # Only publish fully scanned windows that are safely behind upstream
+        # writes. Dense windows are split before their watermark advances.
+        self.settlement_delay_seconds = max(60, _env_int("USAGE_REALTIME_SETTLEMENT_DELAY_SECONDS", 180))
+        self.settlement_max_pages = max(1, _env_int("USAGE_REALTIME_SETTLEMENT_MAX_PAGES", 20))
+        self.settlement_min_window_seconds = max(1, _env_int("USAGE_REALTIME_SETTLEMENT_MIN_WINDOW_SECONDS", 5))
         self.directory: dict[str, Any] = {}
         self.token_maps: dict[str, dict[Any, Any]] = {}
         self.team_by_user: dict[tuple[str, str], tuple[str, str]] = {}
@@ -257,39 +262,16 @@ class UsageRealtimeWorker:
         # Directory names are already durable in PostgreSQL; refresh them
         # after the realtime cursor is running so a slow upstream directory
         # API cannot block cold-start recovery.
-        today_start = datetime.combine(
-            today, datetime.min.time(), tzinfo=timezone.utc
-        )
+        # Legacy cursors/backfill checkpoints were based on rolling pages.
+        # Closed-window settlements supersede them, so do not resume a cursor
+        # that could carry a historical page gap into the new worker.
         for backend in self.client.backends:
-            last_archived = await self.store.latest_archived_event_at(backend.id)
-            # The archive table spans all history. Never let an old event from
-            # a previous day turn the first realtime request into a multi-day
-            # scan; today's recovery is seeded from the database separately.
-            recovery_start = (
-                max(last_archived - timedelta(seconds=self.overlap_seconds), today_start)
-                if last_archived
-                else today_start
-            )
-            recovery_end = datetime.now(timezone.utc)
-            existing_cursor = await self.realtime.cursor(backend.id)
-            recent_floor = recovery_end - timedelta(seconds=self.live_window_seconds)
-            live_start = max(recovery_start, recent_floor)
-            if existing_cursor and existing_cursor >= recent_floor:
-                live_start = max(recovery_start, existing_cursor)
-            await self.realtime.set_cursor(backend.id, live_start)
-            existing_backfill = await self.realtime.backfill_checkpoint(backend.id)
-            if existing_backfill:
-                continue
-            if recovery_start < live_start:
-                await self.realtime.set_backfill_checkpoint(
-                    backend.id,
-                    start_time=recovery_start,
-                    end_time=live_start,
-                    next_page=1,
-                )
-            else:
-                await self.realtime.clear_backfill_checkpoint(backend.id)
-        await self.poll_once(datetime.now(timezone.utc))
+            await self.realtime.clear_backfill_checkpoint(backend.id)
+        # Replay today's closed intervals once after deployment. The audit table
+        # deduplicates request IDs, so this safely fills earlier rolling-page gaps.
+        if _env_int("USAGE_REALTIME_RESYNC_TODAY_ON_START", 1):
+            await self.resettle_today(datetime.now(timezone.utc))
+        await self.settle_pending_windows(datetime.now(timezone.utc))
         await self.flush_archive()
         await self.publish_mirror(ready=True)
         await self.store.publish_realtime_coverage(
@@ -330,6 +312,126 @@ class UsageRealtimeWorker:
         if lookback_minutes is None:
             await self.realtime.set_cursor(backend.id, end_time)
         return inserted
+
+    def settlement_target(self, now: datetime) -> datetime:
+        """Return the exclusive end of the most recent safely closed minute."""
+
+        closed_at = now.astimezone(timezone.utc) - timedelta(seconds=self.settlement_delay_seconds)
+        return closed_at.replace(second=0, microsecond=0)
+
+    async def settle_window(
+        self,
+        backend: LiteLLMBackend,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> bool:
+        """Persist a closed interval, recursively splitting dense page sets."""
+
+        events, complete = await self.client.settled_events_from_logs(
+            start_time, end_time, backend, max_pages=self.settlement_max_pages
+        )
+        if complete:
+            enriched_events = [{**self._enrich_event(backend, event), "backendId": backend.id} for event in events]
+            await self.store.archive_realtime_events(enriched_events)
+            record_segment = getattr(self.store, "record_realtime_settlement_segment", None)
+            if callable(record_segment):
+                await record_segment(
+                    backend_id=backend.id,
+                    start_time=start_time,
+                    end_time=end_time,
+                    status="complete",
+                    request_count=len(enriched_events),
+                    amount=sum(float(event.get("spend") or 0) for event in enriched_events),
+                    completed_at=datetime.now(timezone.utc),
+                )
+            realtime = getattr(self, "realtime", None)
+            if realtime is not None:
+                for event in enriched_events:
+                    await realtime.ingest_event(backend.id, event)
+            return True
+        seconds = (end_time - start_time).total_seconds()
+        if seconds <= self.settlement_min_window_seconds:
+            logger.warning(
+                "settlement window remains incomplete backend=%s start=%s end=%s",
+                backend.id, start_time.isoformat(), end_time.isoformat(),
+            )
+            return False
+        midpoint = start_time + (end_time - start_time) / 2
+        midpoint = midpoint.replace(microsecond=0)
+        if midpoint <= start_time or midpoint >= end_time:
+            return False
+        return await self.settle_window(backend, start_time, midpoint) and await self.settle_window(backend, midpoint, end_time)
+
+    async def settle_and_advance(
+        self, backend: LiteLLMBackend, start_time: datetime, end_time: datetime
+    ) -> bool:
+        """Advance durable progress only after an entire closed interval lands."""
+
+        complete = await self.settle_window(backend, start_time, end_time)
+        set_status = getattr(self.realtime, "set_settlement_status", None)
+        if not complete:
+            record_segment = getattr(self.store, "record_realtime_settlement_segment", None)
+            if callable(record_segment):
+                await record_segment(
+                    backend_id=backend.id,
+                    start_time=start_time,
+                    end_time=end_time,
+                    status="incomplete",
+                    retry_count=1,
+                    error_summary="upstream page set incomplete or exceeded safety limit",
+                )
+            if callable(set_status):
+                await set_status(backend.id, "verifying", "upstream page set incomplete or exceeded safety limit")
+            return False
+        advance = getattr(self.store, "advance_realtime_settlement", None)
+        if callable(advance):
+            await advance(backend.id, end_time)
+        set_verified = getattr(self.realtime, "set_verified_through", None)
+        if callable(set_verified):
+            await set_verified(backend.id, end_time)
+        if callable(set_status):
+            await set_status(backend.id, "settled")
+        return True
+
+    def settlement_day_start(self, target: datetime) -> datetime:
+        offset_minutes = _env_int("USAGE_TIMEZONE_OFFSET_MINUTES", -480)
+        local_tz = timezone(timedelta(minutes=-offset_minutes))
+        local_day = target.astimezone(local_tz).date()
+        return datetime.combine(local_day, datetime.min.time(), tzinfo=local_tz).astimezone(timezone.utc)
+
+    async def settle_pending_windows(self, now: datetime) -> None:
+        """Settle complete one-minute windows through the shared watermark."""
+
+        target = self.settlement_target(now)
+        if target <= self.settlement_day_start(target):
+            return
+        loader = getattr(self.store, "realtime_settlement", None)
+        for backend in self.client.backends:
+            state = await loader(backend.id) if callable(loader) else None
+            start = (state or {}).get("verifiedThrough") or self.settlement_day_start(target)
+            if not isinstance(start, datetime):
+                start = self.settlement_day_start(target)
+            start = start.astimezone(timezone.utc).replace(second=0, microsecond=0)
+            while start < target:
+                end = min(start + timedelta(minutes=1), target)
+                if not await self.settle_and_advance(backend, start, end):
+                    break
+                start = end
+
+    async def resettle_today(self, now: datetime | None = None) -> None:
+        """Rebuild the current local day through closed, auditable windows."""
+
+        now = now or datetime.now(timezone.utc)
+        target = self.settlement_target(now)
+        if target <= self.settlement_day_start(target):
+            return
+        for backend in self.client.backends:
+            start = self.settlement_day_start(target)
+            while start < target:
+                end = min(start + timedelta(minutes=1), target)
+                if not await self.settle_and_advance(backend, start, end):
+                    break
+                start = end
 
     async def backfill_backend(self, backend: LiteLLMBackend) -> int:
         """Advance one bounded historical batch without delaying live polling."""
@@ -461,8 +563,8 @@ class UsageRealtimeWorker:
         await self.store.finalize_realtime_day(previous_day, identities)
 
     async def publish_mirror(self, *, ready: bool = True) -> None:
-        today = usage_today()
-        rows = await self.realtime.aggregate_rows(today)
+        today = self.current_day
+        rows = await self.store.realtime_event_rows(today)
         await self.store.replace_realtime_aggregates(today, rows)
         status = await self.realtime.status()
         await self.store.publish_realtime_state(
@@ -511,8 +613,7 @@ class UsageRealtimeWorker:
                 if (now - last_directory_refresh).total_seconds() >= self.directory_refresh_seconds:
                     await self._refresh_directories()
                     last_directory_refresh = now
-                await self.poll_once(now)
-                await self.backfill_once()
+                await self.settle_pending_windows(now)
                 await self.backfill_cost_aggregates()
                 await self.consume_refresh_requests()
                 if (now - last_reconcile).total_seconds() >= self.reconcile_seconds:

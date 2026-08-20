@@ -240,6 +240,7 @@ let stabilityScenarioState = {
   loading: false,
   error: "",
 };
+const observabilityDetailCache = new Map();
 let costLedgerState = {
   page: 1,
   pageSize: 20,
@@ -840,11 +841,18 @@ function overviewContext(latestDate) {
 
 function freshnessText(freshness) {
   if (!freshness) return "数据更新时间：最近一次同步";
+  if (freshness.verifiedThrough) {
+    const verified = new Date(freshness.verifiedThrough);
+    if (!Number.isNaN(verified.getTime())) {
+      const label = freshness.settlementState === "settled" ? "已核验截至" : "数据核验中，已核验截至";
+      return `${label}：${verified.toLocaleString("zh-CN", { hour12: false })}`;
+    }
+  }
   if (!freshness.lastSyncedAt) return "数据更新时间：暂未同步";
   const parsed = new Date(freshness.lastSyncedAt);
   if (Number.isNaN(parsed.getTime())) return "数据更新时间：未知";
   const timeText = parsed.toLocaleString("zh-CN", { hour12: false });
-  const prefix = freshness.source === "realtime" ? "实时数据更新" : "数据更新时间";
+  const prefix = freshness.source === "realtime" ? "数据核验中" : "数据更新时间";
   return `${freshness.stale || freshness.degraded ? `${prefix}（同步延迟）` : prefix}：${timeText}`;
 }
 
@@ -9197,7 +9205,9 @@ async function loadStabilityScenarioSamples(filters = stabilityScenarioState.fil
   const { startDate, endDate } = currentStabilityWindow();
   try {
     const query = new URLSearchParams({ start_date: startDate, end_date: endDate, model: filters.model || "", scenario: filters.scenario || "", error_code: filters.errorCode || "", page: String(page), page_size: String(stabilityScenarioState.pageSize) });
-    const payload = await api(`/api/admin/stability/scenarios?${query.toString()}`);
+    const cacheKey = `stability-scenarios:${query.toString()}`;
+    const payload = observabilityDetailCache.get(cacheKey) || await api(`/api/admin/stability/scenarios?${query.toString()}`);
+    observabilityDetailCache.set(cacheKey, payload);
     if (requestId !== stabilityScenarioRequestId) return;
     const data = payload.data || {};
     stabilityScenarioState = { ...stabilityScenarioState, items: data.items || [], total: Number(data.total || 0), page: Number(data.page || page), modelOptions: data.modelOptions || [], loading: false, error: "" };
@@ -9225,7 +9235,9 @@ async function openStabilityRequest(requestId, backendId = "") {
   try {
     setStabilityDrawerMode("detail");
     const suffix = backendId ? `?backend_id=${encodeURIComponent(backendId)}` : "";
-    const payload = await api(`/api/admin/stability/requests/${encodeURIComponent(requestId)}${suffix}`);
+    const cacheKey = `stability-request:${requestId}:${backendId}`;
+    const payload = observabilityDetailCache.get(cacheKey) || await api(`/api/admin/stability/requests/${encodeURIComponent(requestId)}${suffix}`);
+    observabilityDetailCache.set(cacheKey, payload);
     const detail = payload.data || {};
     const request = detail.request || detail.finalRequest || detail;
     const labels = { request_id: "请求 ID", requestId: "请求 ID", event_time: "请求时间", eventTime: "请求时间", model: "模型", requestedModelGroup: "请求模型组", provider: "来源", model_group: "模型组", modelGroup: "模型组", model_id: "模型线路", modelId: "模型线路", status: "最终状态", error_code: "错误码", errorCode: "错误码", error_class: "错误分类", errorClass: "错误分类", error_message: "脱敏错误信息", errorMessage: "脱敏错误信息", scenario: "异常场景", request_duration_ms: "请求时长（毫秒）", requestDurationMs: "请求时长（毫秒）", ttft_ms: "TTFT（毫秒）", ttftMs: "TTFT（毫秒）", prompt_tokens: "输入 Token", promptTokens: "输入 Token", completion_tokens: "输出 Token", completionTokens: "输出 Token", total_tokens: "总 Token", totalTokens: "总 Token", attempted_retries: "重试次数", attemptedRetries: "重试次数", max_retries: "最大重试次数", maxRetries: "最大重试次数", trace_id: "调用链标识", traceId: "调用链标识", user_visible_failure: "用户最终失败", finalRequestFailure: "用户最终失败", finalRequestFailureSource: "最终失败口径", organization_id: "组织归属", team_id: "团队归属", principal_id: "归属主体", collected_at: "采集时间", collectedAt: "采集时间" };
@@ -9297,7 +9309,9 @@ async function loadCostLedger() {
     const { startDate, endDate } = currentCostWindow();
     const asOf = costOverview?.data?.asOf || costOverview?.asOf || new Date().toISOString().slice(0, 10);
     const query = new URLSearchParams({ start_date: startDate, end_date: endDate, as_of: asOf, page: String(costLedgerState.page), page_size: String(costLedgerState.pageSize), ...(costLedgerState.filters || {}) });
-    const payload = await api(`/api/admin/costs/ledger?${query.toString()}`);
+    const cacheKey = `cost-ledger:${query.toString()}`;
+    const payload = observabilityDetailCache.get(cacheKey) || await api(`/api/admin/costs/ledger?${query.toString()}`);
+    observabilityDetailCache.set(cacheKey, payload);
     if (requestId !== costLedgerRequestId) return;
     const data = payload.data || {};
     costLedgerState = { ...costLedgerState, items: data.items || [], total: Number(data.total || 0), page: Number(data.page || costLedgerState.page), loading: false };

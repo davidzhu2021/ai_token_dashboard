@@ -1,0 +1,1793 @@
+﻿diff --git a/README.md b/README.md
+index 2ea9264..447988c 100644
+--- a/README.md
++++ b/README.md
+@@ -110,7 +110,7 @@ $env:APP_BASE_URL='http://127.0.0.1:8001'; $env:ORGANIZATION_DEMO_ENABLED='true'
+ - `avery.chen@demo.example`：Demo Company 普通成员，仅个人用量。
+ - `ning.shen@aurora.example`：北辰智造有限公司企业主和团队负责人。
+ 
+-卖方平台管理员保留全局全员/部门看板，并额外看到“客户企业”；进入具体客户后才能维护该客户的部门和成员并查看该客户的 Mock 看板。甲方企业主和管理员只能看到自己的企业范围看板，团队负责人只看自己负责团队，普通成员不显示客户企业或企业范围看板。浏览器刷新会保留本次内存操作；服务重启或平台管理员点击“重置演示数据”后会恢复固定种子。生产环境必须保持 `ORGANIZATION_DEMO_ENABLED=false` 和 `DEV_LOGIN_ENABLED=false`。
++卖方平台管理员保留全局全员/部门看板，并额外看到“客户企业”；进入具体客户后才能维护该客户的部门和成员、查看该客户的 Mock 看板，以及只读查看“企业额度”。甲方企业主和管理员只能看到自己的企业范围看板，并在侧栏看到“充值中心”：每家演示企业初始企业额度为 `$5,000.00`，可执行“模拟充值”，不会发起真实付款、扣减余额、调用支付服务或影响演示用量。乙方平台管理员、乙方普通员工、甲方普通成员、待邀请和暂停成员都不会看到该侧栏入口。团队负责人只看自己负责团队，普通成员不显示客户企业或企业范围看板。浏览器刷新会保留本次内存操作；服务重启或平台管理员点击“重置演示数据”后会恢复固定种子。生产环境必须保持 `ORGANIZATION_DEMO_ENABLED=false` 和 `DEV_LOGIN_ENABLED=false`。
+ 
+ ## Docker 启动
+ 
+diff --git a/assets/app.js b/assets/app.js
+index c324b49..99f7547 100644
+--- a/assets/app.js
++++ b/assets/app.js
+@@ -124,6 +124,17 @@ let billingAvailable = false;
+ let selectedTopupAmount = 0;
+ let pendingTopupTradeNo = "";
+ let topupPollTimer = null;
++// Enterprise demo billing is intentionally separate from the legacy personal
++// billing account. It never falls through to the personal payment endpoints.
++let organizationBillingData = null;
++let organizationBillingLoading = false;
++let organizationBillingLoadError = "";
++let organizationBillingPage = 1;
++const organizationBillingPageSize = 20;
++let organizationBillingScopeKey = "";
++let organizationBillingRequestId = 0;
++let isOrganizationTopupSaving = false;
++let selectedOrganizationTopupAmount = 0;
+ let authConfig = {
+   devLoginEnabled: false,
+   oidcConfigured: false,
+@@ -3226,7 +3237,247 @@ function renderTopupMethods() {
+     .join("");
+ }
+ 
++function organizationBillingField(record, camelCase, snakeCase = "") {
++  if (!record || typeof record !== "object") return undefined;
++  if (record[camelCase] !== undefined) return record[camelCase];
++  return snakeCase && record[snakeCase] !== undefined ? record[snakeCase] : undefined;
++}
++
++function organizationBillingAccount() {
++  const account = organizationBillingData?.account || {};
++  const number = (camelCase, snakeCase = "", fallback = 0) => {
++    const value = organizationBillingField(account, camelCase, snakeCase);
++    return Number.isFinite(Number(value)) ? Number(value) : fallback;
++  };
++  return {
++    initialBalanceUsd: number("initialBalanceUsd", "initial_balance_usd"),
++    totalTopupsUsd: number("totalTopupsUsd", "total_topups_usd"),
++    totalCreditsUsd: number("totalCreditsUsd", "total_credits_usd"),
++    availableBalanceUsd: number("availableBalanceUsd", "available_balance_usd"),
++  };
++}
++
++function organizationBillingUsage(period) {
++  const summary = organizationBillingData?.usageSummary || organizationBillingData?.usage_summary || {};
++  const value = summary?.[period] || {};
++  const number = (camelCase, snakeCase = "") => {
++    const raw = organizationBillingField(value, camelCase, snakeCase);
++    return Number.isFinite(Number(raw)) ? Number(raw) : 0;
++  };
++  return {
++    spend: number("spend", "spend"),
++    tokens: number("tokens", "total_tokens"),
++    requests: number("requests", "request_count"),
++  };
++}
++
++function organizationBillingRecords() {
++  const records = organizationBillingData?.records || {};
++  const items = Array.isArray(records) ? records : records?.items;
++  return Array.isArray(items) ? items : [];
++}
++
++function organizationBillingRecordTotal() {
++  const records = organizationBillingData?.records || {};
++  const total = Array.isArray(records) ? records.length : records?.total;
++  return Number.isFinite(Number(total)) ? Number(total) : organizationBillingRecords().length;
++}
++
++function organizationBillingRecordTypeLabel(type) {
++  return String(type || "") === "initial_credit" ? "初始企业额度" : "模拟充值";
++}
++
++function organizationBillingRecordStatusLabel(status) {
++  return String(status || "") === "completed" ? "已完成" : String(status || "-");
++}
++
++function organizationBillingUsageCard(label, usage) {
++  return `<article class="organization-billing-usage-card">
++    <span>${escapeHtml(label)}</span>
++    <strong>${escapeHtml(money.format(usage.spend))}</strong>
++    <small>预估消耗</small>
++    <div><span>${escapeHtml(formatTokens(usage.tokens))} Token</span><span>${escapeHtml(fmt.format(usage.requests))} 次请求</span></div>
++  </article>`;
++}
++
++function renderOrganizationBilling() {
++  const context = organizationBillingContext();
++  const workspace = el("organizationBillingWorkspace");
++  const personalWorkspace = el("personalBillingWorkspace");
++  if (workspace) workspace.classList.toggle("hidden", !context);
++  if (personalWorkspace) personalWorkspace.classList.toggle("hidden", Boolean(context));
++  if (!context) return false;
++
++  const account = organizationBillingAccount();
++  const today = organizationBillingUsage("today");
++  const last7Days = organizationBillingUsage("last7Days");
++  const last30Days = organizationBillingUsage("last30Days");
++  const canTopup = !context.readOnly && canSimulateOrganizationTopup();
++  const organization = organizationBillingData?.organization || {};
++  const name = String(organization?.name || context.name || "客户企业");
++  const isLoading = organizationBillingLoading && !organizationBillingData;
++
++  setText("organizationBillingScopeName", name);
++  setText("organizationBillingBalance", isLoading ? "加载中" : money.format(account.availableBalanceUsd));
++  setText("organizationBillingBalanceChip", isLoading ? "企业额度加载中" : `余额 ${money.format(account.availableBalanceUsd)}`);
++  setText("organizationBillingTotalCredits", money.format(account.totalCreditsUsd));
++  setText("organizationBillingInitialCredits", money.format(account.initialBalanceUsd));
++  setText("organizationBillingUsageEstimate", money.format(last30Days.spend));
++  setText("organizationBillingUsageTokens", formatTokens(last30Days.tokens));
++  setText("organizationBillingUsageRequests", fmt.format(last30Days.requests));
++  setHtml(
++    "organizationBillingUsageCards",
++    [
++      organizationBillingUsageCard("今日", today),
++      organizationBillingUsageCard("近 7 天", last7Days),
++      organizationBillingUsageCard("近 30 天", last30Days),
++    ].join(""),
++  );
++  const topupButton = el("openOrganizationTopupModalButton");
++  if (topupButton) topupButton.classList.toggle("hidden", !canTopup);
++  const readOnlyHint = el("organizationBillingReadOnlyHint");
++  if (readOnlyHint) readOnlyHint.classList.toggle("hidden", canTopup);
++
++  const recordsBody = el("organizationBillingRecordBody");
++  setText("organizationBillingRecordCount", `${fmt.format(organizationBillingRecordTotal())} 条`);
++  if (!recordsBody) return true;
++  if (organizationBillingLoadError) {
++    recordsBody.innerHTML = `<tr><td colspan="6" class="empty">${escapeHtml(organizationBillingLoadError)}</td></tr>`;
++    return true;
++  }
++  if (isLoading) {
++    recordsBody.innerHTML = '<tr><td colspan="6" class="empty">正在加载企业额度记录…</td></tr>';
++    return true;
++  }
++  const records = organizationBillingRecords();
++  if (!records.length) {
++    recordsBody.innerHTML = '<tr><td colspan="6" class="empty">暂无额度变动记录。</td></tr>';
++    return true;
++  }
++  recordsBody.innerHTML = records.map((record) => {
++    const timestamp = organizationBillingField(record, "timestamp", "timestamp") || organizationBillingField(record, "createdAt", "created_at");
++    const type = organizationBillingField(record, "type", "type");
++    const amount = Number(organizationBillingField(record, "amountUsd", "amount_usd") || 0);
++    const balance = Number(organizationBillingField(record, "balanceAfterUsd", "balance_after_usd") || 0);
++    const operator = organizationBillingField(record, "operator", "operator") || organizationBillingField(record, "operatorEmail", "operator_email") || "-";
++    const status = organizationBillingField(record, "status", "status");
++    return `<tr>
++      <td>${escapeHtml(formatBillingTime(timestamp))}</td>
++      <td>${escapeHtml(organizationBillingRecordTypeLabel(type))}</td>
++      <td class="num">${escapeHtml(money.format(amount))}</td>
++      <td class="num">${escapeHtml(money.format(balance))}</td>
++      <td>${escapeHtml(operator)}</td>
++      <td><span class="billing-order-status success">${escapeHtml(organizationBillingRecordStatusLabel(status))}</span></td>
++    </tr>`;
++  }).join("");
++  return true;
++}
++
++function organizationBillingUrl(context = organizationBillingContext()) {
++  if (!context) return "";
++  const params = new URLSearchParams({
++    page: String(organizationBillingPage),
++    pageSize: String(organizationBillingPageSize),
++  });
++  return `${context.path}?${params.toString()}`;
++}
++
++function resetOrganizationBillingData() {
++  organizationBillingRequestId += 1;
++  organizationBillingData = null;
++  organizationBillingLoading = false;
++  organizationBillingLoadError = "";
++  organizationBillingPage = 1;
++  organizationBillingScopeKey = "";
++  selectedOrganizationTopupAmount = 0;
++  isOrganizationTopupSaving = false;
++  el("organizationTopupModal")?.classList.add("hidden");
++}
++
++async function loadOrganizationBillingData() {
++  const context = organizationBillingContext();
++  if (!context || organizationBillingLoading) return;
++  const scopeKey = organizationBillingContextKey();
++  const requestId = ++organizationBillingRequestId;
++  organizationBillingLoading = true;
++  organizationBillingLoadError = "";
++  organizationBillingScopeKey = scopeKey;
++  renderOrganizationBilling();
++  try {
++    const payload = await api(organizationBillingUrl(context));
++    if (requestId !== organizationBillingRequestId || scopeKey !== organizationBillingContextKey()) return;
++    organizationBillingData = payload || null;
++  } catch (error) {
++    if (requestId !== organizationBillingRequestId || scopeKey !== organizationBillingContextKey()) return;
++    organizationBillingData = null;
++    organizationBillingLoadError = error.message || "企业额度加载失败，请稍后重试。";
++    showToast(organizationBillingLoadError);
++  } finally {
++    if (requestId !== organizationBillingRequestId) return;
++    organizationBillingLoading = false;
++    renderOrganizationBilling();
++  }
++}
++
++function renderOrganizationTopupOptions() {
++  const options = [500, 1000, 2000, 5000];
++  const container = el("organizationTopupOptions");
++  if (!container) return;
++  container.innerHTML = options.map((amount) => `
++    <button type="button" class="billing-amount-option${amount === selectedOrganizationTopupAmount ? " active" : ""}" data-organization-topup-amount="${amount}">$${amount.toLocaleString("en-US")}</button>
++  `).join("");
++}
++
++function closeOrganizationTopupModal(options = {}) {
++  if (isOrganizationTopupSaving && !options.force) return;
++  selectedOrganizationTopupAmount = 0;
++  el("organizationTopupForm")?.reset();
++  setFieldError("organizationTopupError", "");
++  el("organizationTopupModal")?.classList.add("hidden");
++}
++
++function openOrganizationTopupModal() {
++  const context = organizationBillingContext();
++  if (!context || context.readOnly || !canSimulateOrganizationTopup()) return;
++  selectedOrganizationTopupAmount = 0;
++  el("organizationTopupForm")?.reset();
++  setFieldError("organizationTopupError", "");
++  renderOrganizationTopupOptions();
++  el("organizationTopupModal")?.classList.remove("hidden");
++  window.setTimeout(() => el("organizationTopupAmount")?.focus(), 0);
++}
++
++async function submitOrganizationTopup(event) {
++  event.preventDefault();
++  const context = organizationBillingContext();
++  if (!context || context.readOnly || !canSimulateOrganizationTopup() || isOrganizationTopupSaving) return;
++  const amount = Number(el("organizationTopupAmount")?.value || 0);
++  setFieldError("organizationTopupError", "");
++  if (!Number.isFinite(amount) || amount < 1 || amount > 100000 || Math.round(amount * 100) !== amount * 100) {
++    setFieldError("organizationTopupError", "请输入 $1.00 至 $100,000.00 的金额，最多两位小数。");
++    return;
++  }
++  isOrganizationTopupSaving = true;
++  setButtonLoading("submitOrganizationTopupButton", true, "充值中");
++  try {
++    await ensureCsrfToken();
++    await api("/api/organization/current/billing/topups", {
++      method: "POST",
++      body: JSON.stringify({ amountUsd: amount }),
++    });
++    closeOrganizationTopupModal({ force: true });
++    await loadOrganizationBillingData();
++    showToast("模拟充值已完成，未发起真实付款。");
++  } catch (error) {
++    setFieldError("organizationTopupError", error.message || "模拟充值失败，请稍后重试。");
++  } finally {
++    isOrganizationTopupSaving = false;
++    setButtonLoading("submitOrganizationTopupButton", false);
++  }
++}
++
+ function renderBilling() {
++  if (renderOrganizationBilling()) return;
+   const balance = Number(billingAccount?.balanceUsd || 0);
+   const topupTotal = Number(billingAccount?.topupTotalUsd || 0);
+   const spent = Number.isFinite(Number(billingAccount?.spentUsd))
+@@ -3291,6 +3542,13 @@ async function loadBillingData() {
+ 
+ async function refreshBillingAvailability() {
+   // 后端未开放充值时接口返回 404，据此决定导航项是否出现。
++  // Customer demo identities have a separate organization credit contract.
++  // Never use this legacy probe for them because it targets a personal account.
++  if (isMockCustomerIdentity()) {
++    billingAvailable = false;
++    updateBillingNav();
++    return;
++  }
+   if (!currentUser?.id) {
+     billingAvailable = false;
+     updateBillingNav();
+@@ -3311,8 +3569,7 @@ async function refreshBillingAvailability() {
+ }
+ 
+ function updateBillingNav() {
+-  const tab = el("billingTab");
+-  if (tab) tab.classList.toggle("hidden", !billingAvailable);
++  syncNavigationVisibility();
+   // 受限提示里的"前往充值"依赖 billingAvailable，可用性变化后要重渲染。
+   renderAccountAccessState();
+   renderAdminBilling();
+@@ -3508,7 +3765,7 @@ let isAdminBillingLoading = false;
+ let isGeneratingRedemptions = false;
+ 
+ function adminBillingVisible() {
+-  return Boolean(currentUser?.isAdmin && billingAvailable && !isViewingCustomerOrganization());
++  return Boolean(isPlatformAdmin() && billingAvailable && !isViewingCustomerOrganization());
+ }
+ 
+ function renderAdminRedemptions() {
+@@ -3824,6 +4081,51 @@ function canViewCurrentOrganizationUsage() {
+   );
+ }
+ 
++function canViewOrganizationBilling() {
++  return Boolean(currentUser?.canViewOrganizationBilling);
++}
++
++function canSimulateOrganizationTopup() {
++  return Boolean(currentUser?.canSimulateOrganizationTopup);
++}
++
++function organizationBillingContext() {
++  if (isViewingCustomerOrganization()) {
++    const organizationId = selectedCustomerOrganizationId();
++    if (!organizationId) return null;
++    return {
++      kind: "platformCustomer",
++      organizationId,
++      name: selectedCustomerOrganizationName(),
++      readOnly: true,
++      path: `${customerOrganizationPath(organizationId)}/billing`,
++    };
++  }
++  if (!isMockCustomerIdentity() || !canViewOrganizationBilling()) return null;
++  return {
++    kind: "currentOrganization",
++    organizationId: String(currentUser?.organizationId || ""),
++    name: String(currentUser?.organization?.name || currentUser?.organizationName || "我的企业"),
++    readOnly: !canSimulateOrganizationTopup(),
++    path: "/api/organization/current/billing",
++  };
++}
++
++function organizationBillingContextKey() {
++  const context = organizationBillingContext();
++  return context ? `${context.kind}:${context.organizationId}` : "";
++}
++
++function isOrganizationBillingView() {
++  return Boolean(organizationBillingContext());
++}
++
++function canAccessBillingView() {
++  // Demo seller accounts keep only the global operations panel in the full
++  // employee board. They cannot open the customer-facing billing destination.
++  return Boolean(isOrganizationBillingView() || (billingAvailable && !currentUser?.organizationDemoEnabled));
++}
++
+ function selectedCustomerOrganizationId() {
+   const organization = selectedCustomerOrganization?.organization || selectedCustomerOrganization;
+   return String(organization?.id || "");
+@@ -3981,27 +4283,36 @@ function syncNavigationVisibility() {
+   const canViewAdmin = canViewAdminUsage();
+   const canViewDepartments = canViewDepartmentUsage();
+   const isCustomer = isMockCustomerIdentity();
++  // A customer owner/admin gets an enterprise-credit entry. Seller accounts
++  // keep their global billing operations in the admin board, never in this
++  // customer-facing sidebar destination.
++  const canUseBillingSidebar = isCustomer
++    ? canViewOrganizationBilling()
++    : Boolean(billingAvailable && !currentUser?.organizationDemoEnabled);
+   el("customersTab").classList.toggle("hidden", !canBrowseCustomers);
+   el("adminTab").classList.toggle("hidden", !canViewAdmin);
+   el("departmentTab").classList.toggle("hidden", !canViewDepartments);
+   // Customer identities use their demo-scoped views only; never expose
+   // seller account functions that lack a customer-local contract.
+-  document.querySelectorAll('[data-view="keys"], [data-view="billing"]').forEach((button) => {
++  document.querySelectorAll('[data-view="keys"]').forEach((button) => {
+     button.classList.toggle("hidden", isCustomer);
+   });
++  el("billingTab")?.classList.toggle("hidden", !canUseBillingSidebar);
+   document.querySelectorAll('[data-global-page="models"]').forEach((button) => {
+     button.classList.toggle("hidden", isCustomer);
+   });
+ }
+ 
+ function renderCustomerUsageBreadcrumbs(view = currentView) {
+-  const isCustomerUsage = isViewingCustomerOrganization() && ["admin", "department"].includes(view);
++  const isCustomerUsage = isViewingCustomerOrganization() && ["admin", "department", "billing"].includes(view);
+   const scopeLabel = isCustomerUsage ? `客户企业：${selectedCustomerOrganizationName()}` : "";
+   el("customerUsageBreadcrumb")?.classList.toggle("hidden", !(isCustomerUsage && view === "admin"));
+   el("customerDepartmentBreadcrumb")?.classList.toggle("hidden", !(isCustomerUsage && view === "department"));
++  el("customerBillingBreadcrumb")?.classList.toggle("hidden", !(isCustomerUsage && view === "billing"));
+   if (isCustomerUsage) {
+     setText("customerUsageBreadcrumbLabel", scopeLabel);
+     setText("customerDepartmentBreadcrumbLabel", scopeLabel);
++    setText("customerBillingBreadcrumbLabel", scopeLabel);
+   }
+ }
+ 
+@@ -4294,6 +4605,7 @@ async function openCustomerOrganization(organizationId) {
+   organizationMemberTotal = 0;
+   organizationMemberPage = 1;
+   organizationMemberFilters = { search: "", departmentId: "", role: "", status: "" };
++  resetOrganizationBillingData();
+   customerOrganizationDetailTab = "info";
+   syncNavigationVisibility();
+   switchView("organization");
+@@ -4303,6 +4615,7 @@ async function openCustomerOrganization(organizationId) {
+ function closeCustomerOrganization() {
+   selectedCustomerOrganization = null;
+   resetOrganizationUsageViews();
++  resetOrganizationBillingData();
+   organizationDataRequestId += 1;
+   organizationMemberRequestId += 1;
+   isOrganizationLoading = false;
+@@ -4382,18 +4695,22 @@ function renderOrganizationUsageTabs() {
+     button.classList.toggle("active", isActive);
+     button.setAttribute("aria-selected", isActive ? "true" : "false");
+   });
++  const billingTab = tabs.querySelector('[data-organization-usage-view="billing"]');
++  if (billingTab) billingTab.classList.toggle("hidden", !isViewingCustomerOrganization());
+   setText("organizationUsageScopeLabel", scope.kind === "platformCustomer" ? `客户：${scopeName}` : `企业：${scopeName}`);
+ }
+ 
+ function showOrganizationUsage(view) {
+   const scope = organizationUsageScope();
+   if (!scope) return;
+-  customerOrganizationDetailTab = ["info", "usage", "departments-usage"].includes(view) ? view : "info";
++  customerOrganizationDetailTab = ["info", "usage", "departments-usage", "billing"].includes(view) ? view : "info";
+   renderOrganizationUsageTabs();
+   if (customerOrganizationDetailTab === "info") {
+     switchView("organization");
+   } else if (customerOrganizationDetailTab === "usage") {
+     switchView("admin");
++  } else if (customerOrganizationDetailTab === "billing") {
++    switchView("billing");
+   } else {
+     switchView("department");
+   }
+@@ -4637,11 +4954,14 @@ function switchView(view) {
+   if (view === "department" && !canViewDepartmentUsage()) view = "dashboard";
+   if (view === "team" && !currentUser?.isTeamLeader) view = "dashboard";
+   if (view === "organization" && !organizationCanView()) view = "dashboard";
+-  if (isMockCustomerIdentity() && (view === "keys" || view === "billing" || view === "models")) view = "dashboard";
+-  if (view === "billing" && !billingAvailable) view = "dashboard";
++  if (isMockCustomerIdentity() && (view === "keys" || view === "models")) view = "dashboard";
++  if (view === "billing" && !canAccessBillingView()) view = "dashboard";
+   if (currentView === "keys" && view !== "keys") clearRevealedKeys();
+   // 离开充值页就停掉支付轮询与二维码，避免后台空转和收款码久留在页面上。
+-  if (currentView === "billing" && view !== "billing") hideManualPayPanel();
++  if (currentView === "billing" && view !== "billing") {
++    hideManualPayPanel();
++    closeOrganizationTopupModal({ force: true });
++  }
+   currentView = view;
+   setGlobalPage(view === "models" ? "models" : "console");
+   el("appShell").classList.toggle("models-layout", view === "models");
+@@ -4657,7 +4977,7 @@ function switchView(view) {
+   el("dashboardFilters").classList.toggle("hidden", view === "models" || view === "keys" || view === "billing" || view === "customers" || view === "organization");
+   renderCustomerUsageBreadcrumbs(view);
+   const isCustomerDetailView = isViewingCustomerOrganization()
+-    && ["organization", "admin", "department"].includes(view);
++    && ["organization", "admin", "department", "billing"].includes(view);
+   let activeButton = null;
+   document.querySelectorAll("[data-view]").forEach((button) => {
+     // Customer detail is a child workspace of the customer directory, not a
+@@ -4689,7 +5009,9 @@ function switchView(view) {
+   }
+   if (view === "billing") {
+     renderBilling();
+-    if (!isBillingLoading) loadBillingData();
++    if (isOrganizationBillingView()) {
++      if (!organizationBillingLoading) loadOrganizationBillingData();
++    } else if (!isBillingLoading) loadBillingData();
+   }
+   if (view === "dashboard" && !usageData.length) loadDashboardData();
+   if (view === "customers" && !isCustomerOrganizationsLoading) loadCustomerOrganizations();
+@@ -4706,7 +5028,7 @@ function switchView(view) {
+ async function loadCurrentViewData(forceRefresh = false) {
+   if (currentView === "customers") return loadCustomerOrganizations();
+   if (currentView === "keys") return loadKeys();
+-  if (currentView === "billing") return loadBillingData();
++  if (currentView === "billing") return isOrganizationBillingView() ? loadOrganizationBillingData() : loadBillingData();
+   if (currentView === "models") return loadModels();
+   if (currentView === "admin") return loadAdminData(forceRefresh);
+   if (currentView === "team") return loadTeamData(forceRefresh);
+@@ -5034,9 +5356,8 @@ async function showApp(user) {
+   render();
+   const isDemoCustomer = isMockCustomerIdentity();
+   if (isDemoCustomer) {
+-    // The Mock customer path is deliberately limited to personal, team and
+-    // organization usage. Billing and model catalog requests would touch
+-    // seller-only integrations and are rejected by the API.
++    // Customer Mock identities use only their tenant-safe usage and enterprise
++    // credit APIs. In particular, never probe the personal billing endpoint.
+     billingAvailable = false;
+     modelCatalog = [];
+     const scopePromise = loadAuthScope();
+@@ -5112,6 +5433,7 @@ function showLogin() {
+   selectedTopupAmount = 0;
+   pendingTopupTradeNo = "";
+   el("billingPayPanel")?.classList.add("hidden");
++  resetOrganizationBillingData();
+   adminRedemptions = [];
+   adminRedemptionTotal = 0;
+   adminBillingOrders = [];
+@@ -5478,10 +5800,27 @@ el("cancelCustomerOrganizationButton").addEventListener("click", closeCustomerOr
+ el("backToCustomersButton").addEventListener("click", closeCustomerOrganization);
+ el("backToCustomerOrganizationButton").addEventListener("click", () => showOrganizationUsage("info"));
+ el("backToCustomerOrganizationDepartmentButton").addEventListener("click", () => showOrganizationUsage("info"));
++el("backToCustomerOrganizationBillingButton").addEventListener("click", () => showOrganizationUsage("info"));
+ el("createOrganizationDepartmentButton").addEventListener("click", () => openOrganizationDepartmentModal());
+ el("inviteOrganizationMemberButton").addEventListener("click", () => openOrganizationMemberModal());
+ el("cancelOrganizationDepartmentButton").addEventListener("click", closeOrganizationDepartmentModal);
+ el("cancelOrganizationMemberButton").addEventListener("click", closeOrganizationMemberModal);
++el("openOrganizationTopupModalButton").addEventListener("click", openOrganizationTopupModal);
++el("cancelOrganizationTopupButton").addEventListener("click", closeOrganizationTopupModal);
++el("organizationTopupForm").addEventListener("submit", submitOrganizationTopup);
++el("organizationTopupAmount").addEventListener("input", () => {
++  selectedOrganizationTopupAmount = 0;
++  renderOrganizationTopupOptions();
++  setFieldError("organizationTopupError", "");
++});
++el("organizationTopupOptions").addEventListener("click", (event) => {
++  const option = event.target.closest("[data-organization-topup-amount]");
++  if (!option) return;
++  selectedOrganizationTopupAmount = Number(option.dataset.organizationTopupAmount || 0);
++  el("organizationTopupAmount").value = String(selectedOrganizationTopupAmount);
++  renderOrganizationTopupOptions();
++  setFieldError("organizationTopupError", "");
++});
+ 
+ el("customerOrganizationForm").addEventListener("submit", async (event) => {
+   event.preventDefault();
+@@ -6237,6 +6576,7 @@ document.querySelectorAll(".modal-backdrop").forEach((backdrop) => {
+     if (backdrop.id === "customerOrganizationModal") closeCustomerOrganizationModal();
+     if (backdrop.id === "organizationDepartmentModal") closeOrganizationDepartmentModal();
+     if (backdrop.id === "organizationMemberModal") closeOrganizationMemberModal();
++    if (backdrop.id === "organizationTopupModal") closeOrganizationTopupModal();
+   });
+ });
+ 
+@@ -6249,6 +6589,7 @@ document.addEventListener("keydown", (event) => {
+   else if (!el("customerOrganizationModal").classList.contains("hidden")) closeCustomerOrganizationModal();
+   else if (!el("organizationMemberModal").classList.contains("hidden")) closeOrganizationMemberModal();
+   else if (!el("organizationDepartmentModal").classList.contains("hidden")) closeOrganizationDepartmentModal();
++  else if (!el("organizationTopupModal").classList.contains("hidden")) closeOrganizationTopupModal();
+ });
+ 
+ document.addEventListener("visibilitychange", () => {
+diff --git a/backend/main.py b/backend/main.py
+index fa614db..217a4f7 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -12,6 +12,7 @@ import socket
+ import ssl
+ from contextlib import asynccontextmanager
+ from datetime import datetime, timedelta, timezone
++from decimal import Decimal
+ from base64 import urlsafe_b64encode
+ from email.message import EmailMessage
+ from html import unescape
+@@ -662,6 +663,9 @@ def organization_access_fields(
+     # Customer admins have company-wide analytics access.  Master-data writes
+     # stay seller-only in Mock V2, so the old field remains false on purpose.
+     can_view_usage = role in {"owner", "admin"}
++    # Mock enterprise credit is a customer-level capability.  It must not be
++    # inferred from the seller's legacy ``isAdmin`` / ``isPlatformAdmin``.
++    can_view_billing = role in {"owner", "admin"}
+     return {
+         "organizationDemoEnabled": enabled,
+         "isPlatformAdmin": bool(user.get("isPlatformAdmin")),
+@@ -673,6 +677,8 @@ def organization_access_fields(
+         "organizationName": organization_name or None,
+         "organizationRole": role,
+         "canViewOrganizationUsage": can_view_usage,
++        "canViewOrganizationBilling": can_view_billing,
++        "canSimulateOrganizationTopup": can_view_billing,
+         "canManageOrganization": False,
+         # Keep the explicit V2 capability separate from the legacy alias while
+         # older browser bundles are still in circulation.
+@@ -836,6 +842,24 @@ async def require_organization_usage_viewer(request: Request) -> dict[str, Any]:
+     return user
+ 
+ 
++async def require_organization_billing_viewer(request: Request) -> dict[str, Any]:
++    """Require an active customer owner/admin for Mock enterprise credit."""
++
++    user = await organization_user(request)
++    if not user.get("canViewOrganizationBilling"):
++        raise auth_http_error(403, "当前成员没有企业额度查看权限", "ORGANIZATION_BILLING_FORBIDDEN")
++    return user
++
++
++async def require_organization_billing_topup_operator(request: Request) -> dict[str, Any]:
++    """Keep simulated top-up authorization independent from analytics roles."""
++
++    user = await require_organization_billing_viewer(request)
++    if not user.get("canSimulateOrganizationTopup"):
++        raise auth_http_error(403, "当前成员没有企业额度充值权限", "ORGANIZATION_TOPUP_FORBIDDEN")
++    return user
++
++
+ async def require_organization_directory_viewer(request: Request) -> dict[str, Any]:
+     """Allow the customer directory only to the company's analytics roles.
+ 
+@@ -2540,6 +2564,34 @@ class PlatformOrganizationCreateRequest(PlatformOrganizationRequest):
+         return value.strip()
+ 
+ 
++class OrganizationBillingTopupRequest(BaseModel):
++    """Strict payload for a local-only Mock enterprise credit simulation."""
++
++    model_config = ConfigDict(extra="forbid")
++
++    amountUsd: Decimal
++
++    @field_validator("amountUsd", mode="before")
++    @classmethod
++    def require_numeric_amount_usd(cls, value: Any) -> Any:
++        # A quoted amount looks harmless but weakens the public JSON contract.
++        # Keep this Mock endpoint strict so it can later map to a real API.
++        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
++            raise ValueError("amountUsd must be a number")
++        return value
++
++    @field_validator("amountUsd")
++    @classmethod
++    def validate_amount_usd(cls, value: Decimal) -> Decimal:
++        if not value.is_finite():
++            raise ValueError("amountUsd must be a finite number")
++        if value.as_tuple().exponent < -2:
++            raise ValueError("amountUsd must have at most two decimal places")
++        if value < Decimal("1.00") or value > Decimal("100000.00"):
++            raise ValueError("amountUsd must be between 1.00 and 100000.00")
++        return value.quantize(Decimal("0.01"))
++
++
+ def write_key_audit(event: str, email: str, key_id: str, request: Request, result: str) -> None:
+     audit_key_id = hashlib.sha256(key_id.encode("utf-8")).hexdigest() if key_id.startswith("sk-") else key_id
+     safe_id = re.sub(r"[^A-Za-z0-9_-]", "", audit_key_id)[:64] or "-"
+@@ -3292,6 +3344,54 @@ async def organization_current_department_usage(
+     }
+ 
+ 
++@app.get("/api/organization/current/billing")
++async def organization_current_billing(
++    request: Request,
++    page: int = Query(1, ge=1, le=100000),
++    pageSize: int = Query(20, ge=1, le=100),
++) -> dict[str, Any]:
++    """Return an owner/admin's isolated Mock enterprise credit balance."""
++
++    user = await require_organization_billing_viewer(request)
++    organization_id = organization_identifier(organization_current_member(user))
++    try:
++        return await organization_scoped_store_call(
++            organization_id,
++            "billing_payload",
++            page=page,
++            page_size=pageSize,
++        )
++    except OrganizationStoreError as exc:
++        raise organization_store_error(exc) from exc
++
++
++@app.post("/api/organization/current/billing/topups")
++async def organization_current_billing_topup(
++    data: OrganizationBillingTopupRequest,
++    request: Request,
++    page: int = Query(1, ge=1, le=100000),
++    pageSize: int = Query(20, ge=1, le=100),
++) -> dict[str, Any]:
++    """Credit only the session-derived customer balance; never take payment."""
++
++    await enforce_csrf(request)
++    user = await require_organization_billing_topup_operator(request)
++    organization_id = organization_identifier(organization_current_member(user))
++    try:
++        result = await organization_scoped_store_call(
++            organization_id,
++            "simulate_billing_topup",
++            data.amountUsd,
++            operator=str(user.get("name") or user.get("email") or "Customer administrator"),
++            operator_email=str(user.get("email") or ""),
++            page=page,
++            page_size=pageSize,
++        )
++    except OrganizationStoreError as exc:
++        raise organization_store_error(exc) from exc
++    return {"ok": True, **result}
++
++
+ @app.post("/api/organization/current/departments")
+ async def organization_create_department(data: OrganizationDepartmentRequest, request: Request) -> dict[str, Any]:
+     await enforce_csrf(request)
+@@ -3624,6 +3724,27 @@ async def platform_organization_usage(
+     return {"startDate": start_date, "endDate": end_date, "source": source, "employee": (employee or "").strip(), **payload}
+ 
+ 
++@app.get("/api/platform/organizations/{organization_id}/billing")
++async def platform_organization_billing(
++    organization_id: str,
++    request: Request,
++    page: int = Query(1, ge=1, le=100000),
++    pageSize: int = Query(20, ge=1, le=100),
++) -> dict[str, Any]:
++    """Allow the seller to read one customer's Mock credit history only."""
++
++    selected = await require_platform_organization(request, organization_id)
++    try:
++        return await organization_scoped_store_call(
++            str(selected["selectedOrganizationId"]),
++            "billing_payload",
++            page=page,
++            page_size=pageSize,
++        )
++    except OrganizationStoreError as exc:
++        raise organization_store_error(exc) from exc
++
++
+ @app.get("/api/platform/organizations/{organization_id}/departments/usage")
+ async def platform_organization_department_usage(
+     organization_id: str,
+diff --git a/backend/organization_store.py b/backend/organization_store.py
+index 54ea63c..cdbb769 100644
+--- a/backend/organization_store.py
++++ b/backend/organization_store.py
+@@ -15,6 +15,7 @@ import re
+ import threading
+ import uuid
+ from dataclasses import dataclass
++from decimal import Decimal, InvalidOperation
+ from datetime import date, datetime, timedelta, timezone
+ from typing import Any, Protocol
+ 
+@@ -25,6 +26,13 @@ ORGANIZATION_STATUSES = frozenset({"active", "suspended", "archived"})
+ TEAM_ROLES = frozenset({"leader", "member"})
+ ACTIVE_DEPARTMENT_MEMBER_STATUSES = frozenset({"invited", "active"})
+ 
++# This is deliberately separate from the production billing ledger.  Mock
++# organizations receive a deterministic opening credit that is never reduced
++# by generated usage data.
++INITIAL_ORGANIZATION_BALANCE_USD = Decimal("5000.00")
++MIN_SIMULATED_TOPUP_USD = Decimal("1.00")
++MAX_SIMULATED_TOPUP_USD = Decimal("100000.00")
++
+ _SEED_TIMESTAMP = "2026-01-01T00:00:00+00:00"
+ _UNSET = object()
+ _EMAIL_LOCAL_PATTERN = re.compile(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+\Z")
+@@ -173,6 +181,25 @@ class OrganizationStore(Protocol):
+         organization_id: str | None = None,
+     ) -> dict[str, Any]: ...
+ 
++    def billing_payload(
++        self,
++        organization_id: str,
++        *,
++        page: int = 1,
++        page_size: int = 20,
++    ) -> dict[str, Any]: ...
++
++    def simulate_billing_topup(
++        self,
++        organization_id: str,
++        amount_usd: Decimal,
++        *,
++        operator: str,
++        operator_email: str,
++        page: int = 1,
++        page_size: int = 20,
++    ) -> dict[str, Any]: ...
++
+     def reset(self, organization_id: str | None = None) -> dict[str, Any]: ...
+ 
+ 
+@@ -203,11 +230,32 @@ class _Member:
+     has_mock_usage: bool = True
+ 
+ 
++@dataclass
++class _BillingRecord:
++    identifier: str
++    timestamp: str
++    record_type: str
++    amount_usd: Decimal
++    balance_after_usd: Decimal
++    operator: str
++    operator_email: str
++    status: str = "completed"
++
++
++@dataclass
++class _OrganizationBilling:
++    initial_balance_usd: Decimal
++    total_topups_usd: Decimal
++    available_balance_usd: Decimal
++    records: list[_BillingRecord]
++
++
+ @dataclass
+ class _OrganizationState:
+     organization: dict[str, Any]
+     departments: dict[str, _Department]
+     members: dict[str, _Member]
++    billing: _OrganizationBilling
+ 
+ 
+ class InMemoryOrganizationStore:
+@@ -350,6 +398,7 @@ class InMemoryOrganizationStore:
+         departments: tuple[tuple[str, str], ...],
+         members: tuple[tuple[str, str, str, str, str, str, str], ...],
+     ) -> _OrganizationState:
++        billing = InMemoryOrganizationStore._seed_billing()
+         return _OrganizationState(
+             organization={
+                 "id": organization_id,
+@@ -378,6 +427,28 @@ class InMemoryOrganizationStore:
+                 )
+                 for identifier, member_name, email, department_id, role, status, team_role in members
+             },
++            billing=billing,
++        )
++
++    @staticmethod
++    def _seed_billing() -> _OrganizationBilling:
++        """Return a fresh deterministic opening balance for one customer."""
++
++        return _OrganizationBilling(
++            initial_balance_usd=INITIAL_ORGANIZATION_BALANCE_USD,
++            total_topups_usd=Decimal("0.00"),
++            available_balance_usd=INITIAL_ORGANIZATION_BALANCE_USD,
++            records=[
++                _BillingRecord(
++                    identifier="billing-initial-credit",
++                    timestamp=_SEED_TIMESTAMP,
++                    record_type="initial_credit",
++                    amount_usd=INITIAL_ORGANIZATION_BALANCE_USD,
++                    balance_after_usd=INITIAL_ORGANIZATION_BALANCE_USD,
++                    operator="System",
++                    operator_email="",
++                )
++            ],
+         )
+ 
+     def _seed_organizations(self) -> dict[str, _OrganizationState]:
+@@ -562,6 +633,102 @@ class InMemoryOrganizationStore:
+             "stats": self._stats_payload(state),
+         }
+ 
++    @staticmethod
++    def _money(value: Decimal) -> float:
++        """Return a JSON-friendly monetary value rounded to cents."""
++
++        return float(value.quantize(Decimal("0.01")))
++
++    @classmethod
++    def _billing_record_payload(cls, record: _BillingRecord) -> dict[str, Any]:
++        return {
++            "id": record.identifier,
++            "timestamp": record.timestamp,
++            "type": record.record_type,
++            "amountUsd": cls._money(record.amount_usd),
++            "balanceAfterUsd": cls._money(record.balance_after_usd),
++            "operator": record.operator,
++            "operatorEmail": record.operator_email,
++            "status": record.status,
++        }
++
++    @classmethod
++    def _topup_amount(cls, value: Any) -> Decimal:
++        """Require an exact finite USD amount with no sub-cent precision."""
++
++        if isinstance(value, bool):
++            raise OrganizationValidationError("amountUsd must be a number")
++        try:
++            amount = Decimal(str(value))
++        except (InvalidOperation, TypeError, ValueError) as exc:
++            raise OrganizationValidationError("amountUsd must be a number") from exc
++        if not amount.is_finite():
++            raise OrganizationValidationError("amountUsd must be a finite number")
++        if amount.as_tuple().exponent < -2:
++            raise OrganizationValidationError("amountUsd must have at most two decimal places")
++        if amount < MIN_SIMULATED_TOPUP_USD or amount > MAX_SIMULATED_TOPUP_USD:
++            raise OrganizationValidationError("amountUsd must be between 1.00 and 100000.00")
++        return amount.quantize(Decimal("0.01"))
++
++    def _billing_usage_summary(self, state: _OrganizationState) -> dict[str, Any]:
++        """Aggregate deterministic usage for display without touching balance."""
++
++        end_date = date.today()
++        periods = {
++            "today": 1,
++            "last7Days": 7,
++            "last30Days": 30,
++        }
++        summary: dict[str, dict[str, Any]] = {}
++        for key, days in periods.items():
++            start_date = end_date - timedelta(days=days - 1)
++            rows = self._usage_rows_for_state(
++                state,
++                [start_date + timedelta(days=offset) for offset in range(days)],
++                "all",
++            )
++            summary[key] = {
++                "spend": round(sum(float(row.get("spend") or 0.0) for row in rows), 6),
++                "tokens": sum(int(row.get("totalTokens") or 0) for row in rows),
++                "requests": sum(int(row.get("requestCount") or 0) for row in rows),
++            }
++            # Preserve the field names used by existing usage widgets while
++            # giving the billing page compact aliases for its cards.
++            summary[key]["totalTokens"] = summary[key]["tokens"]
++            summary[key]["requestCount"] = summary[key]["requests"]
++        return summary
++
++    def _billing_payload(
++        self,
++        state: _OrganizationState,
++        *,
++        page: int,
++        page_size: int,
++    ) -> dict[str, Any]:
++        current_page = self._page_value(page, "page", 100000)
++        current_page_size = self._page_value(page_size, "page_size", 100)
++        billing = state.billing
++        records = sorted(billing.records, key=lambda item: (item.timestamp, item.identifier), reverse=True)
++        start = (current_page - 1) * current_page_size
++        return {
++            "organization": self._organization_payload(state),
++            "account": {
++                "initialBalanceUsd": self._money(billing.initial_balance_usd),
++                "totalTopupsUsd": self._money(billing.total_topups_usd),
++                "totalCreditsUsd": self._money(billing.initial_balance_usd + billing.total_topups_usd),
++                "availableBalanceUsd": self._money(billing.available_balance_usd),
++            },
++            "usageSummary": self._billing_usage_summary(state),
++            "records": {
++                "items": [self._billing_record_payload(item) for item in records[start : start + current_page_size]],
++                "total": len(records),
++                "page": current_page,
++                "pageSize": current_page_size,
++            },
++            "isDemo": True,
++            "usageDoesNotAffectBalance": True,
++        }
++
+     @staticmethod
+     def _has_duplicate_department_name(
+         state: _OrganizationState, name: str, exclude_id: str = ""
+@@ -713,6 +880,7 @@ class InMemoryOrganizationStore:
+                 },
+                 departments={},
+                 members={},
++                billing=self._seed_billing(),
+             )
+             self._organizations[identifier] = state
+             return self._organization_summary_payload(state)
+@@ -785,6 +953,7 @@ class InMemoryOrganizationStore:
+                 },
+                 departments={department_id: department},
+                 members={owner.identifier: owner},
++                billing=self._seed_billing(),
+             )
+             self._organizations[identifier] = state
+             return {
+@@ -840,6 +1009,70 @@ class InMemoryOrganizationStore:
+             state.organization["archivedAt"] = now
+             return self._organization_summary_payload(state)
+ 
++    # ------------------------------------------------------------------
++    # Mock organization billing
++    # ------------------------------------------------------------------
++
++    def billing_payload(
++        self,
++        organization_id: str,
++        *,
++        page: int = 1,
++        page_size: int = 20,
++    ) -> dict[str, Any]:
++        """Return one tenant's presentation-only organization balance.
++
++        This method intentionally has no dependency on ``BillingStore``, a
++        payment provider, mail, or an upstream client.  Seller routes may read
++        archived customer history; customer authorization is enforced by the
++        HTTP layer before this method is called.
++        """
++
++        with self._lock:
++            return self._billing_payload(
++                self._organization_or_raise(organization_id),
++                page=page,
++                page_size=page_size,
++            )
++
++    def simulate_billing_topup(
++        self,
++        organization_id: str,
++        amount_usd: Decimal,
++        *,
++        operator: str,
++        operator_email: str,
++        page: int = 1,
++        page_size: int = 20,
++    ) -> dict[str, Any]:
++        """Immediately credit a customer-local, non-payment demo balance."""
++
++        amount = self._topup_amount(amount_usd)
++        normalized_operator = self._required_text(operator, "operator", 120)
++        normalized_email = self.normalize_email(operator_email)
++        with self._lock:
++            state = self._organization_or_raise(organization_id)
++            if state.organization.get("status") != "active":
++                raise OrganizationConflictError("billing cannot be changed for an inactive organization")
++            billing = state.billing
++            billing.total_topups_usd += amount
++            billing.available_balance_usd += amount
++            record = _BillingRecord(
++                identifier=f"billing-topup-{uuid.uuid4().hex}",
++                timestamp=self._now(),
++                record_type="simulated_topup",
++                amount_usd=amount,
++                balance_after_usd=billing.available_balance_usd,
++                operator=normalized_operator,
++                operator_email=normalized_email,
++            )
++            billing.records.append(record)
++            state.organization["updatedAt"] = record.timestamp
++            return {
++                "record": self._billing_record_payload(record),
++                **self._billing_payload(state, page=page, page_size=page_size),
++            }
++
+     def for_organization(self, organization_id: str) -> "OrganizationScope":
+         """Return a small tenant facade for route handlers with a selected customer."""
+ 
+@@ -1877,6 +2110,27 @@ class OrganizationScope:
+     def organization_snapshot(self) -> dict[str, Any]:
+         return self._store.get_organization_snapshot(self.organization_id)
+ 
++    def billing_payload(self, *, page: int = 1, page_size: int = 20) -> dict[str, Any]:
++        return self._store.billing_payload(self.organization_id, page=page, page_size=page_size)
++
++    def simulate_billing_topup(
++        self,
++        amount_usd: Decimal,
++        *,
++        operator: str,
++        operator_email: str,
++        page: int = 1,
++        page_size: int = 20,
++    ) -> dict[str, Any]:
++        return self._store.simulate_billing_topup(
++            self.organization_id,
++            amount_usd,
++            operator=operator,
++            operator_email=operator_email,
++            page=page,
++            page_size=page_size,
++        )
++
+     def mock_organization_usage(self, **kwargs: Any) -> dict[str, Any]:
+         return self._store.mock_organization_usage(self.organization_id, **kwargs)
+ 
+diff --git a/index.html b/index.html
+index e038787..3fa7b13 100644
+--- a/index.html
++++ b/index.html
+@@ -1637,6 +1637,7 @@
+         background:
+           linear-gradient(130deg, rgba(255, 255, 255, 0.97), rgba(232, 243, 253, 0.82)),
+           var(--panel);
++        container-type: inline-size;
+         display: grid;
+         grid-template-rows: auto auto;
+         align-content: start;
+@@ -1664,21 +1665,80 @@
+         font-weight: 800;
+       }
+ 
++      .daily-eyebrow {
++        min-width: 0;
++        color: #53677e;
++        line-height: 1.45;
++      }
++
+       .daily-main-head {
+-        display: flex;
+-        justify-content: space-between;
+-        gap: 20px;
+-        align-items: flex-start;
++        display: grid;
++        gap: 10px;
++        min-width: 0;
+         position: relative;
+         z-index: 1;
+       }
+ 
++      .daily-main-title-row {
++        display: grid;
++        grid-template-columns: minmax(0, 1fr) auto;
++        gap: 16px;
++        align-items: start;
++        min-width: 0;
++      }
++
++      .daily-main-meta {
++        display: flex;
++        align-items: center;
++        min-width: 0;
++        padding: 7px 10px;
++        border: 1px solid rgba(6, 115, 210, 0.11);
++        border-radius: 10px;
++        background: linear-gradient(90deg, rgba(232, 243, 253, 0.92), rgba(255, 255, 255, 0.58));
++      }
++
++      .daily-main-meta::before {
++        content: "";
++        align-self: stretch;
++        flex: 0 0 3px;
++        min-height: 16px;
++        margin-right: 8px;
++        border-radius: 999px;
++        background: linear-gradient(180deg, var(--brand), var(--blue));
++        opacity: 0.55;
++      }
++
+       .daily-context {
+         color: var(--muted);
+         font-size: 13px;
++        line-height: 1.55;
++        min-width: 0;
++      }
++
++      .daily-freshness {
++        max-inline-size: 285px;
++        color: var(--muted);
++        font-size: 12px;
++        font-weight: 600;
++        line-height: 1.5;
+         text-align: right;
+-        line-height: 1.6;
+-        max-width: 260px;
++        font-variant-numeric: tabular-nums;
++      }
++
++      @container (max-width: 560px) {
++        .daily-main-title-row {
++          grid-template-columns: minmax(0, 1fr);
++          gap: 4px;
++        }
++
++        .daily-freshness {
++          max-inline-size: none;
++          text-align: left;
++        }
++
++        .daily-main-meta {
++          align-items: flex-start;
++        }
+       }
+ 
+       .daily-main-values {
+@@ -2873,6 +2933,153 @@
+         margin-bottom: 18px;
+       }
+ 
++      /* 企业额度沿用控制台的数据卡片节奏，但与个人支付流程完全隔离。 */
++      .organization-billing-workspace {
++        display: grid;
++        gap: 18px;
++      }
++
++      .organization-billing-hero {
++        display: grid;
++        grid-template-columns: minmax(0, 1fr) minmax(270px, 0.7fr);
++        gap: 28px;
++        align-items: end;
++        padding: 30px 32px;
++        border: 1px solid rgba(6, 115, 210, 0.25);
++        border-radius: var(--radius);
++        background:
++          radial-gradient(circle at 88% 0%, rgba(53, 153, 227, 0.2), transparent 42%),
++          linear-gradient(135deg, #e8f4fe 0%, #fafdff 58%, #eff8ff 100%);
++        box-shadow: var(--shadow-soft);
++      }
++
++      .organization-billing-hero .eyebrow,
++      .organization-billing-hero .organization-demo-badge {
++        margin-right: 8px;
++      }
++
++      .organization-billing-hero h2 {
++        margin: 10px 0 8px;
++        font-size: clamp(28px, 3vw, 40px);
++        letter-spacing: -0.04em;
++      }
++
++      .organization-billing-hero p {
++        max-width: 660px;
++        margin: 0;
++        color: var(--muted);
++        line-height: 1.75;
++      }
++
++      .organization-billing-hero-balance {
++        display: grid;
++        gap: 8px;
++        justify-items: start;
++        padding: 22px;
++        border: 1px solid rgba(6, 115, 210, 0.16);
++        border-radius: 16px;
++        background: rgba(255, 255, 255, 0.86);
++      }
++
++      .organization-billing-hero-balance > span:first-child {
++        color: var(--muted);
++        font-size: 13px;
++      }
++
++      .organization-billing-hero-balance strong {
++        color: #075eab;
++        font-size: clamp(34px, 4vw, 48px);
++        font-variant-numeric: tabular-nums;
++        letter-spacing: -0.05em;
++        line-height: 1;
++      }
++
++      .organization-billing-hero-balance .primary-btn {
++        margin-top: 8px;
++      }
++
++      .organization-billing-readonly {
++        margin-top: 8px;
++        color: var(--muted);
++        font-size: 12px;
++      }
++
++      .organization-billing-metrics,
++      .organization-billing-usage-grid {
++        display: grid;
++        grid-template-columns: repeat(3, minmax(0, 1fr));
++        gap: 14px;
++      }
++
++      .organization-billing-metric,
++      .organization-billing-usage-card {
++        display: grid;
++        gap: 7px;
++        min-width: 0;
++        padding: 20px 22px;
++        border: 1px solid var(--line);
++        border-radius: var(--radius);
++        background: var(--panel-strong);
++        box-shadow: var(--shadow-soft);
++      }
++
++      .organization-billing-metric.accent {
++        border-color: rgba(6, 115, 210, 0.22);
++        background: linear-gradient(140deg, var(--ice), var(--panel-strong));
++      }
++
++      .organization-billing-metric > span,
++      .organization-billing-usage-card > span,
++      .organization-billing-metric small,
++      .organization-billing-usage-card small,
++      .organization-billing-usage-card div {
++        color: var(--muted);
++        font-size: 12px;
++      }
++
++      .organization-billing-metric strong,
++      .organization-billing-usage-card strong {
++        font-size: 25px;
++        font-variant-numeric: tabular-nums;
++      }
++
++      .organization-billing-usage-card div {
++        display: flex;
++        flex-wrap: wrap;
++        gap: 5px 10px;
++        margin-top: 3px;
++      }
++
++      .organization-billing-note {
++        display: flex;
++        align-items: flex-start;
++        gap: 10px;
++        padding: 13px 16px;
++        border: 1px solid rgba(184, 135, 39, 0.22);
++        border-radius: var(--radius-sm);
++        background: rgba(255, 247, 226, 0.72);
++      }
++
++      .organization-billing-note .app-icon {
++        flex: 0 0 auto;
++        color: var(--gold);
++      }
++
++      .organization-billing-note p {
++        margin: 0;
++        color: #6f5520;
++        font-size: 13px;
++        line-height: 1.65;
++      }
++
++      .organization-billing-record-panel .table-wrap {
++        overflow-x: auto;
++      }
++
++      .organization-billing-record-panel table {
++        min-width: 720px;
++      }
++
+       .billing-stat-card {
+         display: grid;
+         gap: 6px;
+@@ -4544,6 +4751,24 @@
+           grid-template-columns: 1fr;
+         }
+ 
++        .organization-billing-hero {
++          grid-template-columns: 1fr;
++          padding: 22px;
++        }
++
++        .organization-billing-metrics,
++        .organization-billing-usage-grid {
++          grid-template-columns: 1fr;
++        }
++
++        .organization-billing-hero-balance {
++          justify-items: stretch;
++        }
++
++        .organization-billing-hero-balance .primary-btn {
++          width: 100%;
++        }
++
+         .billing-action-grid {
+           grid-template-columns: 1fr;
+         }
+@@ -4626,7 +4851,21 @@
+         }
+ 
+         .daily-main-head {
+-          display: grid;
++          gap: 8px;
++        }
++
++        .daily-main-title-row {
++          grid-template-columns: minmax(0, 1fr);
++          gap: 4px;
++        }
++
++        .daily-freshness {
++          max-inline-size: none;
++          text-align: left;
++        }
++
++        .daily-main-meta {
++          align-items: flex-start;
+         }
+ 
+         .daily-context {
+@@ -5931,9 +6170,13 @@
+         <section id="personalDailyOverview" class="daily-overview" aria-label="所选范围用量摘要">
+           <div class="daily-main-card">
+             <div class="daily-main-head">
+-              <span class="daily-eyebrow">所选范围 · 个人用量</span>
+-              <span id="heroContext" class="daily-context">近 1 天 · 全部来源 · 最新数据日 暂无日期</span>
+-              <span id="heroFreshness" class="daily-context">数据更新时间：暂未同步</span>
++              <div class="daily-main-title-row">
++                <span class="daily-eyebrow">所选范围 · 个人用量</span>
++                <span id="heroFreshness" class="daily-freshness">数据更新时间：暂未同步</span>
++              </div>
++              <div class="daily-main-meta">
++                <span id="heroContext" class="daily-context">近 1 天 · 全部来源 · 最新数据日 暂无日期</span>
++              </div>
+             </div>
+             <div class="daily-main-values">
+               <div>
+@@ -6095,9 +6338,13 @@
+           <section id="adminDailyOverview" class="daily-overview" aria-label="所选范围全员用量摘要">
+             <div class="daily-main-card">
+               <div class="daily-main-head">
+-                <span id="adminHeroTitle" class="daily-eyebrow">所选范围 · 管理员视图</span>
+-                <span id="adminHeroContext" class="daily-context">近 1 天 · 全部来源 · 最新数据日 暂无日期</span>
+-                <span id="adminHeroFreshness" class="daily-context">数据更新时间：暂未同步</span>
++                <div class="daily-main-title-row">
++                  <span id="adminHeroTitle" class="daily-eyebrow">所选范围 · 管理员视图</span>
++                  <span id="adminHeroFreshness" class="daily-freshness">数据更新时间：暂未同步</span>
++                </div>
++                <div class="daily-main-meta">
++                  <span id="adminHeroContext" class="daily-context">近 1 天 · 全部来源 · 最新数据日 暂无日期</span>
++                </div>
+               </div>
+               <div class="daily-main-values">
+                 <div>
+@@ -6372,9 +6619,13 @@
+             <section id="teamDailyOverview" class="daily-overview" aria-label="所选范围团队用量摘要">
+               <div class="daily-main-card">
+                 <div class="daily-main-head">
+-                  <span id="teamWelcomeTitle" class="daily-eyebrow">所选范围 · 团队视图</span>
+-                  <span id="teamHeroContext" class="daily-context">近 1 天 · 全部来源 · 最新数据日 暂无日期</span>
+-                  <span id="teamHeroFreshness" class="daily-context">数据更新时间：暂未同步</span>
++                  <div class="daily-main-title-row">
++                    <span id="teamWelcomeTitle" class="daily-eyebrow">所选范围 · 团队视图</span>
++                    <span id="teamHeroFreshness" class="daily-freshness">数据更新时间：暂未同步</span>
++                  </div>
++                  <div class="daily-main-meta">
++                    <span id="teamHeroContext" class="daily-context">近 1 天 · 全部来源 · 最新数据日 暂无日期</span>
++                  </div>
+                 </div>
+                 <div class="daily-main-values">
+                   <div>
+@@ -6560,9 +6811,13 @@
+           <section id="departmentOverviewHero" class="daily-overview" aria-label="所选范围部门用量摘要">
+             <div class="daily-main-card">
+               <div class="daily-main-head">
+-                <span id="departmentWelcomeTitle" class="daily-eyebrow">所选范围 · 部门视图</span>
+-                <span id="departmentHeroContext" class="daily-context">近 1 天 · 全部来源 · 最新数据日 暂无日期</span>
+-                <span id="departmentHeroFreshness" class="daily-context">数据更新时间：暂未同步</span>
++                <div class="daily-main-title-row">
++                  <span id="departmentWelcomeTitle" class="daily-eyebrow">所选范围 · 部门视图</span>
++                  <span id="departmentHeroFreshness" class="daily-freshness">数据更新时间：暂未同步</span>
++                </div>
++                <div class="daily-main-meta">
++                  <span id="departmentHeroContext" class="daily-context">近 1 天 · 全部来源 · 最新数据日 暂无日期</span>
++                </div>
+               </div>
+               <div class="daily-main-values">
+                 <div>
+@@ -6774,6 +7029,7 @@
+             <button class="ghost-btn active" type="button" role="tab" data-organization-usage-view="info" aria-selected="true">组织信息</button>
+             <button class="ghost-btn" type="button" role="tab" data-organization-usage-view="usage" aria-selected="false">全员看板</button>
+             <button class="ghost-btn" type="button" role="tab" data-organization-usage-view="departments-usage" aria-selected="false">部门看板</button>
++            <button class="ghost-btn" type="button" role="tab" data-organization-usage-view="billing" aria-selected="false">企业额度</button>
+           </div>
+ 
+           <section class="organization-stats" aria-label="企业组织概览">
+@@ -6919,6 +7175,85 @@
+         </section>
+ 
+         <section id="billingView" class="view-section hidden">
++          <section id="organizationBillingWorkspace" class="organization-billing-workspace hidden" aria-labelledby="organizationBillingTitle">
++            <div id="customerBillingBreadcrumb" class="organization-detail-tools hidden" aria-label="客户企业额度导航">
++              <button id="backToCustomerOrganizationBillingButton" class="ghost-btn" type="button">返回企业详情</button>
++              <span id="customerBillingBreadcrumbLabel" class="organization-usage-scope">客户企业</span>
++            </div>
++
++            <section class="organization-billing-hero">
++              <div>
++                <span class="organization-demo-badge">演示数据</span>
++                <span class="eyebrow">企业额度</span>
++                <h2 id="organizationBillingTitle">企业账户余额</h2>
++                <p><strong id="organizationBillingScopeName">客户企业</strong> 的额度仅用于本地演示。演示用量不影响企业余额，也不会发起真实付款。</p>
++              </div>
++              <div class="organization-billing-hero-balance">
++                <span>当前可用余额</span>
++                <strong id="organizationBillingBalance">$0.00</strong>
++                <button id="openOrganizationTopupModalButton" class="primary-btn hidden" type="button">
++                  <span class="app-icon"><svg><use href="#icon-cost"></use></svg></span>
++                  模拟充值
++                </button>
++                <span id="organizationBillingReadOnlyHint" class="organization-billing-readonly hidden">平台视图仅供查看</span>
++              </div>
++            </section>
++
++            <section class="organization-billing-metrics" aria-label="企业额度概览">
++              <article class="organization-billing-metric accent">
++                <span>累计企业额度</span>
++                <strong id="organizationBillingTotalCredits">$0.00</strong>
++                <small>含初始企业额度与模拟充值</small>
++              </article>
++              <article class="organization-billing-metric">
++                <span>初始企业额度</span>
++                <strong id="organizationBillingInitialCredits">$0.00</strong>
++                <small>每家演示企业独立初始化</small>
++              </article>
++              <article class="organization-billing-metric">
++                <span>演示用量估算</span>
++                <strong id="organizationBillingUsageEstimate">$0.00</strong>
++                <small><span id="organizationBillingUsageTokens">0</span> Token · <span id="organizationBillingUsageRequests">0</span> 次请求</small>
++              </article>
++            </section>
++
++            <section class="organization-billing-note">
++              <span class="app-icon" aria-hidden="true"><svg><use href="#icon-shield"></use></svg></span>
++              <p>演示用量仅帮助查看企业使用情况，不会扣减企业账户余额。本页不包含支付方式、收款码、兑换码或真实订单。</p>
++            </section>
++
++            <section id="organizationBillingUsageCards" class="organization-billing-usage-grid" aria-label="企业用量统计"></section>
++
++            <section class="panel organization-billing-record-panel">
++              <div class="panel-header">
++                <div class="panel-heading">
++                  <span class="panel-icon"><svg><use href="#icon-table"></use></svg></span>
++                  <div>
++                    <h3 class="panel-title">额度变动记录</h3>
++                    <p class="panel-desc">记录初始企业额度与后续模拟充值。所有内容均为演示数据。</p>
++                  </div>
++                </div>
++                <span id="organizationBillingRecordCount" class="chip blue">0 条</span>
++              </div>
++              <div class="table-wrap">
++                <table aria-label="企业额度变动记录">
++                  <thead>
++                    <tr>
++                      <th>时间</th>
++                      <th>类型</th>
++                      <th class="num">额度</th>
++                      <th class="num">余额</th>
++                      <th>操作人</th>
++                      <th>状态</th>
++                    </tr>
++                  </thead>
++                  <tbody id="organizationBillingRecordBody"></tbody>
++                </table>
++              </div>
++            </section>
++          </section>
++
++          <div id="personalBillingWorkspace">
+           <section class="panel key-page-head">
+             <div>
+               <span class="eyebrow">额度账户</span>
+@@ -7051,6 +7386,7 @@
+               </table>
+             </div>
+           </section>
++          </div>
+         </section>
+ 
+         <section id="modelsView" class="view-section hidden">
+@@ -7287,6 +7623,24 @@
+       </form>
+     </div>
+ 
+-    <script src="/assets/app.js?v=20260730-customer-organizations"></script>
++    <div id="organizationTopupModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="organizationTopupModalTitle">
++      <form id="organizationTopupForm" class="modal organization-topup-modal" autocomplete="off">
++        <h3 id="organizationTopupModalTitle">模拟充值</h3>
++        <p>立即为当前企业增加演示额度，不会调用支付、收款、邮件或任何真实充值服务。</p>
++        <div id="organizationTopupOptions" class="billing-amount-options" role="group" aria-label="模拟充值快速金额"></div>
++        <div class="field">
++          <label for="organizationTopupAmount">自定义金额（美元）</label>
++          <input id="organizationTopupAmount" class="input" type="number" min="1" max="100000" step="0.01" inputmode="decimal" placeholder="请输入模拟充值金额" />
++          <p id="organizationTopupError" class="field-error" aria-live="polite"></p>
++        </div>
++        <p class="organization-modal-note">金额范围为 $1.00 至 $100,000.00，最多两位小数。提交成功后余额和记录会立即刷新。</p>
++        <div class="modal-actions">
++          <button id="cancelOrganizationTopupButton" class="ghost-btn" type="button">取消</button>
++          <button id="submitOrganizationTopupButton" class="primary-btn" type="submit">确认模拟充值</button>
++        </div>
++      </form>
++    </div>
++
++    <script src="/assets/app.js?v=20260730-organization-billing"></script>
+   </body>
+ </html>
+diff --git a/tests/test_frontend_billing.py b/tests/test_frontend_billing.py
+index 21e2989..b342969 100644
+--- a/tests/test_frontend_billing.py
++++ b/tests/test_frontend_billing.py
+@@ -44,11 +44,21 @@ def test_user_page_has_no_redemption_entry() -> None:
+     markup = INDEX_HTML.read_text(encoding="utf-8")
+     source = APP_JS.read_text(encoding="utf-8")
+     billing_markup = markup[markup.index('id="billingView"') : markup.index('id="modelsView"')]
++    personal_billing_markup = billing_markup[
++        billing_markup.index('id="personalBillingWorkspace"') :
++    ]
++    organization_billing_markup = billing_markup[
++        billing_markup.index('id="organizationBillingWorkspace"') : billing_markup.index('id="personalBillingWorkspace"')
++    ]
+ 
+-    # 兑换码只给管理员发放，用户页面不显示兑换入口。
+-    assert 'id="redeemForm"' not in billing_markup
+-    assert 'id="redeemCode"' not in billing_markup
+-    assert "兑换" not in billing_markup
++    # 兑换码只给卖方平台运营面板发放；个人充值与企业 Mock 额度页都
++    # 不能提供兑换入口。企业页可以明确说明“不包含兑换码”，因此不能
++    # 再把说明文字本身误判成一个入口。
++    assert 'id="redeemForm"' not in personal_billing_markup
++    assert 'id="redeemCode"' not in personal_billing_markup
++    assert 'id="redeemForm"' not in organization_billing_markup
++    assert 'id="redeemCode"' not in organization_billing_markup
++    assert "本页不包含支付方式、收款码、兑换码或真实订单。" in organization_billing_markup
+     assert "submitRedeem" not in source
+ 
+ 
+@@ -97,9 +107,13 @@ def test_billing_view_is_reachable_without_entitlement() -> None:
+ def test_topup_entry_hidden_when_billing_unavailable() -> None:
+     source = APP_JS.read_text(encoding="utf-8")
+ 
+-    # 充值未开放时不能给出走不通的入口。
++    # 个人充值未开放，或当前身份不具备企业额度能力时，直接切换到
++    # 充值页也必须回退到我的用量。
+     assert 'el("accountAccessTopupButton").classList.toggle("hidden", !(state.topup && billingAvailable));' in source
+-    assert 'if (view === "billing" && !billingAvailable) view = "dashboard";' in source
++    assert 'if (view === "billing" && !canAccessBillingView()) view = "dashboard";' in source
++    access_guard = source[source.index("function canAccessBillingView()") : source.index("function selectedCustomerOrganizationId()")]
++    assert "isOrganizationBillingView()" in access_guard
++    assert "billingAvailable && !currentUser?.organizationDemoEnabled" in access_guard
+ 
+ 
+ def test_online_panel_hidden_until_a_channel_is_configured() -> None:
+@@ -180,7 +194,11 @@ def test_admin_review_queue_supports_confirm_and_reject() -> None:
+ def test_polling_stops_when_leaving_billing_view() -> None:
+     source = APP_JS.read_text(encoding="utf-8")
+ 
+-    assert 'if (currentView === "billing" && view !== "billing") hideManualPayPanel();' in source
++    # Leaving either billing workspace stops legacy payment polling and closes
++    # the Mock top-up modal, so no billing UI survives a view transition.
++    leaving_billing = source[source.index('if (currentView === "billing" && view !== "billing")') : source.index("currentView = view;")]
++    assert "hideManualPayPanel();" in leaving_billing
++    assert "closeOrganizationTopupModal({ force: true });" in leaving_billing
+     assert "stopTopupPolling();" in source[source.index("function hideManualPayPanel()") :][:200]
+     # 人工确认比自动回调慢，轮询窗口相应放宽。
+     assert "attempts > 100" in source
+@@ -201,11 +219,11 @@ def test_logout_clears_billing_state() -> None:
+         assert cleared in source
+ 
+ 
+-def test_static_asset_version_bumped_for_customer_organization_release() -> None:
++def test_static_asset_version_bumped_for_organization_billing_release() -> None:
+     markup = INDEX_HTML.read_text(encoding="utf-8")
+ 
+     # 不更新版本号线上用户会命中旧缓存，看不到客户企业中心与隔离看板。
+-    assert 'src="/assets/app.js?v=20260730-customer-organizations"' in markup
++    assert 'src="/assets/app.js?v=20260730-organization-billing"' in markup
+ 
+ 
+ def test_billing_copy_avoids_upstream_provider_terms() -> None:
+@@ -217,3 +235,74 @@ def test_billing_copy_avoids_upstream_provider_terms() -> None:
+     for term in ("LiteLLM", "Virtual Key", "max_budget", "Proxy", "proxy"):
+         assert term not in billing_markup, f"充值页面文案不应暴露 {term}"
+         assert term not in billing_source, f"充值前端逻辑不应暴露 {term}"
++
++
++def test_organization_billing_has_a_separate_mock_contract_and_payment_free_workspace() -> None:
++    markup = INDEX_HTML.read_text(encoding="utf-8")
++    source = APP_JS.read_text(encoding="utf-8")
++
++    for required in (
++        'id="organizationBillingWorkspace"',
++        'id="organizationTopupModal"',
++        'id="organizationBillingRecordBody"',
++        'id="openOrganizationTopupModalButton"',
++        'data-organization-usage-view="billing"',
++    ):
++        assert required in markup
++    assert 'path: "/api/organization/current/billing"' in source
++    assert 'path: `${customerOrganizationPath(organizationId)}/billing`' in source
++    assert 'api("/api/organization/current/billing/topups"' in source
++    assert "body: JSON.stringify({ amountUsd: amount })" in source
++    assert "function organizationBillingContext()" in source
++    assert "function renderOrganizationBilling()" in source
++    assert "function submitOrganizationTopup(event)" in source
++
++
++def test_organization_billing_workspace_hides_personal_payment_ui() -> None:
++    source = APP_JS.read_text(encoding="utf-8")
++
++    render_billing = source[source.index("function renderOrganizationBilling()") : source.index("function organizationBillingUrl(")]
++    assert 'workspace.classList.toggle("hidden", !context);' in render_billing
++    assert 'personalWorkspace.classList.toggle("hidden", Boolean(context));' in render_billing
++    assert "if (renderOrganizationBilling()) return;" in source
++
++
++def test_mock_billing_sidebar_requires_customer_capability_not_platform_admin() -> None:
++    source = APP_JS.read_text(encoding="utf-8")
++
++    navigation = source[source.index("function syncNavigationVisibility()") : source.index("function renderCustomerUsageBreadcrumbs")]
++    assert "const canUseBillingSidebar = isCustomer" in navigation
++    assert "? canViewOrganizationBilling()" in navigation
++    assert ": Boolean(billingAvailable && !currentUser?.organizationDemoEnabled);" in navigation
++    assert 'el("billingTab")?.classList.toggle("hidden", !canUseBillingSidebar);' in navigation
++
++
++def test_organization_topup_modal_closes_only_via_existing_safe_modal_contract() -> None:
++    source = APP_JS.read_text(encoding="utf-8")
++
++    backdrop = source[source.index('document.querySelectorAll(".modal-backdrop")') : source.index('document.addEventListener("keydown"')]
++    assert "if (event.target !== backdrop) return;" in backdrop
++    assert 'backdrop.id === "organizationTopupModal"' in backdrop
++    keyboard = source[source.index('document.addEventListener("keydown"') : source.index('document.addEventListener("visibilitychange"')]
++    assert 'if (event.key !== "Escape") return;' in keyboard
++    assert '!el("organizationTopupModal").classList.contains("hidden")' in keyboard
++
++
++def test_mock_customer_billing_never_falls_back_to_personal_billing() -> None:
++    source = APP_JS.read_text(encoding="utf-8")
++
++    billing_refresh = source[source.index("async function refreshBillingAvailability()") : source.index("function updateBillingNav()")]
++    assert "if (isMockCustomerIdentity())" in billing_refresh
++    assert "billingAvailable = false;" in billing_refresh
++    switch_view = source[source.index("function switchView(view)") : source.index("async function loadCurrentViewData")]
++    assert "if (isOrganizationBillingView())" in switch_view
++    assert "loadOrganizationBillingData()" in switch_view
++    assert "else if (!isBillingLoading) loadBillingData();" in switch_view
++
++
++def test_organization_topup_modal_uses_existing_keyboard_and_backdrop_contract() -> None:
++    source = APP_JS.read_text(encoding="utf-8")
++
++    assert 'backdrop.id === "organizationTopupModal"' in source
++    assert '!el("organizationTopupModal").classList.contains("hidden")' in source
++    assert "closeOrganizationTopupModal()" in source
+diff --git a/tests/test_frontend_organization.py b/tests/test_frontend_organization.py
+index d2660f1..48933b3 100644
+--- a/tests/test_frontend_organization.py
++++ b/tests/test_frontend_organization.py
+@@ -79,8 +79,25 @@ def test_customer_usage_detail_hides_platform_billing_management() -> None:
+ 
+     # A seller admin viewing a customer's usage must not load or render the
+     # platform-wide redemption and billing management panel in that scope.
++    # The V2 capability deliberately does not reuse ``isAdmin`` as an
++    # enterprise role, because a customer detail is a tenant-scoped view.
+     assert "function adminBillingVisible()" in source
+-    assert "currentUser?.isAdmin && billingAvailable && !isViewingCustomerOrganization()" in source
++    assert "isPlatformAdmin() && billingAvailable && !isViewingCustomerOrganization()" in source
++    assert "if (adminBillingVisible() && !adminRedemptions.length && !adminBillingOrders.length) loadAdminBillingData();" in source
++
++
++def test_customer_billing_detail_is_read_only_and_stays_in_customer_scope() -> None:
++    source = APP_JS.read_text(encoding="utf-8")
++
++    context = source[source.index("function organizationBillingContext()") : source.index("function organizationBillingContextKey()")]
++    assert 'kind: "platformCustomer"' in context
++    assert "readOnly: true" in context
++    assert 'path: `${customerOrganizationPath(organizationId)}/billing`' in context
++    assert 'path: "/api/organization/current/billing"' in context
++
++    # The customer-detail tab cannot surface the seller's payment workflow.
++    assert "if (!context || context.readOnly || !canSimulateOrganizationTopup()) return;" in source
++    assert "if (!context || context.readOnly || !canSimulateOrganizationTopup() || isOrganizationTopupSaving) return;" in source
+ 
+ 
+ def test_inactive_mock_customer_identity_has_a_clear_limited_access_state() -> None:
+diff --git a/tests/test_static_cache.py b/tests/test_static_cache.py
+index e67de42..8e03078 100644
+--- a/tests/test_static_cache.py
++++ b/tests/test_static_cache.py
+@@ -12,7 +12,7 @@ def test_index_uses_fresh_app_asset_and_disables_html_cache() -> None:
+     assert "Cache-Control" in response.headers
+     assert response.headers["Cache-Control"] == "no-store"
+     assert response.headers["Referrer-Policy"] == "no-referrer"
+-    assert "/assets/app.js?v=20260730-customer-organizations" in response.text
++    assert "/assets/app.js?v=20260730-organization-billing" in response.text
+     assert "20260729-ranking-column-sort" not in response.text
+     assert "20260729-topup-manual-qr" not in response.text
+     assert "20260729-topup-billing-center" not in response.text
+@@ -35,6 +35,31 @@ def test_index_uses_fresh_app_asset_and_disables_html_cache() -> None:
+     assert response.text.index('id="departmentDetailCard"', department_view) < response.text.index('id="departmentOverviewHero"', department_view)
+ 
+ 
++def test_summary_cards_use_two_layer_metadata_header() -> None:
++    client = TestClient(main.app)
++
++    response = client.get("/")
++
++    assert response.status_code == 200
++    summary_cards = (
++        ("personalDailyOverview", "heroContext", "heroFreshness"),
++        ("adminDailyOverview", "adminHeroContext", "adminHeroFreshness"),
++        ("teamDailyOverview", "teamHeroContext", "teamHeroFreshness"),
++        ("departmentOverviewHero", "departmentHeroContext", "departmentHeroFreshness"),
++    )
++    for overview_id, context_id, freshness_id in summary_cards:
++        overview_start = response.text.index(f'id="{overview_id}"')
++        main_card_start = response.text.index('<div class="daily-main-card">', overview_start)
++        source_card_start = response.text.index('<div class="daily-source-card">', main_card_start)
++        card_markup = response.text[main_card_start:source_card_start]
++
++        assert 'class="daily-main-title-row"' in card_markup
++        assert 'class="daily-main-meta"' in card_markup
++        assert f'id="{context_id}" class="daily-context"' in card_markup
++        assert f'id="{freshness_id}" class="daily-freshness"' in card_markup
++        assert card_markup.index('class="daily-main-title-row"') < card_markup.index('class="daily-main-meta"')
++
++
+ def test_spa_fallback_disables_html_cache() -> None:
+     client = TestClient(main.app)
+ 

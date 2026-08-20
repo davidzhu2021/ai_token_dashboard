@@ -276,6 +276,10 @@ CREATE INDEX IF NOT EXISTS usage_event_attribution_ttft_idx
     WHERE ttft_ms IS NOT NULL;
 CREATE INDEX IF NOT EXISTS usage_event_attribution_failure_idx
     ON usage_event_attribution (usage_date, model, final_failure_source, user_visible_failure);
+CREATE INDEX IF NOT EXISTS usage_event_attribution_drilldown_idx
+    ON usage_event_attribution (usage_date, scenario, error_code, event_time DESC);
+CREATE INDEX IF NOT EXISTS usage_event_attribution_model_group_drilldown_idx
+    ON usage_event_attribution (usage_date, model_group, scenario, error_code, event_time DESC);
 
 CREATE TABLE IF NOT EXISTS usage_realtime_daily (
     LIKE usage_daily INCLUDING DEFAULTS INCLUDING CONSTRAINTS
@@ -306,6 +310,22 @@ CREATE TABLE IF NOT EXISTS usage_realtime_settlement (
     last_error TEXT NOT NULL DEFAULT '',
     updated_at TIMESTAMPTZ NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS usage_realtime_settlement_segments (
+    backend_id TEXT NOT NULL,
+    start_time TIMESTAMPTZ NOT NULL,
+    end_time TIMESTAMPTZ NOT NULL,
+    status TEXT NOT NULL,
+    request_count BIGINT NOT NULL DEFAULT 0,
+    amount NUMERIC(16,6) NOT NULL DEFAULT 0,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    error_summary TEXT NOT NULL DEFAULT '',
+    completed_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (backend_id, start_time, end_time)
+);
+CREATE INDEX IF NOT EXISTS usage_realtime_settlement_segments_status_idx
+    ON usage_realtime_settlement_segments (backend_id, status, start_time);
 
 CREATE OR REPLACE VIEW usage_query_daily AS
 SELECT u.*
@@ -348,6 +368,8 @@ CREATE INDEX IF NOT EXISTS cost_api_daily_date_idx
     ON cost_api_daily (usage_date, model, provider);
 CREATE INDEX IF NOT EXISTS cost_api_daily_account_idx
     ON cost_api_daily (usage_date, account_id, key_id, principal_id);
+CREATE INDEX IF NOT EXISTS cost_api_daily_ledger_idx
+    ON cost_api_daily (usage_date DESC, provider, model, account_id);
 
 CREATE TABLE IF NOT EXISTS observability_dashboard_snapshots (
     dashboard_type TEXT NOT NULL,
@@ -1327,6 +1349,54 @@ class UsageStore:
             since,
         )
         return [(str(row["backend_id"]), str(row["request_id"])) for row in records]
+
+    async def realtime_event_rows(self, usage_date: date) -> list[dict[str, Any]]:
+        """Aggregate only audited request facts for the published realtime day."""
+
+        records = await self._require_pool().fetch(
+            """
+            SELECT e.backend_id, e.usage_date, e.raw_user_id, e.source, e.model,
+                   organization_id, team_id, key_id, principal_id, attribution_source,
+                   billing_eligible, MAX(event_time) AS event_time,
+                   MAX(collected_at) AS collected_at,
+                   SUM(prompt_tokens)::bigint AS prompt_tokens, SUM(completion_tokens)::bigint AS completion_tokens,
+                   SUM(total_tokens)::bigint AS total_tokens, SUM(request_count)::bigint AS request_count,
+                   SUM(success_count)::bigint AS success_count, SUM(failure_count)::bigint AS failure_count,
+                   SUM(spend)::numeric AS spend,
+                   MAX(d.employee_email) AS employee_email,
+                   MAX(d.employee_name) AS employee_name,
+                   MAX(d.email_source) AS email_source
+            FROM usage_event_attribution e
+            LEFT JOIN LATERAL (
+                SELECT employee_email, employee_name, email_source
+                FROM usage_daily d
+                WHERE d.backend_id=e.backend_id AND d.usage_date=e.usage_date AND d.user_id=e.raw_user_id
+                ORDER BY employee_email DESC, employee_name DESC
+                LIMIT 1
+            ) d ON TRUE
+            WHERE e.usage_date=$1
+            GROUP BY e.backend_id, e.usage_date, e.raw_user_id, e.source, e.model,
+                     organization_id, team_id, key_id, principal_id, attribution_source, billing_eligible
+            ORDER BY e.backend_id, e.raw_user_id, e.source, e.model
+            """,
+            usage_date,
+        )
+        return [
+            {
+                "backendId": str(row["backend_id"]), "date": row["usage_date"].isoformat(),
+                "userId": str(row["raw_user_id"]), "employeeEmail": str(row["employee_email"] or ""), "employeeName": str(row["employee_name"] or row["raw_user_id"]),
+                "emailSource": str(row["email_source"] or ""), "source": str(row["source"]), "model": str(row["model"]),
+                "promptTokens": int(row["prompt_tokens"] or 0), "completionTokens": int(row["completion_tokens"] or 0),
+                "totalTokens": int(row["total_tokens"] or 0), "requestCount": int(row["request_count"] or 0),
+                "successCount": int(row["success_count"] or 0), "failureCount": int(row["failure_count"] or 0),
+                "spend": float(row["spend"] or 0), "organizationId": str(row["organization_id"] or ""),
+                "teamId": str(row["team_id"] or ""), "keyId": str(row["key_id"] or ""),
+                "principalId": str(row["principal_id"] or ""),
+                "attributionSource": str(row["attribution_source"] or "unattributed"),
+                "billingEligible": bool(row["billing_eligible"]),
+            }
+            for row in records
+        ]
 
     async def latest_archived_event_at(self, backend_id: str) -> datetime | None:
         return await self._require_pool().fetchval(
@@ -3698,6 +3768,24 @@ class UsageStore:
             "updatedAt": row["updated_at"],
         }
 
+    async def realtime_settlements(self, backend_ids: list[str]) -> list[dict[str, Any]]:
+        if not backend_ids:
+            return []
+        records = await self._require_pool().fetch(
+            "SELECT backend_id, verified_through, status, last_error, updated_at FROM usage_realtime_settlement WHERE backend_id=ANY($1::text[])",
+            backend_ids,
+        )
+        return [
+            {
+                "backendId": str(row["backend_id"]),
+                "verifiedThrough": row["verified_through"],
+                "status": str(row["status"] or "pending"),
+                "lastError": str(row["last_error"] or ""),
+                "updatedAt": row["updated_at"],
+            }
+            for row in records
+        ]
+
     async def advance_realtime_settlement(
         self,
         backend_id: str,
@@ -3715,6 +3803,36 @@ class UsageStore:
                 status=EXCLUDED.status, last_error=EXCLUDED.last_error, updated_at=EXCLUDED.updated_at
             """,
             backend_id, verified_through, status, error, datetime.now(timezone.utc),
+        )
+
+    async def record_realtime_settlement_segment(
+        self,
+        *,
+        backend_id: str,
+        start_time: datetime,
+        end_time: datetime,
+        status: str,
+        request_count: int = 0,
+        amount: float | str = 0,
+        retry_count: int = 0,
+        error_summary: str = "",
+        completed_at: datetime | None = None,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        await self._require_pool().execute(
+            """
+            INSERT INTO usage_realtime_settlement_segments (
+                backend_id, start_time, end_time, status, request_count,
+                amount, retry_count, error_summary, completed_at, updated_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            ON CONFLICT (backend_id, start_time, end_time) DO UPDATE SET
+                status=EXCLUDED.status, request_count=EXCLUDED.request_count,
+                amount=EXCLUDED.amount, retry_count=usage_realtime_settlement_segments.retry_count + EXCLUDED.retry_count,
+                error_summary=EXCLUDED.error_summary, completed_at=EXCLUDED.completed_at,
+                updated_at=EXCLUDED.updated_at
+            """,
+            backend_id, start_time, end_time, status, int(request_count), amount,
+            int(retry_count), error_summary[:500], completed_at, now,
         )
         employees = [
             {
@@ -5070,8 +5188,8 @@ class UsageStore:
             _clean_text(scenario),
             _clean_text(error_code),
         )
-        total = int(await pool.fetchval(f"SELECT COUNT(*) FROM usage_event_attribution WHERE {filters}", *args) or 0)
-        records = await pool.fetch(
+        total_query = pool.fetchval(f"SELECT COUNT(*) FROM usage_event_attribution WHERE {filters}", *args)
+        records_query = pool.fetch(
             """
             SELECT request_id, backend_id, event_time, model, scenario, error_code,
                    status, user_visible_failure, attempted_retries, ttft_ms
@@ -5104,7 +5222,7 @@ class UsageStore:
             _clean_text(scenario),
             _clean_text(error_code),
         )
-        option_rows = await pool.fetch(
+        option_rows_query = pool.fetch(
             """
             SELECT name, SUM(n)::bigint AS n
             FROM (
@@ -5127,9 +5245,10 @@ class UsageStore:
             *option_args,
             100,
         )
+        total, records, option_rows = await asyncio.gather(total_query, records_query, option_rows_query)
         return {
             "items": [dict(record) for record in records],
-            "total": total,
+            "total": int(total or 0),
             "modelOptions": [{"name": str(row["name"]), "count": int(row["n"] or 0)} for row in option_rows],
         }
 

@@ -38,7 +38,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.types import Scope
 
-from .cache import TTLCache
+from .cache import AsyncJSONCache, TTLCache
 from .auth import (
     SESSION_USER_KEY,
     allowed_email_domain,
@@ -356,6 +356,11 @@ team_member_usage_cache = TTLCache()
 _observability_refresh_tasks: dict[str, asyncio.Task[Any]] = {}
 _observability_refresh_lock = asyncio.Lock()
 _observability_memory_snapshots: dict[str, dict[str, Any]] = {}
+try:
+    _observability_drilldown_ttl = max(1, int(os.getenv("OBSERVABILITY_DRILLDOWN_CACHE_SECONDS", "60")))
+except ValueError:
+    _observability_drilldown_ttl = 60
+_observability_drilldown_cache = AsyncJSONCache(ttl_seconds=_observability_drilldown_ttl)
 _usage_singleflight: dict[str, asyncio.Task[Any]] = {}
 _usage_singleflight_lock = asyncio.Lock()
 _usage_last_good_payloads: dict[str, dict[str, Any]] = {}
@@ -591,6 +596,22 @@ async def _invalidate_observability_dashboard(dashboard_type: str) -> None:
         dashboard_type,
         default=0,
     )
+    await _observability_drilldown_cache.invalidate_prefix(f"observability:drilldown:{dashboard_type}:")
+
+
+async def _invalidate_observability_drilldowns(dashboard_type: str) -> None:
+    """Invalidate fast drilldowns without requiring the admin dashboard switch."""
+
+    prefix = f"observability:drilldown:{dashboard_type}:"
+    _observability_drilldown_cache.clear_local()
+    await _observability_drilldown_cache.invalidate_prefix(prefix)
+
+
+def _observability_drilldown_key(dashboard_type: str, resource: str, **params: Any) -> str:
+    """Use stable, complete query parameters so cached drilldowns never cross filters."""
+
+    encoded = json.dumps(params, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
+    return "observability:drilldown:" + dashboard_type + ":" + resource + ":" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def usage_sync_role() -> str:
@@ -1149,6 +1170,22 @@ def attach_snapshot_freshness(
     else:
         state = _usage_realtime_read_status
         latest_event = state.get("latestEventAt")
+        verified_values = state.get("verifiedThrough") or {}
+        verified_times: list[datetime] = []
+        if isinstance(verified_values, dict):
+            for value in verified_values.values():
+                try:
+                    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                    verified_times.append(parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc))
+                except (TypeError, ValueError):
+                    continue
+        verified_through = min(verified_times) if verified_times else None
+        settlement_statuses = state.get("settlementStatuses") or {}
+        verifying_backends = sorted(
+            str(backend_id)
+            for backend_id, value in settlement_statuses.items()
+            if isinstance(value, dict) and str(value.get("status") or "") not in {"", "settled"}
+        )
         if isinstance(latest_event, datetime):
             freshness["lastSyncedAt"] = latest_event.isoformat()
         freshness.update(
@@ -1171,6 +1208,18 @@ def attach_snapshot_freshness(
                 ),
                 "backfillActive": bool(state.get("backfillActive")),
                 "backfillBackends": state.get("backfillBackends", []),
+                "verifiedThrough": verified_through.isoformat() if verified_through else None,
+                "verificationLagSeconds": (
+                    max(0, int((datetime.now(timezone.utc) - verified_through).total_seconds()))
+                    if verified_through else None
+                ),
+                "settlementState": "settled" if verified_through else "verifying",
+                "unsettledBackends": verifying_backends,
+                "settlementErrors": {
+                    str(backend_id): str(value.get("error") or "")
+                    for backend_id, value in settlement_statuses.items()
+                    if isinstance(value, dict) and value.get("error")
+                },
             }
         )
     payload["dataFreshness"] = freshness
@@ -5649,6 +5698,24 @@ async def debug_admin_usage_compare(
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     result: dict[str, Any] = {"status": "ok", "usageSync": {"status": "disabled"}}
+    realtime_store = usage_realtime_store()
+    if realtime_store is not None and realtime_enabled():
+        try:
+            await realtime_store.connect()
+            realtime_health = await realtime_store.status()
+            result["usageRealtime"] = {
+                "ready": bool(realtime_health.get("ready")),
+                "verifiedThrough": realtime_health.get("verifiedThrough", {}),
+                "settlementStatuses": realtime_health.get("settlementStatuses", {}),
+                "unsettledBackends": sorted(
+                    backend_id for backend_id, value in (realtime_health.get("settlementStatuses") or {}).items()
+                    if isinstance(value, dict) and value.get("status") not in {None, "", "settled"}
+                ),
+            }
+        except Exception:
+            logger.exception("usage realtime health check failed")
+            result["usageRealtime"] = {"status": "error"}
+            result["status"] = "degraded"
     reader_config = usage_reader_config_status()
     result["usageReaderConfig"] = reader_config
     if not reader_config["configured"] and not local_mock_enabled():
@@ -9629,6 +9696,8 @@ async def internal_observability_events(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail="尝试事件存储尚未就绪")
     if isinstance(result, int):
         result = {"inserted": result, "received": len(normalized_events), "duplicates": len(normalized_events) - result}
+    if int(result.get("inserted") or 0):
+        await _invalidate_observability_drilldowns("stability")
     return _observability_envelope(result, coverage={"partial": False, "incomplete": False}, source="upstream attempt events")
 
 
@@ -9995,33 +10064,30 @@ async def admin_stability_scenarios(request: Request, start_date: str | None = N
     start_date, end_date = resolve_usage_range(start_date, end_date)
     page = max(1, page)
     page_size = max(1, min(100, page_size))
-    store = _admin_observability_store()
-    query = getattr(store, "stability_scenario_samples", None)
-    if callable(query):
-        result = await query(start_date, end_date, model=model, scenario=scenario, error_code=error_code, page=page, page_size=page_size)
-        raw_items, total = result.get("items", []), int(result.get("total") or 0)
-        model_options = result.get("modelOptions") or []
-    else:
-        events = await _admin_stability_events(start_date, end_date, model)
-        filtered = [item for item in events if (not scenario or item.get("scenario") == scenario) and (not error_code or item.get("error_code") == error_code)]
-        start = (page - 1) * page_size
-        raw_items, total = filtered[start:start + page_size], len(filtered)
-        # fallback：从过滤后的事件聚合 model / model_group 生成模型选项。
-        option_counts: dict[str, int] = {}
-        for item in filtered:
-            for key in ("model", "model_group"):
-                name = str(item.get(key) or "").strip()
-                if name:
-                    option_counts[name] = option_counts.get(name, 0) + 1
-        model_options = [
-            {"name": name, "count": count}
-            for name, count in sorted(option_counts.items(), key=lambda pair: (-pair[1], pair[0]))[:100]
-        ]
-    samples = []
-    for item in raw_items:
-        normalized = normalize_event(dict(item))
-        final_failure = normalized.get("finalRequestFailure")
-        samples.append({
+    async def build() -> dict[str, Any]:
+        store = _admin_observability_store()
+        query = getattr(store, "stability_scenario_samples", None)
+        if callable(query):
+            result = await query(start_date, end_date, model=model, scenario=scenario, error_code=error_code, page=page, page_size=page_size)
+            raw_items, total = result.get("items", []), int(result.get("total") or 0)
+            model_options = result.get("modelOptions") or []
+        else:
+            events = await _admin_stability_events(start_date, end_date, model)
+            filtered = [item for item in events if (not scenario or item.get("scenario") == scenario) and (not error_code or item.get("error_code") == error_code)]
+            start = (page - 1) * page_size
+            raw_items, total = filtered[start:start + page_size], len(filtered)
+            option_counts: dict[str, int] = {}
+            for item in filtered:
+                for key in ("model", "model_group"):
+                    name = str(item.get(key) or "").strip()
+                    if name:
+                        option_counts[name] = option_counts.get(name, 0) + 1
+            model_options = [{"name": name, "count": count} for name, count in sorted(option_counts.items(), key=lambda pair: (-pair[1], pair[0]))[:100]]
+        samples = []
+        for item in raw_items:
+            normalized = normalize_event(dict(item))
+            final_failure = normalized.get("finalRequestFailure")
+            samples.append({
             "requestId": item.get("request_id"),
             "backendId": item.get("backend_id"),
             "eventTime": item.get("event_time"),
@@ -10037,54 +10103,41 @@ async def admin_stability_scenarios(request: Request, start_date: str | None = N
             "attemptedRetries": item.get("attempted_retries"),
             "maxRetries": item.get("max_retries"),
             "ttftMs": item.get("ttft_ms"),
-        })
-    sync_states = await store.stability_sync_states()
-    window_covered, missing_reasons = _stability_missing_reasons(
-        sync_states,
-        start_date=start_date,
-        end_date=end_date,
-        configured_backends=set(usage_backend_ids()),
-        event_count=total,
-    )
-    return _observability_envelope(
-        {"items": samples, "total": total, "page": page, "pageSize": page_size, "modelOptions": model_options},
-        coverage={
-            "partial": not window_covered,
-            "incomplete": not window_covered,
-            "syncStates": sync_states,
-            "missingReasons": missing_reasons,
-            "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
-        },
-        source="稳定性事件快照",
-    )
+            })
+        sync_states = await store.stability_sync_states()
+        window_covered, missing_reasons = _stability_missing_reasons(sync_states, start_date=start_date, end_date=end_date, configured_backends=set(usage_backend_ids()), event_count=total)
+        return _observability_envelope({"items": samples, "total": total, "page": page, "pageSize": page_size, "modelOptions": model_options}, coverage={"partial": not window_covered, "incomplete": not window_covered, "syncStates": sync_states, "missingReasons": missing_reasons, "definitionsVersion": STABILITY_DEFINITIONS_VERSION}, source="稳定性事件快照")
+
+    key = _observability_drilldown_key("stability", "scenarios", start_date=start_date, end_date=end_date, model=model, scenario=scenario, error_code=error_code, page=page, page_size=page_size)
+    return await _observability_drilldown_cache.get_or_set(key, build)
 
 
 @app.get("/api/admin/stability/requests/{request_id}")
 async def admin_stability_request(request: Request, request_id: str, backend_id: str = "") -> dict[str, Any]:
     require_observability_dashboard(request)
-    store = _admin_observability_store()
-    try:
-        record = await store.stability_request(request_id, backend_id)
-    except TypeError:
-        record = await store.stability_request(request_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="请求样本不存在")
-    safe_fields = {key: record.get(key) for key in ("backend_id", "request_id", "event_time", "model", "provider", "model_group", "model_id", "source", "status", "error_code", "error_class", "error_message", "scenario", "request_duration_ms", "ttft_ms", "prompt_tokens", "completion_tokens", "total_tokens", "attempted_retries", "max_retries", "trace_id", "user_visible_failure", "organization_id", "team_id", "principal_id", "collected_at")}
-    timeline = await _call_store_optional(store, ("stability_attempt_timeline",), request_id, backend_id, default=None)
-    if timeline is None:
-        event_day = str(record.get("event_time") or date.today().isoformat())[:10]
-        timeline = await _stability_attempt_events(store, event_day, event_day, trace_id=str(record.get("trace_id") or ""), request_id=request_id)
-    normalized = normalize_event(record)
-    return _observability_envelope(
-        {
+    async def build() -> dict[str, Any]:
+        store = _admin_observability_store()
+        try:
+            record = await store.stability_request(request_id, backend_id)
+        except TypeError:
+            record = await store.stability_request(request_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="请求样本不存在")
+        safe_fields = {key: record.get(key) for key in ("backend_id", "request_id", "event_time", "model", "provider", "model_group", "model_id", "source", "status", "error_code", "error_class", "error_message", "scenario", "request_duration_ms", "ttft_ms", "prompt_tokens", "completion_tokens", "total_tokens", "attempted_retries", "max_retries", "trace_id", "user_visible_failure", "organization_id", "team_id", "principal_id", "collected_at")}
+        timeline = await _call_store_optional(store, ("stability_attempt_timeline",), request_id, backend_id, default=None)
+        if timeline is None:
+            event_day = str(record.get("event_time") or date.today().isoformat())[:10]
+            timeline = await _stability_attempt_events(store, event_day, event_day, trace_id=str(record.get("trace_id") or ""), request_id=request_id)
+        normalized = normalize_event(record)
+        return _observability_envelope({
             **safe_fields,
             "finalRequestFailure": normalized.get("finalRequestFailure"),
             "finalRequestFailureSource": normalized.get("finalRequestFailureSource"),
             "timeline": timeline or [],
-        },
-        coverage={"partial": False, "incomplete": not bool(timeline), "missingReasons": [] if timeline else ["upstream_attempt_logs_unavailable"]},
-        source="stability events and attempt timeline",
-    )
+        }, coverage={"partial": False, "incomplete": not bool(timeline), "missingReasons": [] if timeline else ["upstream_attempt_logs_unavailable"]}, source="stability events and attempt timeline")
+
+    key = _observability_drilldown_key("stability", "request", request_id=request_id, backend_id=backend_id)
+    return await _observability_drilldown_cache.get_or_set(key, build)
 
 
 def _cost_item_payload(item: dict[str, Any]) -> dict[str, Any]:
@@ -11232,49 +11285,37 @@ async def admin_costs_ledger(
     if cutoff < start:
         raise HTTPException(status_code=400, detail="as_of 不能早于查询开始日期")
     today = min(cutoff, end)
-    store = _admin_observability_store()
-    api_rows, api_dimensions_complete = await _cost_api_rows(
-        store, start, today, model=model, provider=provider, account_id=account_id
-    )
-    items = await _cost_actual_items(store, today, model=model, provider=provider, account_id=account_id, cost_bucket=cost_bucket)
-    api_rows, items = _filter_cost_sources(
-        api_rows,
-        items,
-        category=category,
-        cost_bucket=cost_bucket,
-        model=model,
-        canonical_model=canonical_model,
-        vendor=vendor,
-        provider=provider,
-        account_id=account_id,
-        reconciliation_status=reconciliation_status,
-        recognition_status=recognition_status,
-    )
-    ledger_rows = [_api_cost_ledger_row(row) for row in api_rows]
-    for item in items:
-        ledger_rows.extend(_manual_cost_ledger_rows(item, start, today))
-    ledger_rows.sort(key=lambda item: (str(item.get("date") or ""), float(item.get("amountUsd") or 0)), reverse=True)
     page_size = max(1, min(500, page_size))
-    offset = (max(1, page) - 1) * page_size
-    total_pages = math.ceil(len(ledger_rows) / page_size) if ledger_rows else 0
-    return _observability_envelope(
-        {
+    page = max(1, page)
+
+    async def build() -> dict[str, Any]:
+        store = _admin_observability_store()
+        api_rows, api_dimensions_complete = await _cost_api_rows(store, start, today, model=model, provider=provider, account_id=account_id)
+        items = await _cost_actual_items(store, today, model=model, provider=provider, account_id=account_id, cost_bucket=cost_bucket)
+        api_rows, items = _filter_cost_sources(api_rows, items, category=category, cost_bucket=cost_bucket, model=model, canonical_model=canonical_model, vendor=vendor, provider=provider, account_id=account_id, reconciliation_status=reconciliation_status, recognition_status=recognition_status)
+        ledger_rows = [_api_cost_ledger_row(row) for row in api_rows]
+        for item in items:
+            ledger_rows.extend(_manual_cost_ledger_rows(item, start, today))
+        ledger_rows.sort(key=lambda item: (str(item.get("date") or ""), float(item.get("amountUsd") or 0)), reverse=True)
+        offset = (page - 1) * page_size
+        total_pages = math.ceil(len(ledger_rows) / page_size) if ledger_rows else 0
+        return _observability_envelope({
             "items": ledger_rows[offset : offset + page_size],
             "total": len(ledger_rows),
-            "page": max(1, page),
+            "page": page,
             "pageSize": page_size,
             "totalPages": total_pages,
             "startDate": start.isoformat(),
             "endDate": end.isoformat(),
             "asOf": today.isoformat(),
-        },
-        coverage={
+        }, coverage={
             "partial": False,
             "incomplete": not bool(api_rows or items) or not api_dimensions_complete,
             "missingDimensions": [] if api_dimensions_complete else ["provider"],
-        },
-        source="cost ledger",
-    )
+        }, source="cost ledger")
+
+    key = _observability_drilldown_key("cost", "ledger", start_date=start.isoformat(), end_date=end.isoformat(), as_of=today.isoformat(), cost_bucket=cost_bucket, category=category, provider=provider, vendor=vendor, model=model, canonical_model=canonical_model, account_id=account_id, reconciliation_status=reconciliation_status, recognition_status=recognition_status, page=page, page_size=page_size)
+    return await _observability_drilldown_cache.get_or_set(key, build)
 
 
 async def _build_costs_annual(
