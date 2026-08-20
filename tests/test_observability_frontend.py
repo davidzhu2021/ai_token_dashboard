@@ -220,10 +220,13 @@ def test_cost_dashboard_trend_breakdown_exposes_three_daily_series() -> None:
     source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
 
     assert 'id="costTrendBreakdown"' in markup
-    for label in ("实际支出", "预测支出", "累计可优化金额"):
+    for label in ("实际支出", "预测支出", "累计高支出波动"):
         assert label in markup
     assert 'class="cost-dashboard-grid"' in markup
     assert 'function buildCostTrendBreakdownPoints' in source
     assert 'function renderMultiLineChart' in source
     assert 'renderCostTrendBreakdown(data)' in source
-    assert 'cumulativeOpportunity' in source
+    assert 'cumulativeVolatility' in source
+    cost_view = markup[markup.index('id="costControlView"'):markup.index('id="governanceWorkbenchView"')]
+    for misleading_copy in ("可省", "可优化金额", "可优化空间"):
+        assert misleading_copy not in cost_view
