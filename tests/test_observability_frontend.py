@@ -117,6 +117,13 @@ def test_model_cost_share_drilldown_uses_modal_overlay() -> None:
     assert "renderCostModelShareDetail" not in source[render_start:render_end]
 
 
+def test_cost_model_share_daily_drilldown_uses_canonical_model_filter() -> None:
+    source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
+    assert "canonicalModel: day.dataset.costModelSeriesName" in source
+    assert "canonical_model: filters.canonicalModel" in source
+    assert "model: day.dataset.costModelSeriesName" not in source
+
+
 def test_stability_drawer_has_model_filter_toolbar() -> None:
     markup = (ROOT / "index.html").read_text(encoding="utf-8")
     source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")

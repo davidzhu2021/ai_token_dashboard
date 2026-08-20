@@ -9156,6 +9156,7 @@ function openCostLedger(filters = {}, returnFocus = document.activeElement) {
     ...(filters.category ? { category: filters.category } : {}),
     ...(filters.costBucket ? { cost_bucket: filters.costBucket } : {}),
     ...(filters.model ? { model: filters.model } : {}),
+    ...(filters.canonicalModel ? { canonical_model: filters.canonicalModel } : {}),
     ...(filters.vendor ? { vendor: filters.vendor } : {}),
     ...(filters.provider ? { provider: filters.provider } : {}),
     ...(filters.accountId ? { account_id: filters.accountId } : {}),
@@ -9163,7 +9164,7 @@ function openCostLedger(filters = {}, returnFocus = document.activeElement) {
     ...(filters.recognitionStatus ? { recognition_status: filters.recognitionStatus } : {}),
   };
   costLedgerState = { ...costLedgerState, filters: normalizedFilters, page: 1, selectedId: "" };
-  el("costDetailDrawerTitle").textContent = filters.costBucket ? `费用明细 · ${filters.costBucket}` : filters.model ? `费用明细 · ${filters.model}` : "费用明细";
+  el("costDetailDrawerTitle").textContent = filters.costBucket ? `费用明细 · ${filters.costBucket}` : filters.canonicalModel ? `费用明细 · ${filters.canonicalModel}` : filters.model ? `费用明细 · ${filters.model}` : "费用明细";
   el("costLedgerDetail").innerHTML = '<p class="empty">选择左侧账本行查看来源与对账信息。</p>';
   setCostDrawerMode("ledger");
   focusDrawer("costDetailDrawer", returnFocus);
@@ -10912,7 +10913,7 @@ el("costModelShareModalBody")?.addEventListener("click", (event) => {
   const day = event.target.closest("[data-cost-model-series-day]");
   if (!day) return;
   closeCostModelShareModal();
-  openCostLedger(currentCostLedgerFilters({ model: day.dataset.costModelSeriesName, startDate: day.dataset.costModelSeriesDay, endDate: day.dataset.costModelSeriesDay }), day);
+  openCostLedger(currentCostLedgerFilters({ canonicalModel: day.dataset.costModelSeriesName, startDate: day.dataset.costModelSeriesDay, endDate: day.dataset.costModelSeriesDay }), day);
 });
 el("mobileViewSelect")?.addEventListener("change", (event) => switchView(event.currentTarget.value));
 el("governanceWorkbenchTabs")?.addEventListener("click", (event) => {

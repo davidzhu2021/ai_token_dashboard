@@ -10232,6 +10232,7 @@ def _filter_cost_sources(
     account_id: str = "",
     reconciliation_status: str = "",
     recognition_status: str = "",
+    canonical_model: str = "",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     filtered_api = list(api_rows)
     filtered_items = list(items)
@@ -10250,6 +10251,13 @@ def _filter_cost_sources(
     if model:
         filtered_api = [item for item in filtered_api if item.get("model") == model]
         filtered_items = [item for item in filtered_items if item.get("model") == model]
+    if canonical_model:
+        filtered_api = [
+            item for item in filtered_api
+            if _cost_model_display_name(item) == canonical_model
+        ]
+        # 规范模型下钻只对应 API Token 实际支出，不能把手动成本项混入。
+        filtered_items = []
     if vendor:
         filtered_api = [item for item in filtered_api if item.get("source") == vendor]
         filtered_items = [item for item in filtered_items if item.get("vendor") == vendor]
@@ -10281,6 +10289,13 @@ def _filter_cost_sources(
             )
         ]
     return filtered_api, filtered_items
+
+
+def _cost_model_display_name(row: dict[str, Any]) -> str:
+    """Return the shared canonical model label used by cost share and drilldowns."""
+
+    source = str(row.get("model_group") or row.get("model") or "").strip()
+    return normalize_model_display_name(source) or source or "未知模型"
 
 
 def _manual_cost_ledger_rows(item: dict[str, Any], start: date, end: date) -> list[dict[str, Any]]:
@@ -10908,12 +10923,20 @@ async def _build_costs_overview(
     all_days = [start + timedelta(days=offset) for offset in range((trend_end - start).days + 1)]
     model_cost_share: dict[str, dict[str, Any]] = {}
     for row in api_rows:
-        model_name = str(row.get("model") or "未知模型")
-        model_group = str(row.get("model_group") or "").strip() or model_name
+        model_group = _cost_model_display_name(row)
         day = str(row.get("usage_date") or "")[:10]
         spend = float(row.get("spend") or 0)
-        bucket = model_cost_share.setdefault(model_group, {"spend": 0.0, "daily": defaultdict(float)})
+        bucket = model_cost_share.setdefault(
+            model_group,
+            {"spend": 0.0, "daily": defaultdict(float), "rawModels": set(), "rawModelGroups": set()},
+        )
         bucket["spend"] += spend
+        raw_model = str(row.get("model") or "").strip()
+        raw_model_group = str(row.get("model_group") or "").strip()
+        if raw_model:
+            bucket["rawModels"].add(raw_model)
+        if raw_model_group:
+            bucket["rawModelGroups"].add(raw_model_group)
         if day:
             bucket["daily"][day] += spend
     model_cost_total = sum(float(item["spend"]) for item in model_cost_share.values())
@@ -10924,6 +10947,8 @@ async def _build_costs_overview(
                 "model": model_name,
                 "spend": round(float(item["spend"]), 2),
                 "share": round(float(item["spend"]) / model_cost_total, 6) if model_cost_total else 0,
+                "rawModels": sorted(item["rawModels"]),
+                "rawModelGroups": sorted(item["rawModelGroups"]),
                 "daily": [
                     {"date": day.isoformat(), "spend": round(float(item["daily"].get(day.isoformat(), 0)), 2)}
                     for day in all_days
@@ -11091,6 +11116,7 @@ async def admin_costs_ledger(
     provider: str = "",
     vendor: str = "",
     model: str = "",
+    canonical_model: str = "",
     account_id: str = "",
     reconciliation_status: str = "",
     recognition_status: str = "",
@@ -11121,6 +11147,7 @@ async def admin_costs_ledger(
         category=category,
         cost_bucket=cost_bucket,
         model=model,
+        canonical_model=canonical_model,
         vendor=vendor,
         provider=provider,
         account_id=account_id,

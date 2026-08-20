@@ -308,6 +308,8 @@ def test_cost_overview_returns_model_cost_share_and_daily_zero_fill(monkeypatch)
             "model": "gpt 系列",
             "spend": 150.0,
             "share": 0.75,
+            "rawModels": ["gpt-4o", "gpt-4o-mini"],
+            "rawModelGroups": ["gpt 系列"],
             "daily": [
                 {"date": "2026-08-01", "spend": 120.0},
                 {"date": "2026-08-02", "spend": 0.0},
@@ -318,6 +320,8 @@ def test_cost_overview_returns_model_cost_share_and_daily_zero_fill(monkeypatch)
             "model": "claude-3",
             "spend": 50.0,
             "share": 0.25,
+            "rawModels": ["claude-3"],
+            "rawModelGroups": [],
             "daily": [
                 {"date": "2026-08-01", "spend": 0.0},
                 {"date": "2026-08-02", "spend": 50.0},
@@ -334,6 +338,47 @@ class FakeModelCostShareStore(FakeObservabilityStore):
             {"usage_date": date(2026, 8, 3), "source": "Codex", "model": "gpt-4o-mini", "model_group": "gpt 系列", "spend": 30.0},
             {"usage_date": date(2026, 8, 2), "source": "Claude Code", "model": "claude-3", "model_group": "", "spend": 50.0},
         ]
+
+
+class FakeCanonicalModelCostStore(FakeObservabilityStore):
+    async def api_cost_rows(self, start_date: str, end_date: str):
+        return [
+            {"usage_date": date(2026, 8, 1), "source": "Codex", "model": "anthropic.claude-opus-4-8", "spend": 40.0},
+            {"usage_date": date(2026, 8, 1), "source": "Codex", "model": "bedrock/anthropic.claude-opus-4-8", "spend": 30.0},
+            {"usage_date": date(2026, 8, 2), "source": "Codex", "model": "openrouter/anthropic/claude-opus-4-8", "spend": 20.0},
+            {"usage_date": date(2026, 8, 2), "source": "Codex", "model": "chatgpt-acct-84-gpt-5.6-sol", "spend": 10.0},
+            {"usage_date": date(2026, 8, 2), "source": "Codex", "model": "gpt-4o", "model_group": "企业 GPT-4o", "spend": 5.0},
+            {"usage_date": date(2026, 8, 2), "source": "Codex", "model": "custom-model", "spend": 1.0},
+        ]
+
+
+def test_cost_model_share_normalizes_equivalent_model_names_and_drills_into_all_rows(monkeypatch) -> None:
+    monkeypatch.setattr(main, "usage_store", lambda: FakeCanonicalModelCostStore())
+    monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True})
+    monkeypatch.setenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "true")
+    client = TestClient(main.app)
+
+    overview = client.get("/api/admin/costs/overview?month=2026-08&as_of=2026-08-02").json()["data"]
+    by_model = {item["model"]: item for item in overview["modelCostShare"]}
+    assert by_model["claude-opus-4-8"]["spend"] == 90.0
+    assert by_model["claude-opus-4-8"]["rawModels"] == [
+        "anthropic.claude-opus-4-8",
+        "bedrock/anthropic.claude-opus-4-8",
+        "openrouter/anthropic/claude-opus-4-8",
+    ]
+    assert by_model["gpt-5.6-sol"]["spend"] == 10.0
+    assert by_model["企业 GPT-4o"]["spend"] == 5.0
+    assert by_model["custom-model"]["spend"] == 1.0
+
+    drilldown = client.get(
+        "/api/admin/costs/ledger?start_date=2026-08-01&end_date=2026-08-02&as_of=2026-08-02&canonical_model=claude-opus-4-8"
+    ).json()["data"]
+    assert drilldown["total"] == 3
+    assert {item["model"] for item in drilldown["items"]} == {
+        "anthropic.claude-opus-4-8",
+        "bedrock/anthropic.claude-opus-4-8",
+        "openrouter/anthropic/claude-opus-4-8",
+    }
 
 
 def test_cost_overview_filters_api_and_manual_costs_consistently(monkeypatch) -> None:
