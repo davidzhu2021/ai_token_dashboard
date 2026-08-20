@@ -297,6 +297,16 @@ CREATE TABLE IF NOT EXISTS usage_realtime_state (
     updated_at TIMESTAMPTZ NOT NULL
 );
 
+-- A watermark is advanced only after every request in its closed interval has
+-- been durably recorded. It survives worker restarts and replaces page cursors.
+CREATE TABLE IF NOT EXISTS usage_realtime_settlement (
+    backend_id TEXT PRIMARY KEY,
+    verified_through TIMESTAMPTZ,
+    status TEXT NOT NULL DEFAULT 'pending',
+    last_error TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE OR REPLACE VIEW usage_query_daily AS
 SELECT u.*
 FROM usage_daily u
@@ -2312,16 +2322,98 @@ class UsageStore:
                         "DELETE FROM usage_department_directory WHERE backend_id=ANY($1::text[])",
                         department_backends,
                     )
-                await connection.execute(f"INSERT INTO usage_daily SELECT * FROM {usage_stage}")
-                await connection.execute(
-                    f"INSERT INTO usage_team_membership_daily SELECT * FROM {membership_stage}"
+                # Report-only imports are retained during the replacement. When
+                # their key overlaps this complete snapshot, the newly collected
+                # aggregate is authoritative and must replace the older row.
+                stage_merges = (
+                    (
+                        "usage_daily",
+                        f"""INSERT INTO usage_daily SELECT * FROM {usage_stage}
+                        ON CONFLICT (backend_id, usage_date, user_id, source, model,
+                            organization_id, team_id, key_id, principal_id,
+                            attribution_source, billing_eligible) DO UPDATE SET
+                            employee_email=EXCLUDED.employee_email,
+                            employee_name=EXCLUDED.employee_name,
+                            prompt_tokens=EXCLUDED.prompt_tokens,
+                            completion_tokens=EXCLUDED.completion_tokens,
+                            total_tokens=EXCLUDED.total_tokens,
+                            request_count=EXCLUDED.request_count,
+                            success_count=EXCLUDED.success_count,
+                            failure_count=EXCLUDED.failure_count,
+                            spend=EXCLUDED.spend,
+                            collected_at=EXCLUDED.collected_at,
+                            email_source=EXCLUDED.email_source""",
+                    ),
+                    (
+                        "usage_team_membership_daily",
+                        f"""INSERT INTO usage_team_membership_daily SELECT * FROM {membership_stage}
+                        ON CONFLICT (backend_id, snapshot_date, team_id, user_id) DO UPDATE SET
+                            team_name=EXCLUDED.team_name,
+                            employee_email=EXCLUDED.employee_email,
+                            employee_name=EXCLUDED.employee_name,
+                            team_role=EXCLUDED.team_role""",
+                    ),
+                    (
+                        "usage_event_attribution",
+                        f"""INSERT INTO usage_event_attribution SELECT * FROM {event_stage}
+                        ON CONFLICT (backend_id, request_id) DO UPDATE SET
+                            event_time=EXCLUDED.event_time,
+                            usage_date=EXCLUDED.usage_date,
+                            raw_user_id=EXCLUDED.raw_user_id,
+                            organization_id=EXCLUDED.organization_id,
+                            team_id=EXCLUDED.team_id,
+                            key_id=EXCLUDED.key_id,
+                            principal_id=EXCLUDED.principal_id,
+                            source=EXCLUDED.source,
+                            model=EXCLUDED.model,
+                            prompt_tokens=EXCLUDED.prompt_tokens,
+                            completion_tokens=EXCLUDED.completion_tokens,
+                            total_tokens=EXCLUDED.total_tokens,
+                            request_count=EXCLUDED.request_count,
+                            success_count=EXCLUDED.success_count,
+                            failure_count=EXCLUDED.failure_count,
+                            spend=EXCLUDED.spend,
+                            attribution_source=EXCLUDED.attribution_source,
+                            billing_eligible=EXCLUDED.billing_eligible,
+                            provider=EXCLUDED.provider,
+                            model_group=EXCLUDED.model_group,
+                            model_id=EXCLUDED.model_id,
+                            api_base=EXCLUDED.api_base,
+                            status=EXCLUDED.status,
+                            error_code=EXCLUDED.error_code,
+                            error_class=EXCLUDED.error_class,
+                            error_message=EXCLUDED.error_message,
+                            scenario=EXCLUDED.scenario,
+                            request_duration_ms=EXCLUDED.request_duration_ms,
+                            ttft_ms=EXCLUDED.ttft_ms,
+                            attempted_retries=EXCLUDED.attempted_retries,
+                            max_retries=EXCLUDED.max_retries,
+                            trace_id=EXCLUDED.trace_id,
+                            user_visible_failure=EXCLUDED.user_visible_failure,
+                            final_failure_source=EXCLUDED.final_failure_source,
+                            collected_at=EXCLUDED.collected_at""",
+                    ),
+                    (
+                        "usage_department_directory",
+                        f"""INSERT INTO usage_department_directory SELECT * FROM {department_stage}
+                        ON CONFLICT (backend_id, department_id) DO UPDATE SET
+                            department_name=EXCLUDED.department_name,
+                            organization_id=EXCLUDED.organization_id,
+                            status=EXCLUDED.status,
+                            synced_at=EXCLUDED.synced_at""",
+                    ),
                 )
-                await connection.execute(
-                    f"INSERT INTO usage_event_attribution SELECT * FROM {event_stage}"
-                )
-                await connection.execute(
-                    f"INSERT INTO usage_department_directory SELECT * FROM {department_stage}"
-                )
+                for target, query in stage_merges:
+                    try:
+                        await connection.execute(query)
+                    except Exception:
+                        logger.exception(
+                            "usage snapshot publish stage merge failed target=%s start=%s end=%s",
+                            target,
+                            start_date,
+                            end_date,
+                        )
+                        raise
                 for snapshot in snapshots:
                     if getattr(snapshot, "events_complete", None) is None:
                         continue
@@ -3588,7 +3680,42 @@ class UsageStore:
         # 筛选后才查。这张快照表按 (backend_id, snapshot_date, team_id, user_id)
         # 建主键，DISTINCT 后的结果集是成员数量级（不是用量行数量级），近 30 天
         # 全员也只有几百行。
-        department_names = await self._employee_department_names(start_date, end_date, covered, employee_filter)
+        department_names, department_snapshot = await self._employee_department_names(
+            start_date, end_date, covered, employee_filter
+        )
+
+    async def realtime_settlement(self, backend_id: str) -> dict[str, Any] | None:
+        row = await self._require_pool().fetchrow(
+            "SELECT verified_through, status, last_error, updated_at FROM usage_realtime_settlement WHERE backend_id=$1",
+            backend_id,
+        )
+        if not row:
+            return None
+        return {
+            "verifiedThrough": row["verified_through"],
+            "status": str(row["status"] or "pending"),
+            "lastError": str(row["last_error"] or ""),
+            "updatedAt": row["updated_at"],
+        }
+
+    async def advance_realtime_settlement(
+        self,
+        backend_id: str,
+        verified_through: datetime,
+        *,
+        status: str = "settled",
+        error: str = "",
+    ) -> None:
+        await self._require_pool().execute(
+            """
+            INSERT INTO usage_realtime_settlement (backend_id, verified_through, status, last_error, updated_at)
+            VALUES ($1,$2,$3,$4,$5)
+            ON CONFLICT (backend_id) DO UPDATE SET
+                verified_through=GREATEST(usage_realtime_settlement.verified_through, EXCLUDED.verified_through),
+                status=EXCLUDED.status, last_error=EXCLUDED.last_error, updated_at=EXCLUDED.updated_at
+            """,
+            backend_id, verified_through, status, error, datetime.now(timezone.utc),
+        )
         employees = [
             {
                 "employeeId": record["employee_id"],
@@ -3640,7 +3767,11 @@ class UsageStore:
             # 未筛选员工时不查明细，用聚合行数表示本次统计规模，避免看板把范围显示成空。
             "totalRecords": len(enriched) if enriched else len(summary_rows),
             "truncated": False,
-            "dataQuality": {"summarySource": "database", "rankingSource": "database"},
+            "dataQuality": {
+                "summarySource": "database",
+                "rankingSource": "database",
+                "departmentSnapshot": department_snapshot,
+            },
             "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered),
         }
 
@@ -3650,7 +3781,7 @@ class UsageStore:
         end_date: str,
         backend_ids: list[str],
         employee_filter: str = "",
-    ) -> dict[str, list[str]]:
+    ) -> tuple[dict[str, list[str]], dict[str, Any]]:
         """返回 {user_id / employee_email: 部门名列表}，供成员下钻显示部门归属。
 
         同一员工可能在多个后端有账号、也可能同时属于多个部门，所以按 user_id 和
@@ -3659,7 +3790,7 @@ class UsageStore:
         """
 
         conditions = [
-            "snapshot_date BETWEEN $1::date AND $2::date",
+            "snapshot_date <= $2::date",
             "backend_id = ANY($3::text[])",
         ]
         args: list[Any] = [_as_date(start_date), _as_date(end_date), backend_ids]
@@ -3669,14 +3800,44 @@ class UsageStore:
             )
             args.append(employee_filter)
         records = await self._require_pool().fetch(
-            "SELECT DISTINCT user_id, employee_email, team_id, team_name FROM usage_team_membership_daily WHERE "
-            + " AND ".join(conditions),
+            """
+            WITH ranked AS (
+                SELECT user_id, employee_email, team_id, team_name, snapshot_date,
+                       MAX(snapshot_date) FILTER (WHERE snapshot_date BETWEEN $1::date AND $2::date)
+                           OVER (PARTITION BY backend_id, user_id) AS range_latest_date,
+                       MAX(snapshot_date) OVER (PARTITION BY backend_id, user_id) AS fallback_latest_date
+                FROM usage_team_membership_daily
+                WHERE """ + " AND ".join(conditions) + """
+            )
+            SELECT DISTINCT user_id, employee_email, team_id, team_name, snapshot_date,
+                   range_latest_date, fallback_latest_date
+            FROM ranked
+            WHERE snapshot_date = COALESCE(range_latest_date, fallback_latest_date)
+            """,
             *args,
         )
         grouped: dict[str, list[str]] = {}
+        latest_date = ""
+        latest_fallback_date = ""
+        has_selected_range = False
+        has_fallback = False
         for record in records:
+            snapshot_date = record.get("snapshot_date")
+            snapshot_date_text = (
+                snapshot_date.isoformat()
+                if hasattr(snapshot_date, "isoformat")
+                else str(snapshot_date or "")
+            )
+            if snapshot_date_text > latest_date:
+                latest_date = snapshot_date_text
+            if record.get("range_latest_date"):
+                has_selected_range = True
+            elif record.get("fallback_latest_date"):
+                has_fallback = True
+                if snapshot_date_text > latest_fallback_date:
+                    latest_fallback_date = snapshot_date_text
             name = _clean_text(record["team_name"]) or _clean_text(record["team_id"])
-            if not name:
+            if not name or _clean_text(record["team_id"]).lower() == "unassigned":
                 continue
             for key in (_clean_text(record["user_id"]).lower(), _clean_text(record["employee_email"]).lower()):
                 if not key:
@@ -3686,7 +3847,19 @@ class UsageStore:
                     names.append(name)
         for names in grouped.values():
             names.sort()
-        return grouped
+        if has_selected_range and has_fallback:
+            source = "mixed"
+        elif has_selected_range:
+            source = "selected_range"
+        elif has_fallback:
+            source = "latest_before_end_date"
+        else:
+            source = "none"
+        return grouped, {
+            "source": source,
+            "latestDate": latest_date or None,
+            "latestFallbackDate": latest_fallback_date or None,
+        }
 
     @staticmethod
     def _employee_summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

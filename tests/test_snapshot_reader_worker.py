@@ -333,6 +333,63 @@ def test_publish_snapshots_uses_copy_before_atomic_replace() -> None:
     assert result["snapshotRevision"]
 
 
+def test_publish_snapshots_merges_stage_rows_without_duplicate_key_failures() -> None:
+    """历史 report-only 行与新的完整快照键重叠时，发布必须不会整体回滚。"""
+
+    calls: list[str] = []
+
+    class Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Connection:
+        def transaction(self):
+            return Transaction()
+
+        async def execute(self, query, *_args):
+            calls.append(" ".join(query.split()))
+
+        async def copy_records_to_table(self, *_args, **_kwargs):
+            return None
+
+        async def fetchval(self, *_args):
+            return "2026-08-20 08:00:00+00"
+
+    class Acquire:
+        async def __aenter__(self):
+            return Connection()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Pool:
+        def acquire(self):
+            return Acquire()
+
+    snapshot = type("Snapshot", (), {
+        "backend_id": "primary",
+        "rows": [{"date": "2026-08-20", "userId": "user-1", "source": "Codex", "model": "gpt-test"}],
+        "memberships": [],
+        "events": None,
+        "departments": [],
+    })()
+    store = UsageStore("postgresql://unused")
+    store.pool = Pool()
+
+    asyncio.run(store.publish_snapshots("2026-08-20", "2026-08-20", [snapshot]))
+
+    stage_inserts = [call for call in calls if call.startswith("INSERT INTO usage_") and "_stage_" in call]
+    assert stage_inserts
+    assert all("ON CONFLICT" in call and "DO UPDATE SET" in call for call in stage_inserts)
+    usage_merge = next(call for call in stage_inserts if call.startswith("INSERT INTO usage_daily"))
+    assert "spend=EXCLUDED.spend" in usage_merge
+    event_merge = next(call for call in stage_inserts if call.startswith("INSERT INTO usage_event_attribution"))
+    assert "status=EXCLUDED.status" in event_merge
+
+
 def test_snapshot_state_falls_back_to_coverage_before_first_publish() -> None:
     """升级后发布状态表为空，但历史快照仍可用，权限读取不应整体失败。"""
 

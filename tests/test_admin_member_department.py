@@ -132,6 +132,64 @@ def test_admin_rows_reports_no_department_when_the_member_has_no_team() -> None:
     assert payload["employees"][0]["departmentNames"] == []
 
 
+def test_admin_rows_uses_latest_department_snapshot_before_selected_end_date() -> None:
+    """今日用量不能因为今日名册尚未发布而丢失昨天已确认的部门归属。"""
+
+    pool = _FakePool(
+        [
+            {
+                "user_id": "alice-primary",
+                "employee_email": "alice@example.com",
+                "team_id": "team-a",
+                "team_name": "研发部",
+                "snapshot_date": "2026-08-19",
+                "fallback_latest_date": "2026-08-19",
+            }
+        ]
+    )
+    store = _store_with(pool)
+
+    payload = asyncio.run(store.admin_rows("2026-08-20", "2026-08-20", "all", None, ["primary", "her"]))
+
+    assert payload is not None
+    assert payload["employees"][0]["departmentNames"] == ["研发部"]
+    assert payload["dataQuality"]["departmentSnapshot"]["source"] == "latest_before_end_date"
+    assert payload["dataQuality"]["departmentSnapshot"]["latestDate"] == "2026-08-19"
+
+
+def test_admin_rows_keeps_each_member_latest_department_when_snapshots_are_mixed() -> None:
+    """一部分成员已有当天名册时，另一部分成员仍须回退自身最近的有效名册。"""
+
+    pool = _FakePool(
+        [
+            {
+                "user_id": "alice-primary",
+                "employee_email": "alice@example.com",
+                "team_id": "team-a",
+                "team_name": "研发部",
+                "snapshot_date": "2026-08-20",
+                "range_latest_date": "2026-08-20",
+            },
+            {
+                "user_id": "bob-primary",
+                "employee_email": "bob@example.com",
+                "team_id": "team-b",
+                "team_name": "算法部",
+                "snapshot_date": "2026-08-19",
+                "fallback_latest_date": "2026-08-19",
+            },
+        ]
+    )
+    store = _store_with(pool)
+
+    payload = asyncio.run(store.admin_rows("2026-08-20", "2026-08-20", "all", None, ["primary", "her"]))
+
+    assert payload is not None
+    assert payload["employees"][0]["departmentNames"] == ["研发部"]
+    assert payload["dataQuality"]["departmentSnapshot"]["source"] == "mixed"
+    assert payload["dataQuality"]["departmentSnapshot"]["latestFallbackDate"] == "2026-08-19"
+
+
 def test_department_names_prefer_email_then_fall_back_to_user_ids() -> None:
     index = {"alice@example.com": ["研发部"], "bob-primary": ["市场部"]}
 

@@ -865,6 +865,15 @@ function usageStatusState(freshness = null, dataQuality = null, coverage = null)
       description: "所选日期范围尚未全部同步，当前合计和排行可能低于实际用量。",
     };
   }
+  const departmentSnapshot = quality.departmentSnapshot || {};
+  if (departmentSnapshot.source === "latest_before_end_date" || departmentSnapshot.source === "mixed") {
+    const dateText = departmentSnapshot.latestFallbackDate || departmentSnapshot.latestDate || "最近一次";
+    return {
+      tone: "warning",
+      title: "部门归属使用最近目录快照",
+      description: `所选范围内的部分成员目录尚未同步，部门列暂按 ${dateText} 的最近有效快照展示。`,
+    };
+  }
   return null;
 }
 
