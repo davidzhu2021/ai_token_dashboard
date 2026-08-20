@@ -102,3 +102,27 @@ def test_aggregate_metrics_without_attempts_stay_none() -> None:
     )
     assert metrics["upstreamExceptionCount"] == 3
     assert metrics["upstreamExceptionRate"] == 3 / 8
+
+
+def test_aggregate_metrics_report_latest_ttft_sample_time() -> None:
+    row = {
+        "request_count": 10,
+        "status_count": 10,
+        "explicit_count": 10,
+        "explicit_failure_count": 1,
+        "failure_known_count": 10,
+        "failure_count": 1,
+        "retry_known_count": 10,
+        "retry_count": 0,
+        "ttft_sample_count": 2,
+        "ttft_p95_ms": 500.0,
+        "ttft_latest_at": "2026-08-20T04:00:00Z",
+        "collected_at": None,
+    }
+
+    metrics = _stability_metrics_from_aggregate(
+        row, None, period={"startDate": "2026-08-13", "endDate": "2026-08-19"}, as_of="2026-08-19"
+    )
+
+    assert metrics["ttftLatestSampleAt"] == "2026-08-20T04:00:00Z"
+    assert metrics["quality"]["ttft"]["latestSampleAt"] == "2026-08-20T04:00:00Z"

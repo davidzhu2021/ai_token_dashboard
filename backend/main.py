@@ -9419,6 +9419,7 @@ def _stability_metrics_from_aggregate(
         "ttftP95Ms": float(row["ttft_p95_ms"]) if row.get("ttft_p95_ms") is not None else None,
         "ttftSampleCount": ttft_count,
         "ttftCoverageRate": ttft_coverage,
+        "ttftLatestSampleAt": row.get("ttft_latest_at"),
         "statusComplete": int(row.get("status_count") or 0) == total and total > 0,
         "retryComplete": int(row.get("retry_known_count") or 0) == total and total > 0,
         "failureComplete": known_count == total and total > 0,
@@ -9437,7 +9438,7 @@ def _stability_metrics_from_aggregate(
         "upstreamException": {"status": result["metricEnvelopes"]["upstreamExceptionRate"]["status"], "completeness": attempt_status_count / attempt_count if attempt_count else 0.0, "sampleCount": attempt_status_count},
         "retryRecovery": {"status": result["metricEnvelopes"]["retryRecoveryRate"]["status"], "completeness": 1.0 if retry_count else 0.0},
         "fallbackRecovery": {"status": result["metricEnvelopes"]["fallbackRecoveryRate"]["status"], "completeness": 1.0 if fallback_count else 0.0, "sampleCount": fallback_count},
-        "ttft": {"status": result["metricEnvelopes"]["ttftP95Ms"]["status"], "completeness": ttft_coverage or 0.0, "sampleCount": ttft_count},
+        "ttft": {"status": result["metricEnvelopes"]["ttftP95Ms"]["status"], "completeness": ttft_coverage or 0.0, "sampleCount": ttft_count, "latestSampleAt": result["ttftLatestSampleAt"]},
     }
     result["missingReasons"] = [key for key, value in (("final_request_status_missing", not failure_samples), ("ttft_samples_missing", not ttft_count), ("upstream_attempt_logs_unavailable", not attempt_count), ("fallback_attempt_logs_unavailable", not fallback_count)) if value]
     return result

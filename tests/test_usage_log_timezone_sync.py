@@ -132,6 +132,45 @@ def test_logs_outside_local_window_are_dropped(monkeypatch) -> None:
     assert all(row["date"] == "2026-07-28" for row in rows["claude-code-alice"])
 
 
+def test_log_sync_preserves_real_ttft_timestamps_in_raw_events(monkeypatch) -> None:
+    monkeypatch.setenv("USAGE_TIMEZONE_OFFSET_MINUTES", "-480")
+    stream_log = _log("claude-code-alice", "2026-07-28T01:00:00Z", 100, "0.1")
+    stream_log.update(
+        {
+            "request_id": "stream-ttft",
+            "completionStartTime": "2026-07-28T01:00:00.750Z",
+            "endTime": "2026-07-28T01:00:02Z",
+        }
+    )
+
+    rows, complete = asyncio.run(
+        _LogClient([[stream_log]]).sync_rows_from_logs("2026-07-28", "2026-07-28", PRIMARY)
+    )
+
+    assert complete is True
+    assert rows.events[0]["completionStartTime"] == "2026-07-28T01:00:00.750Z"
+    assert rows.events[0]["ttftMs"] == pytest.approx(750)
+
+
+def test_log_sync_excludes_completion_timestamp_equal_to_end_time(monkeypatch) -> None:
+    monkeypatch.setenv("USAGE_TIMEZONE_OFFSET_MINUTES", "-480")
+    non_stream_log = _log("claude-code-alice", "2026-07-28T01:00:00Z", 100, "0.1")
+    non_stream_log.update(
+        {
+            "request_id": "non-stream-ttft",
+            "completion_start_time": "2026-07-28T01:00:02Z",
+            "end_time": "2026-07-28T01:00:02Z",
+        }
+    )
+
+    rows, _ = asyncio.run(
+        _LogClient([[non_stream_log]]).sync_rows_from_logs("2026-07-28", "2026-07-28", PRIMARY)
+    )
+
+    assert rows.events[0]["completionStartTime"] == "2026-07-28T01:00:02Z"
+    assert rows.events[0]["ttftMs"] is None
+
+
 def test_scan_groups_all_users_in_one_pass(monkeypatch) -> None:
     """一次全局扫描要覆盖多个账号，避免按账号逐个查询。"""
     monkeypatch.setenv("USAGE_TIMEZONE_OFFSET_MINUTES", "-480")

@@ -4735,6 +4735,7 @@ class UsageStore:
             COUNT(*) FILTER (WHERE attempted_retries > 0 AND status='success')::bigint AS retry_recovered_count,
             COUNT(ttft_ms)::bigint AS ttft_sample_count,
             percentile_cont(0.95) WITHIN GROUP (ORDER BY ttft_ms) FILTER (WHERE ttft_ms IS NOT NULL)::double precision AS ttft_p95_ms,
+            MAX(event_time) FILTER (WHERE ttft_ms IS NOT NULL) AS ttft_latest_at,
             MAX(collected_at) AS latest_collected_at
         """
         overall_query = pool.fetchrow(

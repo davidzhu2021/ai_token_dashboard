@@ -3571,6 +3571,9 @@ class LiteLLMClient:
                         "modelId": _clean_text(_first(log, "model_id", "modelId", default="")),
                         "apiBase": _clean_text(_first(log, "api_base", "apiBase", default="")),
                         "startTime": _first(log, "startTime", "start_time", default=None),
+                        "completionStartTime": _first(
+                            log, "completionStartTime", "completion_start_time", default=None
+                        ),
                         "endTime": _first(log, "endTime", "end_time", default=None),
                     }
                 )
@@ -3745,6 +3748,9 @@ class LiteLLMClient:
                         "modelId": _clean_text(_first(log, "model_id", "modelId", default="")),
                         "apiBase": _clean_text(_first(log, "api_base", "apiBase", default="")),
                         "startTime": _first(log, "startTime", "start_time", default=None),
+                        "completionStartTime": _first(
+                            log, "completionStartTime", "completion_start_time", default=None
+                        ),
                         "endTime": _first(log, "endTime", "end_time", default=None),
                     }
                 )
