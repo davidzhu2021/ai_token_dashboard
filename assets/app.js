@@ -8848,13 +8848,13 @@ function renderCostModelShare(items) {
     target.innerHTML = '<div class="model-empty">当前筛选范围暂无 API 模型成本</div>';
     return;
   }
-  target.classList.toggle("is-compact", series.length <= 4);
-  target.innerHTML = series.map((item, index) => {
+  const rows = series.map((item, index) => {
     const share = Math.max(0, Math.min(1, Number(item.share || 0)));
     const opportunity = Number(item.optimizationSpace || 0);
     const opportunityLabel = opportunity > 0 ? `可省 ${observabilityMoney(opportunity)}` : "暂无优化空间";
     return `<div class="bar-row" role="button" tabindex="0" data-cost-model-series="${escapeHtml(item.model || "")}" aria-label="查看 ${escapeHtml(item.model || "模型系列")} 优化空间与每日支出">${rankingBadge(index)}<strong>${escapeHtml(item.model || "未知模型")}</strong><div class="bar-track" aria-hidden="true"><div class="bar-fill" style="width:${Math.max(share ? 3 : 0, share * 100)}%"></div></div><span class="num"><strong class="cost-model-opportunity ${opportunity > 0 ? "is-positive" : "is-none"}">${opportunityLabel}</strong><small>支出 ${observabilityMoney(item.spend)} · ${(share * 100).toFixed(1)}%</small></span></div>`;
   }).join("");
+  target.innerHTML = `<div class="cost-model-share-head" aria-hidden="true"><span>排名</span><span>模型系列</span><span>占比</span><span>可优化空间</span></div><div class="cost-model-share-rows${series.length <= 4 ? " is-compact" : ""}">${rows}</div>`;
   if (selectedCostModelSeries) openCostModelShareModal(series.find((item) => item.model === selectedCostModelSeries));
 }
 
