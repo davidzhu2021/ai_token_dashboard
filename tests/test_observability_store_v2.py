@@ -149,6 +149,20 @@ def test_cost_ledger_page_prefers_request_level_attribution() -> None:
     assert "request_id" in connection.sql
 
 
+def test_cost_ledger_union_keeps_api_and_manual_rows_same_shape() -> None:
+    class Connection:
+        async def fetch(self, sql, *args):
+            self.sql = sql
+            return []
+
+    connection = Connection()
+    store = UsageStore("postgresql://unused")
+    store.pool = _Pool(connection)
+    run(store.cost_ledger_page("2026-08-01", "2026-08-12"))
+    manual = connection.sql[connection.sql.index("SELECT day::date") : connection.sql.index("FROM cost_items")]
+    assert "NULL, NULL, id, NULL, '' AS source" not in manual
+
+
 def test_stability_samples_use_one_filtered_cte_and_partial_index() -> None:
     source = Path("backend/usage_store.py").read_text(encoding="utf-8")
     start = source.index("async def stability_scenario_samples")
