@@ -4803,8 +4803,49 @@ class UsageStore:
             """,
             *attempt_args,
         )
-        overall, daily, models, scenarios, attempts = await asyncio.gather(
-            overall_query, daily_query, models_query, scenarios_query, attempts_query
+        model_attempts_query = pool.fetch(
+            f"""
+            WITH terminal AS ({terminal_attempts}), traces AS (
+                SELECT COALESCE(NULLIF(requested_model_group,''), NULLIF(actual_model,''), 'unknown') AS dimension,
+                       COALESCE(NULLIF(trace_id,''), NULLIF(request_id,''), event_id) AS trace_key,
+                       BOOL_OR(is_fallback OR event_type LIKE 'fallback_%' OR fallback_from<>'' OR fallback_to<>'') AS fallback_triggered,
+                       BOOL_OR((is_fallback OR event_type LIKE 'fallback_%' OR fallback_from<>'' OR fallback_to<>'') AND status='success') AS fallback_recovered
+                FROM terminal GROUP BY 1,2
+            ), terminal_totals AS (
+                SELECT COALESCE(NULLIF(requested_model_group,''), NULLIF(actual_model,''), 'unknown') AS dimension,
+                       COUNT(*)::bigint AS attempt_count,
+                       COUNT(*) FILTER (WHERE status IN ('success','failure'))::bigint AS attempt_status_count
+                FROM terminal GROUP BY 1
+            ), trace_totals AS (
+                SELECT dimension,
+                       COUNT(*) FILTER (WHERE fallback_triggered)::bigint AS fallback_count,
+                       COUNT(*) FILTER (WHERE fallback_recovered)::bigint AS fallback_recovered_count
+                FROM traces GROUP BY 1
+            )
+            SELECT terminal_totals.dimension,
+                   terminal_totals.attempt_count,
+                   terminal_totals.attempt_status_count,
+                   COALESCE(trace_totals.fallback_count, 0)::bigint AS fallback_count,
+                   COALESCE(trace_totals.fallback_recovered_count, 0)::bigint AS fallback_recovered_count
+            FROM terminal_totals
+            LEFT JOIN trace_totals USING (dimension)
+            """,
+            *attempt_args,
+        )
+        daily_attempts_query = pool.fetch(
+            f"""
+            WITH terminal AS ({terminal_attempts})
+            SELECT event_date AS dimension,
+                   COUNT(*)::bigint AS attempt_count,
+                   COUNT(*) FILTER (WHERE status IN ('success','failure'))::bigint AS attempt_status_count,
+                   COUNT(*) FILTER (WHERE status='failure')::bigint AS failed_attempt_count
+            FROM terminal GROUP BY event_date ORDER BY event_date
+            """,
+            *attempt_args,
+        )
+        overall, daily, models, scenarios, attempts, model_attempts, daily_attempts = await asyncio.gather(
+            overall_query, daily_query, models_query, scenarios_query, attempts_query,
+            model_attempts_query, daily_attempts_query,
         )
         return {
             "overall": dict(overall or {}),
@@ -4812,6 +4853,8 @@ class UsageStore:
             "models": [dict(item) for item in models],
             "scenarios": [dict(item) for item in scenarios],
             "attempts": dict(attempts or {}),
+            "dailyAttempts": [dict(item) for item in daily_attempts],
+            "modelAttempts": [dict(item) for item in model_attempts],
         }
 
     async def stability_scenario_samples(

@@ -177,6 +177,7 @@ app = FastAPI(title="通衢 API", lifespan=app_lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 VERSIONED_APP_CACHE_CONTROL = "public, max-age=31536000, immutable"
 APP_JS_VERSION_PLACEHOLDER = "__APP_JS_VERSION__"
+STABILITY_RANKING_AGGREGATION_VERSION = "2026-08-20.v1"
 
 
 def app_js_version() -> str:
@@ -9639,6 +9640,93 @@ def _stability_model_ranking_key(item: dict[str, Any]) -> tuple[int, int, float,
     )
 
 
+def _stability_model_attempt_metrics(
+    attempt_events: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Aggregate terminal attempt and fallback trace metrics by requested model."""
+
+    terminal: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for item in attempt_events:
+        model = str(
+            item.get("requested_model_group")
+            or item.get("requestedModelGroup")
+            or item.get("actual_model")
+            or item.get("actualModel")
+            or "unknown"
+        )
+        trace = str(item.get("trace_id") or item.get("traceId") or item.get("request_id") or item.get("requestId") or item.get("event_id") or item.get("eventId") or "")
+        attempt = str(item.get("attempt_id") or item.get("attemptId") or f"{item.get('attempt_index', item.get('attemptIndex', 0))}:{item.get('actual_model', item.get('actualModel', ''))}:{item.get('route_name', item.get('route', ''))}")
+        key = (model, trace, attempt)
+        current = terminal.get(key)
+        timestamp = str(item.get("ended_at") or item.get("endedAt") or item.get("event_time") or item.get("eventTime") or "")
+        current_timestamp = str((current or {}).get("ended_at") or (current or {}).get("endedAt") or (current or {}).get("event_time") or (current or {}).get("eventTime") or "")
+        if current is None or timestamp >= current_timestamp:
+            terminal[key] = item
+
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for (model, _trace, _attempt), item in terminal.items():
+        grouped[model].append(item)
+
+    result: dict[str, dict[str, Any]] = {}
+    for model, items in grouped.items():
+        status_count = sum(str(item.get("status") or "").lower() in {"success", "failure"} for item in items)
+        fallback_traces: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in items:
+            event_type = str(item.get("event_type") or item.get("eventType") or "").lower()
+            is_fallback = bool(
+                item.get("is_fallback")
+                or item.get("isFallback")
+                or event_type.startswith("fallback_")
+                or item.get("fallback_from")
+                or item.get("fallbackFrom")
+                or item.get("fallback_to")
+                or item.get("fallbackTo")
+            )
+            if is_fallback:
+                trace = str(item.get("trace_id") or item.get("traceId") or item.get("request_id") or item.get("requestId") or item.get("event_id") or item.get("eventId") or "")
+                fallback_traces[trace].append(item)
+        fallback_count = len(fallback_traces)
+        fallback_recovered = sum(
+            any(str(item.get("status") or "").lower() == "success" for item in trace_items)
+            for trace_items in fallback_traces.values()
+        )
+        data_available = bool(items) and status_count == len(items)
+        result[model] = {
+            "attemptCount": len(items),
+            "attemptStatusCount": status_count,
+            "fallbackAttemptCount": fallback_count,
+            "fallbackRecoveredCount": fallback_recovered,
+            "attemptDataAvailable": data_available,
+            "fallbackRecoveryRate": fallback_recovered / fallback_count if fallback_count else None,
+            "fallbackRecoveryStatus": "observed" if fallback_count else ("not_triggered" if data_available else "unavailable"),
+        }
+    return result
+
+
+def _stability_ranking_attempt_fields(item: dict[str, Any] | None) -> dict[str, Any]:
+    item = item or {}
+    attempt_count = int(item.get("attempt_count", item.get("attemptCount", 0)) or 0)
+    attempt_status_count = int(item.get("attempt_status_count", item.get("attemptStatusCount", 0)) or 0)
+    fallback_count = int(item.get("fallback_count", item.get("fallbackAttemptCount", 0)) or 0)
+    fallback_recovered = int(item.get("fallback_recovered_count", item.get("fallbackRecoveredCount", 0)) or 0)
+    data_available = bool(
+        item.get("attemptDataAvailable")
+        if "attemptDataAvailable" in item
+        else attempt_count > 0 and attempt_status_count == attempt_count
+    )
+    status = (
+        "observed" if fallback_count
+        else "not_triggered" if data_available
+        else "unavailable"
+    )
+    return {
+        "fallbackAttemptCount": fallback_count or None,
+        "fallbackRecoveryCount": fallback_recovered if fallback_count else None,
+        "fallbackRecoveryRate": fallback_recovered / fallback_count if fallback_count else None,
+        "fallbackRecoveryStatus": status,
+    }
+
+
 async def _build_stability_overview(start_date: str, end_date: str, model: str) -> dict[str, Any]:
     store = _admin_observability_store()
     aggregate_query = getattr(store, "stability_overview_aggregates", None)
@@ -9650,14 +9738,25 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
         overview = _stability_metrics_from_aggregate(
             overall_row, attempts, period=metric_period, as_of=end_date
         )
+        attempts_by_day = {
+            str(item.get("dimension")): item
+            for item in aggregates.get("dailyAttempts") or []
+        }
         daily = [
             {
                 "date": str(row.get("dimension")),
-                **_stability_metrics_from_aggregate(row, None, period=metric_period, as_of=end_date),
+                **_stability_metrics_from_aggregate(
+                    row, attempts_by_day.get(str(row.get("dimension"))),
+                    period=metric_period, as_of=end_date,
+                ),
             }
             for row in aggregates.get("daily") or []
         ]
         rankings = []
+        model_attempts = {
+            str(item.get("dimension") or "unknown"): item
+            for item in aggregates.get("modelAttempts") or []
+        }
         for row in aggregates.get("models") or []:
             metrics = _stability_metrics_from_aggregate(
                 row, None, period=metric_period, as_of=end_date
@@ -9665,6 +9764,7 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
             rankings.append({
                 "model": str(row.get("dimension") or "unknown"),
                 **metrics,
+                **_stability_ranking_attempt_fields(model_attempts.get(str(row.get("dimension") or "unknown"))),
                 "state": model_state(
                     metrics["userVisibleFailureRate"], metrics["ttftP95Ms"],
                     env_float("STABILITY_FAILURE_STABLE_THRESHOLD", 0.01),
@@ -9742,12 +9842,14 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
             by_scenario.setdefault((requested_model, scenario_name, str(event.get("error_code") or "")), []).append(event)
     daily = [{"date": day, **stability_metrics(items, [item for item in attempt_events if str(item.get("started_at") or item.get("event_time") or "")[:10] == day], period=metric_period, as_of=end_date)} for day, items in sorted(by_day.items())]
     rankings = []
+    attempt_metrics = _stability_model_attempt_metrics(attempt_events)
     for name, items in by_model.items():
         model_attempts = [item for item in attempt_events if str(item.get("requested_model_group") or item.get("requestedModelGroup") or item.get("actual_model") or item.get("actualModel") or "unknown") == name]
         metrics = stability_metrics(items, model_attempts, period=metric_period, as_of=end_date)
         rankings.append({
             "model": name,
             **metrics,
+            **_stability_ranking_attempt_fields(attempt_metrics.get(name)),
             "state": model_state(
                 metrics["userVisibleFailureRate"],
                 metrics["ttftP95Ms"],
@@ -9831,7 +9933,7 @@ async def admin_stability_overview(
     start_date, end_date = resolve_usage_range(start_date, end_date)
     payload = await _cached_observability_dashboard(
         "stability",
-        {"startDate": start_date, "endDate": end_date, "model": model, "definition": STABILITY_DEFINITIONS_VERSION},
+        {"startDate": start_date, "endDate": end_date, "model": model, "definition": STABILITY_DEFINITIONS_VERSION, "ranking": STABILITY_RANKING_AGGREGATION_VERSION},
         lambda: _build_stability_overview(start_date, end_date, model),
         refresh=bool(refresh),
     )

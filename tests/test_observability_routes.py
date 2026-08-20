@@ -44,6 +44,16 @@ class FakeObservabilityStore:
     async def stability_sync_states(self):
         return [{"backend_id": "primary", "window_start": date(2026, 8, 6), "window_end": date(2026, 8, 12), "partial": False}]
 
+    async def stability_overview_aggregates(self, start_date: str, end_date: str, model: str = ""):
+        return {
+            "overall": {"request_count": 2, "status_count": 2, "failure_known_count": 2, "failure_count": 0, "ttft_sample_count": 0},
+            "daily": [],
+            "models": [{"dimension": "model-a", "request_count": 2, "status_count": 2, "failure_known_count": 2, "failure_count": 0, "ttft_sample_count": 0}],
+            "scenarios": [],
+            "attempts": {"attempt_count": 2, "attempt_status_count": 2, "retry_count": 2, "retry_recovered_count": 1},
+            "modelAttempts": [{"dimension": "model-a", "attempt_count": 2, "attempt_status_count": 2, "fallback_count": 1, "fallback_recovered_count": 1}],
+        }
+
     async def stability_request(self, request_id: str):
         if request_id != "req-1":
             return None
@@ -170,6 +180,9 @@ def test_stability_overview_and_request_metadata_are_admin_only(monkeypatch) -> 
     payload = response.json()
     assert payload["data"]["overview"]["retryRecoveryRate"] == 0.5
     assert payload["coverage"]["partial"] is False
+    ranking = payload["data"]["modelRankings"][0]
+    assert ranking["fallbackRecoveryStatus"] == "observed"
+    assert ranking["fallbackRecoveryRate"] == 1.0
     detail = client.get("/api/admin/stability/requests/req-1")
     assert detail.status_code == 200
     assert "messages" not in detail.json()["data"]

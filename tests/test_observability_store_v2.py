@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date, datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -57,6 +58,16 @@ def test_schema_contains_auditable_stability_and_cost_entities() -> None:
     assert "SET status='pending_evidence'" in USAGE_SCHEMA
 
 
+def test_stability_overview_aggregates_attempts_by_requested_model() -> None:
+    source = Path("backend/usage_store.py").read_text(encoding="utf-8")
+    start = source.index("async def stability_overview_aggregates")
+    fragment = source[start : start + 9000]
+
+    assert "model_attempts_query" in fragment
+    assert "requested_model_group" in fragment
+    assert '"modelAttempts": [dict(item) for item in model_attempts]' in fragment
+
+
 def test_attempt_event_record_is_content_free_and_derives_retry_fallback_flags() -> None:
     record = UsageStore._stability_attempt_record(
         {
@@ -82,8 +93,8 @@ def test_attempt_event_record_is_content_free_and_derives_retry_fallback_flags()
     )
 
     assert record[0:5] == ("primary", "evt-1", "req-1", "trace-1", "")
-    assert record[26] is True
     assert record[27] is True
+    assert record[28] is True
     assert "must not be stored" not in record
 
 
