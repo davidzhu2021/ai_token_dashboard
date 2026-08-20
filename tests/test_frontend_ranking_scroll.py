@@ -11,14 +11,14 @@ def test_all_ranking_surfaces_use_internal_scroll_regions() -> None:
     assert ".ranking-list-panel > .bars" in markup
     assert ".ranking-table-panel > .table-wrap" in markup
     assert ".observability-stability-grid .observability-ranking" in markup
-    assert ".observability-stability-grid .stability-scenario-ranking" in markup
+    assert ".stability-scenario-panel > .stability-scenario-ranking" in markup
     assert ".observability-ranking-panel > .observability-model-list" in markup
     for selector in (
         ".model-rank-group .bars",
         ".ranking-list-panel > .bars",
         ".ranking-table-panel > .table-wrap",
         ".observability-stability-grid .observability-ranking",
-        ".observability-stability-grid .stability-scenario-ranking",
+        ".stability-scenario-panel > .stability-scenario-ranking",
         ".observability-ranking-panel > .observability-model-list",
     ):
         start = markup.index(selector)
@@ -41,7 +41,7 @@ def test_ranking_panels_are_marked_without_affecting_regular_tables() -> None:
     scenario_ranking_at = markup.index('id="stabilityScenarioRanking"')
     scenario_section_at = markup.rindex("<section", 0, scenario_ranking_at)
     scenario_section = markup[scenario_section_at : markup.index(">", scenario_section_at)]
-    assert 'class="panel"' in scenario_section
+    assert "stability-scenario-panel" in scenario_section
     assert "ranking-table-panel" not in scenario_section
 
     assert 'id="departmentBars" class="bars"' in markup
