@@ -9953,11 +9953,23 @@ async def admin_stability_scenarios(request: Request, start_date: str | None = N
     if callable(query):
         result = await query(start_date, end_date, model=model, scenario=scenario, error_code=error_code, page=page, page_size=page_size)
         raw_items, total = result.get("items", []), int(result.get("total") or 0)
+        model_options = result.get("modelOptions") or []
     else:
         events = await _admin_stability_events(start_date, end_date, model)
         filtered = [item for item in events if (not scenario or item.get("scenario") == scenario) and (not error_code or item.get("error_code") == error_code)]
         start = (page - 1) * page_size
         raw_items, total = filtered[start:start + page_size], len(filtered)
+        # fallback：从过滤后的事件聚合 model / model_group 生成模型选项。
+        option_counts: dict[str, int] = {}
+        for item in filtered:
+            for key in ("model", "model_group"):
+                name = str(item.get(key) or "").strip()
+                if name:
+                    option_counts[name] = option_counts.get(name, 0) + 1
+        model_options = [
+            {"name": name, "count": count}
+            for name, count in sorted(option_counts.items(), key=lambda pair: (-pair[1], pair[0]))[:100]
+        ]
     samples = []
     for item in raw_items:
         normalized = normalize_event(dict(item))
@@ -9989,7 +10001,7 @@ async def admin_stability_scenarios(request: Request, start_date: str | None = N
         event_count=total,
     )
     return _observability_envelope(
-        {"items": samples, "total": total, "page": page, "pageSize": page_size},
+        {"items": samples, "total": total, "page": page, "pageSize": page_size, "modelOptions": model_options},
         coverage={
             "partial": not window_covered,
             "incomplete": not window_covered,

@@ -95,6 +95,18 @@ def test_observability_drawers_support_paginated_safe_drilldowns() -> None:
     assert 'messages' not in source[source.index('function openStabilityRequest'):source.index('function closeCostItemModal')]
 
 
+def test_stability_drawer_has_model_filter_toolbar() -> None:
+    markup = (ROOT / "index.html").read_text(encoding="utf-8")
+    source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
+    assert 'id="stabilityScenarioModel"' in markup
+    assert 'id="stabilityScenarioResetButton"' in markup
+    assert 'renderStabilityScenarioModelFilter' in source
+    assert 'modelOptions: data.modelOptions' in source
+    assert 'el("stabilityScenarioModel")?.addEventListener("change"' in source
+    assert 'el("stabilityScenarioResetButton")?.addEventListener("click"' in source
+    assert 'updateStabilityScenarioTitle' in source
+
+
 def test_observability_state_is_latest_wins_and_cleared_on_login_change() -> None:
     source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
     assert 'stabilityOverviewController?.abort()' in source

@@ -234,6 +234,7 @@ let stabilityScenarioState = {
   total: 0,
   items: [],
   filters: { model: "", scenario: "", errorCode: "" },
+  modelOptions: [],
   loading: false,
   error: "",
 };
@@ -8730,9 +8731,6 @@ function renderStabilityOverview() {
     const failureRate = item.finalRequestFailureRate ?? item.userVisibleFailureRate;
     return `<tr><td>${escapeHtml(item.scenario)}</td><td>${escapeHtml(item.requestedModelGroup || item.model || "-")}</td><td>${escapeHtml(item.errorCode || "-")}</td><td>${item.count}</td><td>${escapeHtml(observabilityPercent(failureRate))}</td><td><button class="ghost-btn" type="button" data-stability-scenario="${escapeHtml(item.scenario || "")}" data-stability-model="${escapeHtml(item.requestedModelGroup || item.model || "")}" data-stability-error-code="${escapeHtml(item.errorCode || "")}">查看样本（${item.count || 0}）</button></td></tr>`;
   }).join("") || `<tr><td colspan="6" class="empty">${hasTrendValues && !hasNonZeroTrend ? "本期确无异常场景" : "异常场景数据暂不可用"}</td></tr>`;
-  const matrix = data.scenarioMatrix || data.topScenarios || [];
-  const matrixTotal = Math.max(1, ...matrix.map((item) => Number(item.count || 0)));
-  el("stabilityScenarioMatrix").innerHTML = matrix.slice(0, 8).map((item) => `<button class="observability-composition-row" type="button" data-stability-scenario="${escapeHtml(item.scenario || "")}" data-stability-model="${escapeHtml(item.requestedModelGroup || item.model || "")}" data-stability-error-code="${escapeHtml(item.errorCode || "")}"><span>${escapeHtml(item.requestedModelGroup || item.model || "未知模型")}</span><div><strong>${escapeHtml(item.scenario || "未知场景")}</strong><small class="observability-rank-meta">${escapeHtml(item.errorCode || "无错误码")}</small></div><strong>${Number(item.count || 0).toLocaleString("zh-CN")}</strong></button>`).join("") || observabilityEmptyState("暂无场景矩阵", "有异常记录后将按模型组、场景和错误码展示。", []);
   renderStabilityActions(data);
   renderObservabilityQuality("stabilityQuality", payload, "stability");
   const models = [...new Set((data.modelRankings || []).map((item) => item.model))];
@@ -9014,6 +9012,23 @@ function closeStabilityDrawer() {
   stabilityDrawerReturnFocus = null;
 }
 
+function updateStabilityScenarioTitle(filters) {
+  const parts = [filters.scenario || "全部异常"];
+  if (filters.model) parts.push(filters.model);
+  el("stabilityDrawerTitle").textContent = `场景样本 · ${parts.join(" · ")}`;
+}
+
+function renderStabilityScenarioModelFilter() {
+  const select = el("stabilityScenarioModel");
+  if (!select) return;
+  const options = stabilityScenarioState.modelOptions || [];
+  const selected = stabilityScenarioState.filters.model || "";
+  const names = options.map((item) => String(item.name || "")).filter((name) => name);
+  if (selected && !names.includes(selected)) names.unshift(selected);
+  select.innerHTML = `<option value="">全部模型</option>${names.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("")}`;
+  select.value = names.includes(selected) ? selected : "";
+}
+
 function renderStabilityScenarioSamples() {
   const list = el("stabilityRequestList");
   if (!list) return;
@@ -9041,7 +9056,8 @@ async function loadStabilityScenarioSamples(filters = stabilityScenarioState.fil
     const payload = await api(`/api/admin/stability/scenarios?${query.toString()}`);
     if (requestId !== stabilityScenarioRequestId) return;
     const data = payload.data || {};
-    stabilityScenarioState = { ...stabilityScenarioState, items: data.items || [], total: Number(data.total || 0), page: Number(data.page || page), loading: false, error: "" };
+    stabilityScenarioState = { ...stabilityScenarioState, items: data.items || [], total: Number(data.total || 0), page: Number(data.page || page), modelOptions: data.modelOptions || [], loading: false, error: "" };
+    renderStabilityScenarioModelFilter();
     renderStabilityScenarioSamples();
   } catch (error) {
     if (requestId !== stabilityScenarioRequestId) return;
@@ -9052,7 +9068,8 @@ async function loadStabilityScenarioSamples(filters = stabilityScenarioState.fil
 
 function openStabilityScenario(button) {
   const filters = { model: button.dataset.stabilityModel || "", scenario: button.dataset.stabilityScenario || "", errorCode: button.dataset.stabilityErrorCode || "" };
-  el("stabilityDrawerTitle").textContent = `场景样本 · ${filters.scenario || "全部异常"}`;
+  updateStabilityScenarioTitle(filters);
+  renderStabilityScenarioModelFilter();
   el("stabilityRequestDetail").innerHTML = '<p class="empty">选择左侧样本查看请求元数据。</p>';
   el("stabilityAttemptTimeline").innerHTML = "";
   el("stabilityRequestActions").innerHTML = "";
@@ -10805,6 +10822,16 @@ document.querySelectorAll(".observability-active-filters").forEach((container) =
   if (button) clearObservabilityFilter(button.dataset.observabilityScope, button.dataset.observabilityClear);
 }));
 el("stabilityDrawerClose")?.addEventListener("click", closeStabilityDrawer);
+el("stabilityScenarioModel")?.addEventListener("change", (event) => {
+  const filters = { ...stabilityScenarioState.filters, model: event.target.value || "" };
+  updateStabilityScenarioTitle(filters);
+  loadStabilityScenarioSamples(filters, 1);
+});
+el("stabilityScenarioResetButton")?.addEventListener("click", () => {
+  const filters = { model: "", scenario: "", errorCode: "" };
+  updateStabilityScenarioTitle(filters);
+  loadStabilityScenarioSamples(filters, 1);
+});
 el("stabilityScenarioBody")?.addEventListener("click", (event) => {
   const scenarioButton = event.target.closest("[data-stability-scenario]");
   if (scenarioButton) {
@@ -10831,10 +10858,6 @@ el("stabilityRequestList")?.addEventListener("click", (event) => {
 el("stabilityRanking")?.addEventListener("click", (event) => {
   const button = event.target.closest("[data-stability-model]");
   if (button) openStabilityScenario({ dataset: { stabilityModel: button.dataset.stabilityModel, stabilityScenario: "", stabilityErrorCode: "" } });
-});
-el("stabilityScenarioMatrix")?.addEventListener("click", (event) => {
-  const button = event.target.closest("[data-stability-scenario]");
-  if (button) openStabilityScenario(button);
 });
 el("addCostItemButton")?.addEventListener("click", () => openCostItemModal());
 el("cancelCostItemButton")?.addEventListener("click", closeCostItemModal);

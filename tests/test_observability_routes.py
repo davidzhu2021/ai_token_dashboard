@@ -68,6 +68,47 @@ class FakeObservabilityStore:
             "response": "must-not-leak",
         }
 
+    async def stability_scenario_samples(self, start_date: str, end_date: str, *, model: str = "", scenario: str = "", error_code: str = "", page: int = 1, page_size: int = 20):
+        rows = [
+            {
+                "request_id": "req-1",
+                "backend_id": "primary",
+                "event_time": datetime(2026, 8, 12, tzinfo=timezone.utc),
+                "model": "model-a",
+                "model_group": "group-a",
+                "scenario": "overload",
+                "error_code": "429",
+                "status": "failure",
+                "user_visible_failure": True,
+                "attempted_retries": 1,
+                "ttft_ms": 800,
+            },
+            {
+                "request_id": "req-2",
+                "backend_id": "primary",
+                "event_time": datetime(2026, 8, 12, tzinfo=timezone.utc),
+                "model": "未知模型",
+                "model_group": None,
+                "scenario": "http_4xx",
+                "error_code": "401",
+                "status": "failure",
+                "user_visible_failure": True,
+                "attempted_retries": 0,
+                "ttft_ms": None,
+            },
+        ]
+        if model:
+            rows = [row for row in rows if row["model"] == model or row.get("model_group") == model]
+        return {
+            "items": rows,
+            "total": len(rows),
+            "modelOptions": [
+                {"name": "model-a", "count": 1},
+                {"name": "group-a", "count": 1},
+                {"name": "未知模型", "count": 1},
+            ],
+        }
+
     async def api_cost_rows(self, start_date: str, end_date: str):
         return [{"usage_date": date(2026, 8, 1), "source": "Codex", "model": "model-a", "spend": 120.0}]
 
@@ -190,6 +231,24 @@ def test_stability_overview_and_request_metadata_are_admin_only(monkeypatch) -> 
 
     ordinary = _client(monkeypatch, platform_admin=False)
     assert ordinary.get("/api/admin/stability/overview").status_code == 403
+
+
+def test_stability_scenarios_return_model_options_and_filter_by_model_or_group(monkeypatch) -> None:
+    monkeypatch.setenv("ADMIN_EMAILS", "admin@auto-link.com.cn")
+    client = _client(monkeypatch)
+    payload = client.get("/api/admin/stability/scenarios?start_date=2026-08-06&end_date=2026-08-12").json()["data"]
+    assert payload["total"] == 2
+    assert [item["name"] for item in payload["modelOptions"]] == ["model-a", "group-a", "未知模型"]
+    assert payload["items"][0]["requestId"] == "req-1"
+    assert payload["items"][1]["model"] == "未知模型"
+
+    by_model = client.get("/api/admin/stability/scenarios?start_date=2026-08-06&end_date=2026-08-12&model=model-a").json()["data"]
+    assert by_model["total"] == 1
+    assert by_model["items"][0]["model"] == "model-a"
+
+    by_group = client.get("/api/admin/stability/scenarios?start_date=2026-08-06&end_date=2026-08-12&model=group-a").json()["data"]
+    assert by_group["total"] == 1
+    assert by_group["items"][0]["model"] == "model-a"
 
 
 def test_cost_overview_uses_configured_defaults(monkeypatch) -> None:

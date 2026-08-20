@@ -38,7 +38,6 @@ def test_stability_dashboard_has_four_primary_metrics_and_governance_drilldown()
         assert label in source
     for element_id in (
         "stabilityActions",
-        "stabilityScenarioMatrix",
         "stabilityAttemptTimeline",
         "stabilityRequestActions",
         "stabilityRequestRegression",

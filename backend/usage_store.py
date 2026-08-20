@@ -4703,7 +4703,7 @@ class UsageStore:
                    final_failure_source, collected_at
             FROM usage_event_attribution
             WHERE usage_date BETWEEN $1::date AND $2::date
-              AND ($3='' OR model=$3)
+              AND ($3='' OR model=$3 OR model_group=$3)
             ORDER BY event_time DESC
             """,
             _as_date(start_date),
@@ -4874,9 +4874,11 @@ class UsageStore:
     ) -> dict[str, Any]:
         offset = (max(1, page) - 1) * page_size
         pool = self._require_pool()
+        # model 筛选同时匹配 model 与 model_group，与 overview 排行口径一致，
+        # 保证用模型组名也能筛出样本（model 列可能是占位符“未知模型”）。
         filters = """
             usage_date BETWEEN $1::date AND $2::date
-              AND ($3='' OR model=$3)
+              AND ($3='' OR model=$3 OR model_group=$3)
               AND ($4='' OR scenario=$4)
               AND ($5='' OR error_code=$5)
               AND (
@@ -4908,9 +4910,53 @@ class UsageStore:
             page_size,
             offset,
         )
+        # 模型选项与样本同口径（窗口 + 场景 + 错误码 + 异常条件），但不受 model
+        # 筛选约束；合并 model 与 model_group 的 distinct 值，按出现次数降序。
+        option_filters = """
+            usage_date BETWEEN $1::date AND $2::date
+              AND ($3='' OR scenario=$3)
+              AND ($4='' OR error_code=$4)
+              AND (
+                    user_visible_failure=TRUE
+                 OR attempted_retries > 0
+                 OR COALESCE(error_code, '') <> ''
+                 OR COALESCE(error_class, '') <> ''
+                 OR COALESCE(scenario, 'unknown') <> 'unknown'
+              )
+        """
+        option_args = (
+            _as_date(start_date),
+            _as_date(end_date),
+            _clean_text(scenario),
+            _clean_text(error_code),
+        )
+        option_rows = await pool.fetch(
+            """
+            SELECT name, SUM(n)::bigint AS n
+            FROM (
+                SELECT model AS name, COUNT(*)::bigint AS n
+                FROM usage_event_attribution
+                WHERE """ + option_filters + """
+                  AND NULLIF(model, '') IS NOT NULL
+                GROUP BY model
+                UNION ALL
+                SELECT model_group AS name, COUNT(*)::bigint AS n
+                FROM usage_event_attribution
+                WHERE """ + option_filters + """
+                  AND NULLIF(model_group, '') IS NOT NULL
+                GROUP BY model_group
+            ) merged
+            GROUP BY name
+            ORDER BY n DESC, name
+            LIMIT $5
+            """,
+            *option_args,
+            100,
+        )
         return {
             "items": [dict(record) for record in records],
             "total": total,
+            "modelOptions": [{"name": str(row["name"]), "count": int(row["n"] or 0)} for row in option_rows],
         }
 
     async def stability_request(self, request_id: str, backend_id: str = "") -> dict[str, Any] | None:
