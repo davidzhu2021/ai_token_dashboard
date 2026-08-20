@@ -8851,7 +8851,9 @@ function renderCostModelShare(items) {
   target.classList.toggle("is-compact", series.length <= 4);
   target.innerHTML = series.map((item, index) => {
     const share = Math.max(0, Math.min(1, Number(item.share || 0)));
-    return `<div class="bar-row" role="button" tabindex="0" data-cost-model-series="${escapeHtml(item.model || "")}" aria-label="查看 ${escapeHtml(item.model || "模型系列")} 每日支出">${rankingBadge(index)}<strong>${escapeHtml(item.model || "未知模型")}</strong><div class="bar-track" aria-hidden="true"><div class="bar-fill" style="width:${Math.max(share ? 3 : 0, share * 100)}%"></div></div><span class="num">${observabilityMoney(item.spend)}<small>${(share * 100).toFixed(1)}%</small></span></div>`;
+    const opportunity = Number(item.optimizationSpace || 0);
+    const opportunityLabel = opportunity > 0 ? `可省 ${observabilityMoney(opportunity)}` : "暂无优化空间";
+    return `<div class="bar-row" role="button" tabindex="0" data-cost-model-series="${escapeHtml(item.model || "")}" aria-label="查看 ${escapeHtml(item.model || "模型系列")} 优化空间与每日支出">${rankingBadge(index)}<strong>${escapeHtml(item.model || "未知模型")}</strong><div class="bar-track" aria-hidden="true"><div class="bar-fill" style="width:${Math.max(share ? 3 : 0, share * 100)}%"></div></div><span class="num"><strong class="cost-model-opportunity ${opportunity > 0 ? "is-positive" : "is-none"}">${opportunityLabel}</strong><small>支出 ${observabilityMoney(item.spend)} · ${(share * 100).toFixed(1)}%</small></span></div>`;
   }).join("");
   if (selectedCostModelSeries) openCostModelShareModal(series.find((item) => item.model === selectedCostModelSeries));
 }
@@ -8861,7 +8863,8 @@ function openCostModelShareModal(item, returnFocus = document.activeElement) {
   selectedCostModelSeries = item.model || "";
   costModelShareReturnFocus = returnFocus;
   el("costModelShareModalTitle").textContent = `${item.model || "未知模型"}成本详情`;
-  el("costModelShareModalSubtitle").textContent = `所选范围支出 ${observabilityMoney(item.spend)} · 占比 ${(Number(item.share || 0) * 100).toFixed(1)}%`;
+  const opportunity = Number(item.optimizationSpace || 0);
+  el("costModelShareModalSubtitle").textContent = `所选范围支出 ${observabilityMoney(item.spend)} · 占比 ${(Number(item.share || 0) * 100).toFixed(1)}%${opportunity > 0 ? ` · 可优化 ${observabilityMoney(opportunity)}` : ""}`;
   el("costModelShareModalBody").innerHTML = renderCostModelShareDetail(item);
   const modal = el("costModelShareModal");
   modal.classList.remove("hidden");
@@ -8875,7 +8878,7 @@ function openCostModelShareModal(item, returnFocus = document.activeElement) {
     color: "#0673d2",
     fill: "rgba(6,115,210,.13)",
     axisFormatter: observabilityMoney,
-    tooltipRows: (point) => [{ label: "支出", value: observabilityMoney(point.spend) }],
+    tooltipRows: (point) => [{ label: "支出", value: observabilityMoney(point.spend) }, ...(Number(point.opportunity || 0) > 0 ? [{ label: "优化空间", value: observabilityMoney(point.opportunity) }] : [])],
   });
 }
 
@@ -8891,7 +8894,7 @@ function closeCostModelShareModal() {
 function renderCostModelShareDetail(item) {
   if (!item) return "";
   const daily = Array.isArray(item.daily) ? item.daily : [];
-  return `<section class="cost-model-share-detail" aria-label="${escapeHtml(item.model || "模型系列")}每日支出"><div class="cost-model-share-detail-head"><div><h4>${escapeHtml(item.model || "未知模型")}每日支出</h4><p>点击日期可查看当天费用明细。</p></div></div><svg id="costModelShareChart" class="cost-model-share-chart" role="img" aria-label="${escapeHtml(item.model || "模型系列")}每日支出折线图"></svg><div class="cost-model-share-daily">${daily.map((point) => `<button class="cost-model-share-daily-row" type="button" data-cost-model-series-day="${escapeHtml(point.date || "")}" data-cost-model-series-name="${escapeHtml(item.model || "")}"><span>${escapeHtml(point.date || "")}</span><strong>${observabilityMoney(point.spend)}</strong></button>`).join("")}</div></section>`;
+  return `<section class="cost-model-share-detail" aria-label="${escapeHtml(item.model || "模型系列")}每日支出与优化空间"><div class="cost-model-share-detail-head"><div><h4>${escapeHtml(item.model || "未知模型")}每日支出与优化空间</h4><p>点击日期可查看当天费用明细；可优化金额表示高于典型水平的支出。</p></div></div><svg id="costModelShareChart" class="cost-model-share-chart" role="img" aria-label="${escapeHtml(item.model || "模型系列")}每日支出与优化空间折线图"></svg><div class="cost-model-share-daily">${daily.map((point) => { const opportunity = Number(point.opportunity || 0); return `<button class="cost-model-share-daily-row" type="button" data-cost-model-series-day="${escapeHtml(point.date || "")}" data-cost-model-series-name="${escapeHtml(item.model || "")}"><span>${escapeHtml(point.date || "")}</span><span class="daily-values"><strong>支出 ${observabilityMoney(point.spend)}</strong><small class="opportunity ${opportunity > 0 ? "is-positive" : "is-none"}">${opportunity > 0 ? `可省 ${observabilityMoney(opportunity)}` : "—"}</small></span></button>`; }).join("")}</div></section>`;
 }
 
 function normalizeWorkbenchList(payload, ...keys) {

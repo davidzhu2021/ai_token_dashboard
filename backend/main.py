@@ -103,6 +103,18 @@ from .observability import (
     verified_savings,
 )
 from .key_vault import KeyVault, KeyVaultError
+
+
+def _model_optimization_space(daily_spends: list[float]) -> tuple[float, float | None]:
+    """Estimate savings by flattening daily spend peaks above the median."""
+    values = [float(value) for value in daily_spends if float(value) > 0]
+    if len(values) < 3:
+        return 0.0, None
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    median = ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+    opportunity = sum(max(0.0, value - median) for value in values)
+    return round(opportunity, 2), round(median, 2)
 from .organization_store import (
     DEFAULT_TOKEN_DAILY_BUDGET_USD,
     MAX_MODELS_PER_TOKEN,
@@ -10942,15 +10954,23 @@ async def _build_costs_overview(
     model_cost_total = sum(float(item["spend"]) for item in model_cost_share.values())
     model_cost_share_payload = []
     for model_name, item in sorted(model_cost_share.items(), key=lambda entry: (-float(entry[1]["spend"]), entry[0])):
+        daily_spends = [float(item["daily"].get(day.isoformat(), 0)) for day in all_days]
+        optimization_space, median_daily = _model_optimization_space(daily_spends)
         model_cost_share_payload.append(
             {
                 "model": model_name,
                 "spend": round(float(item["spend"]), 2),
                 "share": round(float(item["spend"]) / model_cost_total, 6) if model_cost_total else 0,
+                "optimizationSpace": optimization_space,
+                "medianDaily": median_daily,
                 "rawModels": sorted(item["rawModels"]),
                 "rawModelGroups": sorted(item["rawModelGroups"]),
                 "daily": [
-                    {"date": day.isoformat(), "spend": round(float(item["daily"].get(day.isoformat(), 0)), 2)}
+                    {
+                        "date": day.isoformat(),
+                        "spend": round(float(item["daily"].get(day.isoformat(), 0)), 2),
+                        "opportunity": round(max(0.0, float(item["daily"].get(day.isoformat(), 0)) - (median_daily or 0)), 2) if median_daily is not None else 0.0,
+                    }
                     for day in all_days
                 ],
             }
