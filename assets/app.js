@@ -8804,19 +8804,6 @@ function renderCostOverview() {
     observabilityMetricCard({ label: metrics.monthBudget != null || metrics.budget != null ? "月度预算" : "日均目标", metric: budgetOrTarget, formatter: observabilityMoney, action: "cost-budget" }),
   ].join("");
   renderObservabilityContext("costContext", costOverview, data, "cost");
-  const trend = data.trend || [];
-  const legacyApi = trend.reduce((sum, item) => sum + Number(item.api || 0), 0);
-  const legacyNonApi = trend.reduce((sum, item) => sum + Number(item.nonApi || 0), 0);
-  const backendComposition = Array.isArray(data.composition) && data.composition.length ? data.composition : data.bucketSplit;
-  const composition = Array.isArray(backendComposition) && backendComposition.length
-    ? backendComposition.map((item) => ({ key: item.key || item.costBucket || "other", label: item.label || item.costBucket || "其他", amountUsd: item.amountUsd ?? item.spend }))
-    : [["api_usage", "API Token", legacyApi], ["other", "非 API 成本", legacyNonApi]].map(([key, label, amountUsd]) => ({ key, label, amountUsd }));
-  const actualComposition = data.actualComposition || composition;
-  const total = Math.max(1, actualComposition.reduce((sum, item) => sum + Number(item.amountUsd ?? item.spend ?? 0), 0));
-  el("costComposition").innerHTML = actualComposition.length ? actualComposition.map((item) => `<button class="observability-composition-row" type="button" data-cost-ledger-filter="${escapeHtml(item.key || item.costBucket || "other")}" aria-label="查看${escapeHtml(item.label || item.costBucket || "其他")}实际费用明细"><span>${escapeHtml(item.label || item.costBucket || "其他")}</span><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Number(item.amountUsd ?? item.spend ?? 0) / total * 100}%"></div></div><strong>${observabilityMoney(item.amountUsd ?? item.spend)}</strong></button>`).join("") : observabilityEmptyState("暂无实际组成", "当前范围没有已确认实际费用。", [{ label: "查看实际账本", attr: 'data-open-governance-tab="actual-ledger"' }]);
-  const forecastComposition = data.forecastComposition || annual.forecastComposition || data.planComposition || activePlan?.composition || activePlan?.items || [];
-  const forecastTotal = Math.max(1, forecastComposition.reduce((sum, item) => sum + Number(item.amountUsd ?? item.spend ?? item.amount ?? 0), 0));
-  el("costForecastComposition").innerHTML = forecastComposition.length ? forecastComposition.map((item) => `<button class="observability-composition-row" type="button" data-open-governance-tab="plans"><span>${escapeHtml(item.label || item.costBucket || item.category || "计划成本")}</span><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Number(item.amountUsd ?? item.spend ?? item.amount ?? 0) / forecastTotal * 100}%"></div></div><strong>${observabilityMoney(item.amountUsd ?? item.spend ?? item.amount)}</strong></button>`).join("") : observabilityEmptyState("暂无官方预测组成", "尚未找到生效且已批准的基准计划，运行速率外推不会混入官方预测。", [{ label: "查看计划版本", attr: 'data-open-governance-tab="plans"' }]);
   el("savingsActionList").innerHTML = (data.savingsActions || []).map((item) => `<article class="observability-action"><div><strong>${escapeHtml(item.name)}</strong><p class="hint">${escapeHtml(item.owner || "未指定负责人")} · ${escapeHtml(item.status)}${item.evidenceUrl ? " · 有证据" : " · 缺证据"}</p></div><div class="observability-table-actions"><span>${item.status === "verified" ? `${observabilityMoney(item.realizedSavingsToDate ?? Math.max(0, Number(item.baselineDailyCost) - Number(item.verifiedDailyCost || 0)))}/日` : item.forecastSavingsRemaining == null ? "尚未计入节省" : `预计 ${observabilityMoney(item.forecastSavingsRemaining)}`}</span>${canManageCosts() ? `<button class="ghost-btn" type="button" data-edit-savings-action="${escapeHtml(item.id)}">编辑</button>` : "只读"}</div></article>`).join("") || `<p class="empty">暂无降本动作</p>`;
   renderCostModelShare(data.modelCostShare || data.modelSplit || []);
   const targetMonth = String(data.month || el("costMonth")?.value || "").slice(0, 7);
@@ -10868,11 +10855,6 @@ el("addSavingsActionButton")?.addEventListener("click", () => openSavingsActionM
 el("cancelSavingsActionButton")?.addEventListener("click", closeSavingsActionModal);
 el("savingsActionForm")?.addEventListener("submit", saveSavingsAction);
 el("costBudgetForm")?.addEventListener("submit", saveCostBudget);
-el("costAllLedgerButton")?.addEventListener("click", (event) => openCostLedger({}, event.currentTarget));
-el("costComposition")?.addEventListener("click", (event) => {
-  const button = event.target.closest("[data-cost-ledger-filter]");
-  if (button) openCostLedger({ costBucket: button.dataset.costLedgerFilter });
-});
 el("costModelShare")?.addEventListener("click", (event) => {
   const close = event.target.closest("[data-close-cost-model-series]");
   if (close) {

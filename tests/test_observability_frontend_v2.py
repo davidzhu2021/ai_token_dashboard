@@ -140,13 +140,11 @@ def test_cost_dashboard_separates_actual_forecast_and_auditable_metrics() -> Non
     markup, source = sources()
     for label in ("年度累计实际", "全年官方预测", "已核验累计节省", "月度预算"):
         assert label in source
-    assert 'id="costComposition"' in markup
-    assert 'id="costForecastComposition"' in markup
     assert 'id="costContext"' in markup
     assert "active_approved_baseline_plan_missing" in source
     assert "as_of=" in source
     assert "recognition_status=" in source
-    for removed in ('id="costTrend"', "实际与运行速率情景", "运行速率情景", "runRateForecast", 'id="costAnomalies"', "异常月份与对账提示", "暂无异常月份"):
+    for removed in ('id="costTrend"', "实际与运行速率情景", "运行速率情景", "runRateForecast", 'id="costAnomalies"', "异常月份与对账提示", "暂无异常月份", 'id="costComposition"', 'id="costForecastComposition"', "实际组成", "官方预测组成", "observability-composition"):
         assert removed not in markup
         assert removed not in source
 

@@ -82,7 +82,6 @@ def test_observability_drawers_support_paginated_safe_drilldowns() -> None:
     assert 'data-stability-scenario=' in source
     assert '/api/admin/stability/scenarios?' in source
     assert 'data-stability-page=' in source
-    assert 'data-cost-ledger-filter=' in source
     assert '/api/admin/costs/ledger?' in source
     assert 'data-cost-ledger-page=' in source
     assert 'data-cost-model-series-day=' in source
