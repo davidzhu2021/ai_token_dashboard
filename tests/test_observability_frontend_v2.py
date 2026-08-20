@@ -69,6 +69,8 @@ def test_top_stability_scenario_metric_separates_name_and_count() -> None:
     assert "stabilityScenarioMetricCard({ metric: topScenarioMetric, scenario: topScenario?.scenario" in source
     assert ".stability-scenario-metric-name" in markup
     assert ".stability-scenario-metric-count" in markup
+    assert ".stability-scenario-metric-count { color:var(--ink,#14243a); font-size:clamp(16px,1.7vw,20px);" in markup
+    assert ".stability-scenario-metric-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:20px;" in markup
 
 
 def test_stability_model_ranking_uses_ranked_stability_cards() -> None:
