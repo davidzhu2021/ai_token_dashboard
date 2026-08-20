@@ -79,3 +79,28 @@ def test_async_json_cache_falls_back_when_redis_fails() -> None:
         assert await cache.get_or_set("observability:cost:one", lambda: asyncio.sleep(0, result={"ok": True})) == {"ok": True}
 
     asyncio.run(run())
+
+
+def test_clearing_local_cache_does_not_cancel_active_request_or_restore_stale_value() -> None:
+    async def run() -> None:
+        cache = AsyncJSONCache(client=FakeRedis())
+        release = asyncio.Event()
+        started = asyncio.Event()
+        calls = 0
+
+        async def build():
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return {"version": calls}
+
+        active = asyncio.create_task(cache.get_or_set("observability:drilldown:stability:one", build))
+        await started.wait()
+        cache.clear_local()
+        release.set()
+        assert await active == {"version": 1}
+        assert await cache.get_or_set("observability:drilldown:stability:one", build) == {"version": 2}
+        assert calls == 2
+
+    asyncio.run(run())

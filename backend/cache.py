@@ -56,6 +56,7 @@ class AsyncJSONCache:
         self._ttl_seconds = max(1, ttl_seconds)
         self._tasks: dict[str, asyncio.Task[Any]] = {}
         self._local: dict[str, CacheEntry] = {}
+        self._generations: dict[str, int] = {}
         self._lock = asyncio.Lock()
 
     async def _redis(self) -> Any | None:
@@ -107,8 +108,10 @@ class AsyncJSONCache:
                 task = asyncio.create_task(factory())
                 self._tasks[key] = task
                 task.add_done_callback(lambda completed, cache_key=key: self._tasks.pop(cache_key, None) if self._tasks.get(cache_key) is completed else None)
+            generation = self._generations.get(key, 0)
         value = await asyncio.shield(task)
-        await self.set(key, value)
+        if self._generations.get(key, 0) == generation:
+            await self.set(key, value)
         return value
 
     async def invalidate_prefix(self, prefix: str) -> None:
@@ -126,11 +129,10 @@ class AsyncJSONCache:
             logger.warning("drilldown cache invalidation unavailable")
 
     def clear_local(self) -> None:
-        """Forget in-flight work after a write so the next request rebuilds."""
+        """Forget local values without interrupting requests already in progress."""
 
         for key in list(self._tasks):
             if key.startswith("observability:drilldown:"):
-                task = self._tasks.pop(key, None)
-                if task and not task.done():
-                    task.cancel()
+                self._generations[key] = self._generations.get(key, 0) + 1
+                self._tasks.pop(key, None)
         self._local.clear()
