@@ -10897,18 +10897,6 @@ el("cancelSavingsActionButton")?.addEventListener("click", closeSavingsActionMod
 el("savingsActionForm")?.addEventListener("submit", saveSavingsAction);
 el("costBudgetForm")?.addEventListener("submit", saveCostBudget);
 el("costModelShare")?.addEventListener("click", (event) => {
-  const close = event.target.closest("[data-close-cost-model-series]");
-  if (close) {
-    selectedCostModelSeries = "";
-    renderCostOverview();
-    return;
-  }
-  const day = event.target.closest("[data-cost-model-series-day]");
-  if (day) {
-    closeCostModelShareModal();
-    openCostLedger(currentCostLedgerFilters({ model: day.dataset.costModelSeriesName, startDate: day.dataset.costModelSeriesDay, endDate: day.dataset.costModelSeriesDay }), day);
-    return;
-  }
   const row = event.target.closest("[data-cost-model-series]");
   if (!row) return;
   openCostModelShareModal((costOverview?.data?.modelCostShare || []).find((item) => item.model === row.dataset.costModelSeries), row);
@@ -10919,6 +10907,12 @@ el("costModelShare")?.addEventListener("keydown", (event) => {
   if (!row) return;
   event.preventDefault();
   openCostModelShareModal((costOverview?.data?.modelCostShare || []).find((item) => item.model === row.dataset.costModelSeries), row);
+});
+el("costModelShareModalBody")?.addEventListener("click", (event) => {
+  const day = event.target.closest("[data-cost-model-series-day]");
+  if (!day) return;
+  closeCostModelShareModal();
+  openCostLedger(currentCostLedgerFilters({ model: day.dataset.costModelSeriesName, startDate: day.dataset.costModelSeriesDay, endDate: day.dataset.costModelSeriesDay }), day);
 });
 el("mobileViewSelect")?.addEventListener("change", (event) => switchView(event.currentTarget.value));
 el("governanceWorkbenchTabs")?.addEventListener("click", (event) => {
