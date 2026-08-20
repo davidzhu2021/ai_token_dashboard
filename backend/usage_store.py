@@ -3754,6 +3754,65 @@ class UsageStore:
             start_date, end_date, covered, employee_filter
         )
 
+        employees = [
+            {
+                "employeeId": record["employee_id"],
+                "employeeName": record["employee_name"] or record["employee_id"],
+                "employeeEmail": record["employee_email"] or "",
+                "bindStatus": _record_bind_status(record),
+                **{
+                    "promptTokens": _as_int(record["prompt_tokens"]),
+                    "completionTokens": _as_int(record["completion_tokens"]),
+                    "totalTokens": _as_int(record["total_tokens"]),
+                    "requestCount": _as_int(record["request_count"]),
+                    "successCount": _as_int(record["success_count"]),
+                    "failureCount": _as_int(record["failure_count"]),
+                    "spend": _as_float(record["spend"]),
+                },
+                "primarySource": record["primary_source"] or "其他",
+                "userIds": list(record["user_ids"] or []),
+                "departmentNames": _department_names_for(
+                    department_names,
+                    record["employee_email"],
+                    list(record["user_ids"] or []),
+                ),
+                "teamRole": "user",
+            }
+            for record in employee_records
+        ]
+
+        summary_records = await pool.fetch(
+            f"""
+            SELECT usage_date, source, {model_sql} AS model_name, {self._aggregate_metrics_sql()}
+            FROM usage_query_daily
+            WHERE {where_sql}
+            GROUP BY usage_date, source, {model_sql}
+            ORDER BY usage_date, source, model_name
+            """,
+            *args,
+        )
+        summary_rows = [self._aggregated_usage_row(record, include_identity=False) for record in summary_records]
+        summary_rows = self._group_rows(summary_rows, ("date", "source", "model"))
+        public_rows = self._public_rows(enriched)
+        return {
+            "rows": public_rows,
+            "summaryRows": summary_rows,
+            "employees": employees,
+            "pageLimit": 0,
+            "pageSize": 0,
+            "pagesRead": 0,
+            "totalPages": 0,
+            # 未筛选员工时不查明细，用聚合行数表示本次统计规模，避免看板把范围显示成空。
+            "totalRecords": len(enriched) if enriched else len(summary_rows),
+            "truncated": False,
+            "dataQuality": {
+                "summarySource": "database",
+                "rankingSource": "database",
+                "departmentSnapshot": department_snapshot,
+            },
+            "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered),
+        }
+
     async def realtime_settlement(self, backend_id: str) -> dict[str, Any] | None:
         row = await self._require_pool().fetchrow(
             "SELECT verified_through, status, last_error, updated_at FROM usage_realtime_settlement WHERE backend_id=$1",
@@ -3834,64 +3893,6 @@ class UsageStore:
             backend_id, start_time, end_time, status, int(request_count), amount,
             int(retry_count), error_summary[:500], completed_at, now,
         )
-        employees = [
-            {
-                "employeeId": record["employee_id"],
-                "employeeName": record["employee_name"] or record["employee_id"],
-                "employeeEmail": record["employee_email"] or "",
-                "bindStatus": _record_bind_status(record),
-                **{
-                    "promptTokens": _as_int(record["prompt_tokens"]),
-                    "completionTokens": _as_int(record["completion_tokens"]),
-                    "totalTokens": _as_int(record["total_tokens"]),
-                    "requestCount": _as_int(record["request_count"]),
-                    "successCount": _as_int(record["success_count"]),
-                    "failureCount": _as_int(record["failure_count"]),
-                    "spend": _as_float(record["spend"]),
-                },
-                "primarySource": record["primary_source"] or "其他",
-                "userIds": list(record["user_ids"] or []),
-                "departmentNames": _department_names_for(
-                    department_names,
-                    record["employee_email"],
-                    list(record["user_ids"] or []),
-                ),
-                "teamRole": "user",
-            }
-            for record in employee_records
-        ]
-
-        summary_records = await pool.fetch(
-            f"""
-            SELECT usage_date, source, {model_sql} AS model_name, {self._aggregate_metrics_sql()}
-            FROM usage_query_daily
-            WHERE {where_sql}
-            GROUP BY usage_date, source, {model_sql}
-            ORDER BY usage_date, source, model_name
-            """,
-            *args,
-        )
-        summary_rows = [self._aggregated_usage_row(record, include_identity=False) for record in summary_records]
-        summary_rows = self._group_rows(summary_rows, ("date", "source", "model"))
-        public_rows = self._public_rows(enriched)
-        return {
-            "rows": public_rows,
-            "summaryRows": summary_rows,
-            "employees": employees,
-            "pageLimit": 0,
-            "pageSize": 0,
-            "pagesRead": 0,
-            "totalPages": 0,
-            # 未筛选员工时不查明细，用聚合行数表示本次统计规模，避免看板把范围显示成空。
-            "totalRecords": len(enriched) if enriched else len(summary_rows),
-            "truncated": False,
-            "dataQuality": {
-                "summarySource": "database",
-                "rankingSource": "database",
-                "departmentSnapshot": department_snapshot,
-            },
-            "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered),
-        }
 
     async def _employee_department_names(
         self,
