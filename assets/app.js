@@ -8845,13 +8845,14 @@ function renderCostModelShare(items) {
   const series = Array.isArray(items) ? items : [];
   if (selectedCostModelSeries && !series.some((item) => item.model === selectedCostModelSeries)) closeCostModelShareModal();
   if (!series.length) {
-    target.innerHTML = '<p class="empty">当前筛选范围暂无 API 模型成本</p>';
+    target.innerHTML = '<div class="model-empty">当前筛选范围暂无 API 模型成本</div>';
     return;
   }
-  target.innerHTML = `<div class="cost-model-share-table-wrap"><table class="cost-model-share-table"><thead><tr><th>模型系列</th><th class="num">所选范围支出</th><th class="num">占比</th><th>每日支出</th></tr></thead><tbody>${series.map((item) => {
+  target.classList.toggle("is-compact", series.length <= 4);
+  target.innerHTML = series.map((item, index) => {
     const share = Math.max(0, Math.min(1, Number(item.share || 0)));
-    return `<tr class="cost-model-share-row" tabindex="0" role="button" data-cost-model-series="${escapeHtml(item.model || "")}" aria-label="查看 ${escapeHtml(item.model || "模型系列")} 每日支出"><td><strong>${escapeHtml(item.model || "未知模型")}</strong></td><td class="num">${observabilityMoney(item.spend)}</td><td class="num">${(share * 100).toFixed(1)}%</td><td><div class="cost-model-share-bar"><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Math.max(share ? 3 : 0, share * 100)}%"></div></div><span>查看趋势</span></div></td></tr>`;
-  }).join("")}</tbody></table></div>`;
+    return `<div class="bar-row" role="button" tabindex="0" data-cost-model-series="${escapeHtml(item.model || "")}" aria-label="查看 ${escapeHtml(item.model || "模型系列")} 每日支出">${rankingBadge(index)}<strong>${escapeHtml(item.model || "未知模型")}</strong><div class="bar-track" aria-hidden="true"><div class="bar-fill" style="width:${Math.max(share ? 3 : 0, share * 100)}%"></div></div><span class="num">${observabilityMoney(item.spend)}<small>${(share * 100).toFixed(1)}%</small></span></div>`;
+  }).join("");
   if (selectedCostModelSeries) openCostModelShareModal(series.find((item) => item.model === selectedCostModelSeries));
 }
 
