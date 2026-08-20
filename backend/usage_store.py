@@ -4763,7 +4763,7 @@ class UsageStore:
                 COALESCE(error_code,'') <> '' OR COALESCE(error_class,'') <> '' OR
                 COALESCE(scenario,'unknown') <> 'unknown'
             )
-            GROUP BY 1,2,3 ORDER BY count DESC LIMIT 10
+            GROUP BY 1,2,3 ORDER BY count DESC
             """,
             *args,
         )

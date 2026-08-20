@@ -9916,7 +9916,7 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
             ),
         })
     scenarios = []
-    for (requested_model, name, error_code), items in sorted(by_scenario.items(), key=lambda pair: len(pair[1]), reverse=True)[:10]:
+    for (requested_model, name, error_code), items in sorted(by_scenario.items(), key=lambda pair: len(pair[1]), reverse=True):
         scenario_attempts = [
             item for item in attempt_events
             if str(item.get("requested_model_group") or item.get("requestedModelGroup") or "unknown") == requested_model

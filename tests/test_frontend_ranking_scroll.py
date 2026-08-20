@@ -11,12 +11,14 @@ def test_all_ranking_surfaces_use_internal_scroll_regions() -> None:
     assert ".ranking-list-panel > .bars" in markup
     assert ".ranking-table-panel > .table-wrap" in markup
     assert ".observability-stability-grid .observability-ranking" in markup
+    assert ".observability-stability-grid .stability-scenario-ranking" in markup
     assert ".observability-ranking-panel > .observability-model-list" in markup
     for selector in (
         ".model-rank-group .bars",
         ".ranking-list-panel > .bars",
         ".ranking-table-panel > .table-wrap",
         ".observability-stability-grid .observability-ranking",
+        ".observability-stability-grid .stability-scenario-ranking",
         ".observability-ranking-panel > .observability-model-list",
     ):
         start = markup.index(selector)
@@ -102,3 +104,11 @@ def test_ranking_tables_keep_headers_visible_and_mobile_heights_bounded() -> Non
     assert "前 10 个部门" not in markup
     assert ".ranking-list-panel { height:360px; min-height:360px; }" in markup
     assert ".ranking-table-panel > .table-wrap { max-height:360px; }" in markup
+
+
+def test_stability_scenario_ranking_is_not_truncated() -> None:
+    store_source = (ROOT / "backend" / "usage_store.py").read_text(encoding="utf-8")
+    main_source = (ROOT / "backend" / "main.py").read_text(encoding="utf-8")
+
+    assert "ORDER BY count DESC LIMIT 10" not in store_source
+    assert "reverse=True)[:10]" not in main_source
