@@ -162,6 +162,15 @@ def test_cost_drawer_switches_between_full_width_browsing_and_detail() -> None:
     assert 'el("costDetailDrawerBackToLedger")?.addEventListener("click", () => setCostDrawerMode("ledger"))' in source
 
 
+def test_cost_drawer_has_model_and_provider_filters_without_reconciliation_filter() -> None:
+    markup = (ROOT / "index.html").read_text(encoding="utf-8")
+    source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
+    assert 'id="costLedgerModelFilter"' in markup
+    assert 'id="costLedgerProviderFilter"' in markup
+    assert 'el("costLedgerModelFilter")?.addEventListener("change"' in source
+    assert 'el("costLedgerProviderFilter")?.addEventListener("change"' in source
+
+
 def test_observability_state_is_latest_wins_and_cleared_on_login_change() -> None:
     source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
     assert 'stabilityOverviewController?.abort()' in source

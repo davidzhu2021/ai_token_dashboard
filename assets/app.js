@@ -9280,11 +9280,28 @@ function openCostLedger(filters = {}, returnFocus = document.activeElement) {
     ...(filters.recognitionStatus ? { recognition_status: filters.recognitionStatus } : {}),
   };
   costLedgerState = { ...costLedgerState, filters: normalizedFilters, page: 1, selectedId: "" };
+  renderCostLedgerFilters();
   el("costDetailDrawerTitle").textContent = filters.costBucket ? `费用明细 · ${filters.costBucket}` : filters.canonicalModel ? `费用明细 · ${filters.canonicalModel}` : filters.model ? `费用明细 · ${filters.model}` : "费用明细";
   el("costLedgerDetail").innerHTML = '<p class="empty">选择左侧账本行查看来源与对账信息。</p>';
   setCostDrawerMode("ledger");
   focusDrawer("costDetailDrawer", returnFocus);
   loadCostLedger();
+}
+
+function renderCostLedgerFilters() {
+  const modelSelect = el("costLedgerModelFilter");
+  const providerSelect = el("costLedgerProviderFilter");
+  if (!modelSelect || !providerSelect) return;
+  const overviewFilters = costOverview?.data?.filters || {};
+  const items = costLedgerState.items || [];
+  const models = [...new Set([...(overviewFilters.models || []), ...items.map((item) => String(item.model || "").trim())].map(String).filter(Boolean))].sort();
+  const providers = [...new Set([...(overviewFilters.providers || []), ...items.map((item) => String(item.provider || item.vendor || "").trim())].map(String).filter(Boolean))].sort();
+  const selectedModel = costLedgerState.filters.model || "";
+  const selectedProvider = costLedgerState.filters.provider || "";
+  modelSelect.innerHTML = `<option value="">全部模型</option>${models.map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("")}`;
+  providerSelect.innerHTML = `<option value="">全部供应渠道</option>${providers.map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("")}`;
+  modelSelect.value = models.includes(selectedModel) ? selectedModel : "";
+  providerSelect.value = providers.includes(selectedProvider) ? selectedProvider : "";
 }
 
 function currentCostLedgerFilters(overrides = {}) {
@@ -9315,6 +9332,7 @@ async function loadCostLedger() {
     if (requestId !== costLedgerRequestId) return;
     const data = payload.data || {};
     costLedgerState = { ...costLedgerState, items: data.items || [], total: Number(data.total || 0), page: Number(data.page || costLedgerState.page), loading: false };
+    renderCostLedgerFilters();
     renderCostLedger();
   } catch (error) {
     if (requestId !== costLedgerRequestId) return;
@@ -11101,6 +11119,20 @@ el("costLedgerList")?.addEventListener("click", (event) => {
   }
   const row = event.target.closest("[data-cost-ledger-id]");
   if (row) showCostLedgerDetail(row.dataset.costLedgerId);
+});
+function updateCostLedgerDrawerFilter(name, value) {
+  costLedgerState = { ...costLedgerState, filters: { ...costLedgerState.filters, [name]: value || undefined }, page: 1, selectedId: "" };
+  loadCostLedger();
+}
+el("costLedgerModelFilter")?.addEventListener("change", (event) => updateCostLedgerDrawerFilter("model", event.target.value));
+el("costLedgerProviderFilter")?.addEventListener("change", (event) => updateCostLedgerDrawerFilter("provider", event.target.value));
+el("costLedgerFilterReset")?.addEventListener("click", () => {
+  const filters = { ...costLedgerState.filters };
+  delete filters.model;
+  delete filters.provider;
+  costLedgerState = { ...costLedgerState, filters, page: 1, selectedId: "" };
+  renderCostLedgerFilters();
+  loadCostLedger();
 });
 el("costDetailDrawerClose")?.addEventListener("click", () => {
   const drawer = el("costDetailDrawer");
