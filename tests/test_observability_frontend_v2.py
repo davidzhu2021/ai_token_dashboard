@@ -64,6 +64,13 @@ def test_stability_model_ranking_uses_compact_metric_columns() -> None:
     assert "data-stability-model=" in source
 
 
+def test_stability_model_ranking_hides_zero_and_full_failure_rates() -> None:
+    source = Path("assets/app.js").read_text(encoding="utf-8")
+
+    assert "const visibleStabilityRankings = stabilityRankings.filter" in source
+    assert "numericFailureRate !== 0 && numericFailureRate !== 1" in source
+
+
 def test_cost_dashboard_separates_actual_forecast_and_auditable_metrics() -> None:
     markup, source = sources()
     for label in ("年度累计实际", "全年官方预测", "已核验累计节省", "月度预算"):

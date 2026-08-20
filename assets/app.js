@@ -8632,14 +8632,20 @@ function renderStabilityOverview() {
     ? observabilityEmptyState("本期确无异常记录", "当前统计期间内，已接入指标均为真实零值。", [{ label: "调整筛选", attr: 'data-observability-empty-action="filters" data-observability-scope="stability"' }])
     : observabilityEmptyState("异常趋势暂不可用", "尝试事件尚未接入或当前窗口尚未同步，缺失数据不会绘制为零值。", [{ label: "重新加载", attr: 'data-observability-retry="stability"' }, { label: "进入治理工作台", attr: 'data-open-governance-tab="stability-actions"' }]);
   const stabilityRankings = data.modelRankings || [];
+  const visibleStabilityRankings = stabilityRankings.filter((item) => {
+    const failureRate = item.finalRequestFailureRate ?? item.userVisibleFailureRate;
+    if (failureRate === null || failureRate === undefined) return true;
+    const numericFailureRate = Number(failureRate);
+    return !Number.isFinite(numericFailureRate) || (numericFailureRate !== 0 && numericFailureRate !== 1);
+  });
   const stabilityRanking = el("stabilityRanking");
-  stabilityRanking.classList.toggle("is-compact", stabilityRankings.length > 0 && stabilityRankings.length <= 4);
+  stabilityRanking.classList.toggle("is-compact", visibleStabilityRankings.length > 0 && visibleStabilityRankings.length <= 4);
   const formatStabilityTtft = (value) => {
     if (value == null || !Number.isFinite(Number(value))) return "暂无数据";
     return Number(value) >= 1000 ? `${(Number(value) / 1000).toFixed(1)}s` : `${Math.round(Number(value))}ms`;
   };
   const stabilityRankingStateClass = (state) => ({ "稳定": "stable", "观察": "observe", "需治理": "repair" }[state] || "unknown");
-  stabilityRanking.innerHTML = stabilityRankings.length ? `<div class="observability-ranking-head" aria-hidden="true"><span>模型</span><span>失败</span><span>兜底</span><span>TTFT</span><span>状态</span></div>${stabilityRankings.map((item) => {
+  stabilityRanking.innerHTML = visibleStabilityRankings.length ? `<div class="observability-ranking-head" aria-hidden="true"><span>模型</span><span>失败</span><span>兜底</span><span>TTFT</span><span>状态</span></div>${visibleStabilityRankings.map((item) => {
     const failureRate = item.finalRequestFailureRate ?? item.userVisibleFailureRate;
     const modelName = item.requestedModelGroup || item.model || "未知模型";
     const state = item.state || "暂无数据";
