@@ -8618,10 +8618,16 @@ function renderStabilityOverview() {
   const hasNonZeroTrend = trendValues.some((value) => value > 0);
   const max = Math.max(1, ...trendValues);
   el("stabilityTrend").classList.toggle("is-empty", !daily.length || !hasTrendValues || !hasNonZeroTrend);
+  const stabilityTrendSegment = (value, className) => {
+    if (value == null) return `<span class="observability-bar-segment${className ? ` ${className}` : ""} is-missing" title="无数据"></span>`;
+    const count = Number(value);
+    const height = count > 0 ? Math.max(3, count / max * 150) : 3;
+    return `<span class="observability-bar-segment${className ? ` ${className}` : ""}${count === 0 ? " is-zero" : ""}" style="height:${height}px">${count > 0 ? `<i>${count.toLocaleString("zh-CN")}</i>` : "<i>0</i>"}</span>`;
+  };
   el("stabilityTrend").innerHTML = daily.length && hasTrendValues && hasNonZeroTrend ? daily.map((item) => {
     const upstream = item.upstreamExceptionCount;
     const failures = item.finalRequestFailureCount ?? item.userVisibleFailureCount;
-    return `<div class="observability-bar" title="${escapeHtml(item.date)} · 上游异常 ${upstream ?? "暂无数据"} · 用户最终失败 ${failures ?? "暂无数据"}">${upstream == null ? "" : `<span class="observability-bar-segment" style="height:${Number(upstream) > 0 ? Math.max(3, Number(upstream) / max * 150) : 0}px"></span>`}${failures == null ? "" : `<span class="observability-bar-segment secondary" style="height:${Number(failures) > 0 ? Math.max(3, Number(failures) / max * 150) : 0}px"></span>`}<small>${escapeHtml(String(item.date).slice(5))}</small></div>`;
+    return `<div class="observability-bar" title="${escapeHtml(item.date)} · 上游异常 ${upstream ?? "无数据"} · 用户最终失败 ${failures ?? "无数据"}">${stabilityTrendSegment(upstream, "")}${stabilityTrendSegment(failures, "secondary")}<small>${escapeHtml(String(item.date).slice(5))}</small></div>`;
   }).join("") : hasTrendValues && !hasNonZeroTrend
     ? observabilityEmptyState("本期确无异常记录", "当前统计期间内，已接入指标均为真实零值。", [{ label: "调整筛选", attr: 'data-observability-empty-action="filters" data-observability-scope="stability"' }])
     : observabilityEmptyState("异常趋势暂不可用", "尝试事件尚未接入或当前窗口尚未同步，缺失数据不会绘制为零值。", [{ label: "重新加载", attr: 'data-observability-retry="stability"' }, { label: "进入治理工作台", attr: 'data-open-governance-tab="stability-actions"' }]);
