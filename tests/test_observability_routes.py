@@ -110,7 +110,7 @@ class FakeObservabilityStore:
         }
 
     async def api_cost_rows(self, start_date: str, end_date: str):
-        return [{"usage_date": date(2026, 8, 1), "source": "Codex", "model": "model-a", "spend": 120.0}]
+        return [{"usage_date": date(2026, 8, 1), "source": "Codex", "model": "model-a", "model_group": "gpt 系列", "spend": 120.0}]
 
     async def list_cost_items(self):
         return []
@@ -263,6 +263,44 @@ def test_cost_overview_uses_configured_defaults(monkeypatch) -> None:
     assert payload["metrics"]["dailyTarget"] == 100
     assert payload["modelSplit"] == [{"model": "model-a", "spend": 120.0}]
     assert response.json()["coverage"]["incomplete"] is True
+
+
+def test_cost_overview_returns_model_cost_share_and_daily_zero_fill(monkeypatch) -> None:
+    monkeypatch.setattr(main, "usage_store", lambda: FakeModelCostShareStore())
+    monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True})
+    monkeypatch.setenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "true")
+    payload = TestClient(main.app).get("/api/admin/costs/overview?month=2026-08&as_of=2026-08-03").json()["data"]
+    assert payload["modelCostShare"] == [
+        {
+            "model": "gpt 系列",
+            "spend": 150.0,
+            "share": 0.75,
+            "daily": [
+                {"date": "2026-08-01", "spend": 120.0},
+                {"date": "2026-08-02", "spend": 0.0},
+                {"date": "2026-08-03", "spend": 30.0},
+            ],
+        },
+        {
+            "model": "claude-3",
+            "spend": 50.0,
+            "share": 0.25,
+            "daily": [
+                {"date": "2026-08-01", "spend": 0.0},
+                {"date": "2026-08-02", "spend": 50.0},
+                {"date": "2026-08-03", "spend": 0.0},
+            ],
+        },
+    ]
+
+
+class FakeModelCostShareStore(FakeObservabilityStore):
+    async def api_cost_rows(self, start_date: str, end_date: str):
+        return [
+            {"usage_date": date(2026, 8, 1), "source": "Codex", "model": "gpt-4o", "model_group": "gpt 系列", "spend": 120.0},
+            {"usage_date": date(2026, 8, 3), "source": "Codex", "model": "gpt-4o-mini", "model_group": "gpt 系列", "spend": 30.0},
+            {"usage_date": date(2026, 8, 2), "source": "Claude Code", "model": "claude-3", "model_group": "", "spend": 50.0},
+        ]
 
 
 def test_cost_overview_filters_api_and_manual_costs_consistently(monkeypatch) -> None:

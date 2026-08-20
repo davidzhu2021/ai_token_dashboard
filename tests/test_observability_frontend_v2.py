@@ -23,13 +23,8 @@ def test_trustworthy_observability_statuses_and_loading_lifecycle() -> None:
     assert 'isStabilityLoading = false;\n      renderStabilityOverview();' in source
     assert 'isCostOverviewLoading = false;\n      renderCostOverview();' in source
     assert 'item.upstream == null ? "无数据"' in source
-    assert 'actual == null ? ""' in source
-    assert '#costTrend { padding-bottom:20px; overflow:clip; }' in markup
-    assert '#costTrend .observability-bar { min-width:0; }' in markup
     assert "本期确无异常记录" in source
     assert "异常趋势暂不可用" in source
-    assert "本期确无费用记录" in source
-    assert "费用趋势暂不可用" in source
 
 
 def test_stability_dashboard_does_not_render_coverage_notice() -> None:
@@ -43,17 +38,14 @@ def test_stability_dashboard_does_not_render_coverage_notice() -> None:
     assert "if (scope === \"stability\" && (reasons.length || coverage.incomplete || coverage.partial)) {\n    return null;\n  }" in reason_copy
 
 
-def test_stability_dashboard_has_four_primary_metrics_and_governance_drilldown() -> None:
+def test_stability_dashboard_keeps_observability_drilldown_without_governance_actions() -> None:
     markup, source = sources()
     for label in ("用户最终失败率", "兜底成功率", "TTFT P95", "Top 异常场景"):
         assert label in source
-    for element_id in (
-        "stabilityActions",
-        "stabilityAttemptTimeline",
-        "stabilityRequestActions",
-        "stabilityRequestRegression",
-    ):
+    for element_id in ("stabilityAttemptTimeline",):
         assert f'id="{element_id}"' in markup
+    for removed_id in ("stabilityActions", "stabilityRequestActions", "stabilityRequestRegression"):
+        assert f'id="{removed_id}"' not in markup
     assert "requestedModelGroup" in source
     assert "ttftCoverageRate" in source
     assert "低覆盖 TTFT 不参与稳定判定" in markup
@@ -152,21 +144,23 @@ def test_cost_dashboard_separates_actual_forecast_and_auditable_metrics() -> Non
     assert 'id="costForecastComposition"' in markup
     assert 'id="costContext"' in markup
     assert "active_approved_baseline_plan_missing" in source
-    assert "运行速率情景" in markup
     assert "as_of=" in source
     assert "recognition_status=" in source
+    for removed in ('id="costTrend"', "实际与运行速率情景", "运行速率情景", "runRateForecast", 'id="costAnomalies"', "异常月份与对账提示", "暂无异常月份"):
+        assert removed not in markup
+        assert removed not in source
 
 
 def test_governance_workbench_is_separate_and_permission_aware() -> None:
     markup, source = sources()
     assert 'data-view="governance-workbench"' in markup
     assert 'id="governanceWorkbenchView"' in markup
-    for tab in ("stability-actions", "regressions", "actual-ledger", "plans", "savings"):
+    for tab in ("actual-ledger", "plans", "savings"):
         assert f'data-governance-tab="{tab}"' in markup
         assert f'data-governance-panel="{tab}"' in markup
-    assert 'canManageStability() || canManageCosts() || canReconcileCosts()' in source
-    assert '"/api/admin/stability/actions"' in source
-    assert '"/api/admin/stability/regressions"' in source
+    for removed in ('data-governance-tab="stability-actions"', 'data-governance-tab="regressions"', 'canManageStability()', '"/api/admin/stability/actions"', '"/api/admin/stability/regressions"'):
+        assert removed not in markup
+        assert removed not in source
     assert '"/api/admin/costs/savings-measurements"' in source
     assert "/api/admin/costs/plan-versions?year=" in source
 

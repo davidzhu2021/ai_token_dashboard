@@ -12,8 +12,8 @@ def test_platform_admin_navigation_and_views_exist() -> None:
     assert 'observabilityCapabilities' in source
     assert 'canViewStability()' in source
     assert 'canViewCosts()' in source
-    assert 'el("stabilityTab")?.classList.toggle("hidden", !canViewStability())' in source
-    assert 'el("costControlTab")?.classList.toggle("hidden", !canViewCosts())' in source
+    assert 'el("stabilityTab")?.classList.toggle("hidden", !canViewStability() || remoteDemoSnapshotOnly)' in source
+    assert 'el("costControlTab")?.classList.toggle("hidden", !canViewCosts() || remoteDemoSnapshotOnly)' in source
 
 
 def test_partial_states_and_request_drawer_are_rendered() -> None:
@@ -22,7 +22,7 @@ def test_partial_states_and_request_drawer_are_rendered() -> None:
     assert 'id="stabilityDrawer"' in markup
     assert "当前窗口覆盖不足" in source
     assert "当前月份覆盖不足" in source
-    assert "提示词和响应正文" in markup
+    assert "不展示内容字段" in markup
 
 
 def test_cost_control_forms_and_write_handlers_exist() -> None:
@@ -32,7 +32,7 @@ def test_cost_control_forms_and_write_handlers_exist() -> None:
         "costBudgetForm",
         "costItemForm",
         "savingsActionForm",
-        "costModelSplit",
+        "costModelShare",
     ):
         assert f'id="{element_id}"' in markup
     assert 'method: id ? "PATCH" : "POST"' in source
@@ -40,15 +40,10 @@ def test_cost_control_forms_and_write_handlers_exist() -> None:
     assert 'method: "DELETE"' in source
 
 
-def test_observability_filters_use_expandable_toolbars() -> None:
+def test_cost_observability_filters_use_expandable_toolbar() -> None:
     markup = (ROOT / "index.html").read_text(encoding="utf-8")
     source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
     for element_id in (
-        "stabilityFiltersButton",
-        "stabilityResetFiltersButton",
-        "stabilityFilterPanel",
-        "stabilityFilterCount",
-        "stabilityActiveFilters",
         "costFiltersButton",
         "costResetFiltersButton",
         "costFilterPanel",
@@ -56,11 +51,9 @@ def test_observability_filters_use_expandable_toolbars() -> None:
         "costActiveFilters",
     ):
         assert f'id="{element_id}"' in markup
-    assert 'aria-controls="stabilityFilterPanel"' in markup
     assert 'aria-controls="costFilterPanel"' in markup
-    assert markup.count('aria-expanded="false"') >= 2
+    assert markup.count('aria-expanded="false"') >= 1
     assert 'data-observability-clear=' in source
-    assert 'setObservabilityFilterPanel("stability"' in source
     assert 'setObservabilityFilterPanel("cost"' in source
 
 
@@ -120,6 +113,19 @@ def test_stability_drawer_switches_between_full_width_browsing_and_request_detai
     assert 'el("stabilityDrawerBackToSamples")?.addEventListener("click", () => setStabilityDrawerMode("samples"))' in source
 
 
+def test_cost_drawer_switches_between_full_width_browsing_and_detail() -> None:
+    markup = (ROOT / "index.html").read_text(encoding="utf-8")
+    source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
+    assert 'id="costDetailDrawerBackToLedger"' in markup
+    assert 'data-cost-drawer-mode="ledger"' in markup
+    assert '.observability-drawer[data-cost-drawer-mode="ledger"] .observability-drawer-layout' in markup
+    assert '.observability-ledger-row strong { display:block; overflow-wrap:anywhere; word-break:break-word; }' in markup
+    assert 'function setCostDrawerMode(mode)' in source
+    assert 'setCostDrawerMode("ledger")' in source
+    assert 'setCostDrawerMode("detail")' in source
+    assert 'el("costDetailDrawerBackToLedger")?.addEventListener("click", () => setCostDrawerMode("ledger"))' in source
+
+
 def test_observability_state_is_latest_wins_and_cleared_on_login_change() -> None:
     source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
     assert 'stabilityOverviewController?.abort()' in source
@@ -166,7 +172,7 @@ def test_stability_middle_panels_have_equal_layout_and_scrollable_ranking() -> N
     assert "@media (max-width: 560px)" in markup and ".observability-stability-grid > .panel { height:300px; min-height:300px; }" in markup
 
 
-def test_stability_actions_panel_spans_the_dashboard_row() -> None:
+def test_stability_dashboard_no_longer_contains_governance_actions_panel() -> None:
     markup = (ROOT / "index.html").read_text(encoding="utf-8")
-    assert ".observability-grid:has(> .panel > #stabilityActions)" in markup
-    assert "grid-template-columns:1fr" in markup
+    assert 'id="stabilityActions"' not in markup
+    assert "排障动作" not in markup

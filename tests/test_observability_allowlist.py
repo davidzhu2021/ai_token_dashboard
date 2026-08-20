@@ -114,6 +114,7 @@ def test_stability_overview_respects_preview_allowlist(monkeypatch) -> None:
     assert client.get("/api/admin/stability/overview").status_code == 404
     assert client.get("/api/admin/costs/overview").status_code == 404
     assert client.get("/api/admin/stability/actions").status_code == 404
+    assert client.get("/api/admin/stability/regressions").status_code == 404
 
     monkeypatch.setattr(
         main,
@@ -121,7 +122,8 @@ def test_stability_overview_respects_preview_allowlist(monkeypatch) -> None:
         lambda request: {"email": "zhuyida@auto-link.com.cn", "isPlatformAdmin": True},
     )
     assert client.get("/api/admin/stability/overview").status_code == 200
-    assert client.get("/api/admin/stability/actions").status_code == 200
+    assert client.get("/api/admin/stability/actions").status_code == 404
+    assert client.get("/api/admin/stability/regressions").status_code == 404
 
 
 def test_stability_overview_open_to_all_admins_when_allowlist_empty(monkeypatch) -> None:
@@ -136,7 +138,8 @@ def test_stability_overview_open_to_all_admins_when_allowlist_empty(monkeypatch)
     )
     client = TestClient(main.app)
     assert client.get("/api/admin/stability/overview").status_code == 200
-    assert client.get("/api/admin/stability/actions").status_code == 200
+    assert client.get("/api/admin/stability/actions").status_code == 404
+    assert client.get("/api/admin/stability/regressions").status_code == 404
 
 
 def test_stability_overview_stays_closed_when_master_flag_off(monkeypatch) -> None:

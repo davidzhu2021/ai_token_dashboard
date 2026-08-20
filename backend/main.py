@@ -5369,51 +5369,6 @@ class SavingsActionRequest(BaseModel):
     financeReviewer: str = Field(default="", max_length=160)
     notes: str = Field(default="", max_length=1000)
 
-
-class StabilityActionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    title: str = Field(min_length=1, max_length=200)
-    owner: str = Field(default="", max_length=160)
-    severity: Literal["low", "medium", "high", "critical"] = "medium"
-    status: Literal["open", "in_progress", "resolved", "verified", "closed"] = "open"
-    targetDate: date | None = None
-    fixReference: str = Field(default="", max_length=1000)
-    requestedModelGroup: str = Field(default="", max_length=256)
-    scenario: str = Field(default="", max_length=64)
-    errorCode: str = Field(default="", max_length=120)
-    notes: str = Field(default="", max_length=2000)
-
-
-class StabilityRegressionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    actionId: str = Field(min_length=1, max_length=128)
-    baselineStart: date
-    baselineEnd: date
-    regressionStart: date
-    regressionEnd: date
-    metric: str = Field(min_length=1, max_length=120)
-    baselineValue: Decimal | None = None
-    regressionValue: Decimal | None = None
-    conclusion: Literal["passed", "failed", "inconclusive"]
-    notes: str = Field(default="", max_length=2000)
-
-    @field_validator("baselineEnd")
-    @classmethod
-    def validate_baseline_window(cls, value: date, info: Any) -> date:
-        start = info.data.get("baselineStart")
-        if start and value < start:
-            raise ValueError("baselineEnd must not be before baselineStart")
-        return value
-
-    @field_validator("regressionEnd")
-    @classmethod
-    def validate_regression_window(cls, value: date, info: Any) -> date:
-        start = info.data.get("regressionStart")
-        if start and value < start:
-            raise ValueError("regressionEnd must not be before regressionStart")
-        return value
-
-
 class CostPlanVersionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     year: int = Field(ge=2020, le=2100)
@@ -9810,18 +9765,12 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
             sync_states, start_date=start_date, end_date=end_date,
             configured_backends=set(usage_backend_ids()), event_count=event_count,
         )
-        actions, regressions = await asyncio.gather(
-            _call_store_optional(store, ("list_stability_actions",), model=model, default=[]),
-            _call_store_optional(store, ("list_stability_regressions",), default=[]),
-        )
         return _observability_envelope(
             {
                 "overview": overview,
                 "daily": daily,
                 "modelRankings": sorted(rankings, key=_stability_model_ranking_key),
                 "topScenarios": scenarios,
-                "actions": [dict(item) for item in (actions or [])[:5]],
-                "regressions": [dict(item) for item in (regressions or [])[:5]],
                 "attemptEventsAvailableFrom": attempts.get("available_from"),
                 "ttftDiagnostics": _stability_ttft_diagnostics(overview),
                 "quality": _stability_quality(overview),
@@ -9899,8 +9848,6 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
             ],
             **stability_metrics(items, scenario_attempts, period=metric_period, as_of=end_date),
         })
-    actions = await _call_store_optional(store, ("list_stability_actions",), model=model, default=[])
-    regressions = await _call_store_optional(store, ("list_stability_regressions",), default=[])
     window_covered, missing_reasons = _stability_missing_reasons(
         sync_states,
         start_date=start_date,
@@ -9924,8 +9871,6 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
             "daily": daily,
             "modelRankings": sorted(rankings, key=_stability_model_ranking_key),
             "topScenarios": scenarios,
-            "actions": actions or [],
-            "regressions": regressions or [],
             "attemptEventsAvailableFrom": min((str(item.get("started_at") or item.get("event_time") or "") for item in attempt_events), default=None),
             "ttftDiagnostics": _stability_ttft_diagnostics(overview),
             "quality": _stability_quality(overview),
@@ -10004,7 +9949,6 @@ async def admin_stability_scenarios(request: Request, start_date: str | None = N
             "attemptedRetries": item.get("attempted_retries"),
             "maxRetries": item.get("max_retries"),
             "ttftMs": item.get("ttft_ms"),
-            "actions": await _call_store_optional(store, ("list_stability_actions",), model=str(item.get("model_group") or item.get("model") or ""), scenario=str(item.get("scenario") or ""), default=[]),
         })
     sync_states = await store.stability_sync_states()
     window_covered, missing_reasons = _stability_missing_reasons(
@@ -10042,9 +9986,6 @@ async def admin_stability_request(request: Request, request_id: str, backend_id:
     if timeline is None:
         event_day = str(record.get("event_time") or date.today().isoformat())[:10]
         timeline = await _stability_attempt_events(store, event_day, event_day, trace_id=str(record.get("trace_id") or ""), request_id=request_id)
-    action_list = await _call_store_optional(store, ("list_stability_actions",), request_id=request_id, scenario=str(record.get("scenario") or ""), default=[])
-    action_ids = {str(item.get("id") or "") for item in (action_list or [])}
-    regressions = await _call_store_optional(store, ("list_stability_regressions",), default=[])
     normalized = normalize_event(record)
     return _observability_envelope(
         {
@@ -10052,130 +9993,10 @@ async def admin_stability_request(request: Request, request_id: str, backend_id:
             "finalRequestFailure": normalized.get("finalRequestFailure"),
             "finalRequestFailureSource": normalized.get("finalRequestFailureSource"),
             "timeline": timeline or [],
-            "actions": action_list or [],
-            "regressions": [item for item in (regressions or []) if str(item.get("action_id") or item.get("actionId") or "") in action_ids],
         },
         coverage={"partial": False, "incomplete": not bool(timeline), "missingReasons": [] if timeline else ["upstream_attempt_logs_unavailable"]},
         source="stability events and attempt timeline",
     )
-
-
-def _stability_action_input(data: StabilityActionRequest, action_id: str | None = None) -> dict[str, Any]:
-    return {
-        "id": action_id or uuid.uuid4().hex,
-        "title": data.title.strip(),
-        "description": data.notes.strip(),
-        "owner": data.owner.strip(),
-        "severity": data.severity,
-        "status": data.status,
-        "targetDate": data.targetDate.isoformat() if data.targetDate else None,
-        "fixReference": data.fixReference.strip(),
-        "requestedModelGroup": data.requestedModelGroup.strip(),
-        "scenario": data.scenario.strip(),
-        "errorCode": data.errorCode.strip(),
-        "notes": data.notes.strip(),
-    }
-
-
-def _stability_regression_input(data: StabilityRegressionRequest, regression_id: str | None = None) -> dict[str, Any]:
-    return {
-        "id": regression_id or uuid.uuid4().hex,
-        "actionId": data.actionId.strip(),
-        "baselineStartDate": data.baselineStart.isoformat(),
-        "baselineEndDate": data.baselineEnd.isoformat(),
-        "regressionStartDate": data.regressionStart.isoformat(),
-        "regressionEndDate": data.regressionEnd.isoformat(),
-        "metricName": data.metric.strip(),
-        "baselineValue": data.baselineValue,
-        "regressionValue": data.regressionValue,
-        "status": "verified",
-        "conclusion": data.conclusion,
-        "notes": data.notes.strip(),
-        "notes": data.notes.strip(),
-    }
-
-
-@app.get("/api/admin/stability/actions")
-async def admin_stability_actions(request: Request, status: str = "", owner: str = "", scenario: str = "") -> dict[str, Any]:
-    require_observability_dashboard(request)
-    store = _admin_observability_store()
-    items = await _call_store_optional(store, ("list_stability_actions",), status=status, owner=owner, scenario=scenario, default=[])
-    return _observability_envelope(items or [], source="stability governance")
-
-
-@app.post("/api/admin/stability/actions")
-async def admin_create_stability_action(data: StabilityActionRequest, request: Request) -> dict[str, Any]:
-    require_observability_dashboard(request)
-    await enforce_csrf(request)
-    store = _admin_observability_store()
-    item = await _call_store_optional(store, ("create_stability_action",), _stability_action_input(data), default=None)
-    if item is None:
-        raise HTTPException(status_code=503, detail="稳定性治理存储尚未就绪")
-    await _invalidate_observability_dashboard("stability")
-    return _observability_envelope(item, source="stability governance")
-
-
-@app.patch("/api/admin/stability/actions/{action_id}")
-async def admin_update_stability_action(action_id: str, data: StabilityActionRequest, request: Request) -> dict[str, Any]:
-    require_observability_dashboard(request)
-    await enforce_csrf(request)
-    store = _admin_observability_store()
-    item = await _call_store_optional(store, ("update_stability_action",), action_id, _stability_action_input(data, action_id), default=None)
-    if item is None:
-        raise HTTPException(status_code=404, detail="稳定性治理动作不存在")
-    await _invalidate_observability_dashboard("stability")
-    return _observability_envelope(item, source="stability governance")
-
-
-@app.delete("/api/admin/stability/actions/{action_id}")
-async def admin_delete_stability_action(action_id: str, request: Request) -> dict[str, Any]:
-    require_observability_dashboard(request)
-    await enforce_csrf(request)
-    deleted = await _call_store_optional(_admin_observability_store(), ("delete_stability_action",), action_id, default=False)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="稳定性治理动作不存在")
-    await _invalidate_observability_dashboard("stability")
-    return _observability_envelope({"deleted": True}, source="stability governance")
-
-
-@app.get("/api/admin/stability/regressions")
-async def admin_stability_regressions(request: Request, action_id: str = "", scenario: str = "") -> dict[str, Any]:
-    require_observability_dashboard(request)
-    items = await _call_store_optional(_admin_observability_store(), ("list_stability_regressions",), action_id=action_id, scenario=scenario, default=[])
-    return _observability_envelope(items or [], source="stability governance")
-
-
-@app.post("/api/admin/stability/regressions")
-async def admin_create_stability_regression(data: StabilityRegressionRequest, request: Request) -> dict[str, Any]:
-    require_observability_dashboard(request)
-    await enforce_csrf(request)
-    item = await _call_store_optional(_admin_observability_store(), ("create_stability_regression",), _stability_regression_input(data), default=None)
-    if item is None:
-        raise HTTPException(status_code=503, detail="回归验证存储尚未就绪")
-    await _invalidate_observability_dashboard("stability")
-    return _observability_envelope(item, source="stability governance")
-
-
-@app.patch("/api/admin/stability/regressions/{regression_id}")
-async def admin_update_stability_regression(regression_id: str, data: StabilityRegressionRequest, request: Request) -> dict[str, Any]:
-    require_observability_dashboard(request)
-    await enforce_csrf(request)
-    item = await _call_store_optional(_admin_observability_store(), ("update_stability_regression",), regression_id, _stability_regression_input(data, regression_id), default=None)
-    if item is None:
-        raise HTTPException(status_code=404, detail="回归验证记录不存在")
-    await _invalidate_observability_dashboard("stability")
-    return _observability_envelope(item, source="stability governance")
-
-
-@app.delete("/api/admin/stability/regressions/{regression_id}")
-async def admin_delete_stability_regression(regression_id: str, request: Request) -> dict[str, Any]:
-    require_observability_dashboard(request)
-    await enforce_csrf(request)
-    deleted = await _call_store_optional(_admin_observability_store(), ("delete_stability_regression",), regression_id, default=False)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="回归验证记录不存在")
-    await _invalidate_observability_dashboard("stability")
-    return _observability_envelope({"deleted": True}, source="stability governance")
 
 
 def _cost_item_payload(item: dict[str, Any]) -> dict[str, Any]:
@@ -11059,6 +10880,30 @@ async def _build_costs_overview(
             model_split[str(row.get("model") or "unknown")] += float(row.get("amountUsd") or 0)
     trend_end = end if target != date.today().strftime("%Y-%m") else today
     all_days = [start + timedelta(days=offset) for offset in range((trend_end - start).days + 1)]
+    model_cost_share: dict[str, dict[str, Any]] = {}
+    for row in api_rows:
+        model_name = str(row.get("model") or "未知模型")
+        model_group = str(row.get("model_group") or "").strip() or model_name
+        day = str(row.get("usage_date") or "")[:10]
+        spend = float(row.get("spend") or 0)
+        bucket = model_cost_share.setdefault(model_group, {"spend": 0.0, "daily": defaultdict(float)})
+        bucket["spend"] += spend
+        if day:
+            bucket["daily"][day] += spend
+    model_cost_total = sum(float(item["spend"]) for item in model_cost_share.values())
+    model_cost_share_payload = []
+    for model_name, item in sorted(model_cost_share.items(), key=lambda entry: (-float(entry[1]["spend"]), entry[0])):
+        model_cost_share_payload.append(
+            {
+                "model": model_name,
+                "spend": round(float(item["spend"]), 2),
+                "share": round(float(item["spend"]) / model_cost_total, 6) if model_cost_total else 0,
+                "daily": [
+                    {"date": day.isoformat(), "spend": round(float(item["daily"].get(day.isoformat(), 0)), 2)}
+                    for day in all_days
+                ],
+            }
+        )
     month_days = (end - start).days + 1
     budget_daily = budget / month_days if budget is not None else None
     elapsed_days = max(1, (today - start).days + 1)
@@ -11105,6 +10950,7 @@ async def _build_costs_overview(
                 {"model": key, "spend": value}
                 for key, value in sorted(model_split.items(), key=lambda item: item[1], reverse=True)
             ],
+            "modelCostShare": model_cost_share_payload,
             "providerSplit": [
                 {"provider": key, "spend": value}
                 for key, value in sorted(

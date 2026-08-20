@@ -5032,7 +5032,7 @@ class UsageStore:
                    spend::double precision AS spend, request_count
             FROM cost_api_daily
             WHERE usage_date BETWEEN $1::date AND $2::date
-              AND ($3='' OR model=$3)
+              AND ($3='' OR model=$3 OR model_group=$3)
               AND ($4='' OR provider=$4)
               AND ($5='' OR account_id=$5 OR key_id=$5 OR principal_id=$5)
             ORDER BY usage_date, spend DESC
