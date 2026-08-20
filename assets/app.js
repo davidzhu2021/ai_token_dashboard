@@ -8513,6 +8513,9 @@ function observabilityReasonCopy(payload, scope) {
     no_events_or_filter_match: "当前窗口无事件或筛选无结果",
     field_missing: "上游记录缺少必要字段",
   };
+  if (scope === "stability" && (reasons.length || coverage.incomplete || coverage.partial)) {
+    return null;
+  }
   if (reasons.length) {
     return {
       title: scope === "stability" ? "稳定性数据覆盖提示" : "费用数据覆盖提示",

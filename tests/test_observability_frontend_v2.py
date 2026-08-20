@@ -32,6 +32,17 @@ def test_trustworthy_observability_statuses_and_loading_lifecycle() -> None:
     assert "费用趋势暂不可用" in source
 
 
+def test_stability_dashboard_does_not_render_coverage_notice() -> None:
+    """稳定性指标卡在覆盖不完整时仍保持展示，不额外占用提示区域。"""
+    _, source = sources()
+
+    start = source.index("function observabilityReasonCopy(payload, scope)")
+    end = source.index("\nfunction renderObservabilityQuality", start)
+    reason_copy = source[start:end]
+
+    assert "if (scope === \"stability\" && (reasons.length || coverage.incomplete || coverage.partial)) {\n    return null;\n  }" in reason_copy
+
+
 def test_stability_dashboard_has_four_primary_metrics_and_governance_drilldown() -> None:
     markup, source = sources()
     for label in ("用户最终失败率", "兜底成功率", "TTFT P95", "Top 异常场景"):
