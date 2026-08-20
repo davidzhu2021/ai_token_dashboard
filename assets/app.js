@@ -8354,6 +8354,22 @@ function observabilityMetricCard({ label, metric, formatter, action = "", hint =
   return `<${tag} class="observability-metric${action ? " is-action" : ""}"${actionAttrs}><div class="observability-metric-label"><span>${escapeHtml(label)}</span><span class="observability-metric-status ${status.tone}">${escapeHtml(status.label)}</span></div><strong>${escapeHtml(value)}</strong><div class="observability-metric-meta">${metadata.length ? metadata.map((item) => `<span>${escapeHtml(item)}</span>`).join("") : `<span>${escapeHtml(hint || "当前接口未返回完整审计元数据")}</span>`}</div></${tag}>`;
 }
 
+function stabilityScenarioMetricCard({ metric, scenario, action = "" }) {
+  const normalized = observabilityMetricObject(metric);
+  const status = observabilityMetricStatus(normalized);
+  const count = normalized.value === null || normalized.value === undefined ? "暂无数据" : `${Number(normalized.value).toLocaleString("zh-CN")} 次`;
+  const periodValue = normalized.period || "";
+  const period = typeof periodValue === "object" ? [periodValue.startDate || periodValue.start, periodValue.endDate || periodValue.end].filter(Boolean).join(" 至 ") : String(periodValue);
+  const metadata = [
+    period,
+    normalized.sampleCount == null ? "" : `样本 ${Number(normalized.sampleCount).toLocaleString("zh-CN")}`,
+    normalized.definitionVersion || normalized.definitionsVersion ? `口径 ${normalized.definitionVersion || normalized.definitionsVersion}` : "",
+  ].filter(Boolean);
+  const tag = action ? "button" : "article";
+  const actionAttrs = action ? ` type="button" data-observability-action="${escapeHtml(action)}"` : "";
+  return `<${tag} class="observability-metric stability-scenario-metric-card${action ? " is-action" : ""}"${actionAttrs}><div class="observability-metric-label"><span>Top 异常场景</span><span class="observability-metric-status ${status.tone}">${escapeHtml(status.label)}</span></div><strong class="stability-scenario-metric-name">${escapeHtml(scenario || "未知场景")}</strong><strong class="stability-scenario-metric-count">${escapeHtml(count)}</strong><div class="observability-metric-meta">${metadata.length ? metadata.map((item) => `<span>${escapeHtml(item)}</span>`).join("") : "<span>当前接口未返回完整审计元数据</span>"}</div></${tag}>`;
+}
+
 function observabilityEmptyState(title, detail, actions = []) {
   return `<div class="observability-empty-state"><strong>${escapeHtml(title)}</strong><p>${escapeHtml(detail)}</p>${actions.length ? `<div class="observability-empty-actions">${actions.map((action) => `<button class="ghost-btn" type="button" ${action.attr}>${escapeHtml(action.label)}</button>`).join("")}</div>` : ""}</div>`;
 }
@@ -8694,7 +8710,7 @@ function renderStabilityOverview() {
     observabilityMetricCard({ label: "用户最终失败率", metric: finalFailure, formatter: observabilityPercent, action: "stability-final-failures" }),
     observabilityMetricCard({ label: "兜底成功率", metric: fallbackRecovery, formatter: observabilityPercent, action: "stability-fallbacks", hint: "需接入显式兜底尝试事件" }),
     observabilityMetricCard({ label: "TTFT P95", metric: ttft, formatter: (value) => `${(Number(value) / 1000).toFixed(2)}s`, action: "stability-ttft" }),
-    observabilityMetricCard({ label: "Top 异常场景", metric: topScenarioMetric, formatter: (value) => topScenario ? `${topScenario.scenario || "未知场景"} · ${Number(value).toLocaleString("zh-CN")} 次` : `${value} 次`, action: "stability-top-scenario" }),
+    stabilityScenarioMetricCard({ metric: topScenarioMetric, scenario: topScenario?.scenario, action: "stability-top-scenario" }),
   ].join("");
   renderObservabilityContext("stabilityContext", payload, data, "stability");
   renderStabilityTrendChart(el("stabilityTrend"), data.daily || []);

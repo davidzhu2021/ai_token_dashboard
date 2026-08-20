@@ -59,6 +59,18 @@ def test_stability_dashboard_has_four_primary_metrics_and_governance_drilldown()
     assert "低覆盖 TTFT 不参与稳定判定" in markup
 
 
+def test_top_stability_scenario_metric_separates_name_and_count() -> None:
+    markup, source = sources()
+
+    assert "function stabilityScenarioMetricCard" in source
+    assert 'class="observability-metric stability-scenario-metric-card' in source
+    assert 'class="stability-scenario-metric-name"' in source
+    assert 'class="stability-scenario-metric-count"' in source
+    assert "stabilityScenarioMetricCard({ metric: topScenarioMetric, scenario: topScenario?.scenario" in source
+    assert ".stability-scenario-metric-name" in markup
+    assert ".stability-scenario-metric-count" in markup
+
+
 def test_stability_model_ranking_uses_ranked_stability_cards() -> None:
     markup, source = sources()
 

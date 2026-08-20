@@ -3271,6 +3271,11 @@
       .observability-metric strong { margin:0; font-size:clamp(22px,2.2vw,30px); line-height:1.15; overflow-wrap:anywhere; }
       .observability-metric-meta { display:grid; gap:3px; min-height:36px; color:var(--muted-text,#68758a); font-size:11px; line-height:1.45; }
       .observability-metric-meta span { color:inherit; font-size:inherit; }
+      .stability-scenario-metric-card { gap:5px; }
+      .stability-scenario-metric-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:18px; font-weight:800; }
+      .stability-scenario-metric-count { color:var(--ink,#14243a); font-size:clamp(24px,2.4vw,32px); font-variant-numeric:tabular-nums; line-height:1.1; }
+      .stability-scenario-metric-card .observability-metric-meta { display:flex; min-width:0; min-height:0; gap:0 8px; flex-wrap:wrap; }
+      .stability-scenario-metric-card .observability-metric-meta span { white-space:nowrap; }
       .observability-metric-status { display:inline-flex; width:fit-content; min-height:22px; align-items:center; padding:0 7px; border-radius:999px; background:#eef3f8; color:#52657c; font-size:11px; font-weight:800; }
       .observability-metric-status.good { background:#e8f6ef; color:#1d6a49; }
       .observability-metric-status.warning { background:#fff3d8; color:#805b12; }
@@ -3322,6 +3327,9 @@
         .observability-metric-grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
         .observability-metric { padding:13px; }
         .observability-metric strong { font-size:21px; }
+        .stability-scenario-metric-name { font-size:16px; }
+        .stability-scenario-metric-count { font-size:24px; }
+        .stability-scenario-metric-card .observability-metric-meta span { white-space:normal; }
         .observability-metric-meta { min-height:0; }
         .observability-context { align-items:flex-start; }
         .observability-action { flex-direction:column; }
