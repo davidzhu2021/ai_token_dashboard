@@ -136,6 +136,7 @@ from .organization_provisioning import OrganizationProvisioningService
 from .usage_store import UsageStore
 from .usage_realtime import UsageRealtimeStore, realtime_enabled
 from .usage_realtime_worker import UsageRealtimeWorker
+from .mock_runtime import MockRuntime
 from .usage_sync import (
     UsageSynchronizer,
     run_sync_with_recent_refresh,
@@ -163,6 +164,39 @@ REMOTE_DEMO_USAGE_PATHS = frozenset({
 })
 
 
+def local_data_mode() -> Literal["mock", "real"]:
+    """Select local development data without allowing remote mock usage."""
+    configured = os.getenv("LOCAL_DATA_MODE", "").strip().lower()
+    if configured not in {"", "mock", "real"}:
+        raise RuntimeError("LOCAL_DATA_MODE 必须是 mock 或 real")
+    parsed = urlparse(os.getenv("APP_BASE_URL", "").strip())
+    loopback = parsed.scheme.lower() == "http" and (parsed.hostname or "").lower() in LOOPBACK_HOSTS
+    if configured == "real":
+        return "real"
+    if not configured and (
+        os.getenv("ORGANIZATION_MODE", "").strip().lower() in {"disabled", "demo", "real"}
+        or env_bool("ORGANIZATION_DEMO_ENABLED", False)
+    ):
+        return "real"
+    if not configured and any(env_bool(name, False) for name in ("AUTH_ENABLED", "PASSWORD_LOGIN_ENABLED")):
+        return "real"
+    return "mock" if loopback else "real"
+
+
+def local_mock_enabled() -> bool:
+    return local_data_mode() == "mock"
+
+
+def validate_local_data_mode() -> None:
+    configured = os.getenv("LOCAL_DATA_MODE", "").strip().lower()
+    parsed = urlparse(os.getenv("APP_BASE_URL", "").strip())
+    loopback = parsed.scheme.lower() == "http" and (parsed.hostname or "").lower() in LOOPBACK_HOSTS
+    if configured == "mock" and not loopback:
+        raise RuntimeError("LOCAL_DATA_MODE=mock 仅允许 APP_BASE_URL 使用本机回环 HTTP 地址")
+    if configured not in {"", "mock", "real"}:
+        raise RuntimeError("LOCAL_DATA_MODE 必须是 mock 或 real")
+
+
 def session_cookie_max_age() -> int:
     """Keep the signed session cookie lifetime aligned with server sessions."""
     try:
@@ -174,6 +208,14 @@ def session_cookie_max_age() -> int:
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
     validate_runtime_auth_config()
+    validate_local_data_mode()
+    if local_data_mode() == "mock":
+        await start_mock_runtime()
+        try:
+            yield
+        finally:
+            await close_litellm_client()
+        return
     await start_billing_store()
     await start_organization_service()
     await start_usage_sync()
@@ -329,6 +371,7 @@ _litellm_client: LiteLLMClient | None = None
 _key_vault: KeyVault | None = None
 _usage_store: UsageStore | None = UsageStore.from_environment()
 _billing_store: BillingStore | None = BillingStore.from_environment()
+_mock_runtime: MockRuntime | None = None
 _auth_store: AuthStore | None = None
 _organization_store: OrganizationStore | PostgreSQLOrganizationRepository | None = None
 _organization_capability_status: dict[str, Any] = {
@@ -788,7 +831,16 @@ def auth_error_response(message: str, status_code: int = 400) -> HTMLResponse:
     return HTMLResponse(html, status_code=status_code)
 
 
-def client() -> LiteLLMClient:
+def mock_runtime() -> MockRuntime:
+    global _mock_runtime
+    if _mock_runtime is None:
+        _mock_runtime = MockRuntime()
+    return _mock_runtime
+
+
+def client() -> Any:
+    if local_data_mode() == "mock":
+        return mock_runtime().client
     global _litellm_client
     try:
         if _litellm_client is None:
@@ -800,22 +852,30 @@ def client() -> LiteLLMClient:
 
 def key_vault() -> KeyVault:
     global _key_vault
+    if local_data_mode() == "mock":
+        return mock_runtime().key_vault
     if _key_vault is None:
         _key_vault = KeyVault.from_environment(ROOT_DIR)
     return _key_vault
 
 
 def usage_store() -> UsageStore | None:
+    if local_data_mode() == "mock":
+        return mock_runtime().usage_store
     return _usage_store
 
 
 def billing_store() -> BillingStore | None:
+    if local_data_mode() == "mock":
+        return mock_runtime().billing_store
     return _billing_store
 
 
 def organization_mode() -> str:
     """Resolve the organization runtime mode with legacy demo compatibility."""
 
+    if local_data_mode() == "mock":
+        return "demo"
     configured = os.getenv("ORGANIZATION_MODE", "").strip().lower()
     if configured:
         if configured not in {"disabled", "demo", "real"}:
@@ -1308,6 +1368,14 @@ async def start_usage_sync() -> None:
     _usage_sync_task = asyncio.create_task(usage_sync_loop(), name="usage-sync-loop")
 
 
+async def start_mock_runtime() -> None:
+    """Initialize only deterministic in-memory dependencies for local mode."""
+    global _organization_store
+    mock_runtime()
+    if _organization_store is None:
+        _organization_store = InMemoryOrganizationStore()
+
+
 async def start_billing_store() -> None:
     """建立充值账本连接。
 
@@ -1750,6 +1818,8 @@ async def close_litellm_client() -> None:
     if _litellm_client is not None:
         await _litellm_client.close()
         _litellm_client = None
+    global _mock_runtime
+    _mock_runtime = None
 
 
 def safe_provider_name() -> str:
@@ -4826,6 +4896,9 @@ async def team_member_usage_payload(
 
 async def current_upstream_user(request: Request, refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
     app_user = require_user(request)
+    if local_mock_enabled():
+        upstream, _ = await cached_resolve_user(app_user["email"], app_user.get("name"), refresh)
+        return app_user, upstream
     if await is_demo_customer_user(app_user):
         # Customer demo identities deliberately have no upstream account.  Any
         # endpoint that still tries to use one must fail closed instead of
@@ -5578,7 +5651,7 @@ async def health() -> dict[str, Any]:
     result: dict[str, Any] = {"status": "ok", "usageSync": {"status": "disabled"}}
     reader_config = usage_reader_config_status()
     result["usageReaderConfig"] = reader_config
-    if not reader_config["configured"]:
+    if not reader_config["configured"] and not local_mock_enabled():
         result["status"] = "degraded"
     if organization_real_enabled() and (
         not _organization_capability_status.get("available")
@@ -5701,7 +5774,7 @@ async def health() -> dict[str, Any]:
                     result["status"] = "degraded"
     else:
         result["usageDatabase"] = {"enabled": False, "connected": False, "status": "disabled"}
-        if usage_sync_role() == "reader":
+        if usage_sync_role() == "reader" and not local_mock_enabled():
             result["usageSync"] = {
                 "role": "reader",
                 "status": "misconfigured",
@@ -5752,6 +5825,9 @@ async def health() -> dict[str, Any]:
     else:
         result["usageRealtime"] = {"status": "disabled", "connected": False, "ready": False}
     billing_ledger = billing_store()
+    if local_mock_enabled():
+        result["billing"] = {"enabled": True, "connected": True, "status": "ok", "mode": "mock", "pendingSyncCount": 0, "pendingReviewCount": 0}
+        return result
     if billing_ledger is None:
         result["billing"] = {"enabled": False, "status": "disabled"}
     elif billing_ledger.pool is None:
@@ -5798,7 +5874,7 @@ async def auth_config() -> dict[str, Any]:
     signup_ready = local_signup_ready()
     recovery_ready = password_recovery_configured()
     return {
-        "devLoginEnabled": env_bool("DEV_LOGIN_ENABLED", False),
+        "devLoginEnabled": local_data_mode() == "mock" or env_bool("DEV_LOGIN_ENABLED", False),
         "remoteDemoReadOnly": remote_demo_read_only(),
         "remoteDemoUsageSnapshotOnly": remote_demo_read_only(),
         "oidcConfigured": oidc_configured(),
@@ -6168,7 +6244,7 @@ async def auth_scope(request: Request) -> dict[str, Any]:
 
 @app.post("/api/auth/dev-login")
 async def dev_login(request: Request) -> dict[str, Any]:
-    if not env_bool("DEV_LOGIN_ENABLED", False):
+    if not local_mock_enabled() and not env_bool("DEV_LOGIN_ENABLED", False):
         raise HTTPException(status_code=403, detail="开发登录未启用，请使用企业统一认证")
     app_base_url = os.getenv("APP_BASE_URL", "http://127.0.0.1:8000").strip()
     app_host = (urlparse(app_base_url).hostname or "").lower()
@@ -11400,7 +11476,8 @@ async def my_keys(
     include_models: bool = Query(True),
 ) -> dict[str, Any]:
     app_user, upstream_user = await current_upstream_user(request)
-    require_active_local_entitlement(app_user)
+    if not local_mock_enabled():
+        require_active_local_entitlement(app_user)
     user_ids = upstream_user_ids(upstream_user)
     if not user_ids:
         raise HTTPException(status_code=502, detail="上游员工记录缺少 user_id")
@@ -12276,7 +12353,7 @@ async def models(request: Request) -> dict[str, Any]:
         if organization_real_enabled()
         else None
     )
-    if await is_demo_customer_user(app_user):
+    if await is_demo_customer_user(app_user) and not local_mock_enabled():
         raise auth_http_error(403, "企业演示账号不提供模型目录查询", "ORGANIZATION_MODELS_FORBIDDEN")
     if real_member is not None:
         require_real_organization_capability()

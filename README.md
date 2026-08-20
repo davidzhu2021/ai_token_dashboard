@@ -97,21 +97,21 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:8000/api/health'
 
 演示模式默认关闭，不要为了演示修改共享的 `.env`。本地验证统一使用 `127.0.0.1:8000`；如果端口已被本项目占用，应复用现有进程，如果被其他程序占用则先确认冲突，不要静默改用其他端口。
 
+本机回环地址默认使用进程内 mock 数据：模型、用量、令牌和企业演示操作均不访问真实上游或支付服务，写操作仅在当前服务进程中生效，重启后恢复固定种子。需要本地真实联调时，才显式设置 `LOCAL_DATA_MODE=real`；非回环或 HTTPS 地址不能启用 mock。
+
 ```powershell
 cd D:\ai_token_dashboard
-$env:APP_BASE_URL = 'http://127.0.0.1:8001'
-$env:ORGANIZATION_MODE = 'demo'
-$env:DEV_LOGIN_ENABLED = 'true'
-.\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8001
+$env:APP_BASE_URL = 'http://127.0.0.1:8000'
+.\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
 ```
 
-也可使用同一条 PowerShell 命令启动，三个变量只作用于当前进程：
+也可使用同一条 PowerShell 命令启动，变量只作用于当前进程：
 
 ```powershell
-$env:APP_BASE_URL='http://127.0.0.1:8000'; $env:ORGANIZATION_MODE='demo'; $env:DEV_LOGIN_ENABLED='true'; .\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+$env:APP_BASE_URL='http://127.0.0.1:8000'; .\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
 ```
 
-打开 `http://127.0.0.1:8000`，用 `ADMIN_EMAILS` 中的卖方平台管理员邮箱进行“开发环境邮箱登录”。`APP_BASE_URL` 必须与浏览器实际访问的协议、主机和端口完全一致，否则请求来源校验会拒绝登录。
+打开 `http://127.0.0.1:8000`，可使用 `owner@demo.example` 或 `admin@demo.example` 进行本地开发登录。`APP_BASE_URL` 必须与浏览器实际访问的协议、主机和端口完全一致，否则请求来源校验会拒绝登录。
 
 演示种子含三家独立客户：`Demo Company`（3 个部门、12 名成员）、北辰智造有限公司和远海零售集团。开启演示后，下列样例邮箱可以在回环地址使用开发登录，即使其域名不在正常企业邮箱白名单中：
 
