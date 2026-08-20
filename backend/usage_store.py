@@ -4773,23 +4773,26 @@ class UsageStore:
         """
         terminal_attempts = f"""
             SELECT DISTINCT ON (
+                backend_id,
                 COALESCE(NULLIF(trace_id,''), NULLIF(request_id,''), event_id),
                 COALESCE(NULLIF(attempt_id,''), attempt_index::text || ':' || actual_model || ':' || route_name)
             ) *
             FROM stability_attempt_events WHERE {attempt_base}
-            ORDER BY COALESCE(NULLIF(trace_id,''), NULLIF(request_id,''), event_id),
+            ORDER BY backend_id,
+                     COALESCE(NULLIF(trace_id,''), NULLIF(request_id,''), event_id),
                      COALESCE(NULLIF(attempt_id,''), attempt_index::text || ':' || actual_model || ':' || route_name),
                      COALESCE(ended_at,event_time) DESC, event_id DESC
         """
         attempts_query = pool.fetchrow(
             f"""
             WITH terminal AS ({terminal_attempts}), traces AS (
-                SELECT COALESCE(NULLIF(trace_id,''), NULLIF(request_id,''), event_id) AS trace_key,
+                SELECT backend_id,
+                       COALESCE(NULLIF(trace_id,''), NULLIF(request_id,''), event_id) AS trace_key,
                        BOOL_OR(is_fallback OR event_type LIKE 'fallback_%' OR fallback_from<>'' OR fallback_to<>'') AS fallback_triggered,
                        BOOL_OR((is_fallback OR event_type LIKE 'fallback_%' OR fallback_from<>'' OR fallback_to<>'') AND status='success') AS fallback_recovered,
                        BOOL_OR(is_retry OR event_type LIKE 'retry_%' OR (attempt_index>0 AND NOT is_fallback)) AS retry_triggered,
                        BOOL_OR((is_retry OR event_type LIKE 'retry_%' OR (attempt_index>0 AND NOT is_fallback)) AND status='success') AS retry_recovered
-                FROM terminal GROUP BY 1
+                FROM terminal GROUP BY 1, 2
             )
             SELECT (SELECT COUNT(*) FROM terminal)::bigint AS attempt_count,
                    (SELECT COUNT(*) FROM terminal WHERE status IN ('success','failure'))::bigint AS attempt_status_count,
@@ -4807,10 +4810,11 @@ class UsageStore:
             f"""
             WITH terminal AS ({terminal_attempts}), traces AS (
                 SELECT COALESCE(NULLIF(requested_model_group,''), NULLIF(actual_model,''), 'unknown') AS dimension,
+                       backend_id,
                        COALESCE(NULLIF(trace_id,''), NULLIF(request_id,''), event_id) AS trace_key,
                        BOOL_OR(is_fallback OR event_type LIKE 'fallback_%' OR fallback_from<>'' OR fallback_to<>'') AS fallback_triggered,
                        BOOL_OR((is_fallback OR event_type LIKE 'fallback_%' OR fallback_from<>'' OR fallback_to<>'') AND status='success') AS fallback_recovered
-                FROM terminal GROUP BY 1,2
+                FROM terminal GROUP BY 1,2,3
             ), terminal_totals AS (
                 SELECT COALESCE(NULLIF(requested_model_group,''), NULLIF(actual_model,''), 'unknown') AS dimension,
                        COUNT(*)::bigint AS attempt_count,

@@ -36,6 +36,18 @@ def test_stability_model_attempt_metrics_deduplicates_terminal_attempts() -> Non
     assert metrics["alpha"]["fallbackRecoveredCount"] == 1
 
 
+def test_stability_model_attempt_metrics_keeps_same_attempt_from_each_backend() -> None:
+    events = [
+        {"backend_id": "primary", "requested_model_group": "alpha", "request_id": "req-1", "attempt_id": "1", "status": "success", "is_fallback": True},
+        {"backend_id": "her", "requested_model_group": "alpha", "request_id": "req-1", "attempt_id": "1", "status": "failure", "is_fallback": True},
+    ]
+
+    metrics = _stability_model_attempt_metrics(events)
+
+    assert metrics["alpha"]["attemptCount"] == 2
+    assert metrics["alpha"]["fallbackAttemptCount"] == 2
+
+
 def test_stability_model_ranking_sorts_statuses_and_metrics() -> None:
     rows = [
         {"model": "repair", "state": "需治理", "finalRequestFailureRate": 0.01, "fallbackRecoveryRate": 1, "ttftP95Ms": 200},

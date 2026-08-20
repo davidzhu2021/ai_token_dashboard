@@ -22,7 +22,7 @@ def test_trustworthy_observability_statuses_and_loading_lifecycle() -> None:
     assert 'target.setAttribute("role", isError ? "alert" : "status")' in source
     assert 'isStabilityLoading = false;\n      renderStabilityOverview();' in source
     assert 'isCostOverviewLoading = false;\n      renderCostOverview();' in source
-    assert 'upstream == null ? ""' in source
+    assert 'item.upstream == null ? "无数据"' in source
     assert 'actual == null ? ""' in source
     assert '#costTrend { padding-bottom:20px; overflow:clip; }' in markup
     assert '#costTrend .observability-bar { min-width:0; }' in markup
@@ -84,6 +84,15 @@ def test_stability_model_ranking_hides_zero_and_full_failure_rates() -> None:
 
     assert "const visibleStabilityRankings = stabilityRankings.filter" in source
     assert "numericFailureRate !== 0 && numericFailureRate !== 1" in source
+
+
+def test_stability_model_ranking_distinguishes_fallback_statuses() -> None:
+    source = Path("assets/app.js").read_text(encoding="utf-8")
+
+    assert "const formatStabilityFallback = (item) =>" in source
+    assert '"not_triggered"' in source
+    assert '"未触发"' in source
+    assert 'item.fallbackRecoveryStatus' in source
 
 
 def test_cost_dashboard_separates_actual_forecast_and_auditable_metrics() -> None:

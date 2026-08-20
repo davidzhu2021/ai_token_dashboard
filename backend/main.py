@@ -9645,8 +9645,9 @@ def _stability_model_attempt_metrics(
 ) -> dict[str, dict[str, Any]]:
     """Aggregate terminal attempt and fallback trace metrics by requested model."""
 
-    terminal: dict[tuple[str, str, str], dict[str, Any]] = {}
+    terminal: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     for item in attempt_events:
+        backend = str(item.get("backend_id") or item.get("backendId") or "")
         model = str(
             item.get("requested_model_group")
             or item.get("requestedModelGroup")
@@ -9656,7 +9657,7 @@ def _stability_model_attempt_metrics(
         )
         trace = str(item.get("trace_id") or item.get("traceId") or item.get("request_id") or item.get("requestId") or item.get("event_id") or item.get("eventId") or "")
         attempt = str(item.get("attempt_id") or item.get("attemptId") or f"{item.get('attempt_index', item.get('attemptIndex', 0))}:{item.get('actual_model', item.get('actualModel', ''))}:{item.get('route_name', item.get('route', ''))}")
-        key = (model, trace, attempt)
+        key = (backend, model, trace, attempt)
         current = terminal.get(key)
         timestamp = str(item.get("ended_at") or item.get("endedAt") or item.get("event_time") or item.get("eventTime") or "")
         current_timestamp = str((current or {}).get("ended_at") or (current or {}).get("endedAt") or (current or {}).get("event_time") or (current or {}).get("eventTime") or "")
@@ -9664,7 +9665,7 @@ def _stability_model_attempt_metrics(
             terminal[key] = item
 
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for (model, _trace, _attempt), item in terminal.items():
+    for (_backend, model, _trace, _attempt), item in terminal.items():
         grouped[model].append(item)
 
     result: dict[str, dict[str, Any]] = {}
@@ -9683,8 +9684,9 @@ def _stability_model_attempt_metrics(
                 or item.get("fallbackTo")
             )
             if is_fallback:
+                backend = str(item.get("backend_id") or item.get("backendId") or "")
                 trace = str(item.get("trace_id") or item.get("traceId") or item.get("request_id") or item.get("requestId") or item.get("event_id") or item.get("eventId") or "")
-                fallback_traces[trace].append(item)
+                fallback_traces[f"{backend}:{trace}"].append(item)
         fallback_count = len(fallback_traces)
         fallback_recovered = sum(
             any(str(item.get("status") or "").lower() == "success" for item in trace_items)
