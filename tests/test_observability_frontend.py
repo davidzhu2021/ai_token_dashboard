@@ -212,3 +212,18 @@ def test_stability_dashboard_no_longer_contains_governance_actions_panel() -> No
     markup = (ROOT / "index.html").read_text(encoding="utf-8")
     assert 'id="stabilityActions"' not in markup
     assert "排障动作" not in markup
+
+
+def test_cost_dashboard_trend_breakdown_exposes_three_daily_series() -> None:
+    """Prevent the cost trend panel from losing its shared daily comparison."""
+    markup = (ROOT / "index.html").read_text(encoding="utf-8")
+    source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="costTrendBreakdown"' in markup
+    for label in ("实际支出", "预测支出", "累计可优化金额"):
+        assert label in markup
+    assert 'class="cost-dashboard-grid"' in markup
+    assert 'function buildCostTrendBreakdownPoints' in source
+    assert 'function renderMultiLineChart' in source
+    assert 'renderCostTrendBreakdown(data)' in source
+    assert 'cumulativeOpportunity' in source

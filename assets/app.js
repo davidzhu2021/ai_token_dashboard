@@ -2525,6 +2525,54 @@ function renderLineChart({ svg, points, valueField, color, fill, axisFormatter, 
   bindChartTooltipEvents(svg);
 }
 
+function renderMultiLineChart({ svg, points, series, axisFormatter }) {
+  if (!svg) return;
+  if (!points.length) {
+    renderEmptyChart(svg, "当前筛选范围暂无数据");
+    return;
+  }
+  const width = 900;
+  const height = 280;
+  const pad = { left: 64, right: 18, top: 20, bottom: 42 };
+  const numericValues = points.flatMap((point) => series.map((item) => Number(point[item.valueField])).filter(Number.isFinite));
+  const max = Math.max(1, ...numericValues);
+  const xStep = points.length > 1 ? (width - pad.left - pad.right) / (points.length - 1) : 1;
+  const x = (index) => (points.length > 1 ? pad.left + index * xStep : width / 2);
+  const y = (value) => height - pad.bottom - (Number(value) / max) * (height - pad.top - pad.bottom);
+  const grid = [0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+    const yy = y(max * ratio);
+    return `<line x1="${pad.left}" y1="${yy}" x2="${width - pad.right}" y2="${yy}" stroke="#dde5ee" stroke-dasharray="4 7"/><text x="12" y="${yy + 4}" fill="#66748a" font-size="12">${axisFormatter(max * ratio)}</text>`;
+  }).join("");
+  const paths = series.map((item) => {
+    let path = "";
+    let segmentOpen = false;
+    points.forEach((point, index) => {
+      const value = Number(point[item.valueField]);
+      if (!Number.isFinite(value)) {
+        segmentOpen = false;
+        return;
+      }
+      path += `${segmentOpen ? " L" : " M"} ${x(index)} ${y(value)}`;
+      segmentOpen = true;
+    });
+    return path ? `<path d="${path}" fill="none" stroke="${item.color}" stroke-width="${item.width || 4}" stroke-linecap="round" stroke-linejoin="round"${item.dash ? ` stroke-dasharray="${item.dash}"` : ""}/>` : "";
+  }).join("");
+  const hits = points.map((point, index) => {
+    const rows = series.map((item) => {
+      const value = Number(point[item.valueField]);
+      return { label: item.label, value: Number.isFinite(value) ? axisFormatter(value) : "无数据" };
+    });
+    const hitLeft = index === 0 ? pad.left : (x(index - 1) + x(index)) / 2;
+    const hitRight = index === points.length - 1 ? width - pad.right : (x(index) + x(index + 1)) / 2;
+    return `<rect class="chart-hit" x="${hitLeft}" y="${pad.top}" width="${Math.max(1, hitRight - hitLeft)}" height="${height - pad.top - pad.bottom}" fill="transparent" data-tooltip="${encodeURIComponent(tooltipMarkup(point.date, rows))}"/>`;
+  }).join("");
+  const labelEvery = Math.max(1, Math.ceil(points.length / 5));
+  const labels = points.map((point, index) => ({ point, index })).filter(({ index }) => index === 0 || index === points.length - 1 || index % labelEvery === 0).map(({ point, index }, labelIndex, labelsToShow) => `<text x="${x(index)}" y="${height - 16}" fill="#66748a" font-size="12" text-anchor="${labelIndex === labelsToShow.length - 1 ? "end" : labelIndex === 0 ? "start" : "middle"}">${String(point.date || "").slice(5)}</text>`).join("");
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.innerHTML = `<rect width="${width}" height="${height}" rx="8" fill="#fbfdff"/>${grid}${paths}${hits}${labels}`;
+  bindChartTooltipEvents(svg);
+}
+
 function renderTrendTo(svgId, data) {
   const points = aggregateByDate(data);
   renderLineChart({
@@ -8819,6 +8867,7 @@ function renderCostOverview() {
   renderObservabilityContext("costContext", costOverview, data, "cost");
   el("savingsActionList").innerHTML = (data.savingsActions || []).map((item) => `<article class="observability-action"><div><strong>${escapeHtml(item.name)}</strong><p class="hint">${escapeHtml(item.owner || "未指定负责人")} · ${escapeHtml(item.status)}${item.evidenceUrl ? " · 有证据" : " · 缺证据"}</p></div><div class="observability-table-actions"><span>${item.status === "verified" ? `${observabilityMoney(item.realizedSavingsToDate ?? Math.max(0, Number(item.baselineDailyCost) - Number(item.verifiedDailyCost || 0)))}/日` : item.forecastSavingsRemaining == null ? "尚未计入节省" : `预计 ${observabilityMoney(item.forecastSavingsRemaining)}`}</span>${canManageCosts() ? `<button class="ghost-btn" type="button" data-edit-savings-action="${escapeHtml(item.id)}">编辑</button>` : "只读"}</div></article>`).join("") || `<p class="empty">暂无降本动作</p>`;
   renderCostModelShare(data.modelCostShare || data.modelSplit || []);
+  renderCostTrendBreakdown(data);
   const targetMonth = String(data.month || currentCostMonth()).slice(0, 7);
   const budget = costBudgets.find((item) => String(item.month).slice(0, 7) === targetMonth);
   if (el("costBudgetAmount")) el("costBudgetAmount").value = String(budget?.budgetUsd ?? metrics.budget ?? "");
@@ -8837,6 +8886,46 @@ function renderCostOverview() {
     select.value = options.includes(selected) ? selected : "";
   });
   renderObservabilityFilterState("cost");
+}
+
+function buildCostTrendBreakdownPoints(data) {
+  const trend = Array.isArray(data?.trend) ? data.trend : [];
+  const opportunityByDate = new Map();
+  for (const item of Array.isArray(data?.modelCostShare) ? data.modelCostShare : []) {
+    for (const point of Array.isArray(item?.daily) ? item.daily : []) {
+      const date = String(point?.date || "");
+      if (!date) continue;
+      opportunityByDate.set(date, (opportunityByDate.get(date) || 0) + Math.max(0, Number(point?.opportunity || 0)));
+    }
+  }
+  let cumulativeOpportunity = 0;
+  return trend.map((point) => {
+    const date = String(point?.date || "");
+    const dailyOpportunity = opportunityByDate.get(date) || 0;
+    cumulativeOpportunity += dailyOpportunity;
+    const actual = point?.actual;
+    const forecast = point?.forecast;
+    return {
+      date,
+      actualSpend: actual !== null && actual !== undefined && Number.isFinite(Number(actual)) ? Number(actual) : null,
+      forecastSpend: forecast !== null && forecast !== undefined && Number.isFinite(Number(forecast)) ? Number(forecast) : null,
+      cumulativeOpportunity,
+    };
+  });
+}
+
+function renderCostTrendBreakdown(data) {
+  const points = buildCostTrendBreakdownPoints(data);
+  renderMultiLineChart({
+    svg: el("costTrendBreakdownChart"),
+    points,
+    axisFormatter: observabilityMoney,
+    series: [
+      { valueField: "actualSpend", label: "实际支出", color: "#2d6cdf" },
+      { valueField: "forecastSpend", label: "预测支出", color: "#d94a45", dash: "9 7" },
+      { valueField: "cumulativeOpportunity", label: "累计可优化金额", color: "#199b55" },
+    ],
+  });
 }
 
 function renderCostModelShare(items) {
