@@ -8588,6 +8588,87 @@ function renderStabilityActions(data) {
   if (regressionTarget) regressionTarget.innerHTML = regressions.map((item) => `<article class="observability-action"><div><strong>${escapeHtml(item.metric || item.name || "回归验证")}</strong><p class="hint">基线 ${escapeHtml(item.baselineWindow || item.baselinePeriod || item.baselineStart || "暂无")} · 回归 ${escapeHtml(item.regressionWindow || item.measurementWindow || item.regressionStart || "暂无")}</p></div><div class="observability-table-actions"><span class="chip ${String(item.conclusion || "").includes("passed") || String(item.conclusion || "").includes("通过") ? "green" : "gold"}">${escapeHtml(item.conclusion || "待结论")}</span></div></article>`).join("") || observabilityEmptyState("暂无回归记录", "治理动作完成后，在这里保留基线、回归窗口与结论。", []);
 }
 
+function renderStabilityTrendChart(container, daily) {
+  if (!container) return;
+  const points = [...(daily || [])]
+    .map((item) => ({
+      date: String(item.date || ""),
+      upstream: item.upstreamExceptionCount,
+      failures: item.finalRequestFailureCount ?? item.userVisibleFailureCount,
+    }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const trendValues = points.flatMap((item) => [item.upstream, item.failures]).filter((value) => value !== null && value !== undefined).map(Number);
+  const hasTrendValues = trendValues.length > 0;
+  const hasNonZeroTrend = trendValues.some((value) => value > 0);
+  const isEmpty = !points.length || !hasTrendValues || !hasNonZeroTrend;
+  container.classList.toggle("is-empty", isEmpty);
+  container.classList.toggle("is-chart", !isEmpty);
+  if (isEmpty) {
+    container.innerHTML = hasTrendValues && !hasNonZeroTrend
+      ? observabilityEmptyState("本期确无异常记录", "当前统计期间内，已接入指标均为真实零值。", [{ label: "调整筛选", attr: 'data-observability-empty-action="filters" data-observability-scope="stability"' }])
+      : observabilityEmptyState("异常趋势暂不可用", "尝试事件尚未接入或当前窗口尚未同步，缺失数据不会绘制为零值。", [{ label: "重新加载", attr: 'data-observability-retry="stability"' }, { label: "进入治理工作台", attr: 'data-open-governance-tab="stability-actions"' }]);
+    return;
+  }
+  const width = 900;
+  const height = 280;
+  const pad = { left: 54, right: 18, top: 20, bottom: 42 };
+  const max = Math.max(1, ...trendValues);
+  const xStep = points.length > 1 ? (width - pad.left - pad.right) / (points.length - 1) : 1;
+  const y = (value) => height - pad.bottom - (Number(value) / max) * (height - pad.top - pad.bottom);
+  const x = (index) => (points.length > 1 ? pad.left + index * xStep : width / 2);
+  const seriesPath = (field) => {
+    let path = "";
+    let penDown = false;
+    points.forEach((item, index) => {
+      const value = item[field];
+      if (value === null || value === undefined) {
+        penDown = false;
+        return;
+      }
+      path += `${penDown ? "L" : "M"}${x(index).toFixed(2)} ${y(Number(value)).toFixed(2)} `;
+      penDown = true;
+    });
+    return path.trim();
+  };
+  const grid = [0, 0.25, 0.5, 0.75, 1]
+    .map((ratio) => {
+      const yy = y(max * ratio);
+      const label = Math.round(max * ratio).toLocaleString("zh-CN");
+      const isBaseline = ratio === 0;
+      return `<line x1="${pad.left}" y1="${yy.toFixed(2)}" x2="${width - pad.right}" y2="${yy.toFixed(2)}" stroke="${isBaseline ? "#b9c6d6" : "#dde5ee"}" stroke-width="${isBaseline ? "1.5" : "1"}"${isBaseline ? "" : ' stroke-dasharray="4 7"'}/><text x="12" y="${(yy + 4).toFixed(2)}" fill="#66748a" font-size="12">${label}</text>`;
+    })
+    .join("");
+  const axisLine = `<line x1="${pad.left}" y1="${pad.top}" x2="${pad.left}" y2="${height - pad.bottom}" stroke="#dde5ee"/>`;
+  const labelEvery = Math.max(1, Math.ceil(points.length / 5));
+  const labels = points
+    .map((item, index) => ({ item, index }))
+    .filter(({ index }) => index === 0 || index === points.length - 1 || index % labelEvery === 0)
+    .map(({ item, index }, position, arr) => {
+      const anchor = position === arr.length - 1 ? "end" : "middle";
+      const cx = x(index);
+      const textX = anchor === "end" ? Math.min(cx, width - pad.right) : Math.max(cx, pad.left);
+      return `<text x="${textX.toFixed(2)}" y="${height - 14}" fill="#66748a" font-size="12" text-anchor="${anchor}">${escapeHtml(item.date.slice(5))}</text>`;
+    })
+    .join("");
+  const seriesDots = (field, color) => points
+    .map((item, index) => {
+      const value = item[field];
+      if (value === null || value === undefined) return "";
+      return `<circle cx="${x(index).toFixed(2)}" cy="${y(Number(value)).toFixed(2)}" r="4.5" fill="${color}"/>`;
+    })
+    .join("");
+  const hits = points.map((item, index) => {
+    const html = tooltipMarkup(item.date, [
+      { label: "调用过程中出错（上游异常）", value: item.upstream == null ? "无数据" : Number(item.upstream).toLocaleString("zh-CN") },
+      { label: "用户最终失败", value: item.failures == null ? "无数据" : Number(item.failures).toLocaleString("zh-CN") },
+    ]);
+    const hitWidth = Math.max(xStep, 16);
+    return `<rect class="chart-hit" x="${(x(index) - hitWidth / 2).toFixed(2)}" y="0" width="${hitWidth}" height="${height - pad.bottom}" fill="transparent" data-tooltip="${encodeURIComponent(html)}"/>`;
+  }).join("");
+  container.innerHTML = `<svg class="observability-trend-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="调用过程中出错与用户最终失败按天趋势">${grid}${axisLine}${labels}<path d="${seriesPath("upstream")}" fill="none" stroke="#1f5fd0" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><path d="${seriesPath("failures")}" fill="none" stroke="#e2783d" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>${seriesDots("upstream", "#1f5fd0")}${seriesDots("failures", "#e2783d")}${hits}</svg>`;
+  bindChartTooltipEvents(container.querySelector("svg"));
+}
+
 function renderStabilityOverview() {
   const payload = stabilityOverview;
   if (!payload) {
@@ -8612,25 +8693,7 @@ function renderStabilityOverview() {
     observabilityMetricCard({ label: "Top 异常场景", metric: topScenarioMetric, formatter: (value) => topScenario ? `${topScenario.scenario || "未知场景"} · ${Number(value).toLocaleString("zh-CN")} 次` : `${value} 次`, action: "stability-top-scenario" }),
   ].join("");
   renderObservabilityContext("stabilityContext", payload, data, "stability");
-  const daily = data.daily || [];
-  const trendValues = daily.flatMap((item) => [item.upstreamExceptionCount, item.finalRequestFailureCount ?? item.userVisibleFailureCount]).filter((value) => value !== null && value !== undefined).map(Number);
-  const hasTrendValues = trendValues.length > 0;
-  const hasNonZeroTrend = trendValues.some((value) => value > 0);
-  const max = Math.max(1, ...trendValues);
-  el("stabilityTrend").classList.toggle("is-empty", !daily.length || !hasTrendValues || !hasNonZeroTrend);
-  const stabilityTrendSegment = (value, className) => {
-    if (value == null) return `<span class="observability-bar-segment${className ? ` ${className}` : ""} is-missing" title="无数据"></span>`;
-    const count = Number(value);
-    const height = count > 0 ? Math.max(3, count / max * 150) : 3;
-    return `<span class="observability-bar-segment${className ? ` ${className}` : ""}${count === 0 ? " is-zero" : ""}" style="height:${height}px">${count > 0 ? `<i>${count.toLocaleString("zh-CN")}</i>` : "<i>0</i>"}</span>`;
-  };
-  el("stabilityTrend").innerHTML = daily.length && hasTrendValues && hasNonZeroTrend ? daily.map((item) => {
-    const upstream = item.upstreamExceptionCount;
-    const failures = item.finalRequestFailureCount ?? item.userVisibleFailureCount;
-    return `<div class="observability-bar" title="${escapeHtml(item.date)} · 上游异常 ${upstream ?? "无数据"} · 用户最终失败 ${failures ?? "无数据"}">${stabilityTrendSegment(upstream, "")}${stabilityTrendSegment(failures, "secondary")}<small>${escapeHtml(String(item.date).slice(5))}</small></div>`;
-  }).join("") : hasTrendValues && !hasNonZeroTrend
-    ? observabilityEmptyState("本期确无异常记录", "当前统计期间内，已接入指标均为真实零值。", [{ label: "调整筛选", attr: 'data-observability-empty-action="filters" data-observability-scope="stability"' }])
-    : observabilityEmptyState("异常趋势暂不可用", "尝试事件尚未接入或当前窗口尚未同步，缺失数据不会绘制为零值。", [{ label: "重新加载", attr: 'data-observability-retry="stability"' }, { label: "进入治理工作台", attr: 'data-open-governance-tab="stability-actions"' }]);
+  renderStabilityTrendChart(el("stabilityTrend"), data.daily || []);
   const stabilityRankings = data.modelRankings || [];
   const visibleStabilityRankings = stabilityRankings.filter((item) => {
     const failureRate = item.finalRequestFailureRate ?? item.userVisibleFailureRate;
