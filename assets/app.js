@@ -3157,7 +3157,7 @@ function renderEmployeeRanking(tableId, countId, employees, emptyText) {
           return `
             <tr class="admin-employee-row ${(tableId === "teamUserTable" && selectedTeamEmployee === (item.employeeEmail || item.employeeId)) || (tableId === "departmentUserTable" && employeeMatchesIdentity(item, selectedDepartmentEmployeeInfo())) ? "active" : ""}" data-employee="${escapeHtml(item.employeeEmail || item.employeeId)}">
               <td class="rank-cell">${rankingBadge(index)}</td>
-              <td><strong>${item.employeeName || item.employeeId}</strong></td>
+              <td><strong>${escapeHtml(item.employeeName || item.employeeId)}</strong>${item.nameSource && item.nameSource !== "litellm_user_alias" ? `<small class="muted" title="名称来源：${escapeHtml(item.nameSource)}"> · ${escapeHtml(item.nameSource === "user_id" ? "账号标识" : item.nameSource === "email_prefix" ? "邮箱推断" : "上游资料")}</small>` : ""}</td>
               <td>${item.employeeEmail || "未绑定邮箱"}</td>
               ${showDepartment ? `<td>${escapeHtml(employeeDepartmentText(item))}</td>` : ""}
               <td>${displaySource(item.primarySource || "其他")}</td>

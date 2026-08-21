@@ -9,7 +9,7 @@ from typing import Any
 from .litellm_client import LiteLLMBackend, LiteLLMClient, usage_today
 from .usage_realtime import UsageRealtimeStore
 from .usage_store import UsageStore
-from .usage_sync import UsageSynchronizer
+from .usage_sync import UsageSynchronizer, resolve_display_identity
 
 
 logger = logging.getLogger("ai-token-dashboard.usage-realtime-worker")
@@ -163,6 +163,22 @@ class UsageRealtimeWorker:
 
     async def _refresh_directories(self, *, refresh_departments: bool = True) -> None:
         self.directory = await self.synchronizer._identity_directory()
+        identity_loader = getattr(getattr(self, "store", None), "identity_directory", None)
+        if callable(identity_loader):
+            try:
+                stored = await identity_loader([backend.id for backend in self.client.backends])
+                by_user = self.directory.setdefault("byUserId", {})
+                for (backend_id, user_id), identity in stored.items():
+                    existing = by_user.get(user_id) or {}
+                    if identity.get("name") or identity.get("displayName"):
+                        by_user[user_id] = {
+                            **existing,
+                            "name": existing.get("name") or identity.get("name") or identity.get("displayName"),
+                            "email": existing.get("email") or identity.get("email") or identity.get("employeeEmail"),
+                            "emailSource": existing.get("emailSource") or identity.get("nameSource") or "",
+                        }
+            except Exception:
+                logger.exception("failed to load stored identity directory")
         self.token_maps = {
             backend.id: await self.synchronizer._token_attribution_map(backend.id)
             for backend in self.client.backends
@@ -194,14 +210,19 @@ class UsageRealtimeWorker:
         self, backend: LiteLLMBackend, event: dict[str, Any]
     ) -> dict[str, Any]:
         user_id = str(event.get("_userId") or "unattributed")
-        resolved = self.synchronizer._apply_identity_directory(
-            backend, user_id, {"name": "", "email": ""}, self.directory
+        resolved = resolve_display_identity(
+            user_id=user_id,
+            log_record=event,
+            directory=self.directory,
+            backend_id=backend.id,
         )
         enriched = {
             **event,
             "employeeEmail": str(resolved.get("email") or ""),
             "employeeName": str(resolved.get("name") or user_id),
             "emailSource": str(resolved.get("emailSource") or ""),
+            "nameSource": str(resolved.get("nameSource") or "user_id"),
+            "nameConfidence": str(resolved.get("confidence") or "low"),
         }
         self.synchronizer._reclassify_primary_her_usage(
             backend, [enriched], self.directory

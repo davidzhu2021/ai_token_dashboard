@@ -288,6 +288,8 @@ def test_snapshot_carries_identities_for_historical_refresh() -> None:
             "name": "王芳",
             "email": "wangfang@carher.net",
             "emailSource": "upstream",
+            "nameSource": "team_member_name",
+            "confidence": "high",
         }
     ]
 

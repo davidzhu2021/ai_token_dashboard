@@ -82,6 +82,117 @@ def _email(value: Any) -> str:
     return value if "@" in value else ""
 
 
+def resolve_display_identity(
+    *,
+    user_id: str,
+    user_record: dict[str, Any] | None = None,
+    log_record: dict[str, Any] | None = None,
+    directory: dict[Any, Any] | None = None,
+    backend_id: str | None = None,
+) -> dict[str, str]:
+    """Resolve a stable, non-empty display identity from upstream hints.
+
+    The ordering intentionally mirrors the employee-facing trust hierarchy:
+    explicit LiteLLM profile aliases first, then metadata/team/log hints,
+    persisted cross-backend directory data, and finally deterministic fallbacks.
+    """
+
+    user_id_text = _text(user_id)
+    user = user_record if isinstance(user_record, dict) else {}
+    log = log_record if isinstance(log_record, dict) else {}
+
+    def metadata(record: dict[str, Any]) -> dict[str, Any]:
+        value = record.get("metadata")
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, dict) else {}
+            except (TypeError, ValueError):
+                return {}
+        return {}
+
+    user_meta = metadata(user)
+    log_meta = metadata(log)
+
+    def candidate(value: Any) -> str:
+        text = _text(value)
+        return text if text and text.casefold() != user_id_text.casefold() else ""
+
+    def first_email(*values: Any) -> str:
+        for value in values:
+            email = _email(value)
+            if email:
+                return email
+        return ""
+
+    email = first_email(
+        user.get("user_email"),
+        user.get("sso_user_id"),
+        user_meta.get("email"),
+        user_meta.get("user_email"),
+        log.get("user_email"),
+        log_meta.get("email"),
+        log_meta.get("user_email"),
+    )
+
+    candidates: list[tuple[str, str]] = [
+        ("litellm_user_alias", candidate(user.get("user_alias"))),
+        ("litellm_metadata_display_name", candidate(user_meta.get("display_name"))),
+        ("litellm_metadata_owner_name", candidate(user_meta.get("owner_name"))),
+        ("team_member_user_alias", candidate(user.get("userAlias"))),
+        ("team_member_name", candidate(user.get("name"))),
+        ("spendlog_user_alias", candidate(log.get("user_alias"))),
+        ("spendlog_name", candidate(log.get("name"))),
+        ("spendlog_metadata_display_name", candidate(log_meta.get("display_name"))),
+        ("spendlog_metadata_owner_name", candidate(log_meta.get("owner_name"))),
+    ]
+    for source, name in candidates:
+        if name:
+            return {
+                "name": name,
+                "email": email,
+                "nameSource": source,
+                "confidence": "high",
+            }
+
+    directory = directory or {}
+    profile: Any = None
+    if backend_id:
+        profile = directory.get((backend_id, user_id_text))
+    if profile is None:
+        profile = directory.get(user_id_text)
+    if profile is None and isinstance(directory.get("byUserId"), dict):
+        profile = directory["byUserId"].get(user_id_text)
+    if isinstance(profile, dict):
+        directory_email = first_email(profile.get("email"), profile.get("employee_email"))
+        directory_name = candidate(profile.get("name") or profile.get("display_name"))
+        if directory_email:
+            email = email or directory_email
+        if directory_name:
+            return {
+                "name": directory_name,
+                "email": email,
+                "nameSource": "identity_directory",
+                "confidence": "high",
+            }
+
+    if email:
+        return {
+            "name": email.split("@", 1)[0],
+            "email": email,
+            "nameSource": "email_prefix",
+            "confidence": "medium",
+        }
+    return {
+        "name": user_id_text,
+        "email": "",
+        "nameSource": "user_id",
+        "confidence": "low",
+    }
+
+
 def _team_members(team: dict[str, Any]) -> list[dict[str, Any]]:
     value = team.get("members_with_roles") or team.get("membersWithRoles") or []
     if isinstance(value, str):
@@ -841,14 +952,19 @@ class UsageSynchronizer:
         """
 
         refresh = getattr(self.store, "refresh_account_identity", None)
-        if not callable(refresh):
-            return
+        directory_upsert = getattr(self.store, "upsert_identity_directory", None)
+        directory_refresh = getattr(self.store, "refresh_usage_identity_columns", None)
         for snapshot in snapshots:
             identities = getattr(snapshot, "identities", None)
             if not identities:
                 continue
             try:
-                await refresh(snapshot.backend_id, identities)
+                if callable(directory_upsert):
+                    await directory_upsert(snapshot.backend_id, identities)
+                if callable(directory_refresh):
+                    await directory_refresh([snapshot.backend_id])
+                if callable(refresh):
+                    await refresh(snapshot.backend_id, identities)
             except Exception:
                 logger.exception("usage identity refresh failed for backend %s", snapshot.backend_id)
 
@@ -1090,15 +1206,28 @@ class UsageSynchronizer:
             except TypeError:
                 directory_teams = await self.client.teams(backend)
         departments = self._department_records(directory_teams)
-        identities = [
-            {
-                "userId": user_id,
-                "name": _text(info.get("name")) or user_id,
-                "email": _email(info.get("email")),
-                "emailSource": _text(info.get("emailSource")),
-            }
-            for user_id, info in account_users.items()
-        ]
+        identities = []
+        for user_id, info in account_users.items():
+            resolved_identity = resolve_display_identity(
+                user_id=user_id,
+                user_record=info,
+                directory=directory,
+                backend_id=backend.id,
+            )
+            resolved_email = resolved_identity["email"] or _email(info.get("email"))
+            if not resolved_email:
+                profile = (directory.get("byUserId") or {}).get(user_id) or {}
+                resolved_email = _email(profile.get("email"))
+            identities.append(
+                {
+                    "userId": user_id,
+                    "name": resolved_identity["name"],
+                    "email": resolved_email,
+                    "nameSource": resolved_identity["nameSource"],
+                    "confidence": resolved_identity["confidence"],
+                    "emailSource": _text(info.get("emailSource")),
+                }
+            )
         return BackendSnapshot(
             backend.id,
             rows,

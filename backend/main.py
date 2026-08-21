@@ -5794,6 +5794,18 @@ async def health() -> dict[str, Any]:
         if result["usageDatabase"].get("status") in {"error", "disconnected"}:
             result["status"] = "degraded"
         else:
+            identity_health = getattr(store, "identity_directory_health", None)
+            if callable(identity_health):
+                try:
+                    identity = await identity_health(usage_backend_ids())
+                    updated_at = identity.get("updatedAt")
+                    result["usageIdentityDirectory"] = {
+                        **identity,
+                        "updatedAt": updated_at.isoformat() if isinstance(updated_at, datetime) else None,
+                    }
+                except Exception:
+                    logger.exception("usage identity directory health check failed")
+                    result["usageIdentityDirectory"] = {"status": "error"}
             state_loader = getattr(store, "sync_state", None)
             if not callable(state_loader):
                 # 未接入共享同步状态的旧 store（含测试替身）沿用进程内状态。

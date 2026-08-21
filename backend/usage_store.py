@@ -129,6 +129,25 @@ CREATE TABLE IF NOT EXISTS usage_department_directory (
 CREATE INDEX IF NOT EXISTS usage_department_directory_org_idx
     ON usage_department_directory (organization_id, status, department_name);
 
+-- Stable identity facts are maintained independently from daily usage snapshots.
+-- This lets realtime and historical rows resolve names even when a daily sync is
+-- delayed or incomplete.
+CREATE TABLE IF NOT EXISTS usage_identity_directory (
+    backend_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    employee_email TEXT NOT NULL DEFAULT '',
+    name_source TEXT NOT NULL DEFAULT 'user_id',
+    confidence TEXT NOT NULL DEFAULT 'low',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (backend_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS usage_identity_directory_email_idx
+    ON usage_identity_directory (employee_email, backend_id);
+CREATE INDEX IF NOT EXISTS usage_identity_directory_updated_idx
+    ON usage_identity_directory (updated_at DESC);
+
 CREATE INDEX IF NOT EXISTS usage_team_membership_lookup_idx
     ON usage_team_membership_daily (backend_id, team_id, snapshot_date);
 CREATE INDEX IF NOT EXISTS usage_team_membership_employee_idx
@@ -212,6 +231,10 @@ CREATE TABLE IF NOT EXISTS usage_event_attribution (
     event_time TIMESTAMPTZ NOT NULL,
     usage_date DATE NOT NULL,
     raw_user_id TEXT NOT NULL DEFAULT '',
+    employee_email TEXT NOT NULL DEFAULT '',
+    employee_name TEXT NOT NULL DEFAULT '',
+    name_source TEXT NOT NULL DEFAULT 'user_id',
+    name_confidence TEXT NOT NULL DEFAULT 'low',
     organization_id TEXT NOT NULL DEFAULT '',
     team_id TEXT NOT NULL DEFAULT '',
     key_id TEXT NOT NULL DEFAULT '',
@@ -247,6 +270,10 @@ CREATE TABLE IF NOT EXISTS usage_event_attribution (
     PRIMARY KEY (backend_id, request_id)
 );
 ALTER TABLE usage_event_attribution ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_event_attribution ADD COLUMN IF NOT EXISTS employee_email TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_event_attribution ADD COLUMN IF NOT EXISTS employee_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_event_attribution ADD COLUMN IF NOT EXISTS name_source TEXT NOT NULL DEFAULT 'user_id';
+ALTER TABLE usage_event_attribution ADD COLUMN IF NOT EXISTS name_confidence TEXT NOT NULL DEFAULT 'low';
 ALTER TABLE usage_event_attribution ADD COLUMN IF NOT EXISTS provider TEXT;
 ALTER TABLE usage_event_attribution ADD COLUMN IF NOT EXISTS model_group TEXT;
 ALTER TABLE usage_event_attribution ADD COLUMN IF NOT EXISTS model_id TEXT;
@@ -957,6 +984,134 @@ class UsageStore:
             raise RuntimeError("用量数据库尚未连接")
         return self.pool
 
+    async def upsert_identity_directory(
+        self,
+        backend_id: str,
+        identities: list[dict[str, Any]],
+    ) -> int:
+        """Persist the latest identity facts for one backend."""
+        rows: list[tuple[str, str, str, str, str, str]] = []
+        for identity in identities:
+            user_id = str(identity.get("userId") or identity.get("user_id") or "").strip()
+            if not user_id:
+                continue
+            display_name = str(
+                identity.get("displayName")
+                or identity.get("display_name")
+                or identity.get("name")
+                or ""
+            ).strip()
+            email = str(
+                identity.get("employeeEmail")
+                or identity.get("employee_email")
+                or identity.get("email")
+                or ""
+            ).strip()
+            source = str(identity.get("nameSource") or identity.get("name_source") or "user_id").strip()
+            confidence = str(identity.get("confidence") or "low").strip()
+            rows.append((backend_id, user_id, display_name, email, source, confidence))
+        if not rows:
+            return 0
+        await self._require_pool().executemany(
+            """
+            INSERT INTO usage_identity_directory (
+                backend_id, user_id, display_name, employee_email,
+                name_source, confidence, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            ON CONFLICT (backend_id, user_id) DO UPDATE SET
+                display_name = CASE
+                    WHEN EXCLUDED.display_name <> '' THEN EXCLUDED.display_name
+                    ELSE usage_identity_directory.display_name
+                END,
+                employee_email = CASE
+                    WHEN EXCLUDED.employee_email <> '' THEN EXCLUDED.employee_email
+                    ELSE usage_identity_directory.employee_email
+                END,
+                name_source = CASE
+                    WHEN EXCLUDED.display_name <> '' THEN EXCLUDED.name_source
+                    ELSE usage_identity_directory.name_source
+                END,
+                confidence = CASE
+                    WHEN EXCLUDED.display_name <> '' THEN EXCLUDED.confidence
+                    ELSE usage_identity_directory.confidence
+                END,
+                updated_at = NOW()
+            """,
+            rows,
+        )
+        return len(rows)
+
+    async def identity_directory(
+        self,
+        backend_ids: list[str],
+    ) -> dict[tuple[str, str], dict[str, str]]:
+        """Load identity facts keyed by ``(backend_id, user_id)``."""
+        if not backend_ids:
+            return {}
+        records = await self._require_pool().fetch(
+            """
+            SELECT backend_id, user_id, display_name, employee_email,
+                   name_source, confidence
+            FROM usage_identity_directory
+            WHERE backend_id = ANY($1::text[])
+            """,
+            backend_ids,
+        )
+        return {
+            (str(row["backend_id"]), str(row["user_id"])): {
+                "displayName": str(row["display_name"] or ""),
+                "employeeEmail": str(row["employee_email"] or ""),
+                "nameSource": str(row["name_source"] or "user_id"),
+                "confidence": str(row["confidence"] or "low"),
+            }
+            for row in records
+        }
+
+    async def refresh_usage_identity_columns(self, backend_ids: list[str]) -> int:
+        """Backfill stale snapshot names without changing usage measures."""
+        if not backend_ids:
+            return 0
+        query = """
+            UPDATE {table} AS u
+            SET employee_name = d.display_name,
+                employee_email = CASE WHEN d.employee_email <> '' THEN d.employee_email ELSE u.employee_email END,
+                email_source = CASE WHEN d.employee_email <> '' THEN 'identity_directory' ELSE u.email_source END
+            FROM usage_identity_directory AS d
+            WHERE u.backend_id = d.backend_id
+              AND u.user_id = d.user_id
+              AND d.display_name <> ''
+              AND (u.employee_name = '' OR u.employee_name = u.user_id
+                   OR u.employee_name IS NULL)
+              AND u.backend_id = ANY($1::text[])
+        """
+        total = 0
+        for table in ("usage_daily", "usage_realtime_daily"):
+            result = await self._require_pool().execute(query.format(table=table), backend_ids)
+            try:
+                total += int(str(result).rsplit(" ", 1)[-1])
+            except (ValueError, IndexError):
+                continue
+        return total
+
+    async def identity_directory_health(self, backend_ids: list[str]) -> dict[str, Any]:
+        if not backend_ids:
+            return {"total": 0, "lowConfidence": 0, "updatedAt": None}
+        row = await self._require_pool().fetchrow(
+            """
+            SELECT COUNT(*)::bigint AS total,
+                   COUNT(*) FILTER (WHERE confidence='low')::bigint AS low_confidence,
+                   MAX(updated_at) AS updated_at
+            FROM usage_identity_directory
+            WHERE backend_id = ANY($1::text[])
+            """,
+            backend_ids,
+        )
+        return {
+            "total": _as_int(row["total"]) if row else 0,
+            "lowConfidence": _as_int(row["low_confidence"]) if row else 0,
+            "updatedAt": row["updated_at"] if row else None,
+        }
+
     async def try_acquire_sync_lock(self) -> Any | None:
         pool = self._require_pool()
         connection = await pool.acquire()
@@ -1366,9 +1521,11 @@ class UsageStore:
                    SUM(total_tokens)::bigint AS total_tokens, SUM(request_count)::bigint AS request_count,
                    SUM(success_count)::bigint AS success_count, SUM(failure_count)::bigint AS failure_count,
                    SUM(spend)::numeric AS spend,
-                   MAX(d.employee_email) AS employee_email,
-                   MAX(d.employee_name) AS employee_name,
-                   MAX(d.email_source) AS email_source
+                   COALESCE(MAX(d.employee_email), MAX(i.employee_email), '') AS employee_email,
+                   COALESCE(MAX(d.employee_name), MAX(i.display_name), '') AS employee_name,
+                   COALESCE(MAX(i.name_source), MAX(d.email_source), 'user_id') AS name_source,
+                   COALESCE(MAX(i.confidence), 'low') AS name_confidence,
+                   COALESCE(MAX(d.email_source), MAX(i.name_source), '') AS email_source
             FROM usage_event_attribution e
             LEFT JOIN LATERAL (
                 SELECT employee_email, employee_name, email_source
@@ -1377,6 +1534,8 @@ class UsageStore:
                 ORDER BY employee_email DESC, employee_name DESC
                 LIMIT 1
             ) d ON TRUE
+            LEFT JOIN usage_identity_directory i
+              ON i.backend_id=e.backend_id AND i.user_id=e.raw_user_id
             WHERE e.usage_date=$1
             GROUP BY e.backend_id, e.usage_date, e.raw_user_id, e.source, e.model,
                      organization_id, team_id, key_id, principal_id, attribution_source, billing_eligible
@@ -1388,6 +1547,7 @@ class UsageStore:
             {
                 "backendId": str(row["backend_id"]), "date": row["usage_date"].isoformat(),
                 "userId": str(row["raw_user_id"]), "employeeEmail": str(row["employee_email"] or ""), "employeeName": str(row["employee_name"] or row["raw_user_id"]),
+                "nameSource": str(row["name_source"] or "user_id"), "nameConfidence": str(row["name_confidence"] or "low"),
                 "emailSource": str(row["email_source"] or ""), "source": str(row["source"]), "model": str(row["model"]),
                 "promptTokens": int(row["prompt_tokens"] or 0), "completionTokens": int(row["completion_tokens"] or 0),
                 "totalTokens": int(row["total_tokens"] or 0), "requestCount": int(row["request_count"] or 0),

@@ -15,6 +15,21 @@ BACKEND = LiteLLMBackend(
 )
 
 
+def test_realtime_event_keeps_identity_source_when_enriched() -> None:
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.directory = {"byUserId": {"u-1": {"name": "张三", "email": "zhangsan@example.com"}}}
+    worker.token_maps = {}
+    worker.team_by_user = {}
+    worker.synchronizer = type("Sync", (), {
+        "_reclassify_primary_her_usage": lambda *args: 0,
+        "_apply_token_attribution": lambda *args: None,
+    })()
+    result = worker._enrich_event(BACKEND, {"_userId": "u-1", "totalTokens": 1})
+    assert result["employeeName"] == "张三"
+    assert result["employeeEmail"] == "zhangsan@example.com"
+    assert result["nameSource"] == "identity_directory"
+
+
 class IncrementalClient(LiteLLMClient):
     def __init__(self, pages):
         self.backends = [BACKEND]

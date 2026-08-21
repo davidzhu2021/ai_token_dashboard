@@ -950,6 +950,83 @@ def test_usage_schema_adds_organization_columns_before_dependent_indexes() -> No
     assert add_column < create_index
 
 
+def test_usage_schema_contains_identity_directory_table_and_indexes() -> None:
+    from backend.usage_store import USAGE_SCHEMA
+
+    assert "CREATE TABLE IF NOT EXISTS usage_identity_directory" in USAGE_SCHEMA
+    assert "PRIMARY KEY (backend_id, user_id)" in USAGE_SCHEMA
+    assert "usage_identity_directory_email_idx" in USAGE_SCHEMA
+    assert "usage_identity_directory_updated_idx" in USAGE_SCHEMA
+
+
+def test_upsert_identity_directory_writes_nonempty_identity_fields() -> None:
+    class FakePool:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, list[tuple[object, ...]]]] = []
+
+        async def executemany(self, query, args):
+            self.calls.append((query, list(args)))
+
+    store = UsageStore("postgresql://unused")
+    pool = FakePool()
+    store.pool = pool
+
+    count = asyncio.run(
+        store.upsert_identity_directory(
+            "primary",
+            [{"userId": "u-1", "displayName": "Alice", "employeeEmail": "alice@example.com", "nameSource": "litellm_user_alias", "confidence": "high"}],
+        )
+    )
+
+    assert count == 1
+    query, args = pool.calls[0]
+    assert "INSERT INTO usage_identity_directory" in query
+    assert "ON CONFLICT (backend_id, user_id)" in query
+    assert args == [("primary", "u-1", "Alice", "alice@example.com", "litellm_user_alias", "high")]
+
+
+def test_identity_directory_returns_keyed_records() -> None:
+    class FakePool:
+        async def fetch(self, query, *args):
+            assert "FROM usage_identity_directory" in query
+            assert args == (["primary"],)
+            return [{"backend_id": "primary", "user_id": "u-1", "display_name": "Alice", "employee_email": "alice@example.com", "name_source": "litellm_user_alias", "confidence": "high"}]
+
+    store = UsageStore("postgresql://unused")
+    store.pool = FakePool()
+    result = asyncio.run(store.identity_directory(["primary"]))
+
+    assert result[("primary", "u-1")] == {
+        "displayName": "Alice",
+        "employeeEmail": "alice@example.com",
+        "nameSource": "litellm_user_alias",
+        "confidence": "high",
+    }
+
+
+def test_refresh_usage_identity_columns_only_replaces_empty_or_user_id_names() -> None:
+    class FakePool:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+        async def execute(self, query, *args):
+            self.calls.append((query, args))
+            return "UPDATE 3"
+
+    store = UsageStore("postgresql://unused")
+    pool = FakePool()
+    store.pool = pool
+    updated = asyncio.run(store.refresh_usage_identity_columns(["primary"]))
+
+    assert updated == 6
+    assert len(pool.calls) == 2
+    for query, args in pool.calls:
+        assert "UPDATE usage_" in query
+        assert "FROM usage_identity_directory" in query
+        assert "u.employee_name = '' OR u.employee_name = u.user_id" in query
+        assert args == (["primary"],)
+
+
 def test_model_usage_counts_uses_complete_database_coverage_and_normalizes_models() -> None:
     class FakePool:
         async def fetch(self, query, *_args):
