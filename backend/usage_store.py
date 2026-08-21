@@ -2393,6 +2393,9 @@ class UsageStore:
 
         if not snapshots:
             return {"rowCount": 0, "snapshotRevision": None}
+        # Normalize at the database boundary so DATE parameters are native date values.
+        start_day = _as_date(start_date)
+        end_day = _as_date(end_date)
         pool = self._require_pool()
         collected_at = datetime.now(timezone.utc)
         backend_ids = sorted({str(snapshot.backend_id) for snapshot in snapshots})
@@ -2523,22 +2526,22 @@ class UsageStore:
                     "AND usage_date BETWEEN $2::date AND $3::date "
                     "AND attribution_source <> 'legacy_report_only'",
                     backend_ids,
-                    _as_date(start_date),
-                    _as_date(end_date),
+                    start_day,
+                    end_day,
                 )
                 await connection.execute(
                     "DELETE FROM usage_team_membership_daily WHERE backend_id=ANY($1::text[]) "
                     "AND snapshot_date BETWEEN $2::date AND $3::date",
                     backend_ids,
-                    _as_date(start_date),
-                    _as_date(end_date),
+                    start_day,
+                    end_day,
                 )
                 await connection.execute(
                     "DELETE FROM usage_sync_coverage WHERE backend_id=ANY($1::text[]) "
                     "AND usage_date BETWEEN $2::date AND $3::date",
                     backend_ids,
-                    _as_date(start_date),
-                    _as_date(end_date),
+                    start_day,
+                    end_day,
                 )
                 if event_backends:
                     for event_backend, (event_start, event_end) in event_windows.items():
@@ -2655,8 +2658,8 @@ class UsageStore:
                         if getattr(snapshot, "event_window_complete", None) is not None
                         else getattr(snapshot, "events_complete", False)
                     )
-                    state_start = getattr(snapshot, "event_start_date", None) or start_date
-                    state_end = getattr(snapshot, "event_end_date", None) or end_date
+                    state_start = getattr(snapshot, "event_start_date", None) or start_day
+                    state_end = getattr(snapshot, "event_end_date", None) or end_day
                     event_count = int(
                         await connection.fetchval(
                             "SELECT COUNT(*) FROM usage_event_attribution "
@@ -2683,8 +2686,8 @@ class UsageStore:
                             error_message=EXCLUDED.error_message
                         """,
                         str(snapshot.backend_id),
-                        getattr(snapshot, "event_start_date", None) or start_date,
-                        getattr(snapshot, "event_end_date", None) or end_date,
+                        getattr(snapshot, "event_start_date", None) or state_start,
+                        getattr(snapshot, "event_end_date", None) or state_end,
                         "complete" if state_complete else "partial",
                         not state_complete,
                         event_count,
@@ -2699,8 +2702,8 @@ class UsageStore:
                     CROSS JOIN generate_series($2::date, $3::date, interval '1 day') AS day
                     """,
                     backend_ids,
-                    _as_date(start_date),
-                    _as_date(end_date),
+                    start_day,
+                    end_day,
                     collected_at,
                 )
                 revision = await connection.fetchval(
@@ -2710,7 +2713,7 @@ class UsageStore:
                     WHERE usage_date=$1::date AND backend_id=ANY($2::text[])
                     HAVING COUNT(DISTINCT backend_id)=cardinality($2::text[])
                     """,
-                    _as_date(end_date),
+                    end_day,
                     backend_ids,
                 )
                 await connection.execute(
@@ -2722,8 +2725,8 @@ class UsageStore:
                     """,
                     str(revision or ""),
                     collected_at,
-                    _as_date(start_date),
-                    _as_date(end_date),
+                    start_day,
+                    end_day,
                     backend_ids,
                 )
         return {

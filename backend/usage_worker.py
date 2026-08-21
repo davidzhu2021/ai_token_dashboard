@@ -12,7 +12,7 @@ from .organization_repository import PostgreSQLOrganizationRepository
 from .usage_store import UsageStore
 from .usage_sync import UsageSynchronizer, run_sync_with_recent_refresh, run_usage_backfill_once
 from .usage_realtime import UsageRealtimeStore, realtime_enabled
-from .usage_realtime_worker import UsageRealtimeWorker
+from .usage_realtime_worker import UsageRealtimeWorker, new_worker_id
 
 
 logger = logging.getLogger("ai-token-dashboard.usage-worker")
@@ -284,7 +284,7 @@ async def _main() -> None:
             store,
             realtime,
             repository,
-            worker_id=f"{socket.gethostname()}:{os.getpid()}",
+            worker_id=new_worker_id(),
         )
     else:
         worker = UsageSyncWorker(client, store, repository)

@@ -135,7 +135,7 @@ from .organization_repository import PostgreSQLOrganizationRepository
 from .organization_provisioning import OrganizationProvisioningService
 from .usage_store import UsageStore
 from .usage_realtime import UsageRealtimeStore, realtime_enabled
-from .usage_realtime_worker import UsageRealtimeWorker
+from .usage_realtime_worker import UsageRealtimeWorker, new_worker_id
 from .mock_runtime import MockRuntime
 from .usage_sync import (
     UsageSynchronizer,
@@ -658,10 +658,8 @@ def snapshot_reader_configured() -> bool:
 def usage_reader_config_status() -> dict[str, Any]:
     role = usage_sync_role()
     database_configured = bool(os.getenv("USAGE_DATABASE_URL", "").strip())
-    sync_enabled = env_bool("USAGE_SYNC_ENABLED", False) or env_bool(
-        "USAGE_REALTIME_ENABLED", False
-    )
-    realtime_requested = env_bool("USAGE_REALTIME_ENABLED", False)
+    realtime_requested = realtime_enabled()
+    sync_enabled = env_bool("USAGE_SYNC_ENABLED", False) or realtime_requested
     redis_configured = bool(os.getenv("USAGE_REDIS_URL", "").strip())
     missing: list[str] = []
     if role == "reader":
@@ -1156,6 +1154,7 @@ def attach_snapshot_freshness(
 ) -> dict[str, Any]:
     freshness = usage_data_freshness(last_synced, start_date, end_date)
     freshness["snapshotRevision"] = revision
+    freshness["errorCode"] = "REALTIME_STALE" if freshness.get("stale") else ""
     if end_date < usage_today().isoformat() or not realtime_enabled():
         freshness["source"] = "database_history"
     elif ":live:fallback" in revision:
@@ -1163,6 +1162,8 @@ def attach_snapshot_freshness(
             {
                 "source": "database_fallback",
                 "degraded": True,
+                "stale": True,
+                "errorCode": "REALTIME_PUBLISH_FAILED",
                 "realtimeRevision": None,
                 "latestEventAt": None,
             }
@@ -1192,6 +1193,7 @@ def attach_snapshot_freshness(
             {
                 "source": "realtime",
                 "degraded": bool(state.get("backfillActive")),
+                "errorCode": "REALTIME_STALE" if freshness.get("stale") else "",
                 "realtimeRevision": state.get("revision"),
                 "latestEventAt": latest_event.isoformat()
                 if isinstance(latest_event, datetime)
@@ -1402,7 +1404,7 @@ async def start_usage_sync() -> None:
         if realtime is None:
             return
         _usage_realtime_worker = UsageRealtimeWorker(
-            client(), store, realtime, worker_id=f"combined:{os.getpid()}"
+            client(), store, realtime, worker_id=new_worker_id()
         )
         _usage_realtime_task = asyncio.create_task(
             _usage_realtime_worker.run(), name="usage-realtime-loop"
@@ -5851,6 +5853,14 @@ async def health() -> dict[str, Any]:
                 ):
                     result["usageSync"]["status"] = "degraded"
                     result["status"] = "degraded"
+            refresh_queue_status = getattr(store, "refresh_queue_status", None)
+            if callable(refresh_queue_status):
+                try:
+                    result["usageRefreshQueue"] = await refresh_queue_status()
+                except Exception:
+                    logger.exception("usage refresh queue health check failed")
+                    result["usageRefreshQueue"] = {"status": "error", "errorCode": "SNAPSHOT_REFRESH_FAILED"}
+                    result["status"] = "degraded"
     else:
         result["usageDatabase"] = {"enabled": False, "connected": False, "status": "disabled"}
         if usage_sync_role() == "reader" and not local_mock_enabled():
@@ -5879,6 +5889,11 @@ async def health() -> dict[str, Any]:
                 status = "unhealthy"
             result["usageRealtime"] = {
                 "status": status,
+                "errorCode": "REALTIME_STALE" if status != "ok" else "",
+                "workerLock": {
+                    "acquired": bool(realtime_status.get("workerLockOwner")),
+                    "owner": realtime_status.get("workerLockOwner"),
+                },
                 "connected": True,
                 "ready": bool(realtime_status.get("ready")),
                 "revision": realtime_status.get("revision"),

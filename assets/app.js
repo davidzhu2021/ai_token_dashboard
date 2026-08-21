@@ -859,6 +859,20 @@ function freshnessText(freshness) {
 function usageStatusState(freshness = null, dataQuality = null, coverage = null) {
   const quality = dataQuality && typeof dataQuality === "object" ? dataQuality : {};
   const range = coverage && typeof coverage === "object" ? coverage : {};
+  if (freshness?.errorCode === "REALTIME_PUBLISH_FAILED") {
+    return {
+      tone: "danger",
+      title: "实时快照发布失败",
+      description: "当前数据可能尚未包含最新用量，请稍后刷新后再核对。",
+    };
+  }
+  if (freshness?.stale) {
+    return {
+      tone: "warning",
+      title: "数据同步中",
+      description: "最新用量正在同步，当前显示的 0 可能尚未包含刚刚发生的请求。",
+    };
+  }
   if (quality.snapshotUnavailable) {
     return {
       tone: "danger",

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import socket
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -13,6 +15,11 @@ from .usage_sync import UsageSynchronizer, resolve_display_identity
 
 
 logger = logging.getLogger("ai-token-dashboard.usage-realtime-worker")
+
+
+def new_worker_id() -> str:
+    """Return an owner token that cannot be reused by a restarted process."""
+    return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:12]}"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -39,6 +46,16 @@ class UsageRealtimeWorker:
         self.worker_id = worker_id
         self.stop_event = asyncio.Event()
         self.poll_seconds = max(2, _env_int("USAGE_REALTIME_POLL_SECONDS", 10))
+        self.backend_timeout_seconds = max(
+            2, _env_int("USAGE_REALTIME_BACKEND_TIMEOUT_SECONDS", 20)
+        )
+        self.live_cycle_timeout_seconds = max(
+            self.backend_timeout_seconds,
+            _env_int("USAGE_REALTIME_LIVE_CYCLE_TIMEOUT_SECONDS", 45),
+        )
+        self.background_budget_seconds = max(
+            1, _env_int("USAGE_REALTIME_BACKGROUND_BUDGET_SECONDS", 5)
+        )
         self.overlap_seconds = max(
             1, _env_int("USAGE_REALTIME_OVERLAP_SECONDS", 60)
         )
@@ -523,10 +540,56 @@ class UsageRealtimeWorker:
         inserted = 0
         for backend in self.client.backends:
             try:
-                inserted += await self.poll_backend(backend, end_time)
+                inserted += await asyncio.wait_for(
+                    self.poll_backend(backend, end_time),
+                    timeout=self.backend_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "REALTIME_BACKEND_TIMEOUT backend=%s timeout_seconds=%s",
+                    backend.id,
+                    self.backend_timeout_seconds,
+                )
             except Exception:
-                logger.exception("realtime poll failed backend=%s", backend.id)
+                logger.exception("REALTIME_POLL_FAILED backend=%s", backend.id)
         return inserted
+
+    async def run_background_once(self, now: datetime) -> None:
+        """Run at most one non-live task without delaying the next live cycle."""
+        operations = (
+            lambda: self.settle_pending_windows(now),
+            self.backfill_cost_aggregates,
+            self.consume_refresh_requests,
+            self.backfill_once,
+        )
+        for operation in operations:
+            try:
+                await asyncio.wait_for(
+                    operation(), timeout=self.background_budget_seconds
+                )
+                return
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "HISTORICAL_BACKFILL_PARTIAL operation=%s budget_seconds=%s",
+                    getattr(operation, "__name__", "settlement"),
+                    self.background_budget_seconds,
+                )
+                return
+            except Exception:
+                logger.exception(
+                    "SNAPSHOT_REFRESH_FAILED operation=%s",
+                    getattr(operation, "__name__", "settlement"),
+                )
+                return
+
+    async def run_live_once(self, now: datetime) -> None:
+        """Poll every backend with hard isolation, then publish one mirror."""
+        await self.poll_once(now)
+        await self.flush_archive()
+        await self.publish_mirror()
+        await self.store.publish_realtime_coverage(
+            usage_today(), [backend.id for backend in self.client.backends]
+        )
 
     async def flush_archive(self) -> int:
         total = 0
@@ -634,23 +697,32 @@ class UsageRealtimeWorker:
                 if (now - last_directory_refresh).total_seconds() >= self.directory_refresh_seconds:
                     await self._refresh_directories()
                     last_directory_refresh = now
-                await self.settle_pending_windows(now)
-                await self.backfill_cost_aggregates()
-                await self.consume_refresh_requests()
+                # Live polling and publication always happen before any
+                # settlement, refresh, cost, or historical backfill work.
+                try:
+                    await asyncio.wait_for(
+                        self.run_live_once(now),
+                        timeout=self.live_cycle_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "REALTIME_PUBLISH_FAILED timeout_seconds=%s",
+                        self.live_cycle_timeout_seconds,
+                    )
+                except Exception:
+                    logger.exception("REALTIME_PUBLISH_FAILED")
                 if (now - last_reconcile).total_seconds() >= self.reconcile_seconds:
                     for backend in self.client.backends:
                         try:
-                            await self.poll_backend(backend, now, lookback_minutes=15)
-                        except Exception:
-                            logger.exception(
-                                "realtime reconcile failed backend=%s", backend.id
+                            await asyncio.wait_for(
+                                self.poll_backend(backend, now, lookback_minutes=15),
+                                timeout=self.backend_timeout_seconds,
                             )
+                        except asyncio.TimeoutError:
+                            logger.error("REALTIME_RECONCILE_TIMEOUT backend=%s", backend.id)
+                        except Exception:
+                            logger.exception("REALTIME_RECONCILE_FAILED backend=%s", backend.id)
                     last_reconcile = now
-                await self.flush_archive()
-                await self.publish_mirror()
-                await self.store.publish_realtime_coverage(
-                    usage_today(), [backend.id for backend in self.client.backends]
-                )
                 await self.store.update_worker_state(
                     worker_id=self.worker_id,
                     status="idle",
@@ -660,6 +732,7 @@ class UsageRealtimeWorker:
                     snapshot_revision=str(await self.realtime.revision()),
                     last_error="",
                 )
+                await self.run_background_once(now)
                 try:
                     await asyncio.wait_for(
                         self.stop_event.wait(), timeout=self.poll_seconds

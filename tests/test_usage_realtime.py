@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from backend.litellm_client import LiteLLMBackend, LiteLLMClient
 from backend.usage_realtime import UsageRealtimeStore
-from backend.usage_realtime_worker import UsageRealtimeWorker
+from backend.usage_realtime_worker import UsageRealtimeWorker, new_worker_id
 from backend.usage_store import UsageStore
 
 
@@ -638,6 +638,51 @@ def test_worker_lock_scripts_are_atomic_and_owner_scoped() -> None:
         ("renew", ["usage:realtime:worker-lock"], ["worker-a", "90"]),
         ("release", ["usage:realtime:worker-lock"], ["worker-a"]),
     ]
+
+
+def test_worker_ids_are_unique_across_restarts() -> None:
+    first = new_worker_id()
+    second = new_worker_id()
+
+    assert first != second
+    assert first.count(":") == 2
+    assert len(first.rsplit(":", 1)[-1]) == 12
+
+
+def test_worker_lock_acquisition_uses_nx_and_ttl() -> None:
+    calls = []
+
+    class Client:
+        async def set(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return True
+
+    store = UsageRealtimeStore.__new__(UsageRealtimeStore)
+    store.client = Client()
+    store.lock_ttl_seconds = 300
+
+    assert asyncio.run(store.acquire_worker_lock("worker-new", 90)) is True
+    assert calls == [(("usage:realtime:worker-lock", "worker-new"), {"nx": True, "ex": 90})]
+
+
+def test_live_cycle_publishes_even_when_background_work_fails() -> None:
+    calls = []
+
+    class Store:
+        async def publish_realtime_coverage(self, *_args):
+            calls.append("coverage")
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.store = Store()
+    worker.client = type("Client", (), {"backends": []})()
+    worker.poll_once = lambda *_args: asyncio.sleep(0)
+    worker.flush_archive = lambda: asyncio.sleep(0)
+    worker.publish_mirror = lambda: asyncio.sleep(0)
+    worker.current_day = date(2026, 8, 13)
+
+    asyncio.run(worker.run_live_once(datetime(2026, 8, 13, tzinfo=timezone.utc)))
+
+    assert calls == ["coverage"]
 
 
 def test_realtime_worker_renews_lock_independently_of_work_loop(monkeypatch) -> None:

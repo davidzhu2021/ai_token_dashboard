@@ -482,6 +482,7 @@ return {1, revision}
                 parsed_statuses[backend_id] = {"status": "verifying", "error": "invalid settlement status"}
         return {
             "connected": True,
+            "workerLockOwner": await self.client.get(f"{self.prefix}:worker-lock"),
             "ready": await self.ready(),
             "revision": await self.revision(),
             "latestEventAt": latest_dt,

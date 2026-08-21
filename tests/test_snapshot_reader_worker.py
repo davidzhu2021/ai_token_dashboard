@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from fastapi import HTTPException
@@ -331,6 +331,58 @@ def test_publish_snapshots_uses_copy_before_atomic_replace() -> None:
     assert first_copy < first_delete
     assert result["rowCount"] == 1
     assert result["snapshotRevision"]
+
+
+def test_publish_snapshots_converts_date_window_arguments_before_sql() -> None:
+    captured: list[tuple[object, ...]] = []
+
+    class Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Connection:
+        def transaction(self):
+            return Transaction()
+
+        async def execute(self, query, *args):
+            if "DELETE FROM usage_daily" in query:
+                captured.append(args)
+
+        async def copy_records_to_table(self, *_args, **_kwargs):
+            return None
+
+        async def fetchval(self, *_args):
+            return "2026-08-05 08:00:00+00"
+
+    class Acquire:
+        async def __aenter__(self):
+            return Connection()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Pool:
+        def acquire(self):
+            return Acquire()
+
+    snapshot = type("Snapshot", (), {
+        "backend_id": "primary",
+        "rows": [{"date": "2026-08-05", "userId": "user-1", "source": "Codex", "model": "gpt-test"}],
+        "memberships": [],
+        "events": None,
+        "departments": [],
+    })()
+    store = UsageStore("postgresql://unused")
+    store.pool = Pool()
+
+    asyncio.run(store.publish_snapshots("2026-08-05", "2026-08-05", [snapshot]))
+
+    assert captured
+    assert isinstance(captured[0][1], date)
+    assert isinstance(captured[0][2], date)
 
 
 def test_publish_snapshots_merges_stage_rows_without_duplicate_key_failures() -> None:
