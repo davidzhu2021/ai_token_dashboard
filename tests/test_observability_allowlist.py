@@ -60,7 +60,7 @@ def _capabilities(me: dict[str, Any]) -> dict[str, bool]:
 
 
 def _enable_observability(monkeypatch, *, allowlist: str | None) -> None:
-    monkeypatch.setenv("ADMIN_EMAILS", "zhuyida@auto-link.com.cn,leader@auto-link.com.cn")
+    monkeypatch.setenv("ADMIN_EMAILS", "zhuyida@auto-link.com.cn,leader@auto-link.com.cn,liuguoxian@auto-link.com.cn")
     monkeypatch.setenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "true")
     if allowlist is None:
         monkeypatch.delenv("ADMIN_OBSERVABILITY_ALLOWED_EMAILS", raising=False)
@@ -183,7 +183,7 @@ def _logged_in_me(monkeypatch, email: str, name: str) -> dict[str, Any]:
 
 
 def test_auth_me_capabilities_follow_allowlist(monkeypatch) -> None:
-    _enable_observability(monkeypatch, allowlist="zhuyida@auto-link.com.cn")
+    _enable_observability(monkeypatch, allowlist="zhuyida@auto-link.com.cn,liuguoxian@auto-link.com.cn")
 
     zhuyida = _logged_in_me(monkeypatch, "zhuyida@auto-link.com.cn", "朱奕达")
     assert zhuyida["isPlatformAdmin"] is True
@@ -206,6 +206,17 @@ def test_auth_me_capabilities_follow_allowlist(monkeypatch) -> None:
         "costView": False,
         "costManage": False,
         "costReconcile": False,
+    }
+
+    liuguoxian = _logged_in_me(monkeypatch, "liuguoxian@auto-link.com.cn", "刘国现")
+    assert liuguoxian["isPlatformAdmin"] is True
+    assert liuguoxian["observabilityDashboardsEnabled"] is True
+    assert _capabilities(liuguoxian) == {
+        "stabilityView": True,
+        "stabilityManage": True,
+        "costView": True,
+        "costManage": True,
+        "costReconcile": True,
     }
 
 

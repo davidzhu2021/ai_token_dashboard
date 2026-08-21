@@ -224,7 +224,7 @@ OIDC_SKIP_CASDOOR_PAGE=true
 OIDC_PROVIDER_LOGIN_HOST=accounts.feishu.cn
 OAUTH_PROVIDER_NAME=飞书扫码登录
 ALLOWED_EMAIL_DOMAIN=auto-link.com.cn
-ADMIN_EMAILS=zhuyida@auto-link.com.cn,leader@auto-link.com.cn
+ADMIN_EMAILS=zhuyida@auto-link.com.cn,leader@auto-link.com.cn,liuguoxian@auto-link.com.cn
 
 FEISHU_DIRECT_LOGIN_ENABLED=false
 FEISHU_APP_ID=cli-your-feishu-app-id
