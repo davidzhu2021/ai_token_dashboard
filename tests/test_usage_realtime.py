@@ -609,6 +609,49 @@ def test_realtime_directory_refresh_updates_department_directory() -> None:
     assert calls == ["departments"]
 
 
+def test_realtime_directory_refresh_persists_identity_directory() -> None:
+    calls = []
+
+    class Store:
+        async def upsert_identity_directory(self, backend_id, identities):
+            calls.append(("upsert", backend_id, identities))
+
+        async def refresh_usage_identity_columns(self, backend_ids):
+            calls.append(("refresh", backend_ids))
+
+    class Synchronizer:
+        organization_repository = None
+
+        async def _identity_directory(self):
+            return {"byUserId": {}}
+
+        async def _token_attribution_map(self, backend_id):
+            return {}
+
+        async def sync_department_directories(self):
+            pass
+
+    class Client:
+        backends = [BACKEND]
+
+        async def users(self, backend):
+            return [{"user_id": "cursor-zhangsan", "user_alias": "张三", "user_email": "zhangsan@example.com"}]
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.client = Client()
+    worker.store = Store()
+    worker.synchronizer = Synchronizer()
+    worker.directory = {}
+    worker.token_maps = {}
+
+    asyncio.run(worker._refresh_directories())
+
+    assert calls[0][0:2] == ("upsert", "primary")
+    assert calls[0][2][0]["name"] == "张三"
+    assert calls[0][2][0]["email"] == "zhangsan@example.com"
+    assert calls[1] == ("refresh", ["primary"])
+
+
 def test_worker_lock_scripts_are_atomic_and_owner_scoped() -> None:
     calls = []
 

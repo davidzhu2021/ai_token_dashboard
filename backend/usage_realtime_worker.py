@@ -180,6 +180,45 @@ class UsageRealtimeWorker:
 
     async def _refresh_directories(self, *, refresh_departments: bool = True) -> None:
         self.directory = await self.synchronizer._identity_directory()
+        # Persist the upstream directory even in realtime-only mode.  The
+        # regular snapshot synchronizer performs this after a full scan, but
+        # realtime workers may run without that path ever executing.
+        store = getattr(self, "store", None)
+        directory_upsert = getattr(store, "upsert_identity_directory", None)
+        directory_refresh = getattr(store, "refresh_usage_identity_columns", None)
+        if callable(directory_upsert):
+            for backend in self.client.backends:
+                try:
+                    users_loader = getattr(self.client, "users", None)
+                    if not callable(users_loader):
+                        continue
+                    users = await users_loader(backend)
+                    identities = []
+                    for user in users or []:
+                        user_id = str(user.get("user_id") or user.get("userId") or "").strip()
+                        if not user_id:
+                            continue
+                        resolved = resolve_display_identity(
+                            user_id=user_id,
+                            user_record=user,
+                            directory=self.directory,
+                            backend_id=backend.id,
+                        )
+                        identities.append(
+                            {
+                                "userId": user_id,
+                                "name": resolved.get("name") or user_id,
+                                "email": resolved.get("email") or "",
+                                "nameSource": resolved.get("nameSource") or "user_id",
+                                "confidence": resolved.get("confidence") or "low",
+                            }
+                        )
+                    if identities:
+                        await directory_upsert(backend.id, identities)
+                        if callable(directory_refresh):
+                            await directory_refresh([backend.id])
+                except Exception:
+                    logger.exception("realtime identity directory refresh failed backend=%s", backend.id)
         identity_loader = getattr(getattr(self, "store", None), "identity_directory", None)
         if callable(identity_loader):
             try:
