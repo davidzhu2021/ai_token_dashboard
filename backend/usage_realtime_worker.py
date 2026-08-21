@@ -308,8 +308,30 @@ class UsageRealtimeWorker:
         # Replay today's closed intervals once after deployment. The audit table
         # deduplicates request IDs, so this safely fills earlier rolling-page gaps.
         if _env_int("USAGE_REALTIME_RESYNC_TODAY_ON_START", 1):
-            await self.resettle_today(datetime.now(timezone.utc))
-        await self.settle_pending_windows(datetime.now(timezone.utc))
+            try:
+                await asyncio.wait_for(
+                    self.resettle_today(datetime.now(timezone.utc)),
+                    timeout=self.background_budget_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "HISTORICAL_BACKFILL_PARTIAL startup_resettle budget_seconds=%s",
+                    self.background_budget_seconds,
+                )
+            except Exception:
+                logger.exception("SNAPSHOT_REFRESH_FAILED startup_resettle")
+        try:
+            await asyncio.wait_for(
+                self.settle_pending_windows(datetime.now(timezone.utc)),
+                timeout=self.background_budget_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "HISTORICAL_BACKFILL_PARTIAL startup_settlement budget_seconds=%s",
+                self.background_budget_seconds,
+            )
+        except Exception:
+            logger.exception("SNAPSHOT_REFRESH_FAILED startup_settlement")
         await self.flush_archive()
         await self.publish_mirror(ready=True)
         await self.store.publish_realtime_coverage(
