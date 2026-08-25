@@ -458,10 +458,20 @@ class UsageRealtimeWorker:
             return
         try:
             start_date, end_date = self.synchronizer.date_range(days)
-            result = await self.synchronizer.sync(start_date, end_date)
+            directory = await self.synchronizer._identity_directory()
+            total = 0
+            replace = getattr(self.store, "replace_membership_snapshot", None)
+            if not callable(replace):
+                return
+            for backend in self.client.backends:
+                users = await self.client.users(backend)
+                memberships = await self.synchronizer.collect_memberships(
+                    backend, users, start_date, end_date, {}, directory
+                )
+                total += await replace(backend.id, start_date, end_date, memberships)
             logger.info(
-                "startup member snapshot sync status=%s start=%s end=%s",
-                result.get("status"), start_date, end_date,
+                "startup member snapshot sync status=ok rows=%s start=%s end=%s",
+                total, start_date, end_date,
             )
         except asyncio.CancelledError:
             raise

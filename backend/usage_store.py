@@ -2383,6 +2383,36 @@ class UsageStore:
                 )
         return len(records)
 
+    async def replace_membership_snapshot(
+        self, backend_id: str, start_date: str, end_date: str,
+        memberships: list[dict[str, Any]],
+    ) -> int:
+        """Replace only recent team memberships without rewriting usage data."""
+        records = [
+            self._membership_record(backend_id, row)
+            for row in memberships
+            if row.get("snapshotDate") and row.get("teamId")
+        ]
+        async with self._require_pool().acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "DELETE FROM usage_team_membership_daily WHERE backend_id=$1 AND snapshot_date BETWEEN $2::date AND $3::date",
+                    backend_id, _as_date(start_date), _as_date(end_date),
+                )
+                if records:
+                    await connection.executemany(
+                        """
+                        INSERT INTO usage_team_membership_daily
+                            (backend_id, snapshot_date, team_id, team_name, user_id, employee_email, employee_name, team_role)
+                        VALUES ($1,$2::date,$3,$4,$5,$6,$7,$8)
+                        ON CONFLICT (backend_id, snapshot_date, team_id, user_id) DO UPDATE SET
+                            team_name=EXCLUDED.team_name, employee_email=EXCLUDED.employee_email,
+                            employee_name=EXCLUDED.employee_name, team_role=EXCLUDED.team_role
+                        """,
+                        records,
+                    )
+        return len(records)
+
     async def publish_snapshots(
         self,
         start_date: str,
