@@ -1,6 +1,14 @@
 import asyncio
 
 from backend import main
+from backend.usage_sync import _team_members
+
+
+def test_team_members_accepts_upstream_string_user_ids() -> None:
+    assert _team_members({"members": ["claude-code-tankaiwen", "cursor-tankaiwen"]}) == [
+        {"user_id": "claude-code-tankaiwen"},
+        {"user_id": "cursor-tankaiwen"},
+    ]
 
 
 def test_run_usage_sync_uses_recent_refresh_guard(monkeypatch) -> None:

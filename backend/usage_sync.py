@@ -194,7 +194,13 @@ def resolve_display_identity(
 
 
 def _team_members(team: dict[str, Any]) -> list[dict[str, Any]]:
-    value = team.get("members_with_roles") or team.get("membersWithRoles") or []
+    value = (
+        team.get("members_with_roles")
+        or team.get("membersWithRoles")
+        or team.get("members")
+        or team.get("user_ids")
+        or []
+    )
     if isinstance(value, str):
         try:
             import json
@@ -202,7 +208,13 @@ def _team_members(team: dict[str, Any]) -> list[dict[str, Any]]:
             value = json.loads(value)
         except ValueError:
             return []
-    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+    if not isinstance(value, list):
+        return []
+    return [
+        item if isinstance(item, dict) else {"user_id": item}
+        for item in value
+        if isinstance(item, (dict, str)) and _text(item.get("user_id") if isinstance(item, dict) else item)
+    ]
 
 
 @dataclass
