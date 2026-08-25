@@ -279,6 +279,33 @@ def test_cost_overview_accepts_explicit_date_range_and_rejects_partial_or_invali
     assert client.get("/api/admin/costs/overview?start_date=2026-08-02&end_date=2026-08-01").status_code == 400
 
 
+def test_cost_overview_uses_usage_daily_source_when_cost_aggregate_is_partial(monkeypatch) -> None:
+    class PartialCostAggregateStore(FakeObservabilityStore):
+        async def api_cost_rows(self, start_date: str, end_date: str):
+            return [
+                {"usage_date": date(2026, 8, 1), "source": "Codex", "model": "model-a", "spend": 120.0},
+                {"usage_date": date(2026, 8, 2), "source": "Codex", "model": "model-a", "spend": 80.0},
+            ]
+
+        async def api_cost_ledger_rows(self, start_date: str, end_date: str, **kwargs):
+            return [{"usage_date": date(2026, 8, 1), "source": "Codex", "model": "model-a", "spend": 120.0}]
+
+    monkeypatch.setattr(main, "usage_store", lambda: PartialCostAggregateStore())
+    monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True})
+    monkeypatch.setenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "true")
+    payload = TestClient(main.app).get("/api/admin/costs/overview?start_date=2026-08-01&end_date=2026-08-02&as_of=2026-08-02").json()["data"]
+    assert payload["metrics"]["monthToDateActual"] == 200.0
+
+
+def test_cost_overview_exposes_interval_actual_and_annual_actual_separately(monkeypatch) -> None:
+    monkeypatch.setattr(main, "usage_store", lambda: FakeCostLedgerStore())
+    monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True})
+    monkeypatch.setenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "true")
+    payload = TestClient(main.app).get("/api/admin/costs/overview?start_date=2026-08-12&end_date=2026-08-12&as_of=2026-08-12").json()["data"]
+    assert payload["metrics"]["intervalActual"] == 13.5
+    assert payload["annual"]["actualToDate"] == 24.5
+
+
 def test_cost_overview_prorates_cross_month_budget_and_anchors_annual_data_to_end_date(monkeypatch) -> None:
     class CrossMonthStore(FakeObservabilityStore):
         async def list_cost_budgets(self):

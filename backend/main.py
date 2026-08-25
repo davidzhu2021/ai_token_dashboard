@@ -10604,6 +10604,20 @@ async def _cost_api_rows(
     provider: str = "",
     account_id: str = "",
 ) -> tuple[list[dict[str, Any]], bool]:
+    # Keep the cost dashboard on the same daily fact view as the all-employee
+    # dashboard. The dedicated cost aggregate is rebuilt asynchronously and
+    # may cover only part of a requested interval.
+    daily_query = getattr(store, "api_cost_rows", None)
+    if callable(daily_query) and not provider:
+        try:
+            kwargs = {key: value for key, value in (("model", model), ("account_id", account_id)) if value}
+            rows = await daily_query(start.isoformat(), end.isoformat(), **kwargs)
+        except TypeError:
+            # Keep compatibility with lightweight stores that expose the
+            # historical two-argument method used by existing test adapters.
+            rows = await daily_query(start.isoformat(), end.isoformat())
+        if rows:
+            return rows, False
     query = getattr(store, "api_cost_ledger_rows", None)
     if callable(query):
         rows = await query(
@@ -11145,6 +11159,7 @@ async def _build_costs_overview(
                 "verifiedSavings": audited_savings["realizedSavingsUsd"],
                 **savings,
                 "monthToDateActual": round(actual, 2),
+                "intervalActual": round(actual, 2),
                 "monthForecast": round(float(forecast.get("forecast") or 0), 2),
                 "monthBudget": round(interval_budget, 2),
                 "intervalBudget": round(interval_budget, 2),

@@ -187,7 +187,7 @@ def test_observability_state_is_latest_wins_and_cleared_on_login_change() -> Non
 def test_cost_surface_exposes_annual_metrics_and_finance_metadata() -> None:
     markup = (ROOT / "index.html").read_text(encoding="utf-8")
     source = (ROOT / "assets" / "app.js").read_text(encoding="utf-8")
-    for text in ('年度累计实际', '全年预测', '未来预计节省', '对账状态', '财务凭证号'):
+    for text in ('当前筛选区间花费及预算', '年度累计', '全年官方预测', '已核验累计节省', '对账状态', '财务凭证号'):
         assert text in markup or text in source
     for element_id in ('costBucket', 'costProvider', 'costAccount', 'costReconciliation', 'costDetailDrawer'):
         assert f'id="{element_id}"' in markup
