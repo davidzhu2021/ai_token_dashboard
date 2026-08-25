@@ -563,7 +563,9 @@ async def _cached_observability_dashboard(
         payload["cache"] = _observability_cache_meta(record, state="refreshing" if not task.done() else "stale", refreshing=not task.done(), layer=layer, response_bytes=_observability_response_bytes(payload))
         return payload
     task = await _start_observability_refresh(dashboard_type, snapshot_key, builder)
-    budget = max(100, env_int("OBSERVABILITY_COLD_QUERY_BUDGET_MS", 1500)) / 1000
+    budget_name = "STABILITY_COLD_QUERY_BUDGET_MS" if dashboard_type == "stability" else "OBSERVABILITY_COLD_QUERY_BUDGET_MS"
+    default_budget = 4000 if dashboard_type == "stability" else 1500
+    budget = max(100, env_int(budget_name, default_budget)) / 1000
     try:
         return await asyncio.wait_for(asyncio.shield(task), timeout=budget)
     except asyncio.TimeoutError as exc:

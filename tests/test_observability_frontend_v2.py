@@ -27,6 +27,17 @@ def test_trustworthy_observability_statuses_and_loading_lifecycle() -> None:
     assert "异常趋势暂不可用" in source
 
 
+def test_stability_loading_retries_generation_response_without_failure_toast() -> None:
+    _, source = sources()
+    start = source.index("async function loadStabilityOverview")
+    end = source.index("function renderCostOverview", start)
+    loader = source[start:end]
+    assert "STABILITY_OVERVIEW_MAX_RETRIES" in source
+    assert "retryAfter" in source
+    assert "稳定性数据正在生成，请稍候" in loader
+    assert "error.status !== 503" in loader
+
+
 def test_stability_dashboard_does_not_render_coverage_notice() -> None:
     """稳定性指标卡在覆盖不完整时仍保持展示，不额外占用提示区域。"""
     _, source = sources()

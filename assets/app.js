@@ -477,6 +477,7 @@ async function api(path, options = {}, requestState = {}) {
     const error = new Error(message);
     error.status = response.status;
     error.code = code;
+    error.retryAfter = Number(response.headers.get("Retry-After") || 0);
     throw error;
   }
   if (response.status === 204) return null;
@@ -757,6 +758,7 @@ const CUSTOM_RANGE_MAX_DAYS = 90;
 let customDateRange = null;
 let lastPresetRangeValue = "1";
 let stabilityCustomDateRange = null;
+const STABILITY_OVERVIEW_MAX_RETRIES = 4;
 let costCustomDateRange = null;
 
 function daysBetween(startDate, endDate) {
@@ -8858,10 +8860,32 @@ async function loadStabilityOverview(forceRefresh = false) {
   isStabilityLoading = true;
   stabilityLoadError = "";
   renderObservabilityQuality("stabilityQuality", stabilityOverview, "stability");
+  const maxRetries = STABILITY_OVERVIEW_MAX_RETRIES;
+  let retryAttempt = 0;
   try {
     const { startDate, endDate } = currentStabilityWindow();
     const model = el("stabilityModel")?.value || "";
-    const nextOverview = await api(`/api/admin/stability/overview?start_date=${startDate}&end_date=${endDate}&model=${encodeURIComponent(model)}${forceRefresh ? "&refresh=1" : ""}`, { signal: stabilityOverviewController.signal, cache: "no-store" });
+    let nextOverview;
+    while (true) {
+      try {
+        nextOverview = await api(`/api/admin/stability/overview?start_date=${startDate}&end_date=${endDate}&model=${encodeURIComponent(model)}${forceRefresh ? "&refresh=1" : ""}`, { signal: stabilityOverviewController.signal, cache: "no-store" });
+        break;
+      } catch (error) {
+        if (error.name === "AbortError" || error.status !== 503 || retryAttempt >= maxRetries) throw error;
+        retryAttempt += 1;
+        stabilityLoadError = "";
+        renderObservabilityQuality("stabilityQuality", stabilityOverview, "stability");
+        const retryDelay = Math.min(8000, error.retryAfter > 0 ? error.retryAfter * 1000 : 1000 * (2 ** (retryAttempt - 1)));
+        showToast("稳定性数据正在生成，请稍候");
+        await new Promise((resolve, reject) => {
+          const timer = globalThis.setTimeout(resolve, retryDelay);
+          stabilityOverviewController.signal.addEventListener("abort", () => {
+            globalThis.clearTimeout(timer);
+            reject(Object.assign(new Error("已取消"), { name: "AbortError" }));
+          }, { once: true });
+        });
+      }
+    }
     if (requestId !== stabilityOverviewRequestId) return;
     stabilityOverview = nextOverview;
   } catch (error) {

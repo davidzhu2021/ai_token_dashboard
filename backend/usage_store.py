@@ -5242,74 +5242,69 @@ class UsageStore:
                      COALESCE(NULLIF(attempt_id,''), attempt_index::text || ':' || actual_model || ':' || route_name),
                      COALESCE(ended_at,event_time) DESC, event_id DESC
         """
-        attempts_query = pool.fetchrow(
+        attempt_summary_query = pool.fetchrow(
             f"""
-            WITH terminal AS ({terminal_attempts}), traces AS (
-                SELECT backend_id,
-                       COALESCE(NULLIF(trace_id,''), NULLIF(request_id,''), event_id) AS trace_key,
+            WITH terminal AS MATERIALIZED ({terminal_attempts}),
+            traces AS MATERIALIZED (
+                SELECT COALESCE(NULLIF(requested_model_group,''), NULLIF(actual_model,''), 'unknown') AS dimension,
+                       backend_id, COALESCE(NULLIF(trace_id,''), NULLIF(request_id,''), event_id) AS trace_key,
                        BOOL_OR(is_fallback OR event_type LIKE 'fallback_%' OR fallback_from<>'' OR fallback_to<>'') AS fallback_triggered,
                        BOOL_OR((is_fallback OR event_type LIKE 'fallback_%' OR fallback_from<>'' OR fallback_to<>'') AND status='success') AS fallback_recovered,
                        BOOL_OR(is_retry OR event_type LIKE 'retry_%' OR (attempt_index>0 AND NOT is_fallback)) AS retry_triggered,
                        BOOL_OR((is_retry OR event_type LIKE 'retry_%' OR (attempt_index>0 AND NOT is_fallback)) AND status='success') AS retry_recovered
-                FROM terminal GROUP BY 1, 2
-            )
-            SELECT (SELECT COUNT(*) FROM terminal)::bigint AS attempt_count,
-                   (SELECT COUNT(*) FROM terminal WHERE status IN ('success','failure'))::bigint AS attempt_status_count,
-                   (SELECT COUNT(*) FROM terminal WHERE status='failure')::bigint AS failed_attempt_count,
-                   COUNT(*) FILTER (WHERE fallback_triggered)::bigint AS fallback_count,
-                   COUNT(*) FILTER (WHERE fallback_recovered)::bigint AS fallback_recovered_count,
-                   COUNT(*) FILTER (WHERE retry_triggered)::bigint AS retry_count,
-                   COUNT(*) FILTER (WHERE retry_recovered)::bigint AS retry_recovered_count,
-                   (SELECT MIN(COALESCE(started_at,event_time)) FROM terminal) AS available_from
-            FROM traces
-            """,
-            *attempt_args,
-        )
-        model_attempts_query = pool.fetch(
-            f"""
-            WITH terminal AS ({terminal_attempts}), traces AS (
-                SELECT COALESCE(NULLIF(requested_model_group,''), NULLIF(actual_model,''), 'unknown') AS dimension,
-                       backend_id,
-                       COALESCE(NULLIF(trace_id,''), NULLIF(request_id,''), event_id) AS trace_key,
-                       BOOL_OR(is_fallback OR event_type LIKE 'fallback_%' OR fallback_from<>'' OR fallback_to<>'') AS fallback_triggered,
-                       BOOL_OR((is_fallback OR event_type LIKE 'fallback_%' OR fallback_from<>'' OR fallback_to<>'') AND status='success') AS fallback_recovered
                 FROM terminal GROUP BY 1,2,3
-            ), terminal_totals AS (
+            ), overall AS (
+                SELECT (SELECT COUNT(*) FROM terminal)::bigint AS attempt_count,
+                       (SELECT COUNT(*) FROM terminal WHERE status IN ('success','failure'))::bigint AS attempt_status_count,
+                       (SELECT COUNT(*) FROM terminal WHERE status='failure')::bigint AS failed_attempt_count,
+                       COUNT(*) FILTER (WHERE fallback_triggered)::bigint AS fallback_count,
+                       COUNT(*) FILTER (WHERE fallback_recovered)::bigint AS fallback_recovered_count,
+                       COUNT(*) FILTER (WHERE retry_triggered)::bigint AS retry_count,
+                       COUNT(*) FILTER (WHERE retry_recovered)::bigint AS retry_recovered_count,
+                       (SELECT MIN(COALESCE(started_at,event_time)) FROM terminal) AS available_from FROM traces
+            ), terminal_model_totals AS (
                 SELECT COALESCE(NULLIF(requested_model_group,''), NULLIF(actual_model,''), 'unknown') AS dimension,
                        COUNT(*)::bigint AS attempt_count,
                        COUNT(*) FILTER (WHERE status IN ('success','failure'))::bigint AS attempt_status_count
                 FROM terminal GROUP BY 1
-            ), trace_totals AS (
-                SELECT dimension,
-                       COUNT(*) FILTER (WHERE fallback_triggered)::bigint AS fallback_count,
+            ), trace_model_totals AS (
+                SELECT dimension, COUNT(*) FILTER (WHERE fallback_triggered)::bigint AS fallback_count,
                        COUNT(*) FILTER (WHERE fallback_recovered)::bigint AS fallback_recovered_count
-                FROM traces GROUP BY 1
+                FROM traces GROUP BY dimension
+            ), by_model AS (
+                SELECT terminal_model_totals.dimension, terminal_model_totals.attempt_count,
+                       terminal_model_totals.attempt_status_count,
+                       COALESCE(trace_model_totals.fallback_count, 0)::bigint AS fallback_count,
+                       COALESCE(trace_model_totals.fallback_recovered_count, 0)::bigint AS fallback_recovered_count
+                FROM terminal_model_totals LEFT JOIN trace_model_totals USING (dimension)
+            ), by_day AS (
+                SELECT event_date AS dimension, COUNT(*)::bigint AS attempt_count,
+                       COUNT(*) FILTER (WHERE status IN ('success','failure'))::bigint AS attempt_status_count,
+                       COUNT(*) FILTER (WHERE status='failure')::bigint AS failed_attempt_count
+                FROM terminal GROUP BY event_date
             )
-            SELECT terminal_totals.dimension,
-                   terminal_totals.attempt_count,
-                   terminal_totals.attempt_status_count,
-                   COALESCE(trace_totals.fallback_count, 0)::bigint AS fallback_count,
-                   COALESCE(trace_totals.fallback_recovered_count, 0)::bigint AS fallback_recovered_count
-            FROM terminal_totals
-            LEFT JOIN trace_totals USING (dimension)
-            """,
-            *attempt_args,
+            SELECT row_to_json(overall) AS attempts,
+                   COALESCE((SELECT json_agg(by_model) FROM by_model), '[]'::json) AS model_attempts,
+                   COALESCE((SELECT json_agg(by_day ORDER BY dimension) FROM by_day), '[]'::json) AS daily_attempts
+            FROM overall
+            """, *attempt_args,
         )
-        daily_attempts_query = pool.fetch(
-            f"""
-            WITH terminal AS ({terminal_attempts})
-            SELECT event_date AS dimension,
-                   COUNT(*)::bigint AS attempt_count,
-                   COUNT(*) FILTER (WHERE status IN ('success','failure'))::bigint AS attempt_status_count,
-                   COUNT(*) FILTER (WHERE status='failure')::bigint AS failed_attempt_count
-            FROM terminal GROUP BY event_date ORDER BY event_date
-            """,
-            *attempt_args,
+        overall, daily, models, scenarios, attempt_summary = await asyncio.gather(
+            overall_query, daily_query, models_query, scenarios_query, attempt_summary_query,
         )
-        overall, daily, models, scenarios, attempts, model_attempts, daily_attempts = await asyncio.gather(
-            overall_query, daily_query, models_query, scenarios_query, attempts_query,
-            model_attempts_query, daily_attempts_query,
-        )
+        summary = dict(attempt_summary or {})
+
+        def decode_json(value: Any, fallback: Any) -> Any:
+            if isinstance(value, str):
+                try:
+                    return json.loads(value)
+                except json.JSONDecodeError:
+                    return fallback
+            return value if value is not None else fallback
+
+        attempts = decode_json(summary.get("attempts"), {})
+        model_attempts = decode_json(summary.get("model_attempts"), [])
+        daily_attempts = decode_json(summary.get("daily_attempts"), [])
         return {
             "overall": dict(overall or {}),
             "daily": [dict(item) for item in daily],

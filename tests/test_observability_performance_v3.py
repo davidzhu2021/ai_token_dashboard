@@ -111,6 +111,21 @@ def test_governance_workbench_does_not_preload_full_overviews() -> None:
     assert "loadCostOverview()" not in block
 
 
+def test_stability_cold_budget_uses_stability_specific_override(monkeypatch) -> None:
+    async def run() -> None:
+        store = SnapshotStore()
+        monkeypatch.setattr(main, "_admin_observability_store", lambda: store)
+        monkeypatch.setattr(main, "env_int", lambda name, default: 2200 if name == "STABILITY_COLD_QUERY_BUDGET_MS" else default)
+
+        async def builder():
+            return {"data": {"value": 3}}
+
+        result = await main._cached_observability_dashboard("stability", {"day": "2026-08-25"}, builder)
+        assert result["data"]["value"] == 3
+
+    asyncio.run(run())
+
+
 def test_refresh_claim_casts_timestamp_and_interval_parameters() -> None:
     class Pool:
         query = ""
