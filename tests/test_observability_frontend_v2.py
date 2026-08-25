@@ -160,6 +160,17 @@ def test_cost_dashboard_separates_actual_forecast_and_auditable_metrics() -> Non
         assert removed not in source
 
 
+def test_cost_interval_card_uses_actual_date_range_for_period() -> None:
+    _, source = sources()
+
+    start = source.index('const intervalPeriod =')
+    end = source.index('const annualActual =', start)
+    interval_source = source[start:end]
+    assert 'data.startDate && data.endDate' in interval_source
+    assert '`${data.startDate} 至 ${data.endDate}`' in interval_source
+    assert 'meta.period' in interval_source
+
+
 def test_governance_workbench_is_separate_and_permission_aware() -> None:
     markup, source = sources()
     assert 'data-view="governance-workbench"' in markup

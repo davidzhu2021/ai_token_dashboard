@@ -8919,7 +8919,8 @@ function renderCostOverview() {
   const meta = observabilityPayloadMeta(costOverview, data);
   const contractMetrics = data.metricContracts || data.coreMetrics || metrics.metricEnvelopes || {};
   const annualContracts = annual.metricEnvelopes || {};
-  const intervalActual = observabilityMetricObject(contractMetrics.intervalActual ?? metrics.intervalActual ?? metrics.monthToDateActual, { period: meta.period || `${data.startDate || ""} ～ ${data.endDate || ""}`, asOf: meta.asOf, source: costOverview.source, status: "actual" });
+  const intervalPeriod = data.startDate && data.endDate ? `${data.startDate} 至 ${data.endDate}` : (meta.period || "");
+  const intervalActual = observabilityMetricObject(contractMetrics.intervalActual ?? metrics.intervalActual ?? metrics.monthToDateActual, { period: intervalPeriod, asOf: meta.asOf, source: costOverview.source, status: "actual" });
   const annualActual = observabilityMetricObject(annualContracts.actualToDate ?? contractMetrics.yearToDateActual ?? metrics.yearToDateActual ?? annual.actualToDate ?? annual.actual, { period: `${String(data.month || currentCostMonth()).slice(0, 4)} 年`, asOf: meta.asOf, source: costOverview.source, status: "actual" });
   const activePlan = data.activePlanVersion || data.activePlan || annual.activePlanVersion || annual.activePlan || governanceWorkbenchData.planVersions.find((item) => (item.active || item.isActive || item.activatedAt) && ["approved", "active"].includes(String(item.status || "").toLowerCase()));
   const hasOfficialForecastContract = contractMetrics.officialYearForecast !== undefined || metrics.officialYearForecast !== undefined || annual.officialForecast !== undefined;
