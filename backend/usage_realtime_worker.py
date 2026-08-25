@@ -56,6 +56,10 @@ class UsageRealtimeWorker:
         self.background_budget_seconds = max(
             1, _env_int("USAGE_REALTIME_BACKGROUND_BUDGET_SECONDS", 5)
         )
+        self.refresh_queue_budget_seconds = max(
+            self.background_budget_seconds,
+            _env_int("USAGE_REFRESH_QUEUE_BUDGET_SECONDS", 60),
+        )
         self.overlap_seconds = max(
             1, _env_int("USAGE_REALTIME_OVERLAP_SECONDS", 60)
         )
@@ -677,23 +681,27 @@ class UsageRealtimeWorker:
 
     async def run_background_once(self, now: datetime) -> None:
         """Run at most one non-live task without delaying the next live cycle."""
-        operations = (
-            self.consume_refresh_requests,
-            lambda: self.settle_pending_windows(now),
-            self.backfill_cost_aggregates,
-            self.backfill_once,
+        queue_budget = max(
+            self.background_budget_seconds,
+            int(getattr(self, "refresh_queue_budget_seconds", 60)),
         )
-        for operation in operations:
+        operations = (
+            (self.consume_refresh_requests, queue_budget),
+            (lambda: self.settle_pending_windows(now), self.background_budget_seconds),
+            (self.backfill_cost_aggregates, self.background_budget_seconds),
+            (self.backfill_once, self.background_budget_seconds),
+        )
+        for operation, budget_seconds in operations:
             try:
                 await asyncio.wait_for(
-                    operation(), timeout=self.background_budget_seconds
+                    operation(), timeout=budget_seconds
                 )
                 return
             except asyncio.TimeoutError:
                 logger.warning(
                     "HISTORICAL_BACKFILL_PARTIAL operation=%s budget_seconds=%s",
                     getattr(operation, "__name__", "settlement"),
-                    self.background_budget_seconds,
+                    budget_seconds,
                 )
                 continue
             except Exception:
