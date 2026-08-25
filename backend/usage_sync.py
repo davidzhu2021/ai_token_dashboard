@@ -1321,8 +1321,15 @@ class UsageSynchronizer:
                         )
                     except Exception:
                         logger.debug("failed to expand team member accounts for %s", email, exc_info=True)
+                # Team directory responses often omit the member email. Once
+                # the user profile supplies it, include every local account
+                # carrying the same email so cursor/Claude identities share
+                # one team snapshot.
+                if not email:
+                    email = _email(info.get("email"))
+                if email:
+                    candidate_ids.extend(account_by_email.get(email, []))
                 candidate_ids = list(dict.fromkeys(candidate_ids))
-                email = email or _email(info.get("email"))
                 name = name or (candidate_ids[0] if candidate_ids else "unknown")
                 role = _text(member.get("role") or member.get("user_role") or member.get("team_role")) or "user"
                 for candidate_user_id in candidate_ids:

@@ -1411,6 +1411,55 @@ def test_usage_sync_expands_team_membership_to_all_email_accounts() -> None:
     assert len(team_rows) == 2
 
 
+def test_usage_sync_expands_team_membership_when_upstream_member_omits_email() -> None:
+    class FakeClient:
+        def _admin_user_map(self, _users):
+            return {
+                "claude-code-tankaiwen": {
+                    "name": "谭凯文",
+                    "email": "tankaiwen@auto-link.com.cn",
+                    "userIds": ["claude-code-tankaiwen", "cursor-tankaiwen"],
+                },
+                "cursor-tankaiwen": {
+                    "name": "谭凯文",
+                    "email": "tankaiwen@auto-link.com.cn",
+                    "userIds": ["claude-code-tankaiwen", "cursor-tankaiwen"],
+                },
+            }
+
+        async def teams(self, _backend):
+            return [{
+                "team_id": "team-ai-infra",
+                "team_alias": "AI Infra部",
+                "members_with_roles": [{"user_id": "claude-code-tankaiwen", "role": "user"}],
+            }]
+
+        def _is_backend_usage_account(self, _backend, _user_id):
+            return True
+
+    backend = type("Backend", (), {"id": "primary", "source": None})()
+    synchronizer = UsageSynchronizer(
+        FakeClient(),
+        object(),
+    )
+
+    rows = asyncio.run(synchronizer.collect_memberships(
+        backend,
+        [
+            {"user_id": "claude-code-tankaiwen", "user_email": "tankaiwen@auto-link.com.cn"},
+            {"user_id": "cursor-tankaiwen", "user_email": "tankaiwen@auto-link.com.cn"},
+        ],
+        "2026-08-25",
+        "2026-08-25",
+    ))
+
+    team_rows = [row for row in rows if row["teamId"] == "team-ai-infra"]
+    assert {row["userId"] for row in team_rows} == {
+        "claude-code-tankaiwen",
+        "cursor-tankaiwen",
+    }
+
+
 def test_usage_sync_lock_failure_is_recorded_and_not_released() -> None:
     class FakeStore:
         released = False

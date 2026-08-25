@@ -842,11 +842,11 @@ class UsageRealtimeWorker:
             self._renew_worker_lock_loop(), name="usage-realtime-lock-renewal"
         )
         try:
-            await self.recover()
             self._startup_member_sync_task = asyncio.create_task(
                 self.startup_member_snapshot_sync(),
                 name="usage-startup-member-snapshot-sync",
             )
+            await self.recover()
             last_reconcile = datetime.now(timezone.utc)
             last_directory_refresh = last_reconcile
             while not self.stop_event.is_set():
