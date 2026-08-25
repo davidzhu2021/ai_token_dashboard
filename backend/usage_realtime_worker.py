@@ -113,6 +113,7 @@ class UsageRealtimeWorker:
         self.team_by_user: dict[tuple[str, str], tuple[str, str]] = {}
         self.current_day = usage_today()
         self._lock_renew_task: asyncio.Task[None] | None = None
+        self._startup_member_sync_task: asyncio.Task[None] | None = None
         self._lock_lost = asyncio.Event()
 
     def realtime_poll_window(
@@ -366,6 +367,7 @@ class UsageRealtimeWorker:
             last_started_at=started_at,
             last_error="",
         )
+
         await self.realtime.set_ready(False)
         # Persist any stream entries left pending by a previous worker before
         # rebuilding today's Redis aggregates from PostgreSQL.
@@ -448,6 +450,23 @@ class UsageRealtimeWorker:
             snapshot_revision=str(await self.realtime.revision()),
             last_error="",
         )
+
+    async def startup_member_snapshot_sync(self) -> None:
+        """Refresh recent team membership snapshots without blocking live polling."""
+        days = max(0, _env_int("USAGE_REALTIME_STARTUP_MEMBER_SYNC_DAYS", 6))
+        if days <= 0:
+            return
+        try:
+            start_date, end_date = self.synchronizer.date_range(days)
+            result = await self.synchronizer.sync(start_date, end_date)
+            logger.info(
+                "startup member snapshot sync status=%s start=%s end=%s",
+                result.get("status"), start_date, end_date,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("startup member snapshot sync failed")
 
     async def poll_backend(
         self, backend: LiteLLMBackend, end_time: datetime, *, lookback_minutes: int | None = None
@@ -814,6 +833,10 @@ class UsageRealtimeWorker:
         )
         try:
             await self.recover()
+            self._startup_member_sync_task = asyncio.create_task(
+                self.startup_member_snapshot_sync(),
+                name="usage-startup-member-snapshot-sync",
+            )
             last_reconcile = datetime.now(timezone.utc)
             last_directory_refresh = last_reconcile
             while not self.stop_event.is_set():
@@ -877,6 +900,13 @@ class UsageRealtimeWorker:
                 except asyncio.CancelledError:
                     pass
                 self._lock_renew_task = None
+            if self._startup_member_sync_task is not None:
+                self._startup_member_sync_task.cancel()
+                try:
+                    await self._startup_member_sync_task
+                except asyncio.CancelledError:
+                    pass
+                self._startup_member_sync_task = None
             await self.realtime.release_worker_lock(self.worker_id)
         if self._lock_lost.is_set():
             raise RuntimeError("realtime usage worker lock was lost")
