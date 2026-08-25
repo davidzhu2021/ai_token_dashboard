@@ -89,6 +89,13 @@ class UsageRealtimeWorker:
             self.poll_seconds,
             _env_int("USAGE_REALTIME_LIVE_WINDOW_SECONDS", 60),
         )
+        self.max_cursor_age_seconds = max(
+            self.live_window_seconds,
+            _env_int("USAGE_REALTIME_MAX_CURSOR_AGE_SECONDS", 900),
+        )
+        self.history_window_seconds = max(
+            60, _env_int("USAGE_REALTIME_HISTORY_WINDOW_SECONDS", 3600)
+        )
         self.backfill_pages_per_cycle = max(
             1, _env_int("USAGE_REALTIME_BACKFILL_PAGES_PER_CYCLE", 5)
         )
@@ -104,6 +111,30 @@ class UsageRealtimeWorker:
         self._lock_renew_task: asyncio.Task[None] | None = None
         self._lock_lost = asyncio.Event()
 
+    def realtime_poll_window(
+        self, cursor: datetime | None, end_time: datetime
+    ) -> tuple[datetime, datetime | None]:
+        """Keep live polling bounded and return an optional history origin."""
+        live_window = max(1, int(getattr(self, "live_window_seconds", 60)))
+        max_age = max(live_window, int(getattr(self, "max_cursor_age_seconds", 900)))
+        safe_start = end_time - timedelta(seconds=live_window)
+        if cursor is None:
+            return safe_start, None
+        cursor = cursor.astimezone(timezone.utc)
+        if (end_time - cursor).total_seconds() > max_age:
+            return safe_start, cursor
+        return cursor - timedelta(seconds=self.overlap_seconds), None
+
+    def history_backfill_window(
+        self, start_time: datetime, end_time: datetime
+    ) -> tuple[datetime, datetime]:
+        history_window = max(60, int(getattr(self, "history_window_seconds", 3600)))
+        bounded_end = min(
+            end_time,
+            start_time + timedelta(seconds=history_window),
+        )
+        return start_time, bounded_end
+
     async def consume_refresh_requests(self) -> bool:
         """Process durable reader refresh requests outside the API request path."""
 
@@ -112,7 +143,7 @@ class UsageRealtimeWorker:
         if not callable(claim) or not callable(finish):
             return False
         requests = await claim(
-            limit=max(1, _env_int("USAGE_REFRESH_QUEUE_BATCH_SIZE", 100))
+            limit=max(1, _env_int("USAGE_REFRESH_QUEUE_BATCH_SIZE", 10))
         )
         if not requests:
             return False
@@ -352,7 +383,24 @@ class UsageRealtimeWorker:
         # Closed-window settlements supersede them, so do not resume a cursor
         # that could carry a historical page gap into the new worker.
         for backend in self.client.backends:
+            cursor_loader = getattr(self.realtime, "cursor", None)
+            previous_cursor = await cursor_loader(backend.id) if callable(cursor_loader) else None
             await self.realtime.clear_backfill_checkpoint(backend.id)
+            if previous_cursor is not None:
+                live_start = datetime.now(timezone.utc) - timedelta(
+                    seconds=self.live_window_seconds
+                )
+                if (
+                    live_start - previous_cursor
+                ).total_seconds() > self.max_cursor_age_seconds:
+                    setter = getattr(self.realtime, "set_backfill_checkpoint", None)
+                    if callable(setter):
+                        await setter(
+                            backend.id,
+                            start_time=previous_cursor,
+                            end_time=live_start,
+                            next_page=1,
+                        )
         # Replay today's closed intervals once after deployment. The audit table
         # deduplicates request IDs, so this safely fills earlier rolling-page gaps.
         if _env_int("USAGE_REALTIME_RESYNC_TODAY_ON_START", 1):
@@ -404,7 +452,7 @@ class UsageRealtimeWorker:
         if lookback_minutes is not None:
             start_time = end_time - timedelta(minutes=lookback_minutes)
         else:
-            start_time = (cursor or end_time) - timedelta(seconds=self.overlap_seconds)
+            start_time, _history_start = self.realtime_poll_window(cursor, end_time)
         events, complete = await self.client.incremental_events_from_logs(
             start_time, end_time, backend, page_size=100
         )
@@ -548,9 +596,12 @@ class UsageRealtimeWorker:
         if not checkpoint:
             return 0
         next_page = int(checkpoint["nextPage"])
+        window_start, window_end = self.history_backfill_window(
+            checkpoint["startTime"], checkpoint["endTime"]
+        )
         events, complete = await self.client.incremental_events_from_logs(
-            checkpoint["startTime"],
-            checkpoint["endTime"],
+            window_start,
+            window_end,
             backend,
             page_size=100,
             start_page=next_page,
@@ -564,7 +615,7 @@ class UsageRealtimeWorker:
             inserted += int(accepted)
         if complete:
             live_cursor = await self.realtime.cursor(backend.id)
-            next_start = checkpoint["endTime"]
+            next_start = window_end
             next_end = live_cursor or next_start
             if (next_end - next_start).total_seconds() > self.live_window_seconds:
                 await self.realtime.set_backfill_checkpoint(
@@ -585,8 +636,8 @@ class UsageRealtimeWorker:
         else:
             await self.realtime.set_backfill_checkpoint(
                 backend.id,
-                start_time=checkpoint["startTime"],
-                end_time=checkpoint["endTime"],
+                start_time=window_start,
+                end_time=window_end,
                 next_page=next_page + self.backfill_pages_per_cycle,
             )
             logger.info(
@@ -627,9 +678,9 @@ class UsageRealtimeWorker:
     async def run_background_once(self, now: datetime) -> None:
         """Run at most one non-live task without delaying the next live cycle."""
         operations = (
+            self.consume_refresh_requests,
             lambda: self.settle_pending_windows(now),
             self.backfill_cost_aggregates,
-            self.consume_refresh_requests,
             self.backfill_once,
         )
         for operation in operations:
@@ -644,13 +695,13 @@ class UsageRealtimeWorker:
                     getattr(operation, "__name__", "settlement"),
                     self.background_budget_seconds,
                 )
-                return
+                continue
             except Exception:
                 logger.exception(
                     "SNAPSHOT_REFRESH_FAILED operation=%s",
                     getattr(operation, "__name__", "settlement"),
                 )
-                return
+                continue
 
     async def run_live_once(self, now: datetime) -> None:
         """Poll every backend with hard isolation, then publish one mirror."""

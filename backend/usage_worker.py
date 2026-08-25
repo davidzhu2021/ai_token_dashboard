@@ -135,7 +135,7 @@ class UsageSyncWorker:
         finish = getattr(self.store, "finish_refresh_requests", None)
         if not callable(claim) or not callable(finish):
             return False
-        requests = await claim(limit=max(1, _env_int("USAGE_REFRESH_QUEUE_BATCH_SIZE", 100)))
+        requests = await claim(limit=max(1, _env_int("USAGE_REFRESH_QUEUE_BATCH_SIZE", 10)))
         if not requests:
             return False
         request_keys = [str(item["requestKey"]) for item in requests]

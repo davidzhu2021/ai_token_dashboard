@@ -507,6 +507,56 @@ def test_incomplete_realtime_window_does_not_advance_cursor() -> None:
     assert inserted == 0
 
 
+def test_stale_cursor_uses_recent_live_window_and_preserves_history_start(monkeypatch) -> None:
+    monkeypatch.setenv("USAGE_REALTIME_MAX_CURSOR_AGE_SECONDS", "900")
+    monkeypatch.setenv("USAGE_REALTIME_LIVE_WINDOW_SECONDS", "900")
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.overlap_seconds = 60
+    worker.max_cursor_age_seconds = 900
+    worker.live_window_seconds = 900
+
+    now = datetime(2026, 8, 25, 8, 0, tzinfo=timezone.utc)
+    old = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+    start, history = worker.realtime_poll_window(old, now)
+
+    assert start == datetime(2026, 8, 25, 7, 45, tzinfo=timezone.utc)
+    assert history == old
+    assert (now - start).total_seconds() <= 900
+
+
+def test_history_backfill_window_is_bounded() -> None:
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.history_window_seconds = 3600
+    start = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 8, 25, 8, 0, tzinfo=timezone.utc)
+
+    bounded = worker.history_backfill_window(start, end)
+
+    assert bounded == (start, start + timedelta(hours=1))
+
+
+def test_background_queue_runs_when_settlement_times_out() -> None:
+    calls = []
+
+    async def slow_settlement(_now):
+        await asyncio.sleep(0.05)
+
+    async def consume_queue():
+        calls.append("queue")
+        return True
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.background_budget_seconds = 0.01
+    worker.settle_pending_windows = slow_settlement
+    worker.consume_refresh_requests = consume_queue
+    worker.backfill_cost_aggregates = lambda: asyncio.sleep(0)
+    worker.backfill_once = lambda: asyncio.sleep(0)
+
+    asyncio.run(worker.run_background_once(datetime(2026, 8, 25, 8, 0, tzinfo=timezone.utc)))
+
+    assert calls == ["queue"]
+
+
 def test_realtime_backfill_persists_next_page_after_each_bounded_batch() -> None:
     calls = []
 
