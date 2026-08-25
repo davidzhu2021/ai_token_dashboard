@@ -780,6 +780,33 @@ def test_realtime_worker_consumes_reader_refresh_queue() -> None:
     assert worker.store.finished == (["r1"], True, "")
 
 
+def test_realtime_worker_releases_claim_when_refresh_is_cancelled() -> None:
+    class Store:
+        async def claim_refresh_requests(self, **_kwargs):
+            return [{"requestKey": "r1", "startDate": "2026-08-10", "endDate": "2026-08-14"}]
+
+        async def finish_refresh_requests(self, keys, *, success, error=""):
+            self.finished = (keys, success, error)
+
+    class Synchronizer:
+        async def sync(self, _start_date, _end_date):
+            raise asyncio.CancelledError()
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.store = Store()
+    worker.synchronizer = Synchronizer()
+
+    async def run():
+        try:
+            await worker.consume_refresh_requests()
+        except asyncio.CancelledError:
+            return
+        raise AssertionError("cancelled refresh should propagate")
+
+    asyncio.run(run())
+    assert worker.store.finished == (["r1"], False, "CancelledError")
+
+
 def test_realtime_worker_waits_for_existing_lock(monkeypatch) -> None:
     attempts = 0
 

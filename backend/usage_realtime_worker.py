@@ -127,6 +127,15 @@ class UsageRealtimeWorker:
                 success=success,
                 error="" if success else "; ".join(result.get("errors") or ["sync failed"]),
             )
+        except asyncio.CancelledError:
+            # The realtime loop may cancel this operation when its short
+            # background budget expires. Release the claim before propagating
+            # cancellation so the request can be retried instead of sticking
+            # in `running` forever.
+            await asyncio.shield(
+                finish(request_keys, success=False, error="CancelledError")
+            )
+            raise
         except Exception as exc:
             await finish(request_keys, success=False, error=exc.__class__.__name__)
             logger.exception(
