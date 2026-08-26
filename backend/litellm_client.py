@@ -3504,6 +3504,9 @@ class LiteLLMClient:
 
         grouped: dict[str, dict[tuple[str, str, str, str, str, str], dict[str, Any]]] = defaultdict(dict)
         event_rows: list[dict[str, Any]] = []
+        # Concurrent page reads can overlap while the upstream log table is
+        # changing. Deduplicate before aggregation to keep usage and spend exact.
+        seen_request_ids: set[str] = set()
 
         def absorb(logs: list[dict[str, Any]]) -> None:
             for log in logs:
@@ -3559,6 +3562,9 @@ class LiteLLMClient:
                             default=str,
                         ).encode("utf-8")
                     ).hexdigest()
+                if request_id in seen_request_ids:
+                    continue
+                seen_request_ids.add(request_id)
                 event_row = self._empty_usage_row(day, source, model)
                 event_row.update(attribution)
                 event_row.update(

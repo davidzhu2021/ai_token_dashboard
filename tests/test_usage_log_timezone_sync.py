@@ -197,6 +197,28 @@ def test_scan_groups_all_users_in_one_pass(monkeypatch) -> None:
     assert [int(r["page"]) for r in client.requests] == [1, 2]
 
 
+def test_log_sync_deduplicates_request_repeated_on_overlapping_pages(monkeypatch) -> None:
+    """分页结果重叠时，同一请求只能计入一次汇总和费用。"""
+    monkeypatch.setenv("USAGE_TIMEZONE_OFFSET_MINUTES", "-480")
+    first = _log("claude-code-alice", "2026-07-28T01:00:00+00:00", 100, "1.0")
+    first["request_id"] = "req-overlap"
+    duplicate = dict(first)
+    second = _log("claude-code-alice", "2026-07-28T02:00:00+00:00", 200, "2.0")
+    second["request_id"] = "req-second"
+
+    rows, complete = asyncio.run(
+        _LogClient([[first], [duplicate, second]]).sync_rows_from_logs(
+            "2026-07-28", "2026-07-28", PRIMARY
+        )
+    )
+
+    assert complete is True
+    assert rows["claude-code-alice"][0]["totalTokens"] == 300
+    assert rows["claude-code-alice"][0]["spend"] == pytest.approx(3.0)
+    assert rows["claude-code-alice"][0]["requestCount"] == 2
+    assert len(rows.events) == 2
+
+
 def test_log_sync_can_filter_by_stable_key_hash(monkeypatch) -> None:
     monkeypatch.setenv("USAGE_TIMEZONE_OFFSET_MINUTES", "-480")
     key_hash = "a" * 64
