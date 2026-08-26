@@ -210,13 +210,15 @@ CREATE TABLE IF NOT EXISTS usage_refresh_requests (
     completed_at TIMESTAMPTZ,
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT NOT NULL DEFAULT '',
-    next_attempt_at TIMESTAMPTZ
+    next_attempt_at TIMESTAMPTZ,
+    last_duration_ms DOUBLE PRECISION
 );
 ALTER TABLE usage_refresh_requests ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
 ALTER TABLE usage_refresh_requests ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
 ALTER TABLE usage_refresh_requests ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE usage_refresh_requests ADD COLUMN IF NOT EXISTS last_error TEXT NOT NULL DEFAULT '';
 ALTER TABLE usage_refresh_requests ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ;
+ALTER TABLE usage_refresh_requests ADD COLUMN IF NOT EXISTS last_duration_ms DOUBLE PRECISION;
 CREATE INDEX IF NOT EXISTS usage_refresh_requests_pending_idx
     ON usage_refresh_requests (status, requested_at);
 
@@ -1312,13 +1314,15 @@ class UsageStore:
         success: bool,
         error: str = "",
         retry_after_seconds: int = 0,
+        duration_ms: float | None = None,
     ) -> None:
         if not request_keys:
             return
         await self._require_pool().execute(
             """
             UPDATE usage_refresh_requests
-            SET status=$1, completed_at=$2, last_error=$3, next_attempt_at=$5
+            SET status=$1, completed_at=$2, last_error=$3, next_attempt_at=$5,
+                last_duration_ms=$6
             WHERE request_key=ANY($4::text[])
             """,
             "completed" if success else "pending",
@@ -1330,6 +1334,7 @@ class UsageStore:
                 if not success and retry_after_seconds > 0
                 else None
             ),
+            float(duration_ms) if duration_ms is not None else None,
         )
 
     async def refresh_queue_status(self) -> dict[str, Any]:
@@ -1341,7 +1346,9 @@ class UsageStore:
                    MAX(attempts) FILTER (WHERE status IN ('pending', 'running')) AS max_attempts,
                    MAX(claimed_at) FILTER (WHERE status IN ('pending', 'running')) AS last_attempted_at,
                    (array_agg(last_error ORDER BY claimed_at DESC NULLS LAST)
-                       FILTER (WHERE status IN ('pending', 'running') AND last_error <> ''))[1] AS last_error
+                       FILTER (WHERE status IN ('pending', 'running') AND last_error <> ''))[1] AS last_error,
+                   (array_agg(last_duration_ms ORDER BY claimed_at DESC NULLS LAST)
+                       FILTER (WHERE status IN ('pending', 'running')))[1] AS last_duration_ms
             FROM usage_refresh_requests
             """
         )
@@ -1352,6 +1359,11 @@ class UsageStore:
             "maxAttempts": int((row or {}).get("max_attempts") or 0),
             "lastAttemptedAt": (row or {}).get("last_attempted_at"),
             "lastError": str((row or {}).get("last_error") or ""),
+            "lastDurationMs": (
+                float(row["last_duration_ms"])
+                if (row or {}).get("last_duration_ms") is not None
+                else None
+            ),
         }
 
     async def snapshot_revision(

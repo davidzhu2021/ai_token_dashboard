@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import socket
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -174,6 +175,30 @@ class UsageSyncWorker:
         # refreshes are allowed to target a bounded past range.
         days = max(1, (latest - earliest).days + 1)
         attempts = max(int(item.get("attempts") or 1) for item in requests)
+        started_at = time.perf_counter()
+
+        async def finish_requests(**kwargs: Any) -> None:
+            """Persist queue outcome, tolerating pre-migration store doubles."""
+
+            duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            kwargs["duration_ms"] = duration_ms
+            try:
+                await finish(request_keys, **kwargs)
+            except TypeError as exc:
+                # Older test doubles/pre-migration adapters do not know the
+                # optional duration field; do not lose the queue outcome.
+                if "duration_ms" not in str(exc):
+                    raise
+                kwargs.pop("duration_ms", None)
+                await finish(request_keys, **kwargs)
+            logger.info(
+                "usage refresh queue finished keys=%s status=%s duration_ms=%s attempts=%s",
+                len(request_keys),
+                "completed" if kwargs.get("success") else "pending",
+                duration_ms,
+                attempts,
+            )
+
         try:
             result = await self._run_sync(days, end_date=latest.isoformat())
             success = result.get("status") == "ok"
@@ -183,11 +208,10 @@ class UsageSyncWorker:
             }
             if not success:
                 finish_kwargs["retry_after_seconds"] = _retry_delay_seconds(attempts)
-            await finish(request_keys, **finish_kwargs)
+            await finish_requests(**finish_kwargs)
         except asyncio.CancelledError:
             await asyncio.shield(
-                finish(
-                    request_keys,
+                finish_requests(
                     success=False,
                     error="CancelledError",
                     retry_after_seconds=_retry_delay_seconds(attempts),
@@ -195,8 +219,7 @@ class UsageSyncWorker:
             )
             return True
         except Exception as exc:
-            await finish(
-                request_keys,
+            await finish_requests(
                 success=False,
                 error=exc.__class__.__name__,
                 retry_after_seconds=_retry_delay_seconds(attempts),

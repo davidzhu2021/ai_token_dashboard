@@ -208,6 +208,33 @@ def test_snapshot_worker_retries_cancelled_refresh_with_backoff(monkeypatch) -> 
     assert store.finished == (["r1"], False, "CancelledError", 7)
 
 
+def test_snapshot_worker_records_refresh_duration(monkeypatch) -> None:
+    class Store:
+        async def claim_refresh_requests(self, **_kwargs):
+            return [{
+                "requestKey": "r1",
+                "startDate": "2026-08-10",
+                "endDate": "2026-08-14",
+                "attempts": 1,
+            }]
+
+        async def finish_refresh_requests(self, keys, **kwargs):
+            self.finished = (keys, kwargs)
+
+    worker = UsageSyncWorker(
+        type("Client", (), {"backends": []})(),
+        Store(),
+    )
+
+    async def sync(_days, **_kwargs):
+        return {"status": "ok"}
+
+    worker._run_sync = sync
+    assert asyncio.run(worker.consume_refresh_requests()) is True
+
+    assert worker.store.finished[1]["duration_ms"] >= 0
+
+
 def test_snapshot_revision_is_part_of_usage_cache_keys() -> None:
     first = main.personal_usage_cache_key(
         "user@example.com", "2026-08-01", "2026-08-05", "all", "revision-a"
