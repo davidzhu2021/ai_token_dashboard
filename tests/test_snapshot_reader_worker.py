@@ -204,7 +204,7 @@ def test_snapshot_worker_retries_cancelled_refresh_with_backoff(monkeypatch) -> 
 
     worker._run_sync = cancelled
     assert asyncio.run(worker.consume_refresh_requests()) is True
-    assert store.claim_kwargs["stale_after_seconds"] == 900
+    assert store.claim_kwargs["stale_after_seconds"] == 300
     assert store.finished == (["r1"], False, "CancelledError", 7)
 
 

@@ -155,7 +155,7 @@ class UsageSyncWorker:
         if not callable(claim) or not callable(finish):
             return False
         stale_after_seconds = max(
-            60, _env_int("USAGE_REFRESH_CLAIM_STALE_SECONDS", 900)
+            60, _env_int("USAGE_REFRESH_CLAIM_STALE_SECONDS", 300)
         )
         requests = await claim(
             limit=max(1, _env_int("USAGE_REFRESH_QUEUE_BATCH_SIZE", 10)),
