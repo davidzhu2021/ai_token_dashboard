@@ -5966,7 +5966,11 @@ async def health() -> dict[str, Any]:
                 raw_status = (realtime_status.get("settlementStatuses") or {}).get(backend_id) or {}
                 settlement_backends[backend_id] = {
                     "verifiedThrough": (realtime_status.get("verifiedThrough") or {}).get(backend_id),
-                    "status": raw_status.get("status") if isinstance(raw_status, dict) else "verifying",
+                    "status": (
+                        str(raw_status.get("status") or "verifying")
+                        if isinstance(raw_status, dict)
+                        else "verifying"
+                    ),
                     "error": raw_status.get("error", "") if isinstance(raw_status, dict) else "",
                     "lagSeconds": settlement_lags.get(backend_id),
                 }

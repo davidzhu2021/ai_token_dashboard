@@ -843,6 +843,8 @@ def test_health_marks_configured_backend_without_settlement_state_as_unsettled(m
     payload = asyncio.run(main.health())
 
     assert payload["settlement"]["unsettledBackends"] == ["her", "primary"]
+    assert payload["settlement"]["backends"]["primary"]["status"] == "verifying"
+    assert payload["settlement"]["backends"]["her"]["status"] == "verifying"
 
 
 def test_team_leader_scope_reports_multiple_teams() -> None:

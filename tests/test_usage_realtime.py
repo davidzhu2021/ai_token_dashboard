@@ -403,7 +403,8 @@ def test_recovery_discards_legacy_page_backfill_checkpoints() -> None:
         async def set_verified_through(self, *_args): return None
 
     class Store:
-        async def update_worker_state(self, **_kwargs): return None
+        async def update_worker_state(self, **_kwargs):
+            raise AssertionError("realtime worker must not write snapshot worker state")
         async def realtime_recovery_rows(self, *_args): return []
         async def realtime_request_ids(self, *_args): return []
         async def latest_archived_event_at(self, *_args): return None
