@@ -740,8 +740,8 @@ class UsageRealtimeWorker:
             int(getattr(self, "refresh_queue_budget_seconds", 60)),
         )
         operations = (
-            (self.consume_refresh_requests, queue_budget),
             (lambda: self.settle_pending_windows(now), self.background_budget_seconds),
+            (self.consume_refresh_requests, queue_budget),
             (self.backfill_cost_aggregates, self.background_budget_seconds),
             (self.backfill_once, self.background_budget_seconds),
         )

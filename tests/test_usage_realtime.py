@@ -617,6 +617,29 @@ def test_background_queue_runs_when_settlement_times_out() -> None:
     assert calls == ["queue"]
 
 
+def test_background_settlement_runs_before_a_long_refresh_queue() -> None:
+    calls = []
+
+    async def settle(_now):
+        calls.append("settlement")
+
+    async def consume_queue():
+        calls.append("queue")
+        return True
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.background_budget_seconds = 0.01
+    worker.refresh_queue_budget_seconds = 0.01
+    worker.settle_pending_windows = settle
+    worker.consume_refresh_requests = consume_queue
+    worker.backfill_cost_aggregates = lambda: asyncio.sleep(0)
+    worker.backfill_once = lambda: asyncio.sleep(0)
+
+    asyncio.run(worker.run_background_once(datetime(2026, 8, 25, 8, 0, tzinfo=timezone.utc)))
+
+    assert calls == ["settlement"]
+
+
 def test_realtime_backfill_persists_next_page_after_each_bounded_batch() -> None:
     calls = []
 
