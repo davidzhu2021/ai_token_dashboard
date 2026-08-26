@@ -275,16 +275,21 @@ class UsageSyncWorker:
             self._heartbeat_loop(), name="usage-worker-heartbeat"
         )
         try:
-            startup_days = await self.startup_sync_days()
-            if startup_days is not None:
-                await self._run_sync(startup_days)
+            # Drain durable refresh requests before a potentially large startup
+            # snapshot scan so an old queue cannot wait behind historical work.
+            if await self.consume_refresh_requests():
                 last_refresh = self.now()
             else:
-                self._current_status = "idle"
-                await self.store.heartbeat_worker(self.worker_id, "idle")
-                # 启动时快照仍新鲜，跳过了同步。周期必须从上一次成功时刻起算，
-                # 否则每次重启都把时钟推后一整个周期，快照年龄会超出新鲜度预算。
-                last_refresh = await self.store.latest_success_at() or self.now()
+                startup_days = await self.startup_sync_days()
+                if startup_days is not None:
+                    await self._run_sync(startup_days)
+                    last_refresh = self.now()
+                else:
+                    self._current_status = "idle"
+                    await self.store.heartbeat_worker(self.worker_id, "idle")
+                    # 启动时快照仍新鲜，跳过了同步。周期必须从上一次成功时刻起算，
+                    # 否则每次重启都把时钟推后一整个周期，快照年龄会超出新鲜度预算。
+                    last_refresh = await self.store.latest_success_at() or self.now()
             last_calibration = self.now()
             while not self.stop_event.is_set():
                 if await self.backfill_cost_aggregates():

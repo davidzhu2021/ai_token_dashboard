@@ -959,6 +959,44 @@ def _scheduling_worker(now: datetime) -> UsageSyncWorker:
     return UsageSyncWorker(client, object(), now=lambda: now)
 
 
+def test_worker_prioritizes_refresh_queue_before_startup_snapshot(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class Store:
+        async def connect(self):
+            return None
+
+        async def heartbeat_worker(self, *_args, **_kwargs):
+            return None
+
+        async def update_worker_state(self, **_kwargs):
+            return None
+
+    client = type("Client", (), {"backends": []})()
+    worker = UsageSyncWorker(
+        client,
+        Store(),
+        now=lambda: datetime(2026, 8, 5, tzinfo=timezone.utc),
+    )
+
+    async def consume() -> bool:
+        calls.append("queue")
+        worker.stop_event.set()
+        return True
+
+    async def startup_days() -> int | None:
+        calls.append("startup")
+        return 2
+
+    monkeypatch.setattr(worker, "consume_refresh_requests", consume)
+    monkeypatch.setattr(worker, "startup_sync_days", startup_days)
+    monkeypatch.setattr(worker, "_heartbeat_loop", lambda: asyncio.sleep(0))
+
+    asyncio.run(worker.run())
+
+    assert calls == ["queue"]
+
+
 def test_refresh_account_identity_updates_history_rows() -> None:
     """身份回填的失败会被同步的 except 吞掉，这里直接跑通整条语句路径。"""
 
