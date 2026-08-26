@@ -735,10 +735,9 @@ class UsageRealtimeWorker:
 
     async def run_background_once(self, now: datetime) -> None:
         """Run at most one non-live task without delaying the next live cycle."""
-        queue_budget = max(
-            self.background_budget_seconds,
-            int(getattr(self, "refresh_queue_budget_seconds", 60)),
-        )
+        # Queue refreshes are resumable; never let one long upstream scan delay
+        # the next live polling cycle.
+        queue_budget = self.background_budget_seconds
         operations = (
             (lambda: self.settle_pending_windows(now), self.background_budget_seconds),
             (self.consume_refresh_requests, queue_budget),
