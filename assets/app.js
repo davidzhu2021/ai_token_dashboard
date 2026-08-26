@@ -846,7 +846,9 @@ function freshnessText(freshness) {
   if (freshness.verifiedThrough) {
     const verified = new Date(freshness.verifiedThrough);
     if (!Number.isNaN(verified.getTime())) {
-      const label = freshness.settlementState === "settled" ? "已核验截至" : "数据核验中，已核验截至";
+      const label = freshness.settlementState === "settled" && !(freshness.unsettledBackends || []).length
+        ? "已核验截至"
+        : "数据核验中，已核验截至";
       return `${label}：${verified.toLocaleString("zh-CN", { hour12: false })}`;
     }
   }

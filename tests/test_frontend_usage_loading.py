@@ -80,3 +80,12 @@ def test_billing_loads_share_in_flight_requests_and_use_short_ttl() -> None:
     assert "if (organizationBillingRequest && organizationBillingScopeKey === queryKey)" in organization
     assert "Date.now() - organizationBillingLoadedAt < ORGANIZATION_BILLING_CACHE_TTL_MS" in organization
     assert "organizationBillingRequest = request;" in organization
+
+
+def test_freshness_copy_reflects_verification_state() -> None:
+    source = app_js()
+    body = function_body(source, "function freshnessText(", "\nfunction usageStatusState(")
+
+    assert 'freshness.settlementState === "settled"' in body
+    assert 'freshness.unsettledBackends' in body
+    assert '"数据核验中，已核验截至"' in body

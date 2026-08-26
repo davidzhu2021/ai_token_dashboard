@@ -1175,20 +1175,45 @@ def attach_snapshot_freshness(
         latest_event = state.get("latestEventAt")
         verified_values = state.get("verifiedThrough") or {}
         verified_times: list[datetime] = []
+        verified_by_backend: dict[str, str] = {}
         if isinstance(verified_values, dict):
-            for value in verified_values.values():
+            for backend_id, value in verified_values.items():
                 try:
                     parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-                    verified_times.append(parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc))
+                    normalized = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+                    verified_times.append(normalized)
+                    verified_by_backend[str(backend_id)] = normalized.isoformat()
                 except (TypeError, ValueError):
                     continue
         verified_through = min(verified_times) if verified_times else None
         settlement_statuses = state.get("settlementStatuses") or {}
-        verifying_backends = sorted(
+        status_backends = sorted(
             str(backend_id)
             for backend_id, value in settlement_statuses.items()
             if isinstance(value, dict) and str(value.get("status") or "") not in {"", "settled"}
         )
+        configured_backends = set(usage_backend_ids())
+        now = datetime.now(timezone.utc)
+        settlement_threshold = max(
+            env_int("USAGE_REALTIME_SETTLEMENT_DELAY_SECONDS", 180),
+            env_int("USAGE_REALTIME_STALE_SECONDS", 30),
+        )
+        lagging_backends = set(status_backends)
+        for backend_id in configured_backends:
+            backend_status = settlement_statuses.get(backend_id)
+            if not isinstance(backend_status, dict) or str(backend_status.get("status") or "") != "settled":
+                lagging_backends.add(backend_id)
+            raw_value = verified_by_backend.get(backend_id)
+            if not raw_value:
+                lagging_backends.add(backend_id)
+                continue
+            try:
+                backend_verified = datetime.fromisoformat(raw_value)
+                if (now - backend_verified).total_seconds() > settlement_threshold:
+                    lagging_backends.add(backend_id)
+            except ValueError:
+                lagging_backends.add(backend_id)
+        all_backends_settled = bool(configured_backends) and not lagging_backends and configured_backends.issubset(verified_by_backend)
         if isinstance(latest_event, datetime):
             freshness["lastSyncedAt"] = latest_event.isoformat()
         freshness.update(
@@ -1213,12 +1238,13 @@ def attach_snapshot_freshness(
                 "backfillActive": bool(state.get("backfillActive")),
                 "backfillBackends": state.get("backfillBackends", []),
                 "verifiedThrough": verified_through.isoformat() if verified_through else None,
+                "verifiedThroughByBackend": verified_by_backend,
                 "verificationLagSeconds": (
                     max(0, int((datetime.now(timezone.utc) - verified_through).total_seconds()))
                     if verified_through else None
                 ),
-                "settlementState": "settled" if verified_through else "verifying",
-                "unsettledBackends": verifying_backends,
+                "settlementState": "settled" if all_backends_settled else "verifying",
+                "unsettledBackends": sorted(lagging_backends),
                 "settlementErrors": {
                     str(backend_id): str(value.get("error") or "")
                     for backend_id, value in settlement_statuses.items()

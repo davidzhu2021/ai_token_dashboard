@@ -589,23 +589,48 @@ class UsageRealtimeWorker:
         return datetime.combine(local_day, datetime.min.time(), tzinfo=local_tz).astimezone(timezone.utc)
 
     async def settle_pending_windows(self, now: datetime) -> None:
-        """Settle complete one-minute windows through the shared watermark."""
+        """Give every backend one independent settlement attempt per cycle."""
 
         target = self.settlement_target(now)
         if target <= self.settlement_day_start(target):
             return
         loader = getattr(self.store, "realtime_settlement", None)
+        backend_budget = max(
+            0.5,
+            self.background_budget_seconds / max(1, len(self.client.backends)),
+        )
         for backend in self.client.backends:
             state = await loader(backend.id) if callable(loader) else None
             start = (state or {}).get("verifiedThrough") or self.settlement_day_start(target)
             if not isinstance(start, datetime):
                 start = self.settlement_day_start(target)
             start = start.astimezone(timezone.utc).replace(second=0, microsecond=0)
-            while start < target:
-                end = min(start + timedelta(minutes=1), target)
-                if not await self.settle_and_advance(backend, start, end):
-                    break
-                start = end
+            if start >= target:
+                continue
+            end = min(start + timedelta(minutes=1), target)
+            try:
+                complete = await asyncio.wait_for(
+                    self.settle_and_advance(backend, start, end),
+                    timeout=backend_budget,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "settlement backend timed out backend=%s timeout_seconds=%s",
+                    backend.id,
+                    backend_budget,
+                )
+                set_status = getattr(self.realtime, "set_settlement_status", None)
+                if callable(set_status):
+                    await set_status(backend.id, "verifying", "settlement timed out")
+                continue
+            except Exception as exc:
+                logger.exception("settlement failed backend=%s", backend.id)
+                set_status = getattr(self.realtime, "set_settlement_status", None)
+                if callable(set_status):
+                    await set_status(backend.id, "verifying", exc.__class__.__name__)
+                continue
+            if not complete:
+                continue
 
     async def resettle_today(self, now: datetime | None = None) -> None:
         """Rebuild the current local day through closed, auditable windows."""

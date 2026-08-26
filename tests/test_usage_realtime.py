@@ -201,6 +201,66 @@ def test_settlement_target_stops_at_the_last_closed_minute() -> None:
     assert target == datetime(2026, 8, 13, 2, 2, tzinfo=timezone.utc)
 
 
+def _fair_settlement_worker(states, settle):
+    primary = BACKEND
+    her = LiteLLMBackend(
+        id="her", label="Her", base_url="http://her", admin_key="key"
+    )
+
+    class Client:
+        backends = [primary, her]
+
+    class Store:
+        async def realtime_settlement(self, backend_id):
+            return {"verifiedThrough": states[backend_id]}
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.client = Client()
+    worker.store = Store()
+    worker.realtime = None
+    worker.settlement_delay_seconds = 180
+    worker.background_budget_seconds = 1
+    worker.settle_and_advance = settle
+    return worker, primary, her
+
+
+def test_settlement_processes_at_most_one_window_per_backend() -> None:
+    calls = []
+    states = {
+        "primary": datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc),
+        "her": datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc),
+    }
+
+    async def settle(backend, start, end):
+        calls.append((backend.id, start, end))
+        return True
+
+    worker, _, _ = _fair_settlement_worker(states, settle)
+    asyncio.run(worker.settle_pending_windows(datetime(2026, 8, 13, 2, 5, tzinfo=timezone.utc)))
+
+    assert [item[0] for item in calls] == ["primary", "her"]
+    assert all((end - start) == timedelta(minutes=1) for _, start, end in calls)
+
+
+def test_settlement_timeout_for_one_backend_does_not_block_other() -> None:
+    calls = []
+    states = {
+        "primary": datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc),
+        "her": datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc),
+    }
+
+    async def settle(backend, start, end):
+        calls.append(backend.id)
+        if backend.id == "primary":
+            await asyncio.sleep(1)
+        return True
+
+    worker, _, _ = _fair_settlement_worker(states, settle)
+    asyncio.run(worker.settle_pending_windows(datetime(2026, 8, 13, 2, 5, tzinfo=timezone.utc)))
+
+    assert calls == ["primary", "her"]
+
+
 def test_dense_settlement_window_is_split_without_advancing_the_watermark() -> None:
     calls = []
 
