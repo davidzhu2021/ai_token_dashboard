@@ -283,7 +283,8 @@ USAGE_TIMEZONE_OFFSET_MINUTES=-480
 - `ADMIN_USAGE_PAGE_SIZE` 必须小于等于 100；想扩大日志覆盖范围时增加 `ADMIN_USAGE_LOG_MAX_PAGES`，不要增大单页大小。
 - `USAGE_SYNC_ENABLED=true` 时启用独立 PostgreSQL 聚合快照；数据库只保存按日期、账号、来源和模型聚合的 Token、请求、成功/失败及金额，不保存 API Key、提示词、响应正文或请求明细。
 - `USAGE_DATABASE_URL` 应填写应用容器可访问的 PostgreSQL 地址，例如 `postgresql://ai_dashboard:<password>@usage-db:5432/ai_usage`；`USAGE_DB_PASSWORD` 只用于 Compose 初始化数据库用户密码。
-- 用量同步由独立的 `usage-sync-worker` 容器负责，Web 容器以 `USAGE_SYNC_ROLE=reader` 只读快照，页面访问和手动刷新都不会触发上游查询。首次启动会回填 `USAGE_INITIAL_BACKFILL_DAYS`（默认 90）天，之后按 `USAGE_SYNC_INTERVAL_SECONDS`（默认 1800 秒）刷新最近 `USAGE_SYNC_RECENT_DAYS`（默认 2）天，并按 `USAGE_SYNC_CALIBRATION_INTERVAL_SECONDS`（默认 21600 秒）补跑最近 `USAGE_SYNC_CALIBRATION_DAYS`（默认 3）天校准。
+- 用量同步由独立的 `usage-sync-worker` 容器负责，实时核验由独立的 `usage-realtime-worker` 容器负责；Web 容器以 `USAGE_SYNC_ROLE=reader` 只读快照，页面访问和手动刷新都不会触发上游查询。刷新队列失败会按 `USAGE_REFRESH_RETRY_BASE_SECONDS` / `USAGE_REFRESH_RETRY_MAX_SECONDS` 退避重试。首次启动会回填 `USAGE_INITIAL_BACKFILL_DAYS`（默认 90）天，之后按 `USAGE_SYNC_INTERVAL_SECONDS`（默认 1800 秒）刷新最近 `USAGE_SYNC_RECENT_DAYS`（默认 2）天，并按 `USAGE_SYNC_CALIBRATION_INTERVAL_SECONDS`（默认 21600 秒）补跑最近 `USAGE_SYNC_CALIBRATION_DAYS`（默认 3 天）校准。
+- 实时结算查询使用独立的 `USAGE_REALTIME_SETTLEMENT_TIMEOUT_SECONDS`（默认 20 秒），可用 `USAGE_REALTIME_SETTLEMENT_TIMEOUT_PRIMARY_SECONDS` / `USAGE_REALTIME_SETTLEMENT_TIMEOUT_HER_SECONDS` 为不同上游设置超时；该超时不再复用实时后台任务的 5 秒调度预算。
 - 正常情况下看板数据允许最多 30 分钟延迟；超过 `USAGE_LIVE_REFRESH_MAX_AGE_SECONDS` 会在界面标记为同步中，`/api/health.usageSync` 在 worker 心跳超过 `USAGE_SYNC_HEARTBEAT_MAX_AGE_SECONDS`（默认 120 秒）或最近成功同步超过 `USAGE_SYNC_SUCCESS_MAX_AGE_SECONDS`（默认 3600 秒）时报告 degraded。
 - `USAGE_SYNC_ROLE=combined` 只用于本地单进程开发，此时同步仍在 Web 进程内按 `USAGE_SYNC_LOOKBACK_DAYS`（默认 3）天运行。
 

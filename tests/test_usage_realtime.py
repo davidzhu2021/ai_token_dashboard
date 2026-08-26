@@ -595,28 +595,6 @@ def test_history_backfill_window_is_bounded() -> None:
     assert bounded == (start, start + timedelta(hours=1))
 
 
-def test_background_queue_runs_when_settlement_times_out() -> None:
-    calls = []
-
-    async def slow_settlement(_now):
-        await asyncio.sleep(0.05)
-
-    async def consume_queue():
-        calls.append("queue")
-        return True
-
-    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
-    worker.background_budget_seconds = 0.01
-    worker.settle_pending_windows = slow_settlement
-    worker.consume_refresh_requests = consume_queue
-    worker.backfill_cost_aggregates = lambda: asyncio.sleep(0)
-    worker.backfill_once = lambda: asyncio.sleep(0)
-
-    asyncio.run(worker.run_background_once(datetime(2026, 8, 25, 8, 0, tzinfo=timezone.utc)))
-
-    assert calls == ["queue"]
-
-
 def test_background_settlement_runs_before_a_long_refresh_queue() -> None:
     calls = []
 
@@ -891,53 +869,115 @@ def test_realtime_worker_renews_lock_independently_of_work_loop(monkeypatch) -> 
     assert worker.stop_event.is_set()
 
 
-def test_realtime_worker_consumes_reader_refresh_queue() -> None:
-    class Store:
-        async def claim_refresh_requests(self, **_kwargs):
-            return [{"requestKey": "r1", "startDate": "2026-08-10", "endDate": "2026-08-14"}]
+def test_realtime_worker_does_not_schedule_reader_refresh_queue() -> None:
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    calls = []
+    worker.background_budget_seconds = 0.01
+    worker.settlement_timeout_seconds = 0.01
+    worker.settle_pending_windows = lambda _now: asyncio.sleep(0)
+    worker.backfill_cost_aggregates = lambda: asyncio.sleep(0)
+    worker.backfill_once = lambda: asyncio.sleep(0)
+    worker.consume_refresh_requests = lambda: calls.append("queue")
 
-        async def finish_refresh_requests(self, keys, *, success, error=""):
-            self.finished = (keys, success, error)
+    asyncio.run(worker.run_background_once(datetime(2026, 8, 25, tzinfo=timezone.utc)))
 
-    class Synchronizer:
-        async def sync(self, start_date, end_date):
-            self.range = (start_date, end_date)
-            return {"status": "ok"}
+    assert calls == []
+
+
+def test_realtime_background_operations_rotate_after_successful_settlement() -> None:
+    calls = []
+
+    async def settle(_now):
+        calls.append("settlement")
+
+    async def cost():
+        calls.append("cost")
+
+    async def backfill():
+        calls.append("backfill")
 
     worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
-    worker.store = Store()
-    worker.synchronizer = Synchronizer()
+    worker.background_budget_seconds = 1
+    worker.settlement_timeout_seconds = 20
+    worker.settle_pending_windows = settle
+    worker.backfill_cost_aggregates = cost
+    worker.backfill_once = backfill
 
-    assert asyncio.run(worker.consume_refresh_requests()) is True
-    assert worker.synchronizer.range == ("2026-08-10", "2026-08-14")
-    assert worker.store.finished == (["r1"], True, "")
+    asyncio.run(worker.run_background_once(datetime(2026, 8, 25, tzinfo=timezone.utc)))
+    asyncio.run(worker.run_background_once(datetime(2026, 8, 25, tzinfo=timezone.utc)))
+
+    assert calls == ["settlement", "cost"]
 
 
-def test_realtime_worker_releases_claim_when_refresh_is_cancelled() -> None:
-    class Store:
-        async def claim_refresh_requests(self, **_kwargs):
-            return [{"requestKey": "r1", "startDate": "2026-08-10", "endDate": "2026-08-14"}]
-
-        async def finish_refresh_requests(self, keys, *, success, error=""):
-            self.finished = (keys, success, error)
-
-    class Synchronizer:
-        async def sync(self, _start_date, _end_date):
-            raise asyncio.CancelledError()
-
+def test_realtime_background_work_is_scheduled_without_blocking_live_loop() -> None:
     worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
-    worker.store = Store()
-    worker.synchronizer = Synchronizer()
+    worker._background_task = None
+    worker.stop_event = asyncio.Event()
+    started = asyncio.Event()
+    release = asyncio.Event()
 
-    async def run():
-        try:
-            await worker.consume_refresh_requests()
-        except asyncio.CancelledError:
-            return
-        raise AssertionError("cancelled refresh should propagate")
+    async def slow_background(_now):
+        started.set()
+        await release.wait()
 
-    asyncio.run(run())
-    assert worker.store.finished == (["r1"], False, "CancelledError")
+    worker.run_background_once = slow_background
+
+    async def scenario():
+        await worker.schedule_background_once(
+            datetime(2026, 8, 25, tzinfo=timezone.utc)
+        )
+        await asyncio.wait_for(started.wait(), timeout=0.2)
+        assert worker._background_task is not None
+        assert not worker._background_task.done()
+        release.set()
+        await worker._background_task
+
+    asyncio.run(scenario())
+
+
+def test_settlement_timeout_can_be_overridden_per_backend(monkeypatch) -> None:
+    monkeypatch.setenv("USAGE_REALTIME_SETTLEMENT_TIMEOUT_HER_SECONDS", "31")
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.settlement_timeout_seconds = 20
+    her = LiteLLMBackend(id="her", label="Her", base_url="http://her", admin_key="key")
+
+    assert worker.settlement_timeout_for_backend(her) == 31
+    assert worker.settlement_timeout_for_backend(BACKEND) == 20
+
+
+def test_settlement_scan_logs_pages_duration_and_incomplete_reason(caplog) -> None:
+    class Client(IncrementalClient):
+        async def request_backend(self, backend, method, path, **kwargs):
+            self.requests.append(kwargs["params"])
+            return {"data": [{"request_id": "req-1"}], "total_pages": 2, "page": 1}
+
+    client = Client([])
+    with caplog.at_level("INFO", logger="ai-token-dashboard.litellm"):
+        events, complete = asyncio.run(
+            client.settled_events_from_logs(
+                datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc),
+                datetime(2026, 8, 13, 2, 1, tzinfo=timezone.utc),
+                BACKEND,
+                max_pages=2,
+            )
+        )
+
+    assert events == []
+    assert complete is False
+    assert "backend=primary" in caplog.text
+    assert "pages=2/2" in caplog.text
+    assert "complete=False" in caplog.text
+
+
+def test_settlement_timeout_uses_dedicated_timeout(monkeypatch) -> None:
+    monkeypatch.setenv("USAGE_REALTIME_SETTLEMENT_TIMEOUT_SECONDS", "18")
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.backend_timeout_seconds = 20
+    worker.background_budget_seconds = 5
+    worker.settlement_timeout_seconds = 18
+
+    assert worker.settlement_timeout_seconds == 18
+    assert worker.settlement_timeout_seconds > worker.background_budget_seconds
 
 
 def test_realtime_worker_waits_for_existing_lock(monkeypatch) -> None:

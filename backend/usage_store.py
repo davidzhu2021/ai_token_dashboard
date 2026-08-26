@@ -209,12 +209,14 @@ CREATE TABLE IF NOT EXISTS usage_refresh_requests (
     claimed_at TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
     attempts INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT NOT NULL DEFAULT ''
+    last_error TEXT NOT NULL DEFAULT '',
+    next_attempt_at TIMESTAMPTZ
 );
 ALTER TABLE usage_refresh_requests ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
 ALTER TABLE usage_refresh_requests ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
 ALTER TABLE usage_refresh_requests ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE usage_refresh_requests ADD COLUMN IF NOT EXISTS last_error TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_refresh_requests ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS usage_refresh_requests_pending_idx
     ON usage_refresh_requests (status, requested_at);
 
@@ -1220,8 +1222,8 @@ class UsageStore:
             """
             INSERT INTO usage_refresh_requests (
                 request_key, start_date, end_date, status, requested_at,
-                claimed_at, completed_at, attempts, last_error
-            ) VALUES ($1, $2::date, $3::date, 'pending', $4, NULL, NULL, 0, '')
+                claimed_at, completed_at, attempts, last_error, next_attempt_at
+            ) VALUES ($1, $2::date, $3::date, 'pending', $4, NULL, NULL, 0, '', NULL)
             ON CONFLICT (request_key) DO UPDATE SET
                 status=CASE
                     WHEN usage_refresh_requests.status='running'
@@ -1247,6 +1249,11 @@ class UsageStore:
                     WHEN usage_refresh_requests.status='running'
                     THEN usage_refresh_requests.last_error
                     ELSE ''
+                END,
+                next_attempt_at=CASE
+                    WHEN usage_refresh_requests.status='running'
+                    THEN usage_refresh_requests.next_attempt_at
+                    ELSE NULL
                 END
             """,
             request_key,
@@ -1269,7 +1276,7 @@ class UsageStore:
             WITH candidates AS (
                 SELECT request_key
                 FROM usage_refresh_requests
-                WHERE status='pending'
+                WHERE (status='pending' AND (next_attempt_at IS NULL OR next_attempt_at <= $1))
                    OR (status='running' AND claimed_at < $1::timestamptz - ($2::double precision * INTERVAL '1 second'))
                 ORDER BY requested_at
                 FOR UPDATE SKIP LOCKED
@@ -1277,7 +1284,7 @@ class UsageStore:
             )
             UPDATE usage_refresh_requests AS request
             SET status='running', claimed_at=$1, attempts=request.attempts + 1,
-                last_error=''
+                last_error='', next_attempt_at=NULL
             FROM candidates
             WHERE request.request_key=candidates.request_key
             RETURNING request.request_key, request.start_date, request.end_date,
@@ -1304,19 +1311,25 @@ class UsageStore:
         *,
         success: bool,
         error: str = "",
+        retry_after_seconds: int = 0,
     ) -> None:
         if not request_keys:
             return
         await self._require_pool().execute(
             """
             UPDATE usage_refresh_requests
-            SET status=$1, completed_at=$2, last_error=$3
+            SET status=$1, completed_at=$2, last_error=$3, next_attempt_at=$5
             WHERE request_key=ANY($4::text[])
             """,
             "completed" if success else "pending",
             datetime.now(timezone.utc) if success else None,
             str(error or "")[:2000],
             request_keys,
+            (
+                datetime.now(timezone.utc) + timedelta(seconds=max(0, int(retry_after_seconds)))
+                if not success and retry_after_seconds > 0
+                else None
+            ),
         )
 
     async def refresh_queue_status(self) -> dict[str, Any]:
@@ -1324,7 +1337,11 @@ class UsageStore:
             """
             SELECT COUNT(*) FILTER (WHERE status='pending') AS pending_count,
                    COUNT(*) FILTER (WHERE status='running') AS running_count,
-                   MIN(requested_at) FILTER (WHERE status IN ('pending', 'running')) AS oldest_requested_at
+                   MIN(requested_at) FILTER (WHERE status IN ('pending', 'running')) AS oldest_requested_at,
+                   MAX(attempts) FILTER (WHERE status IN ('pending', 'running')) AS max_attempts,
+                   MAX(claimed_at) FILTER (WHERE status IN ('pending', 'running')) AS last_attempted_at,
+                   (array_agg(last_error ORDER BY claimed_at DESC NULLS LAST)
+                       FILTER (WHERE status IN ('pending', 'running') AND last_error <> ''))[1] AS last_error
             FROM usage_refresh_requests
             """
         )
@@ -1332,6 +1349,9 @@ class UsageStore:
             "pendingCount": int((row or {}).get("pending_count") or 0),
             "runningCount": int((row or {}).get("running_count") or 0),
             "oldestRequestedAt": (row or {}).get("oldest_requested_at"),
+            "maxAttempts": int((row or {}).get("max_attempts") or 0),
+            "lastAttemptedAt": (row or {}).get("last_attempted_at"),
+            "lastError": str((row or {}).get("last_error") or ""),
         }
 
     async def snapshot_revision(
@@ -1388,6 +1408,7 @@ class UsageStore:
             "lastStartedAt": row["last_started_at"],
             "lastFinishedAt": row["last_finished_at"],
             "lastSuccessAt": row["last_success_at"],
+            "publishedAt": row["published_at"],
             "lastError": str(row["last_error"] or ""),
             "snapshotRevision": str(row["snapshot_revision"] or ""),
             "publishedAt": row["published_at"],

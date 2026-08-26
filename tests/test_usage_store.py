@@ -1494,6 +1494,7 @@ def test_health_reports_degraded_when_usage_database_is_unavailable(monkeypatch)
             return {"enabled": True, "connected": False, "status": "error", "error": "ConnectionError"}
 
     monkeypatch.setattr(main, "_usage_store", FakeStore())
+    monkeypatch.setattr(main, "local_data_mode", lambda: "real")
     monkeypatch.setattr(main, "_usage_sync_status", {"status": "error", "lastRun": "2026-07-22T00:00:00+00:00"})
     payload = asyncio.run(main.health())
     assert payload["status"] == "degraded"
@@ -1506,6 +1507,7 @@ def test_health_reports_degraded_when_one_backend_sync_fails(monkeypatch) -> Non
             return {"enabled": True, "connected": True, "status": "ok"}
 
     monkeypatch.setattr(main, "_usage_store", FakeStore())
+    monkeypatch.setattr(main, "local_data_mode", lambda: "real")
     monkeypatch.setattr(main, "_usage_sync_status", {"status": "partial", "lastRun": "2026-07-22T00:00:00+00:00"})
     payload = asyncio.run(main.health())
     assert payload["status"] == "degraded"

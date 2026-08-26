@@ -97,6 +97,33 @@ services:
       - .env
     environment:
       USAGE_SYNC_ROLE: worker
+      # Snapshot/refresh queue work runs independently from realtime polling.
+      USAGE_REALTIME_ENABLED: "false"
+      USAGE_REDIS_URL: ${USAGE_REDIS_URL:-redis://usage-redis:6379/0}
+      USAGE_DB_POOL_MIN_SIZE: ${USAGE_WORKER_DB_POOL_MIN_SIZE:-1}
+      USAGE_DB_POOL_MAX_SIZE: ${USAGE_WORKER_DB_POOL_MAX_SIZE:-3}
+    volumes:
+      - key-vault-data:/app/.data
+    depends_on:
+      usage-db:
+        condition: service_healthy
+      usage-redis:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+
+  usage-realtime-worker:
+    build:
+      context: .
+    image: ai-token-dashboard:latest
+    container_name: ai-token-dashboard-realtime
+    command: ["python", "-m", "backend.usage_worker"]
+    env_file:
+      - .env
+    environment:
+      USAGE_SYNC_ROLE: worker
+      USAGE_REALTIME_ENABLED: "true"
       USAGE_REDIS_URL: ${USAGE_REDIS_URL:-redis://usage-redis:6379/0}
       USAGE_DB_POOL_MIN_SIZE: ${USAGE_WORKER_DB_POOL_MIN_SIZE:-1}
       USAGE_DB_POOL_MAX_SIZE: ${USAGE_WORKER_DB_POOL_MAX_SIZE:-3}

@@ -6,7 +6,7 @@ from fastapi import HTTPException
 
 from backend import main
 from backend.usage_store import UsageStore
-from backend.usage_worker import UsageSyncWorker
+from backend.usage_worker import UsageSyncWorker, usage_worker_from_environment
 
 
 def test_reader_role_does_not_start_usage_sync(monkeypatch) -> None:
@@ -26,6 +26,7 @@ def test_reader_role_does_not_start_usage_sync(monkeypatch) -> None:
 
 def test_health_exposes_missing_reader_configuration(monkeypatch) -> None:
     monkeypatch.setenv("USAGE_SYNC_ROLE", "reader")
+    monkeypatch.setattr(main, "local_data_mode", lambda: "real")
     monkeypatch.delenv("USAGE_DATABASE_URL", raising=False)
     monkeypatch.delenv("USAGE_SYNC_ENABLED", raising=False)
     monkeypatch.delenv("USAGE_REALTIME_ENABLED", raising=False)
@@ -40,6 +41,7 @@ def test_health_exposes_missing_reader_configuration(monkeypatch) -> None:
 
 
 def test_worker_consumes_reader_refresh_queue(monkeypatch) -> None:
+    monkeypatch.setattr("backend.usage_worker.usage_today", lambda: date(2026, 8, 14))
     class Store:
         async def claim_refresh_requests(self, **_kwargs):
             return [{"requestKey": "r1", "startDate": "2026-08-10", "endDate": "2026-08-14"}]
@@ -53,7 +55,7 @@ def test_worker_consumes_reader_refresh_queue(monkeypatch) -> None:
     worker = UsageSyncWorker(client, store, now=lambda: now)
     calls = []
 
-    async def fake_sync(days):
+    async def fake_sync(days, **_kwargs):
         calls.append(days)
         return {"status": "ok"}
 
@@ -61,6 +63,148 @@ def test_worker_consumes_reader_refresh_queue(monkeypatch) -> None:
     assert asyncio.run(worker.consume_refresh_requests()) is True
     assert calls == [5]
     assert store.finished == (["r1"], True, "")
+
+
+def test_worker_merges_refresh_queue_to_earliest_start_and_latest_end(monkeypatch) -> None:
+    monkeypatch.setattr("backend.usage_worker.usage_today", lambda: date(2026, 8, 18))
+    class Store:
+        async def claim_refresh_requests(self, **_kwargs):
+            return [
+                {"requestKey": "r1", "startDate": "2026-08-10", "endDate": "2026-08-14", "attempts": 1},
+                {"requestKey": "r2", "startDate": "2026-08-12", "endDate": "2026-08-18", "attempts": 2},
+            ]
+
+        async def finish_refresh_requests(self, keys, *, success, error="", retry_after_seconds=0):
+            self.finished = (keys, success, error, retry_after_seconds)
+
+    now = datetime(2026, 8, 18, tzinfo=timezone.utc)
+    client = type("Client", (), {"backends": [type("Backend", (), {"id": "primary"})()]})()
+    store = Store()
+    worker = UsageSyncWorker(client, store, now=lambda: now)
+    calls = []
+
+    async def fake_sync(days, **_kwargs):
+        calls.append(days)
+        return {"status": "ok"}
+
+    worker._run_sync = fake_sync
+    assert asyncio.run(worker.consume_refresh_requests()) is True
+    assert calls == [9]
+    assert store.finished == (["r1", "r2"], True, "", 0)
+
+
+def test_worker_passes_merged_historical_end_date_to_sync(monkeypatch) -> None:
+    class Store:
+        async def claim_refresh_requests(self, **_kwargs):
+            return [{
+                "requestKey": "r1",
+                "startDate": "2026-08-10",
+                "endDate": "2026-08-14",
+                "attempts": 1,
+            }]
+
+        async def finish_refresh_requests(self, *_args, **_kwargs):
+            return None
+
+        async def update_worker_state(self, **_kwargs):
+            return None
+
+    client = type("Client", (), {"backends": []})()
+    worker = UsageSyncWorker(client, Store())
+    calls = []
+
+    async def fake_sync(_client, _store, days, _repository, _factory, *, end_date=None):
+        calls.append((days, end_date))
+        return {"status": "ok"}
+
+    monkeypatch.setattr("backend.usage_worker.run_sync_with_recent_refresh", fake_sync)
+    assert asyncio.run(worker.consume_refresh_requests()) is True
+    assert calls == [(5, "2026-08-14")]
+
+
+def test_partial_refresh_stays_pending_for_retry(monkeypatch) -> None:
+    class Store:
+        async def claim_refresh_requests(self, **_kwargs):
+            return [{"requestKey": "r1", "startDate": "2026-08-10", "endDate": "2026-08-14", "attempts": 1}]
+
+        async def update_worker_state(self, **_kwargs):
+            return None
+
+        async def finish_refresh_requests(self, keys, **kwargs):
+            self.finished = (keys, kwargs)
+
+    worker = UsageSyncWorker(type("Client", (), {"backends": []})(), Store())
+
+    async def partial(_days, **_kwargs):
+        return {"status": "partial", "errors": ["primary: incomplete"]}
+
+    worker._run_sync = partial
+    assert asyncio.run(worker.consume_refresh_requests()) is True
+    assert worker.store.finished[1]["success"] is False
+    assert worker.store.finished[1]["retry_after_seconds"] > 0
+
+
+def test_refresh_queue_does_not_truncate_ranges_longer_than_initial_backfill(monkeypatch) -> None:
+    monkeypatch.setenv("USAGE_INITIAL_BACKFILL_DAYS", "90")
+
+    class Store:
+        async def claim_refresh_requests(self, **_kwargs):
+            return [{"requestKey": "r1", "startDate": "2025-01-01", "endDate": "2026-08-14", "attempts": 1}]
+
+        async def update_worker_state(self, **_kwargs):
+            return None
+
+        async def finish_refresh_requests(self, *_args, **_kwargs):
+            return None
+
+    worker = UsageSyncWorker(type("Client", (), {"backends": []})(), Store())
+    calls = []
+
+    async def sync(days, **kwargs):
+        calls.append((days, kwargs["end_date"]))
+        return {"status": "ok"}
+
+    worker._run_sync = sync
+    asyncio.run(worker.consume_refresh_requests())
+    assert calls == [(591, "2026-08-14")]
+
+
+def test_worker_factory_disables_realtime_for_snapshot_queue_worker(monkeypatch) -> None:
+    monkeypatch.setenv("USAGE_REALTIME_ENABLED", "true")
+    monkeypatch.setenv("USAGE_SYNC_ROLE", "worker")
+
+    class Store:
+        pass
+
+    client = type("Client", (), {"backends": []})()
+    worker = usage_worker_from_environment(client, Store(), realtime=None)
+
+    assert isinstance(worker, UsageSyncWorker)
+
+
+def test_snapshot_worker_retries_cancelled_refresh_with_backoff(monkeypatch) -> None:
+    monkeypatch.setenv("USAGE_REFRESH_RETRY_BASE_SECONDS", "7")
+    monkeypatch.setenv("USAGE_REFRESH_RETRY_MAX_SECONDS", "60")
+
+    class Store:
+        async def claim_refresh_requests(self, **kwargs):
+            self.claim_kwargs = kwargs
+            return [{"requestKey": "r1", "startDate": "2026-08-10", "endDate": "2026-08-14"}]
+
+        async def finish_refresh_requests(self, keys, *, success, error="", retry_after_seconds=0):
+            self.finished = (keys, success, error, retry_after_seconds)
+
+    now = datetime(2026, 8, 14, tzinfo=timezone.utc)
+    client = type("Client", (), {"backends": [type("Backend", (), {"id": "primary"})()]})()
+    store = Store()
+    worker = UsageSyncWorker(client, store, now=lambda: now)
+
+    async def cancelled(_days, **_kwargs):
+        raise asyncio.CancelledError()
+
+    worker._run_sync = cancelled
+    assert asyncio.run(worker.consume_refresh_requests()) is True
+    assert store.finished == (["r1"], False, "CancelledError", 7)
 
 
 def test_snapshot_revision_is_part_of_usage_cache_keys() -> None:
@@ -528,12 +672,177 @@ def test_health_degrades_on_stale_worker_heartbeat(monkeypatch) -> None:
                 "lastError": "",
             }
 
+    monkeypatch.setattr(main, "local_data_mode", lambda: "real")
     monkeypatch.setattr(main, "_usage_store", Store())
     monkeypatch.setattr(main, "organization_real_enabled", lambda: False)
     payload = asyncio.run(main.health())
 
     assert payload["status"] == "degraded"
     assert payload["usageSync"]["status"] == "degraded"
+
+
+def test_health_uses_snapshot_published_at_not_realtime_heartbeat(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+
+    class Store:
+        async def health(self):
+            return {"enabled": True, "connected": True, "status": "ok"}
+
+        async def sync_state(self):
+            return {
+                "status": "idle",
+                "workerId": "realtime-worker",
+                "heartbeatAt": now,
+                "lastSuccessAt": now,
+                "publishedAt": now - timedelta(hours=2),
+                "lastStartedAt": None,
+                "lastFinishedAt": None,
+                "snapshotRevision": "rev",
+                "lastError": "",
+            }
+
+    monkeypatch.setenv("USAGE_SYNC_ROLE", "reader")
+    monkeypatch.setattr(main, "local_data_mode", lambda: "real")
+    monkeypatch.setattr(main, "_usage_store", Store())
+    monkeypatch.setattr(main, "organization_real_enabled", lambda: False)
+
+    payload = asyncio.run(main.health())
+
+    assert payload["usageSync"]["snapshotLagSeconds"] >= 7199
+
+
+def test_health_does_not_treat_last_success_as_snapshot_publish(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+
+    class Store:
+        async def health(self):
+            return {"enabled": True, "connected": True, "status": "ok"}
+
+        async def sync_state(self):
+            return {
+                "status": "idle",
+                "workerId": "realtime-worker",
+                "heartbeatAt": now,
+                "lastSuccessAt": now,
+                "publishedAt": None,
+                "lastStartedAt": None,
+                "lastFinishedAt": None,
+                "snapshotRevision": "",
+                "lastError": "",
+            }
+
+    monkeypatch.setenv("USAGE_SYNC_ROLE", "reader")
+    monkeypatch.setattr(main, "local_data_mode", lambda: "real")
+    monkeypatch.setattr(main, "_usage_store", Store())
+    monkeypatch.setattr(main, "organization_real_enabled", lambda: False)
+
+    payload = asyncio.run(main.health())
+
+    assert payload["usageSync"]["publishedAt"] is None
+    assert payload["usageSync"]["snapshotLagSeconds"] is None
+    assert payload["usageSync"]["status"] == "degraded"
+
+
+def test_health_refresh_queue_exposes_age_and_retry_metadata(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+
+    class Store:
+        async def health(self):
+            return {"enabled": True, "connected": True, "status": "ok"}
+
+        async def sync_state(self):
+            return {"status": "idle", "heartbeatAt": now, "publishedAt": now}
+
+        async def refresh_queue_status(self):
+            return {
+                "pendingCount": 10,
+                "runningCount": 1,
+                "oldestRequestedAt": now - timedelta(hours=2),
+                "maxAttempts": 691,
+                "lastAttemptedAt": now - timedelta(minutes=1),
+                "lastError": "CancelledError",
+            }
+
+    monkeypatch.setenv("USAGE_SYNC_ROLE", "reader")
+    monkeypatch.setattr(main, "local_data_mode", lambda: "real")
+    monkeypatch.setattr(main, "_usage_store", Store())
+    monkeypatch.setattr(main, "organization_real_enabled", lambda: False)
+
+    payload = asyncio.run(main.health())
+
+    queue = payload["usageRefreshQueue"]
+    assert queue["pendingCount"] == 10
+    assert queue["runningCount"] == 1
+    assert queue["maxAttempts"] == 691
+    assert queue["lastError"] == "CancelledError"
+    assert queue["oldestAgeSeconds"] >= 7199
+
+
+def test_health_marks_settled_status_with_stale_watermark_as_unsettled(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+
+    class Store:
+        async def health(self):
+            return {"enabled": True, "connected": True, "status": "ok"}
+
+        async def sync_state(self):
+            return {"status": "idle", "heartbeatAt": now, "publishedAt": now}
+
+    class Realtime:
+        async def connect(self):
+            return None
+
+        async def status(self):
+            return {
+                "ready": True,
+                "latestEventLagSeconds": 1,
+                "latestEventAt": now,
+                "verifiedThrough": {"primary": (now - timedelta(minutes=20)).isoformat()},
+                "settlementStatuses": {"primary": {"status": "settled", "error": ""}},
+            }
+
+    monkeypatch.setenv("USAGE_SYNC_ROLE", "reader")
+    monkeypatch.setenv("USAGE_REALTIME_ENABLED", "true")
+    monkeypatch.setattr(main, "realtime_enabled", lambda: True)
+    monkeypatch.setattr(main, "usage_backend_ids", lambda: ["primary"])
+    monkeypatch.setattr(main, "local_data_mode", lambda: "real")
+    monkeypatch.setattr(main, "_usage_store", Store())
+    monkeypatch.setattr(main, "_usage_realtime_store", Realtime())
+    monkeypatch.setattr(main, "organization_real_enabled", lambda: False)
+
+    payload = asyncio.run(main.health())
+
+    assert payload["settlement"]["unsettledBackends"] == ["primary"]
+
+
+def test_health_marks_configured_backend_without_settlement_state_as_unsettled(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+
+    class Store:
+        async def health(self):
+            return {"enabled": True, "connected": True, "status": "ok"}
+
+        async def sync_state(self):
+            return {"status": "idle", "heartbeatAt": now, "publishedAt": now}
+
+    class Realtime:
+        async def connect(self):
+            return None
+
+        async def status(self):
+            return {"ready": True, "latestEventLagSeconds": 1, "latestEventAt": now}
+
+    monkeypatch.setenv("USAGE_SYNC_ROLE", "reader")
+    monkeypatch.setattr(main, "realtime_enabled", lambda: True)
+    monkeypatch.setattr(main, "usage_backend_ids", lambda: ["primary", "her"])
+    monkeypatch.setattr(main, "local_data_mode", lambda: "real")
+    monkeypatch.setattr(main, "_usage_store", Store())
+    monkeypatch.setattr(main, "_usage_realtime_store", Realtime())
+    monkeypatch.setattr(main, "organization_real_enabled", lambda: False)
+
+    payload = asyncio.run(main.health())
+
+    assert payload["settlement"]["unsettledBackends"] == ["her", "primary"]
 
 
 def test_team_leader_scope_reports_multiple_teams() -> None:

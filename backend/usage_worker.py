@@ -25,6 +25,12 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _retry_delay_seconds(attempts: int) -> int:
+    base = max(1, _env_int("USAGE_REFRESH_RETRY_BASE_SECONDS", 30))
+    maximum = max(base, _env_int("USAGE_REFRESH_RETRY_MAX_SECONDS", 900))
+    return min(maximum, base * (2 ** max(0, min(8, attempts - 1))))
+
+
 class UsageSyncWorker:
     def __init__(
         self,
@@ -60,7 +66,9 @@ class UsageSyncWorker:
             except asyncio.TimeoutError:
                 continue
 
-    async def _run_sync(self, days: int) -> dict[str, Any]:
+    async def _run_sync(
+        self, days: int, *, end_date: str | date | None = None
+    ) -> dict[str, Any]:
         started_at = self.now()
         self._current_status = "running"
         await self.store.update_worker_state(
@@ -77,6 +85,7 @@ class UsageSyncWorker:
                 days,
                 self.repository,
                 UsageSynchronizer,
+                end_date=end_date,
             )
             if result.get("status") in {"ok", "partial"} and isinstance(
                 self.repository, PostgreSQLOrganizationRepository
@@ -140,15 +149,43 @@ class UsageSyncWorker:
             return False
         request_keys = [str(item["requestKey"]) for item in requests]
         earliest = min(date.fromisoformat(str(item["startDate"])) for item in requests)
-        days = max(1, (usage_today() - earliest).days + 1)
-        days = min(days, max(1, _env_int("USAGE_INITIAL_BACKFILL_DAYS", 90)))
-        result = await self._run_sync(days)
-        success = result.get("status") in {"ok", "partial"}
-        await finish(
-            request_keys,
-            success=success,
-            error="" if success else "; ".join(result.get("errors") or ["sync failed"]),
+        latest = max(
+            date.fromisoformat(str(item.get("endDate") or item["startDate"]))
+            for item in requests
         )
+        # One idempotent sync covers the complete union of claimed windows.
+        # Do not silently replace the requested end with today's date: historical
+        # refreshes are allowed to target a bounded past range.
+        days = max(1, (latest - earliest).days + 1)
+        attempts = max(int(item.get("attempts") or 1) for item in requests)
+        try:
+            result = await self._run_sync(days, end_date=latest.isoformat())
+            success = result.get("status") == "ok"
+            finish_kwargs = {
+                "success": success,
+                "error": "" if success else "; ".join(result.get("errors") or ["sync failed"]),
+            }
+            if not success:
+                finish_kwargs["retry_after_seconds"] = _retry_delay_seconds(attempts)
+            await finish(request_keys, **finish_kwargs)
+        except asyncio.CancelledError:
+            await asyncio.shield(
+                finish(
+                    request_keys,
+                    success=False,
+                    error="CancelledError",
+                    retry_after_seconds=_retry_delay_seconds(attempts),
+                )
+            )
+            return True
+        except Exception as exc:
+            await finish(
+                request_keys,
+                success=False,
+                error=exc.__class__.__name__,
+                retry_after_seconds=_retry_delay_seconds(attempts),
+            )
+            logger.exception("queued usage refresh failed")
         return True
 
     async def backfill_cost_aggregates(self) -> bool:
@@ -267,6 +304,29 @@ class UsageSyncWorker:
                 await self._heartbeat_task
 
 
+def usage_worker_from_environment(
+    client: LiteLLMClient,
+    store: UsageStore,
+    realtime: UsageRealtimeStore | None = None,
+    repository: Any | None = None,
+) -> Any:
+    """Build the worker selected by the process environment.
+
+    Compose runs realtime collection and snapshot refresh in separate services;
+    keeping the selection here makes the split explicit and testable.
+    """
+
+    if realtime_enabled() and realtime is not None:
+        return UsageRealtimeWorker(
+            client,
+            store,
+            realtime,
+            repository,
+            worker_id=new_worker_id(),
+        )
+    return UsageSyncWorker(client, store, repository)
+
+
 async def _main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     store = UsageStore.from_environment()
@@ -277,17 +337,7 @@ async def _main() -> None:
     if os.getenv("ORGANIZATION_MODE", "disabled").strip().lower() == "real":
         repository = PostgreSQLOrganizationRepository.from_environment()
     realtime = UsageRealtimeStore.from_environment()
-    worker: Any
-    if realtime_enabled() and realtime is not None:
-        worker = UsageRealtimeWorker(
-            client,
-            store,
-            realtime,
-            repository,
-            worker_id=new_worker_id(),
-        )
-    else:
-        worker = UsageSyncWorker(client, store, repository)
+    worker = usage_worker_from_environment(client, store, realtime, repository)
     try:
         await worker.run()
     finally:

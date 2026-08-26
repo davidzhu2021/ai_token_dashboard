@@ -5728,24 +5728,6 @@ async def debug_admin_usage_compare(
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     result: dict[str, Any] = {"status": "ok", "usageSync": {"status": "disabled"}}
-    realtime_store = usage_realtime_store()
-    if realtime_store is not None and realtime_enabled():
-        try:
-            await realtime_store.connect()
-            realtime_health = await realtime_store.status()
-            result["usageRealtime"] = {
-                "ready": bool(realtime_health.get("ready")),
-                "verifiedThrough": realtime_health.get("verifiedThrough", {}),
-                "settlementStatuses": realtime_health.get("settlementStatuses", {}),
-                "unsettledBackends": sorted(
-                    backend_id for backend_id, value in (realtime_health.get("settlementStatuses") or {}).items()
-                    if isinstance(value, dict) and value.get("status") not in {None, "", "settled"}
-                ),
-            }
-        except Exception:
-            logger.exception("usage realtime health check failed")
-            result["usageRealtime"] = {"status": "error"}
-            result["status"] = "degraded"
     reader_config = usage_reader_config_status()
     result["usageReaderConfig"] = reader_config
     if not reader_config["configured"] and not local_mock_enabled():
@@ -5849,14 +5831,18 @@ async def health() -> dict[str, Any]:
                 now = datetime.now(timezone.utc)
                 heartbeat = state.get("heartbeatAt")
                 last_success = state.get("lastSuccessAt")
+                # ``lastSuccessAt`` is a worker operation timestamp.  In realtime
+                # mode it may advance on every heartbeat, so only the durable
+                # snapshot publication timestamp is valid freshness evidence.
+                snapshot_published_at = state.get("publishedAt")
                 heartbeat_lag = (
                     max(0, int((now - heartbeat).total_seconds()))
                     if isinstance(heartbeat, datetime)
                     else None
                 )
                 snapshot_lag = (
-                    max(0, int((now - last_success).total_seconds()))
-                    if isinstance(last_success, datetime)
+                    max(0, int((now - snapshot_published_at).total_seconds()))
+                    if isinstance(snapshot_published_at, datetime)
                     else None
                 )
                 result["usageSync"] = {
@@ -5868,6 +5854,7 @@ async def health() -> dict[str, Any]:
                     "lastStartedAt": state["lastStartedAt"].isoformat() if isinstance(state.get("lastStartedAt"), datetime) else None,
                     "lastFinishedAt": state["lastFinishedAt"].isoformat() if isinstance(state.get("lastFinishedAt"), datetime) else None,
                     "lastSuccessAt": last_success.isoformat() if isinstance(last_success, datetime) else None,
+                    "publishedAt": snapshot_published_at.isoformat() if isinstance(snapshot_published_at, datetime) else None,
                     "snapshotLagSeconds": snapshot_lag,
                     "snapshotRevision": state.get("snapshotRevision"),
                     "lastError": state.get("lastError"),
@@ -5884,7 +5871,22 @@ async def health() -> dict[str, Any]:
             refresh_queue_status = getattr(store, "refresh_queue_status", None)
             if callable(refresh_queue_status):
                 try:
-                    result["usageRefreshQueue"] = await refresh_queue_status()
+                    queue = await refresh_queue_status()
+                    oldest = queue.get("oldestRequestedAt")
+                    attempted = queue.get("lastAttemptedAt")
+                    now = datetime.now(timezone.utc)
+                    if isinstance(oldest, datetime):
+                        if oldest.tzinfo is None:
+                            oldest = oldest.replace(tzinfo=timezone.utc)
+                        queue["oldestRequestedAt"] = oldest.isoformat()
+                        queue["oldestAgeSeconds"] = max(0, int((now - oldest).total_seconds()))
+                    else:
+                        queue["oldestAgeSeconds"] = None
+                    if isinstance(attempted, datetime):
+                        if attempted.tzinfo is None:
+                            attempted = attempted.replace(tzinfo=timezone.utc)
+                        queue["lastAttemptedAt"] = attempted.isoformat()
+                    result["usageRefreshQueue"] = queue
                 except Exception:
                     logger.exception("usage refresh queue health check failed")
                     result["usageRefreshQueue"] = {"status": "error", "errorCode": "SNAPSHOT_REFRESH_FAILED"}
@@ -5906,14 +5908,36 @@ async def health() -> dict[str, Any]:
             realtime_status = await realtime.status()
             lag = realtime_status.get("latestEventLagSeconds")
             stale_seconds = max(10, env_int("USAGE_REALTIME_STALE_SECONDS", 30))
+            settlement_delay = max(
+                60, env_int("USAGE_REALTIME_SETTLEMENT_DELAY_SECONDS", 180)
+            )
+            now = datetime.now(timezone.utc)
+            settlement_lags: dict[str, int | None] = {}
+            for backend_id, raw_value in (realtime_status.get("verifiedThrough") or {}).items():
+                try:
+                    verified = datetime.fromisoformat(str(raw_value).replace("Z", "+00:00"))
+                    if verified.tzinfo is None:
+                        verified = verified.replace(tzinfo=timezone.utc)
+                    settlement_lags[str(backend_id)] = max(0, int((now - verified).total_seconds()))
+                except (TypeError, ValueError):
+                    settlement_lags[str(backend_id)] = None
+            expected_backend_ids = {str(value) for value in usage_backend_ids()}
+            missing_settlement_backends = expected_backend_ids - set(settlement_lags)
+            for backend_id in missing_settlement_backends:
+                settlement_lags[backend_id] = None
+            max_settlement_lag = max(
+                (value for value in settlement_lags.values() if value is not None),
+                default=None,
+            )
             status = "ok"
             if (
                 not realtime_status.get("ready")
                 or realtime_status.get("backfillActive")
                 or (lag is not None and lag > stale_seconds)
+                or any(value is None or value > settlement_delay * 2 for value in settlement_lags.values())
             ):
                 status = "degraded"
-            if lag is not None and lag > 120:
+            if (lag is not None and lag > 120) or (max_settlement_lag is not None and max_settlement_lag > 600):
                 status = "unhealthy"
             result["usageRealtime"] = {
                 "status": status,
@@ -5929,10 +5953,36 @@ async def health() -> dict[str, Any]:
                 if isinstance(realtime_status.get("latestEventAt"), datetime)
                 else None,
                 "latestEventLagSeconds": lag,
+                "settlementLagSeconds": settlement_lags,
+                "maxSettlementLagSeconds": max_settlement_lag,
                 "pendingArchiveCount": realtime_status.get("pendingArchiveCount", 0),
                 "cursors": realtime_status.get("cursors", {}),
                 "backfillActive": bool(realtime_status.get("backfillActive")),
                 "backfillBackends": realtime_status.get("backfillBackends", []),
+            }
+            settlement_backends: dict[str, Any] = {}
+            backend_ids = expected_backend_ids | set(settlement_lags) | set(realtime_status.get("settlementStatuses") or {})
+            for backend_id in sorted(backend_ids):
+                raw_status = (realtime_status.get("settlementStatuses") or {}).get(backend_id) or {}
+                settlement_backends[backend_id] = {
+                    "verifiedThrough": (realtime_status.get("verifiedThrough") or {}).get(backend_id),
+                    "status": raw_status.get("status") if isinstance(raw_status, dict) else "verifying",
+                    "error": raw_status.get("error", "") if isinstance(raw_status, dict) else "",
+                    "lagSeconds": settlement_lags.get(backend_id),
+                }
+            result["settlement"] = {
+                "status": status,
+                "backends": settlement_backends,
+                "unsettledBackends": sorted(
+                    backend_id for backend_id, value in settlement_backends.items()
+                    if value.get("status") not in {None, "", "settled"}
+                    or value.get("verifiedThrough") is None
+                    or (
+                        value.get("lagSeconds") is not None
+                        and value["lagSeconds"] > settlement_delay * 2
+                    )
+                ),
+                "maxLagSeconds": max_settlement_lag,
             }
             if status != "ok":
                 result["status"] = status

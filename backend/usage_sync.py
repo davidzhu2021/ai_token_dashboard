@@ -1380,11 +1380,18 @@ async def run_sync_once(
     days: int,
     organization_repository: Any | None = None,
     synchronizer_factory: Any | None = None,
+    *,
+    end_date: str | date | None = None,
 ) -> dict[str, Any]:
-    start_date, end_date = UsageSynchronizer.date_range(days)
+    if end_date is None:
+        start_date, resolved_end_date = UsageSynchronizer.date_range(days)
+    else:
+        start_date, resolved_end_date = UsageSynchronizer.date_range(
+            days, date.fromisoformat(str(end_date))
+        )
     factory = synchronizer_factory or UsageSynchronizer
     return await factory(client, store, organization_repository).sync(
-        start_date, end_date
+        start_date, resolved_end_date
     )
 
 
@@ -1394,11 +1401,17 @@ async def run_sync_with_recent_refresh(
     days: int,
     organization_repository: Any | None = None,
     synchronizer_factory: Any | None = None,
+    *,
+    end_date: str | date | None = None,
 ) -> dict[str, Any]:
     """Refresh recent request logs after an efficient long aggregate backfill."""
 
     if organization_repository is None and synchronizer_factory is None:
-        result = await run_sync_once(client, store, days)
+        result = (
+            await run_sync_once(client, store, days)
+            if end_date is None
+            else await run_sync_once(client, store, days, end_date=end_date)
+        )
     else:
         result = await run_sync_once(
             client,
@@ -1406,6 +1419,7 @@ async def run_sync_with_recent_refresh(
             days,
             organization_repository,
             synchronizer_factory,
+            end_date=end_date,
         )
     if result.get("status") != "ok" or not _env_bool("USAGE_SYNC_LOG_TIMEZONE_ENABLED", True):
         return result
@@ -1417,7 +1431,11 @@ async def run_sync_with_recent_refresh(
     # Keep organization attribution enabled on both passes; otherwise the
     # accurate recent replacement can lose imported/managed token ownership.
     if organization_repository is None and synchronizer_factory is None:
-        recent_result = await run_sync_once(client, store, recent_days)
+        recent_result = (
+            await run_sync_once(client, store, recent_days)
+            if end_date is None
+            else await run_sync_once(client, store, recent_days, end_date=end_date)
+        )
     else:
         recent_result = await run_sync_once(
             client,
@@ -1425,6 +1443,7 @@ async def run_sync_with_recent_refresh(
             recent_days,
             organization_repository,
             synchronizer_factory,
+            end_date=end_date,
         )
     output = dict(result)
     output["recentRefresh"] = {"days": recent_days, **recent_result}

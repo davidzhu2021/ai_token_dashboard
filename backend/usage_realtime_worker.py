@@ -56,9 +56,11 @@ class UsageRealtimeWorker:
         self.background_budget_seconds = max(
             1, _env_int("USAGE_REALTIME_BACKGROUND_BUDGET_SECONDS", 5)
         )
-        self.refresh_queue_budget_seconds = max(
-            self.background_budget_seconds,
-            _env_int("USAGE_REFRESH_QUEUE_BUDGET_SECONDS", 60),
+        # Settlement is an upstream database query, so it must not inherit the
+        # short background scheduling budget.  The per-backend override is
+        # resolved when a window is attempted below.
+        self.settlement_timeout_seconds = max(
+            2, _env_int("USAGE_REALTIME_SETTLEMENT_TIMEOUT_SECONDS", 20)
         )
         self.overlap_seconds = max(
             1, _env_int("USAGE_REALTIME_OVERLAP_SECONDS", 60)
@@ -114,7 +116,22 @@ class UsageRealtimeWorker:
         self.current_day = usage_today()
         self._lock_renew_task: asyncio.Task[None] | None = None
         self._startup_member_sync_task: asyncio.Task[None] | None = None
+        self._background_task: asyncio.Task[None] | None = None
         self._lock_lost = asyncio.Event()
+        self._background_operation_index = 0
+
+    def settlement_timeout_for_backend(self, backend: LiteLLMBackend) -> float:
+        """Return the independent upstream timeout for one backend."""
+
+        default = max(2, float(getattr(self, "settlement_timeout_seconds", 20)))
+        suffix = "".join(char if char.isalnum() else "_" for char in backend.id.upper())
+        value = os.getenv(f"USAGE_REALTIME_SETTLEMENT_TIMEOUT_{suffix}_SECONDS")
+        if value is None:
+            return default
+        try:
+            return max(2.0, float(value))
+        except ValueError:
+            return default
 
     def realtime_poll_window(
         self, cursor: datetime | None, end_time: datetime
@@ -139,45 +156,6 @@ class UsageRealtimeWorker:
             start_time + timedelta(seconds=history_window),
         )
         return start_time, bounded_end
-
-    async def consume_refresh_requests(self) -> bool:
-        """Process durable reader refresh requests outside the API request path."""
-
-        claim = getattr(self.store, "claim_refresh_requests", None)
-        finish = getattr(self.store, "finish_refresh_requests", None)
-        if not callable(claim) or not callable(finish):
-            return False
-        requests = await claim(
-            limit=max(1, _env_int("USAGE_REFRESH_QUEUE_BATCH_SIZE", 10))
-        )
-        if not requests:
-            return False
-        request_keys = [str(item["requestKey"]) for item in requests]
-        start_date = min(str(item["startDate"]) for item in requests)
-        end_date = max(str(item["endDate"]) for item in requests)
-        try:
-            result = await self.synchronizer.sync(start_date, end_date)
-            success = result.get("status") in {"ok", "partial"}
-            await finish(
-                request_keys,
-                success=success,
-                error="" if success else "; ".join(result.get("errors") or ["sync failed"]),
-            )
-        except asyncio.CancelledError:
-            # The realtime loop may cancel this operation when its short
-            # background budget expires. Release the claim before propagating
-            # cancellation so the request can be retried instead of sticking
-            # in `running` forever.
-            await asyncio.shield(
-                finish(request_keys, success=False, error="CancelledError")
-            )
-            raise
-        except Exception as exc:
-            await finish(request_keys, success=False, error=exc.__class__.__name__)
-            logger.exception(
-                "realtime queued refresh failed start=%s end=%s", start_date, end_date
-            )
-        return True
 
     async def backfill_cost_aggregates(self) -> bool:
         next_range = getattr(self.store, "next_cost_api_backfill_range", None)
@@ -359,15 +337,6 @@ class UsageRealtimeWorker:
         return enriched
 
     async def recover(self) -> None:
-        started_at = datetime.now(timezone.utc)
-        await self.store.update_worker_state(
-            worker_id=self.worker_id,
-            status="recovering",
-            heartbeat_at=started_at,
-            last_started_at=started_at,
-            last_error="",
-        )
-
         await self.realtime.set_ready(False)
         # Persist any stream entries left pending by a previous worker before
         # rebuilding today's Redis aggregates from PostgreSQL.
@@ -413,19 +382,19 @@ class UsageRealtimeWorker:
             try:
                 await asyncio.wait_for(
                     self.resettle_today(datetime.now(timezone.utc)),
-                    timeout=self.background_budget_seconds,
+                    timeout=max(2, float(getattr(self, "settlement_timeout_seconds", 20))),
                 )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "HISTORICAL_BACKFILL_PARTIAL startup_resettle budget_seconds=%s",
-                    self.background_budget_seconds,
+                    "HISTORICAL_BACKFILL_PARTIAL startup_resettle timeout_seconds=%s",
+                    max(2, float(getattr(self, "settlement_timeout_seconds", 20))),
                 )
             except Exception:
                 logger.exception("SNAPSHOT_REFRESH_FAILED startup_resettle")
         try:
             await asyncio.wait_for(
                 self.settle_pending_windows(datetime.now(timezone.utc)),
-                timeout=self.background_budget_seconds,
+                timeout=max(2, float(getattr(self, "settlement_timeout_seconds", 20))),
             )
         except asyncio.TimeoutError:
             logger.warning(
@@ -441,15 +410,7 @@ class UsageRealtimeWorker:
         )
         await self.realtime.set_ready(True)
         finished_at = datetime.now(timezone.utc)
-        await self.store.update_worker_state(
-            worker_id=self.worker_id,
-            status="idle",
-            heartbeat_at=finished_at,
-            last_finished_at=finished_at,
-            last_success_at=finished_at,
-            snapshot_revision=str(await self.realtime.revision()),
-            last_error="",
-        )
+        logger.info("realtime worker recovered worker_id=%s finished_at=%s", self.worker_id, finished_at.isoformat())
 
     async def startup_member_snapshot_sync(self) -> None:
         """Refresh recent team membership snapshots without blocking live polling."""
@@ -595,10 +556,6 @@ class UsageRealtimeWorker:
         if target <= self.settlement_day_start(target):
             return
         loader = getattr(self.store, "realtime_settlement", None)
-        backend_budget = max(
-            0.5,
-            self.background_budget_seconds / max(1, len(self.client.backends)),
-        )
         for backend in self.client.backends:
             state = await loader(backend.id) if callable(loader) else None
             start = (state or {}).get("verifiedThrough") or self.settlement_day_start(target)
@@ -608,16 +565,17 @@ class UsageRealtimeWorker:
             if start >= target:
                 continue
             end = min(start + timedelta(minutes=1), target)
+            timeout_seconds = self.settlement_timeout_for_backend(backend)
             try:
                 complete = await asyncio.wait_for(
                     self.settle_and_advance(backend, start, end),
-                    timeout=backend_budget,
+                    timeout=timeout_seconds,
                 )
             except asyncio.TimeoutError:
                 logger.warning(
                     "settlement backend timed out backend=%s timeout_seconds=%s",
                     backend.id,
-                    backend_budget,
+                    timeout_seconds,
                 )
                 set_status = getattr(self.realtime, "set_settlement_status", None)
                 if callable(set_status):
@@ -734,17 +692,32 @@ class UsageRealtimeWorker:
         return inserted
 
     async def run_background_once(self, now: datetime) -> None:
-        """Run at most one non-live task without delaying the next live cycle."""
-        # Queue refreshes are resumable; never let one long upstream scan delay
-        # the next live polling cycle.
-        queue_budget = self.background_budget_seconds
+        """Run bounded background work with round-robin fairness.
+
+        Refresh requests intentionally do not belong to this worker.  Rotating
+        the starting operation prevents a successful settlement from starving
+        cost and historical backfill work forever.
+        """
         operations = (
-            (lambda: self.settle_pending_windows(now), self.background_budget_seconds),
-            (self.consume_refresh_requests, queue_budget),
-            (self.backfill_cost_aggregates, self.background_budget_seconds),
-            (self.backfill_once, self.background_budget_seconds),
+            (
+                lambda: self.settle_pending_windows(now),
+                max(2, float(getattr(self, "settlement_timeout_seconds", 20))),
+            ),
+            (
+                self.backfill_cost_aggregates,
+                max(1, float(getattr(self, "background_budget_seconds", 5))),
+            ),
+            (
+                self.backfill_once,
+                max(1, float(getattr(self, "background_budget_seconds", 5))),
+            ),
         )
-        for operation, budget_seconds in operations:
+        count = len(operations)
+        start_index = int(getattr(self, "_background_operation_index", 0)) % count
+        for offset in range(count):
+            index = (start_index + offset) % count
+            operation, budget_seconds = operations[index]
+            self._background_operation_index = (index + 1) % count
             try:
                 await asyncio.wait_for(
                     operation(), timeout=budget_seconds
@@ -763,6 +736,25 @@ class UsageRealtimeWorker:
                     getattr(operation, "__name__", "settlement"),
                 )
                 continue
+
+    async def schedule_background_once(self, now: datetime) -> None:
+        """Start one background pass without holding up live polling."""
+
+        task = getattr(self, "_background_task", None)
+        if task is not None and not task.done():
+            return
+
+        async def run_pass() -> None:
+            try:
+                await self.run_background_once(now)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("realtime background pass failed")
+
+        self._background_task = asyncio.create_task(
+            run_pass(), name="usage-realtime-background"
+        )
 
     async def run_live_once(self, now: datetime) -> None:
         """Poll every backend with hard isolation, then publish one mirror."""
@@ -909,16 +901,7 @@ class UsageRealtimeWorker:
                         except Exception:
                             logger.exception("REALTIME_RECONCILE_FAILED backend=%s", backend.id)
                     last_reconcile = now
-                await self.store.update_worker_state(
-                    worker_id=self.worker_id,
-                    status="idle",
-                    heartbeat_at=datetime.now(timezone.utc),
-                    last_finished_at=datetime.now(timezone.utc),
-                    last_success_at=datetime.now(timezone.utc),
-                    snapshot_revision=str(await self.realtime.revision()),
-                    last_error="",
-                )
-                await self.run_background_once(now)
+                await self.schedule_background_once(now)
                 try:
                     await asyncio.wait_for(
                         self.stop_event.wait(), timeout=self.poll_seconds
@@ -927,6 +910,14 @@ class UsageRealtimeWorker:
                     continue
         finally:
             self.stop_event.set()
+            background_task = getattr(self, "_background_task", None)
+            if background_task is not None:
+                background_task.cancel()
+                try:
+                    await background_task
+                except asyncio.CancelledError:
+                    pass
+                self._background_task = None
             if self._lock_renew_task is not None:
                 self._lock_renew_task.cancel()
                 try:

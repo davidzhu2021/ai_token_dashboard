@@ -3783,56 +3783,87 @@ class LiteLLMClient:
         """
         backend = backend or self.backends[0]
         await self._ensure_deployment_model_map(backend)
+        started_at = time.perf_counter()
+        pages_read = 0
+        total_pages = 0
+
+        def audit(*, complete: bool, failure: str = "") -> None:
+            logger.info(
+                "realtime settlement scan backend=%s duration_ms=%s pages=%s/%s complete=%s failure=%s",
+                backend.id,
+                round((time.perf_counter() - started_at) * 1000),
+                pages_read,
+                total_pages,
+                complete,
+                failure or "none",
+            )
+
         start_text = start_time.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         end_text = end_time.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        payload = await self.request_backend(
-            backend,
-            "GET",
-            "/spend/logs/v2",
-            params={
-                "start_date": start_text,
-                "end_date": end_text,
-                "page": 1,
-                "page_size": 100,
-                "sort_by": "startTime",
-                "sort_order": "asc",
-            },
-        )
-        total_pages = max(1, _as_int(_first(payload, "total_pages", "totalPages", default=1)))
-        if total_pages > max(1, max_pages):
-            return [], False
-        pages = [_records(payload)]
-        first_page_number = _as_int(_first(payload, "page", default=1))
-        if first_page_number != 1:
-            return [], False
-        for page in range(2, total_pages + 1):
-            response = await self.request_backend(
+        try:
+            payload = await self.request_backend(
                 backend,
                 "GET",
                 "/spend/logs/v2",
                 params={
                     "start_date": start_text,
                     "end_date": end_text,
-                    "page": page,
+                    "page": 1,
                     "page_size": 100,
                     "sort_by": "startTime",
                     "sort_order": "asc",
                 },
             )
+        except Exception as exc:
+            audit(complete=False, failure=f"{exc.__class__.__name__}:first_page")
+            raise
+        pages_read = 1
+        total_pages = max(1, _as_int(_first(payload, "total_pages", "totalPages", default=1)))
+        if total_pages > max(1, max_pages):
+            audit(complete=False, failure="max_pages_exceeded")
+            return [], False
+        pages = [_records(payload)]
+        first_page_number = _as_int(_first(payload, "page", default=1))
+        if first_page_number != 1:
+            audit(complete=False, failure="first_page_mismatch")
+            return [], False
+        for page in range(2, total_pages + 1):
+            try:
+                response = await self.request_backend(
+                    backend,
+                    "GET",
+                    "/spend/logs/v2",
+                    params={
+                        "start_date": start_text,
+                        "end_date": end_text,
+                        "page": page,
+                        "page_size": 100,
+                        "sort_by": "startTime",
+                        "sort_order": "asc",
+                    },
+                )
+            except Exception as exc:
+                audit(complete=False, failure=f"{exc.__class__.__name__}:page_{page}")
+                raise
+            pages_read += 1
             # The closed interval should have a stable shape. Treat any
             # discrepancy as incomplete and retry this interval later.
             if _as_int(_first(response, "total_pages", "totalPages", default=total_pages)) != total_pages:
+                audit(complete=False, failure=f"total_pages_drift:page_{page}")
                 return [], False
             if _as_int(_first(response, "page", default=page)) != page:
+                audit(complete=False, failure=f"page_number_mismatch:page_{page}")
                 return [], False
             # A non-final page must be full. A short/empty page here means the
             # upstream result changed while the scan was in flight.
             records = _records(response)
             if page < total_pages and len(records) < 100:
+                audit(complete=False, failure=f"short_page:page_{page}")
                 return [], False
             pages.append(records)
 
         if total_pages > 1 and len(pages[0]) < 100:
+            audit(complete=False, failure="short_page:page_1")
             return [], False
 
         events: list[dict[str, Any]] = []
@@ -3849,9 +3880,11 @@ class LiteLLMClient:
                     "_userId": self._log_raw_user(log) or "unattributed",
                 })
                 if not event["requestId"]:
+                    audit(complete=False, failure="missing_request_id")
                     return [], False
                 self._add_log_to_row(event, log)
                 events.append(event)
+        audit(complete=True)
         return events, True
 
     async def stability_rows_from_logs(
