@@ -88,7 +88,10 @@ redis.call('SADD', aggregate_index, aggregate_key)
 redis.call('EXPIRE', aggregate_index, ARGV[1])
 redis.call('SET', event_key, ARGV[23], 'EX', ARGV[1])
 local revision = redis.call('INCR', revision_key)
-redis.call('SET', latest_event_key, ARGV[24])
+local latest = redis.call('GET', latest_event_key)
+if latest == false or ARGV[24] > latest then
+  redis.call('SET', latest_event_key, ARGV[24])
+end
 if ARGV[25] == '1' then
   redis.call('XADD', stream_key, '*', 'event', ARGV[23])
 end

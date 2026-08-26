@@ -477,6 +477,13 @@ def test_usage_query_view_replaces_ready_day_instead_of_adding_it() -> None:
     assert "JOIN usage_realtime_state s ON s.usage_date=r.usage_date AND s.ready" in USAGE_SCHEMA
 
 
+def test_realtime_latest_event_watermark_never_moves_backward() -> None:
+    script = UsageRealtimeStore._INGEST_LUA
+
+    assert "local latest = redis.call('GET', latest_event_key)" in script
+    assert "if latest == false or ARGV[24] > latest then" in script
+
+
 def test_realtime_configuration_enables_postgres_history_store(monkeypatch) -> None:
     monkeypatch.setenv("USAGE_DATABASE_URL", "postgresql://unused")
     monkeypatch.setenv("USAGE_SYNC_ENABLED", "false")
