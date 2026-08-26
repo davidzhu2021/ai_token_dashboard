@@ -132,8 +132,18 @@ class UsageSyncWorker:
             history_start, history_end, self.backend_ids
         ):
             return initial_days
-        last_success = await self.store.latest_success_at()
-        if last_success is None or (self.now() - last_success).total_seconds() > stale_after:
+        snapshot_state = getattr(self.store, "snapshot_state", None)
+        published_at: datetime | None = None
+        if callable(snapshot_state):
+            state = await snapshot_state() or {}
+            raw_published_at = state.get("publishedAt")
+            if isinstance(raw_published_at, datetime):
+                published_at = raw_published_at
+        if published_at is None:
+            # Compatibility with pre-publication stores that only expose the
+            # worker operation timestamp.
+            published_at = await self.store.latest_success_at()
+        if published_at is None or (self.now() - published_at).total_seconds() > stale_after:
             return recent_days
         return None
 
@@ -144,7 +154,13 @@ class UsageSyncWorker:
         finish = getattr(self.store, "finish_refresh_requests", None)
         if not callable(claim) or not callable(finish):
             return False
-        requests = await claim(limit=max(1, _env_int("USAGE_REFRESH_QUEUE_BATCH_SIZE", 10)))
+        stale_after_seconds = max(
+            60, _env_int("USAGE_REFRESH_CLAIM_STALE_SECONDS", 900)
+        )
+        requests = await claim(
+            limit=max(1, _env_int("USAGE_REFRESH_QUEUE_BATCH_SIZE", 10)),
+            stale_after_seconds=stale_after_seconds,
+        )
         if not requests:
             return False
         request_keys = [str(item["requestKey"]) for item in requests]

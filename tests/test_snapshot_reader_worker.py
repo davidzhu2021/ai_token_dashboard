@@ -204,6 +204,7 @@ def test_snapshot_worker_retries_cancelled_refresh_with_backoff(monkeypatch) -> 
 
     worker._run_sync = cancelled
     assert asyncio.run(worker.consume_refresh_requests()) is True
+    assert store.claim_kwargs["stale_after_seconds"] == 900
     assert store.finished == (["r1"], False, "CancelledError", 7)
 
 
@@ -644,6 +645,27 @@ def test_worker_startup_uses_recent_refresh_when_snapshot_is_old(monkeypatch) ->
 
         async def latest_success_at(self):
             return now - timedelta(minutes=31)
+
+    client = type("Client", (), {"backends": [type("Backend", (), {"id": "primary"})()]})()
+    monkeypatch.setenv("USAGE_SYNC_STARTUP_MAX_AGE_SECONDS", "1800")
+    monkeypatch.setenv("USAGE_SYNC_RECENT_DAYS", "2")
+    worker = UsageSyncWorker(client, Store(), now=lambda: now)
+
+    assert asyncio.run(worker.startup_sync_days()) == 2
+
+
+def test_worker_startup_uses_snapshot_publication_not_worker_success(monkeypatch) -> None:
+    now = datetime(2026, 8, 5, 8, tzinfo=timezone.utc)
+
+    class Store:
+        async def has_complete_coverage(self, *_args):
+            return True
+
+        async def latest_success_at(self):
+            return now - timedelta(minutes=5)
+
+        async def snapshot_state(self):
+            return {"publishedAt": now - timedelta(hours=2)}
 
     client = type("Client", (), {"backends": [type("Backend", (), {"id": "primary"})()]})()
     monkeypatch.setenv("USAGE_SYNC_STARTUP_MAX_AGE_SECONDS", "1800")
