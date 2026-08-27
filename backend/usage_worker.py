@@ -51,6 +51,52 @@ class UsageSyncWorker:
         self._heartbeat_task: asyncio.Task[Any] | None = None
         self._current_status = "starting"
 
+    async def _realtime_settlement_lagging(self) -> bool:
+        """Yield to the realtime worker while its verification watermark is behind."""
+        if os.getenv("USAGE_REFRESH_REALTIME_GUARD_ENABLED", "false").strip().lower() not in {"1", "true", "yes", "on"}:
+            return False
+        realtime = getattr(self, "realtime", None)
+        owns_realtime = False
+        if realtime is None and os.getenv("USAGE_REDIS_URL", "").strip():
+            try:
+                realtime = UsageRealtimeStore(os.getenv("USAGE_REDIS_URL", "").strip())
+                owns_realtime = True
+            except Exception:
+                return False
+        if realtime is None:
+            return False
+        try:
+            await realtime.connect()
+            state = await realtime.status()
+            threshold = max(60, _env_int("USAGE_REFRESH_DEFER_SETTLEMENT_LAG_SECONDS", 120))
+            statuses = state.get("settlementStatuses") or {}
+            if any(
+                isinstance(value, dict) and str(value.get("status") or "") not in {"", "settled"}
+                for value in statuses.values()
+            ):
+                return True
+            verified = state.get("verifiedThrough") or {}
+            now = self.now()
+            for value in verified.values() if isinstance(verified, dict) else ():
+                try:
+                    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    if (now - parsed).total_seconds() > threshold:
+                        return True
+                except (TypeError, ValueError):
+                    return True
+            return False
+        except Exception:
+            # A Redis outage must not prevent the durable snapshot worker from recovering.
+            return False
+        finally:
+            if owns_realtime:
+                try:
+                    await realtime.close()
+                except Exception:
+                    pass
+
     @property
     def backend_ids(self) -> list[str]:
         return [backend.id for backend in self.client.backends]
@@ -155,6 +201,9 @@ class UsageSyncWorker:
         finish = getattr(self.store, "finish_refresh_requests", None)
         if not callable(claim) or not callable(finish):
             return False
+        if await self._realtime_settlement_lagging():
+            logger.warning("deferring queued usage refresh while realtime settlement is lagging")
+            return False
         stale_after_seconds = max(
             60, _env_int("USAGE_REFRESH_CLAIM_STALE_SECONDS", 300)
         )
@@ -200,7 +249,11 @@ class UsageSyncWorker:
             )
 
         try:
-            result = await self._run_sync(days, end_date=latest.isoformat())
+            timeout_seconds = max(1, _env_int("USAGE_REFRESH_TASK_TIMEOUT_SECONDS", 900))
+            result = await asyncio.wait_for(
+                self._run_sync(days, end_date=latest.isoformat()),
+                timeout=timeout_seconds,
+            )
             success = result.get("status") == "ok"
             finish_kwargs = {
                 "success": success,
@@ -368,7 +421,10 @@ def usage_worker_from_environment(
             repository,
             worker_id=new_worker_id(),
         )
-    return UsageSyncWorker(client, store, repository)
+    worker = UsageSyncWorker(client, store, repository)
+    # Snapshot workers use this object only for the realtime lag guard.
+    worker.realtime = realtime
+    return worker
 
 
 async def _main() -> None:
@@ -380,7 +436,9 @@ async def _main() -> None:
     repository = None
     if os.getenv("ORGANIZATION_MODE", "disabled").strip().lower() == "real":
         repository = PostgreSQLOrganizationRepository.from_environment()
-    realtime = UsageRealtimeStore.from_environment()
+    # The snapshot worker only reads realtime health, but still needs the
+    # shared Redis status object to yield while settlement is backlogged.
+    realtime = UsageRealtimeStore.from_environment(allow_disabled=True)
     worker = usage_worker_from_environment(client, store, realtime, repository)
     try:
         await worker.run()

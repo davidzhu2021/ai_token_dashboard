@@ -242,6 +242,23 @@ def test_settlement_processes_at_most_one_window_per_backend() -> None:
     assert all((end - start) == timedelta(minutes=1) for _, start, end in calls)
 
 
+def test_settlement_can_catch_up_multiple_windows_per_backend(monkeypatch) -> None:
+    calls = []
+    states = {"primary": datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc)}
+
+    async def settle(backend, start, end):
+        calls.append((backend.id, start, end))
+        return True
+
+    worker, primary, _ = _fair_settlement_worker(states, settle)
+    worker.client.backends = [primary]
+    worker.settlement_windows_per_cycle = 3
+    asyncio.run(worker.settle_pending_windows(datetime(2026, 8, 13, 2, 5, tzinfo=timezone.utc)))
+
+    assert len(calls) == 2
+    assert calls[-1][2] == datetime(2026, 8, 13, 2, 2, tzinfo=timezone.utc)
+
+
 def test_settlement_timeout_for_one_backend_does_not_block_other() -> None:
     calls = []
     states = {

@@ -99,6 +99,7 @@ services:
       USAGE_SYNC_ROLE: worker
       # Snapshot/refresh queue work runs independently from realtime polling.
       USAGE_REALTIME_ENABLED: "false"
+      USAGE_REFRESH_REALTIME_GUARD_ENABLED: "true"
       USAGE_REDIS_URL: ${USAGE_REDIS_URL:-redis://usage-redis:6379/0}
       USAGE_DB_POOL_MIN_SIZE: ${USAGE_WORKER_DB_POOL_MIN_SIZE:-1}
       USAGE_DB_POOL_MAX_SIZE: ${USAGE_WORKER_DB_POOL_MAX_SIZE:-3}
@@ -124,6 +125,9 @@ services:
     environment:
       USAGE_SYNC_ROLE: worker
       USAGE_REALTIME_ENABLED: "true"
+      # Keep realtime settlement ahead of historical refresh work while
+      # bounding each loop's upstream load.
+      USAGE_REALTIME_SETTLEMENT_WINDOWS_PER_CYCLE: ${USAGE_REALTIME_SETTLEMENT_WINDOWS_PER_CYCLE:-3}
       USAGE_REDIS_URL: ${USAGE_REDIS_URL:-redis://usage-redis:6379/0}
       USAGE_DB_POOL_MIN_SIZE: ${USAGE_WORKER_DB_POOL_MIN_SIZE:-1}
       USAGE_DB_POOL_MAX_SIZE: ${USAGE_WORKER_DB_POOL_MAX_SIZE:-3}

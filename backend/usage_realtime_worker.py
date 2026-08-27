@@ -110,6 +110,9 @@ class UsageRealtimeWorker:
         self.settlement_delay_seconds = max(60, _env_int("USAGE_REALTIME_SETTLEMENT_DELAY_SECONDS", 180))
         self.settlement_max_pages = max(1, _env_int("USAGE_REALTIME_SETTLEMENT_MAX_PAGES", 20))
         self.settlement_min_window_seconds = max(1, _env_int("USAGE_REALTIME_SETTLEMENT_MIN_WINDOW_SECONDS", 5))
+        self.settlement_windows_per_cycle = max(
+            1, _env_int("USAGE_REALTIME_SETTLEMENT_WINDOWS_PER_CYCLE", 1)
+        )
         self.directory: dict[str, Any] = {}
         self.token_maps: dict[str, dict[Any, Any]] = {}
         self.team_by_user: dict[tuple[str, str], tuple[str, str]] = {}
@@ -564,31 +567,35 @@ class UsageRealtimeWorker:
             start = start.astimezone(timezone.utc).replace(second=0, microsecond=0)
             if start >= target:
                 continue
-            end = min(start + timedelta(minutes=1), target)
             timeout_seconds = self.settlement_timeout_for_backend(backend)
-            try:
-                complete = await asyncio.wait_for(
-                    self.settle_and_advance(backend, start, end),
-                    timeout=timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "settlement backend timed out backend=%s timeout_seconds=%s",
-                    backend.id,
-                    timeout_seconds,
-                )
-                set_status = getattr(self.realtime, "set_settlement_status", None)
-                if callable(set_status):
-                    await set_status(backend.id, "verifying", "settlement timed out")
-                continue
-            except Exception as exc:
-                logger.exception("settlement failed backend=%s", backend.id)
-                set_status = getattr(self.realtime, "set_settlement_status", None)
-                if callable(set_status):
-                    await set_status(backend.id, "verifying", exc.__class__.__name__)
-                continue
-            if not complete:
-                continue
+            for _ in range(max(1, getattr(self, "settlement_windows_per_cycle", 1))):
+                if start >= target:
+                    break
+                end = min(start + timedelta(minutes=1), target)
+                try:
+                    complete = await asyncio.wait_for(
+                        self.settle_and_advance(backend, start, end),
+                        timeout=timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "settlement backend timed out backend=%s timeout_seconds=%s",
+                        backend.id,
+                        timeout_seconds,
+                    )
+                    set_status = getattr(self.realtime, "set_settlement_status", None)
+                    if callable(set_status):
+                        await set_status(backend.id, "verifying", "settlement timed out")
+                    break
+                except Exception as exc:
+                    logger.exception("settlement failed backend=%s", backend.id)
+                    set_status = getattr(self.realtime, "set_settlement_status", None)
+                    if callable(set_status):
+                        await set_status(backend.id, "verifying", exc.__class__.__name__)
+                    break
+                if not complete:
+                    break
+                start = end
 
     async def resettle_today(self, now: datetime | None = None) -> None:
         """Rebuild the current local day through closed, auditable windows."""

@@ -116,8 +116,8 @@ return {1, revision}
         self._connected = False
 
     @classmethod
-    def from_environment(cls) -> UsageRealtimeStore | None:
-        if not realtime_enabled():
+    def from_environment(cls, *, allow_disabled: bool = False) -> UsageRealtimeStore | None:
+        if not realtime_enabled() and not (allow_disabled and os.getenv("USAGE_REDIS_URL", "").strip()):
             return None
         return cls(os.getenv("USAGE_REDIS_URL", "").strip())
 

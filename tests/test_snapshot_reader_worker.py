@@ -1024,6 +1024,56 @@ def test_worker_prioritizes_refresh_queue_before_startup_snapshot(monkeypatch) -
     assert calls == ["queue"]
 
 
+def test_refresh_queue_timeout_returns_request_to_pending(monkeypatch) -> None:
+    calls = []
+
+    class Store:
+        async def claim_refresh_requests(self, **_kwargs):
+            return [{"requestKey": "r1", "startDate": "2026-08-01", "endDate": "2026-08-03", "attempts": 1}]
+
+        async def finish_refresh_requests(self, keys, **kwargs):
+            calls.append((keys, kwargs))
+
+        async def update_worker_state(self, **_kwargs):
+            pass
+
+    worker = UsageSyncWorker(type("Client", (), {"backends": []})(), Store())
+    monkeypatch.setenv("USAGE_REFRESH_TASK_TIMEOUT_SECONDS", "1")
+
+    async def slow_sync(*_args, **_kwargs):
+        await asyncio.sleep(2)
+
+    worker._run_sync = slow_sync
+
+    assert asyncio.run(worker.consume_refresh_requests()) is True
+    assert calls[0][0] == ["r1"]
+    assert calls[0][1]["success"] is False
+    assert calls[0][1]["error"] == "TimeoutError"
+
+
+def test_refresh_queue_defers_when_realtime_settlement_is_lagging(monkeypatch) -> None:
+    class Store:
+        async def claim_refresh_requests(self, **_kwargs):
+            raise AssertionError("refresh must be deferred before claiming work")
+
+        async def finish_refresh_requests(self, *_args, **_kwargs):
+            pass
+
+    class Realtime:
+        async def connect(self):
+            pass
+
+        async def status(self):
+            return {"ready": True, "latestEventLagSeconds": 10, "settlementStatuses": {"primary": {"status": "verifying"}}}
+
+    worker = UsageSyncWorker(type("Client", (), {"backends": []})(), Store())
+    monkeypatch.setenv("USAGE_REFRESH_REALTIME_GUARD_ENABLED", "true")
+    monkeypatch.setenv("USAGE_REFRESH_DEFER_SETTLEMENT_LAG_SECONDS", "60")
+    worker.realtime = Realtime()
+
+    assert asyncio.run(worker.consume_refresh_requests()) is False
+
+
 def test_refresh_account_identity_updates_history_rows() -> None:
     """身份回填的失败会被同步的 except 吞掉，这里直接跑通整条语句路径。"""
 
