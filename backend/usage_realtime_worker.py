@@ -350,9 +350,18 @@ class UsageRealtimeWorker:
         rows = await self.store.realtime_recovery_rows(today)
         for row in rows:
             await self.realtime.seed_aggregate(str(row["backendId"]), row)
-        request_ids = await self.store.realtime_request_ids(
-            datetime.now(timezone.utc) - timedelta(days=3)
-        )
+        # Restore the full Redis deduplication retention window.  Narrowing this
+        # to today would let a restart replay older events into live aggregates.
+        # The indexed query remains bounded in time, and timeout degrades only
+        # the dedup warmup rather than killing the worker.
+        try:
+            request_ids = await self.store.realtime_request_ids(
+                datetime.now(timezone.utc)
+                - timedelta(seconds=max(3600, int(getattr(self.realtime, "ttl_seconds", 259200))))
+            )
+        except TimeoutError:
+            logger.warning("REALTIME_RECOVERY_DEGRADED request_id_restore_timeout")
+            request_ids = []
         await self.realtime.seed_request_ids(request_ids)
         # Directory names are already durable in PostgreSQL; refresh them
         # after the realtime cursor is running so a slow upstream directory
@@ -552,50 +561,62 @@ class UsageRealtimeWorker:
         local_day = target.astimezone(local_tz).date()
         return datetime.combine(local_day, datetime.min.time(), tzinfo=local_tz).astimezone(timezone.utc)
 
+    async def _settle_backend_pending_windows(self, backend: LiteLLMBackend, target: datetime) -> None:
+        """Advance one backend without allowing another backend to block it."""
+        loader = getattr(self.store, "realtime_settlement", None)
+        state = await loader(backend.id) if callable(loader) else None
+        start = (state or {}).get("verifiedThrough") or self.settlement_day_start(target)
+        if not isinstance(start, datetime):
+            start = self.settlement_day_start(target)
+        start = start.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        if start >= target:
+            return
+        timeout_seconds = self.settlement_timeout_for_backend(backend)
+        for _ in range(max(1, getattr(self, "settlement_windows_per_cycle", 1))):
+            if start >= target:
+                break
+            end = min(start + timedelta(minutes=1), target)
+            try:
+                complete = await asyncio.wait_for(
+                    self.settle_and_advance(backend, start, end),
+                    timeout=timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("settlement backend timed out backend=%s timeout_seconds=%s", backend.id, timeout_seconds)
+                set_status = getattr(self.realtime, "set_settlement_status", None)
+                if callable(set_status):
+                    await set_status(backend.id, "verifying", "settlement timed out")
+                break
+            except Exception as exc:
+                logger.exception("settlement failed backend=%s", backend.id)
+                set_status = getattr(self.realtime, "set_settlement_status", None)
+                if callable(set_status):
+                    await set_status(backend.id, "verifying", exc.__class__.__name__)
+                break
+            if not complete:
+                break
+            start = end
+
     async def settle_pending_windows(self, now: datetime) -> None:
-        """Give every backend one independent settlement attempt per cycle."""
+        """Give each backend an isolated settlement task per cycle."""
 
         target = self.settlement_target(now)
         if target <= self.settlement_day_start(target):
             return
-        loader = getattr(self.store, "realtime_settlement", None)
-        for backend in self.client.backends:
-            state = await loader(backend.id) if callable(loader) else None
-            start = (state or {}).get("verifiedThrough") or self.settlement_day_start(target)
-            if not isinstance(start, datetime):
-                start = self.settlement_day_start(target)
-            start = start.astimezone(timezone.utc).replace(second=0, microsecond=0)
-            if start >= target:
-                continue
-            timeout_seconds = self.settlement_timeout_for_backend(backend)
-            for _ in range(max(1, getattr(self, "settlement_windows_per_cycle", 1))):
-                if start >= target:
-                    break
-                end = min(start + timedelta(minutes=1), target)
-                try:
-                    complete = await asyncio.wait_for(
-                        self.settle_and_advance(backend, start, end),
-                        timeout=timeout_seconds,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "settlement backend timed out backend=%s timeout_seconds=%s",
-                        backend.id,
-                        timeout_seconds,
-                    )
-                    set_status = getattr(self.realtime, "set_settlement_status", None)
-                    if callable(set_status):
-                        await set_status(backend.id, "verifying", "settlement timed out")
-                    break
-                except Exception as exc:
-                    logger.exception("settlement failed backend=%s", backend.id)
-                    set_status = getattr(self.realtime, "set_settlement_status", None)
-                    if callable(set_status):
-                        await set_status(backend.id, "verifying", exc.__class__.__name__)
-                    break
-                if not complete:
-                    break
-                start = end
+        results = await asyncio.gather(
+            *(
+                self._settle_backend_pending_windows(backend, target)
+                for backend in self.client.backends
+            ),
+            return_exceptions=True,
+        )
+        for backend, result in zip(self.client.backends, results):
+            if isinstance(result, BaseException):
+                logger.exception(
+                    "settlement backend task failed backend=%s",
+                    backend.id,
+                    exc_info=(type(result), result, result.__traceback__),
+                )
 
     async def resettle_today(self, now: datetime | None = None) -> None:
         """Rebuild the current local day through closed, auditable windows."""

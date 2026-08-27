@@ -278,6 +278,38 @@ def test_settlement_timeout_for_one_backend_does_not_block_other() -> None:
     assert calls == ["primary", "her"]
 
 
+def test_settlement_backends_run_concurrently_when_one_is_slow() -> None:
+    completed = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+    states = {
+        "primary": datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc),
+        "her": datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc),
+    }
+
+    async def settle(backend, _start, _end):
+        if backend.id == "primary":
+            started.set()
+            await release.wait()
+        completed.append(backend.id)
+        return True
+
+    worker, _, _ = _fair_settlement_worker(states, settle)
+
+    async def scenario():
+        task = asyncio.create_task(
+            worker.settle_pending_windows(datetime(2026, 8, 13, 2, 5, tzinfo=timezone.utc))
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        release.set()
+        await task
+
+    asyncio.run(scenario())
+
+    assert completed.index("her") < completed.index("primary")
+
+
 def test_dense_settlement_window_is_split_without_advancing_the_watermark() -> None:
     calls = []
 
@@ -399,6 +431,7 @@ def test_publish_mirror_uses_the_durable_request_audit_rows() -> None:
     worker.store = Store()
     worker.realtime = Realtime()
     worker.current_day = date(2026, 8, 13)
+    worker.realtime.ttl_seconds = 259200
 
     asyncio.run(worker.publish_mirror())
 
@@ -441,6 +474,113 @@ def test_recovery_discards_legacy_page_backfill_checkpoints() -> None:
     asyncio.run(worker.recover())
 
     assert cleared == ["primary"]
+
+
+def test_recovery_tolerates_request_id_restore_timeout() -> None:
+    calls = []
+
+    class Realtime:
+        async def set_ready(self, *_args): return None
+        async def clear_day(self, *_args): return None
+        async def seed_aggregate(self, *_args): return None
+        async def seed_request_ids(self, *_args): calls.append("seed")
+        async def clear_backfill_checkpoint(self, _backend_id): return None
+        async def cursor(self, _backend_id): return None
+        async def status(self): return {"revision": 1, "latestEventAt": None}
+
+    class Store:
+        async def realtime_recovery_rows(self, *_args): return []
+        async def realtime_request_ids(self, *_args):
+            raise TimeoutError("database statement timeout")
+        async def latest_archived_event_at(self, *_args): return None
+        async def realtime_event_rows(self, *_args): return []
+        async def replace_realtime_aggregates(self, *_args): return None
+        async def publish_realtime_state(self, *_args, **_kwargs): return None
+        async def publish_realtime_coverage(self, *_args): return None
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.realtime = Realtime()
+    worker.store = Store()
+    worker.client = type("Client", (), {"backends": [BACKEND]})()
+    worker.worker_id = "test"
+    worker.overlap_seconds = 60
+    worker.live_window_seconds = 60
+    worker.max_cursor_age_seconds = 900
+    worker.current_day = date(2026, 8, 13)
+    worker.resettle_today = lambda *_args: asyncio.sleep(0)
+    worker.settle_pending_windows = lambda *_args: asyncio.sleep(0)
+    worker.flush_archive = lambda: asyncio.sleep(0)
+    worker.publish_mirror = lambda **_kwargs: asyncio.sleep(0)
+
+    asyncio.run(worker.recover())
+
+    assert calls == ["seed"]
+
+
+def test_recovery_request_id_window_matches_realtime_retention() -> None:
+    captured = []
+
+    class Realtime:
+        ttl_seconds = 259200
+
+        async def set_ready(self, *_args): return None
+        async def clear_day(self, *_args): return None
+        async def seed_aggregate(self, *_args): return None
+        async def seed_request_ids(self, *_args): return None
+        async def clear_backfill_checkpoint(self, _backend_id): return None
+        async def cursor(self, _backend_id): return None
+        async def status(self): return {"revision": 1, "latestEventAt": None}
+
+    class Store:
+        async def realtime_recovery_rows(self, *_args): return []
+        async def realtime_request_ids(self, since):
+            captured.append(since)
+            return []
+        async def realtime_event_rows(self, *_args): return []
+        async def replace_realtime_aggregates(self, *_args): return None
+        async def publish_realtime_state(self, *_args, **_kwargs): return None
+        async def publish_realtime_coverage(self, *_args): return None
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.realtime = Realtime()
+    worker.store = Store()
+    worker.client = type("Client", (), {"backends": [BACKEND]})()
+    worker.worker_id = "test"
+    worker.overlap_seconds = 60
+    worker.live_window_seconds = 60
+    worker.max_cursor_age_seconds = 900
+    worker.current_day = date(2026, 8, 13)
+    worker.resettle_today = lambda *_args: asyncio.sleep(0)
+    worker.settle_pending_windows = lambda *_args: asyncio.sleep(0)
+    worker.flush_archive = lambda: asyncio.sleep(0)
+    worker.publish_mirror = lambda **_kwargs: asyncio.sleep(0)
+
+    before = datetime.now(timezone.utc)
+    asyncio.run(worker.recover())
+
+    assert captured
+    assert (before - captured[0]).total_seconds() >= 259199
+
+
+def test_realtime_request_id_restore_query_is_bounded_to_recent_events() -> None:
+    from backend.usage_store import UsageStore
+
+    captured = []
+
+    class Pool:
+        async def fetch(self, query, *args):
+            captured.append((query, args))
+            return []
+
+    store = UsageStore("postgresql://unused")
+    store.pool = Pool()
+    since = datetime(2026, 8, 13, 0, 0, tzinfo=timezone.utc)
+    asyncio.run(store.realtime_request_ids(since))
+
+    query, args = captured[0]
+    assert "event_time >= $1" in query
+    assert "ORDER BY event_time" in query
+    assert args == (since,)
 
 
 def test_publish_snapshot_date_parameters_are_date_objects() -> None:

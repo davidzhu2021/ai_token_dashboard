@@ -297,6 +297,8 @@ ALTER TABLE usage_event_attribution ADD COLUMN IF NOT EXISTS final_failure_sourc
 CREATE INDEX IF NOT EXISTS usage_event_attribution_org_time_idx
     ON usage_event_attribution (organization_id, event_time)
     WHERE organization_id <> '';
+CREATE INDEX IF NOT EXISTS usage_event_attribution_event_time_backend_idx
+    ON usage_event_attribution (event_time, backend_id, request_id);
 CREATE INDEX IF NOT EXISTS usage_event_attribution_key_time_idx
     ON usage_event_attribution (key_id, event_time)
     WHERE key_id <> '';
