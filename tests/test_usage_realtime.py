@@ -476,6 +476,38 @@ def test_recovery_discards_legacy_page_backfill_checkpoints() -> None:
     assert cleared == ["primary"]
 
 
+def test_recovery_publishes_live_before_startup_reconcile() -> None:
+    events = []
+
+    class Realtime:
+        async def set_ready(self, ready): events.append(("ready", ready))
+        async def clear_day(self, *_args): pass
+        async def seed_aggregate(self, *_args): pass
+        async def seed_request_ids(self, *_args): pass
+        async def clear_backfill_checkpoint(self, *_args): pass
+        async def cursor(self, *_args): return None
+        async def status(self): return {"revision": 1, "latestEventAt": None}
+
+    class Store:
+        async def realtime_recovery_rows(self, *_args): return []
+        async def realtime_request_ids(self, *_args): return []
+        async def realtime_event_rows(self, *_args): return []
+        async def replace_realtime_aggregates(self, *_args): pass
+        async def publish_realtime_state(self, *_args, **_kwargs): pass
+        async def publish_realtime_coverage(self, *_args): pass
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.realtime = Realtime(); worker.store = Store(); worker.client = type("Client", (), {"backends": [BACKEND]})()
+    worker.worker_id = "test"; worker.overlap_seconds = 60; worker.live_window_seconds = 60; worker.current_day = date(2026, 8, 13)
+    worker.flush_archive = lambda: asyncio.sleep(0)
+    worker.publish_mirror = lambda **_kwargs: asyncio.sleep(0)
+    worker.startup_reconcile = lambda: asyncio.sleep(0)
+
+    asyncio.run(worker.recover())
+
+    assert events[-1] == ("ready", True)
+
+
 def test_recovery_tolerates_request_id_restore_timeout() -> None:
     calls = []
 

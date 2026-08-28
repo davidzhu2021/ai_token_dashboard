@@ -122,6 +122,7 @@ class UsageRealtimeWorker:
         self.current_day = usage_today()
         self._lock_renew_task: asyncio.Task[None] | None = None
         self._startup_member_sync_task: asyncio.Task[None] | None = None
+        self._startup_reconcile_task: asyncio.Task[None] | None = None
         self._background_task: asyncio.Task[None] | None = None
         self._lock_lost = asyncio.Event()
         self._background_operation_index = 0
@@ -391,33 +392,6 @@ class UsageRealtimeWorker:
                             end_time=live_start,
                             next_page=1,
                         )
-        # Replay today's closed intervals once after deployment. The audit table
-        # deduplicates request IDs, so this safely fills earlier rolling-page gaps.
-        if _env_int("USAGE_REALTIME_RESYNC_TODAY_ON_START", 1):
-            try:
-                await asyncio.wait_for(
-                    self.resettle_today(datetime.now(timezone.utc)),
-                    timeout=max(2, float(getattr(self, "settlement_timeout_seconds", 20))),
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "HISTORICAL_BACKFILL_PARTIAL startup_resettle timeout_seconds=%s",
-                    max(2, float(getattr(self, "settlement_timeout_seconds", 20))),
-                )
-            except Exception:
-                logger.exception("SNAPSHOT_REFRESH_FAILED startup_resettle")
-        try:
-            await asyncio.wait_for(
-                self.settle_pending_windows(datetime.now(timezone.utc)),
-                timeout=max(2, float(getattr(self, "settlement_timeout_seconds", 20))),
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "HISTORICAL_BACKFILL_PARTIAL startup_settlement budget_seconds=%s",
-                self.background_budget_seconds,
-            )
-        except Exception:
-            logger.exception("SNAPSHOT_REFRESH_FAILED startup_settlement")
         await self.flush_archive()
         await self.publish_mirror(ready=True)
         await self.store.publish_realtime_coverage(
@@ -426,6 +400,28 @@ class UsageRealtimeWorker:
         await self.realtime.set_ready(True)
         finished_at = datetime.now(timezone.utc)
         logger.info("realtime worker recovered worker_id=%s finished_at=%s", self.worker_id, finished_at.isoformat())
+
+    async def startup_reconcile(self) -> None:
+        """Backfill closed windows after live publication is available."""
+        if _env_int("USAGE_REALTIME_RESYNC_TODAY_ON_START", 1):
+            try:
+                await asyncio.wait_for(
+                    self.resettle_today(datetime.now(timezone.utc)),
+                    timeout=max(2, float(getattr(self, "settlement_timeout_seconds", 20))),
+                )
+            except asyncio.TimeoutError:
+                logger.warning("HISTORICAL_BACKFILL_PARTIAL startup_resettle timeout_seconds=%s", max(2, float(getattr(self, "settlement_timeout_seconds", 20))))
+            except Exception:
+                logger.exception("SNAPSHOT_REFRESH_FAILED startup_resettle")
+        try:
+            await asyncio.wait_for(
+                self.settle_pending_windows(datetime.now(timezone.utc)),
+                timeout=max(2, float(getattr(self, "settlement_timeout_seconds", 20))),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("HISTORICAL_BACKFILL_PARTIAL startup_settlement timeout_seconds=%s", max(2, float(getattr(self, "settlement_timeout_seconds", 20))))
+        except Exception:
+            logger.exception("SNAPSHOT_REFRESH_FAILED startup_settlement")
 
     async def startup_member_snapshot_sync(self) -> None:
         """Refresh recent team membership snapshots without blocking live polling."""
@@ -894,6 +890,10 @@ class UsageRealtimeWorker:
                 name="usage-startup-member-snapshot-sync",
             )
             await self.recover()
+            # Historical recovery must never delay the first live publication.
+            self._startup_reconcile_task = asyncio.create_task(
+                self.startup_reconcile(), name="usage-startup-reconcile"
+            )
             last_reconcile = datetime.now(timezone.utc)
             last_directory_refresh = last_reconcile
             while not self.stop_event.is_set():
@@ -963,6 +963,13 @@ class UsageRealtimeWorker:
                 except asyncio.CancelledError:
                     pass
                 self._startup_member_sync_task = None
+            if self._startup_reconcile_task is not None:
+                self._startup_reconcile_task.cancel()
+                try:
+                    await self._startup_reconcile_task
+                except asyncio.CancelledError:
+                    pass
+                self._startup_reconcile_task = None
             await self.realtime.release_worker_lock(self.worker_id)
         if self._lock_lost.is_set():
             raise RuntimeError("realtime usage worker lock was lost")
