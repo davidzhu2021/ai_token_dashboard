@@ -10116,6 +10116,33 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
                 "sampleRequests": [{"requestId": item} for item in sample_ids],
                 **_stability_metrics_from_aggregate(row, None, period=metric_period, as_of=end_date),
             })
+        error_codes = []
+        error_denominator = sum(int(item.get("count") or 0) for item in scenarios if str(item.get("errorCode") or "") != "429")
+        for item in scenarios:
+            code = str(item.get("errorCode") or "NO_CODE")
+            if code == "429":
+                continue
+            count = int(item.get("count") or 0)
+            if not count:
+                continue
+            error_codes.append({
+                "errorCode": code,
+                "count": count,
+                "errorShare": count / error_denominator if error_denominator else None,
+                "totalShare": count / event_count if event_count else None,
+                "meaning": "按错误分类、消息、模型和请求 ID 下钻定位",
+                "action": "补充错误码并完成前置校验与来源治理",
+                "samples": item.get("sampleRequests") or [],
+            })
+        merged_codes = {}
+        for item in error_codes:
+            current = merged_codes.setdefault(item["errorCode"], {**item, "count": 0, "samples": []})
+            current["count"] += item["count"]
+            current["samples"] = (current["samples"] + item["samples"])[:20]
+        for item in merged_codes.values():
+            item["errorShare"] = item["count"] / error_denominator if error_denominator else None
+            item["totalShare"] = item["count"] / event_count if event_count else None
+        error_codes = sorted(merged_codes.values(), key=lambda item: (-item["count"], item["errorCode"]))
         sync_states = await store.stability_sync_states()
         event_count = int(overall_row.get("request_count") or 0)
         window_covered, missing_reasons = _stability_missing_reasons(
@@ -10128,6 +10155,8 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
                 "daily": daily,
                 "modelRankings": sorted(rankings, key=_stability_model_ranking_key),
                 "topScenarios": scenarios,
+                "errorCodes": error_codes,
+                "governanceActions": error_codes[:5],
                 "attemptEventsAvailableFrom": attempts.get("available_from"),
                 "ttftDiagnostics": _stability_ttft_diagnostics(overview),
                 "quality": _stability_quality(overview),
