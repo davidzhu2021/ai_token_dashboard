@@ -1259,7 +1259,7 @@ def attach_snapshot_freshness(
         configured_backends = set(usage_backend_ids())
         now = datetime.now(timezone.utc)
         settlement_threshold = max(
-            env_int("USAGE_REALTIME_SETTLEMENT_DELAY_SECONDS", 180),
+            env_int("USAGE_REALTIME_SETTLEMENT_DELAY_SECONDS", 60),
             env_int("USAGE_REALTIME_STALE_SECONDS", 30),
         )
         lagging_backends = set(status_backends)
@@ -5973,7 +5973,7 @@ async def health() -> dict[str, Any]:
             lag = realtime_status.get("latestEventLagSeconds")
             stale_seconds = max(10, env_int("USAGE_REALTIME_STALE_SECONDS", 30))
             settlement_delay = max(
-                60, env_int("USAGE_REALTIME_SETTLEMENT_DELAY_SECONDS", 180)
+                60, env_int("USAGE_REALTIME_SETTLEMENT_DELAY_SECONDS", 60)
             )
             now = datetime.now(timezone.utc)
             settlement_lags: dict[str, int | None] = {}

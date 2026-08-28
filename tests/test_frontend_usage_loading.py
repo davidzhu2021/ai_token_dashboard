@@ -61,6 +61,7 @@ def test_api_has_timeout_and_chart_events_are_delegated_once() -> None:
     assert 'timeoutError.name = "TimeoutError";' in api_body
     assert 'timeoutError.code = "REQUEST_TIMEOUT";' in api_body
     assert "callerSignal?.addEventListener" in api_body
+    assert 'cache: "no-store"' in api_body
     assert 'svg.dataset.chartTooltipBound === "true"' in chart_body
     assert 'svg.addEventListener("pointerleave", hideChartTooltip);' in chart_body
     assert 'node.addEventListener("pointerleave"' not in line_chart
@@ -89,3 +90,9 @@ def test_freshness_copy_reflects_verification_state() -> None:
     assert 'freshness.settlementState === "settled"' in body
     assert 'freshness.unsettledBackends' in body
     assert '"数据核验中，已核验截至"' in body
+
+
+def test_usage_auto_refresh_is_five_seconds() -> None:
+    source = app_js()
+    body = function_body(source, "function scheduleUsageAutoRefresh()", "\nfunction observabilityPercent(")
+    assert "setInterval(refreshVisibleUsageData, 5_000)" in body

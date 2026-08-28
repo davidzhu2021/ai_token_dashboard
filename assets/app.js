@@ -442,6 +442,9 @@ async function api(path, options = {}, requestState = {}) {
   try {
     response = await fetch(path, {
       credentials: "same-origin",
+      // Usage revisions change frequently; never let the browser reuse an old
+      // dashboard response between polling ticks.
+      cache: "no-store",
       ...fetchOptions,
       headers,
       signal: requestController.signal,
@@ -8397,7 +8400,7 @@ async function refreshVisibleUsageData() {
 
 function scheduleUsageAutoRefresh() {
   if (usageAutoRefreshTimer) clearInterval(usageAutoRefreshTimer);
-  usageAutoRefreshTimer = setInterval(refreshVisibleUsageData, 30_000);
+  usageAutoRefreshTimer = setInterval(refreshVisibleUsageData, 5_000);
 }
 
 function observabilityPercent(value) {
@@ -12052,7 +12055,7 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     clearRevealedKeys();
     clearOrganizationClaimLastUrl();
-  } else if (isUsageView() && Date.now() - lastUsageAutoRefreshAt >= 30_000) {
+  } else if (isUsageView() && Date.now() - lastUsageAutoRefreshAt >= 5_000) {
     refreshVisibleUsageData();
   }
 });

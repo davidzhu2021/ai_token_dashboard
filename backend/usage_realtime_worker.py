@@ -45,7 +45,10 @@ class UsageRealtimeWorker:
         self.synchronizer = UsageSynchronizer(client, store, repository)
         self.worker_id = worker_id
         self.stop_event = asyncio.Event()
-        self.poll_seconds = max(2, _env_int("USAGE_REALTIME_POLL_SECONDS", 10))
+        # Poll often enough that the dashboard's live view does not wait on a
+        # coarse background cadence. The environment variable remains the
+        # operational override for slower upstreams.
+        self.poll_seconds = max(2, _env_int("USAGE_REALTIME_POLL_SECONDS", 5))
         self.backend_timeout_seconds = max(
             2, _env_int("USAGE_REALTIME_BACKEND_TIMEOUT_SECONDS", 20)
         )
@@ -107,7 +110,7 @@ class UsageRealtimeWorker:
         )
         # Only publish fully scanned windows that are safely behind upstream
         # writes. Dense windows are split before their watermark advances.
-        self.settlement_delay_seconds = max(60, _env_int("USAGE_REALTIME_SETTLEMENT_DELAY_SECONDS", 180))
+        self.settlement_delay_seconds = max(60, _env_int("USAGE_REALTIME_SETTLEMENT_DELAY_SECONDS", 60))
         self.settlement_max_pages = max(1, _env_int("USAGE_REALTIME_SETTLEMENT_MAX_PAGES", 20))
         self.settlement_min_window_seconds = max(1, _env_int("USAGE_REALTIME_SETTLEMENT_MIN_WINDOW_SECONDS", 5))
         self.settlement_windows_per_cycle = max(

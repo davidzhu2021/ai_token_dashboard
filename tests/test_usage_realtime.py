@@ -1191,3 +1191,11 @@ def test_realtime_worker_waits_for_existing_lock(monkeypatch) -> None:
     asyncio.run(worker.run())
 
     assert attempts == 2
+
+
+def test_realtime_worker_defaults_are_live_friendly(monkeypatch) -> None:
+    import inspect
+
+    source = inspect.getsource(UsageRealtimeWorker.__init__)
+    assert '_env_int("USAGE_REALTIME_POLL_SECONDS", 5)' in source
+    assert '_env_int("USAGE_REALTIME_SETTLEMENT_DELAY_SECONDS", 60)' in source
