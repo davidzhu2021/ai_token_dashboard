@@ -104,7 +104,7 @@ from .observability import (
 )
 from .key_vault import KeyVault, KeyVaultError
 from .litellm_stability import configured_litellm_reader, LiteLLMStabilityReader
-from .stability_governance import build_error_governance
+from .stability_governance import ERROR_MEANINGS, build_error_governance
 
 
 def _model_optimization_space(daily_spends: list[float]) -> tuple[float, float | None]:
@@ -10117,6 +10117,7 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
                 **_stability_metrics_from_aggregate(row, None, period=metric_period, as_of=end_date),
             })
         error_codes = []
+        event_count = int(overall_row.get("request_count") or 0)
         error_denominator = sum(int(item.get("count") or 0) for item in scenarios if str(item.get("errorCode") or "") != "429")
         for item in scenarios:
             code = str(item.get("errorCode") or "NO_CODE")
@@ -10125,13 +10126,14 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
             count = int(item.get("count") or 0)
             if not count:
                 continue
+            meaning, action = ERROR_MEANINGS.get(code, ("上游或客户端异常", "按错误分类、消息、模型和请求 ID 下钻定位"))
             error_codes.append({
                 "errorCode": code,
                 "count": count,
                 "errorShare": count / error_denominator if error_denominator else None,
                 "totalShare": count / event_count if event_count else None,
-                "meaning": "按错误分类、消息、模型和请求 ID 下钻定位",
-                "action": "补充错误码并完成前置校验与来源治理",
+                "meaning": meaning,
+                "action": action,
                 "samples": item.get("sampleRequests") or [],
             })
         merged_codes = {}
@@ -10143,7 +10145,6 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
             item["errorShare"] = item["count"] / error_denominator if error_denominator else None
             item["totalShare"] = item["count"] / event_count if event_count else None
         error_codes = sorted(merged_codes.values(), key=lambda item: (-item["count"], item["errorCode"]))
-        event_count = int(overall_row.get("request_count") or 0)
         sync_states = await store.stability_sync_states()
         window_covered, missing_reasons = _stability_missing_reasons(
             sync_states, start_date=start_date, end_date=end_date,

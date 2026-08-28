@@ -8785,7 +8785,9 @@ function renderStabilityErrorCodeRanking(data) {
   if (!target) return;
   const codes = Array.isArray(data?.errorCodes) ? data.errorCodes.filter((item) => String(item?.errorCode || "") !== "429") : [];
   const quotaCount = Number(data?.overview?.rateLimitCount || 0);
-  target.innerHTML = codes.length ? `<div class="stability-error-code-list">${codes.slice(0, 5).map((item, index) => `<button class="stability-error-code-row" type="button" data-stability-error-code="${escapeHtml(item.errorCode || "")}" data-stability-model="${escapeHtml(el("stabilityModel")?.value || "")}" data-stability-scenario=""><span class="bar-rank ${index < 3 ? "is-leading" : ""}">${index + 1}</span><strong>${escapeHtml(item.errorCode || "NO_CODE")}</strong><span class="stability-error-code-bar"><i style="width:${Math.max(3, Number(item.count || 0) / Math.max(1, Number(codes[0]?.count || 0)) * 100)}%"></i></span><span>${Number(item.count || 0).toLocaleString("zh-CN")} · ${item.errorShare == null ? "暂无占比" : `${(Number(item.errorShare) * 100).toFixed(1)}%`}</span></button>`).join("")}</div>${quotaCount ? `<p class="hint">429 共 ${quotaCount.toLocaleString("zh-CN")} 次，单列为额度事件，不计入稳定性错误率。</p>` : ""}` : observabilityEmptyState("暂无错误码数据", "当前窗口没有可审计的稳定性错误。", []);
+  const pct = (value) => value == null || !Number.isFinite(Number(value)) ? "暂无数据" : `${(Number(value) * 100).toFixed(2)}%`;
+  const maxCount = Math.max(1, ...codes.map((item) => Number(item.count) || 0));
+  target.innerHTML = codes.length ? `<div class="observability-ranking-list stability-error-code-list">${codes.map((item, index) => `<button class="observability-rank-card stability-error-code-row is-${index < 2 ? "repair" : "observe"}" type="button" title="查看 ${escapeHtml(item.errorCode || "NO_CODE")} 的稳定性样本" data-stability-error-code="${escapeHtml(item.errorCode || "")}" data-stability-model="${escapeHtml(el("stabilityModel")?.value || "")}" data-stability-scenario=""><span class="observability-rank-badge ${index < 3 ? "is-leading" : ""}">${index + 1}</span><div class="observability-rank-identity"><strong class="observability-rank-model">${escapeHtml(item.errorCode || "NO_CODE")}</strong><div class="observability-rank-score"><span>错误次数</span><div class="observability-rank-track" aria-hidden="true"><div class="observability-rank-fill" style="width:${Math.max(3, Number(item.count || 0) / maxCount * 100)}%"></div></div><strong>${Number(item.count || 0).toLocaleString("zh-CN")}</strong></div></div><div class="observability-rank-metrics stability-error-code-metrics"><span class="observability-rank-metric"><span>错误占比</span><strong>${escapeHtml(pct(item.errorShare))}</strong></span><span class="observability-rank-metric"><span>总量占比</span><strong>${escapeHtml(pct(item.totalShare))}</strong></span><span class="observability-rank-metric"><span>含义</span><strong title="${escapeHtml(item.meaning || "")}">${escapeHtml(item.meaning || "暂无说明")}</strong></span><span class="observability-rank-metric stability-error-code-action"><span>建议 Action</span><strong title="${escapeHtml(item.action || "")}">${escapeHtml(item.action || "暂无说明")}</strong></span></div><span class="observability-rank-status">查看样本</span></button>`).join("")}</div>${quotaCount ? `<p class="hint">429 共 ${quotaCount.toLocaleString("zh-CN")} 次，单列为额度事件，不计入稳定性错误率。</p>` : ""}` : observabilityEmptyState("暂无错误码数据", "当前窗口没有可审计的稳定性错误；覆盖不足时不会以 0 代替。", []);
 }
 
 function renderStabilityOverview() {
@@ -8798,10 +8800,6 @@ function renderStabilityOverview() {
     return;
   }
   const data = payload.data || {};
-  if (Array.isArray(data.errorCodes) && !Array.isArray(data.modelRankings) && !Array.isArray(data.topScenarios)) {
-    renderStabilityGovernance(payload, data);
-    return;
-  }
   const overview = data.overview || {};
   const quality = overview.quality || data.quality || {};
   const finalFailure = stabilityMetricContract(overview, data, payload, "finalRequestFailureRate", "userVisibleFailureRate", { coverageRate: quality.finalRequestFailure?.completeness, sampleCount: overview.requestCount, status: quality.finalRequestFailure?.status });
@@ -8869,27 +8867,6 @@ function renderStabilityOverview() {
   select.innerHTML = `<option value="">全部模型</option>${models.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("")}`;
   select.value = models.includes(selected) ? selected : "";
   renderObservabilityFilterState("stability");
-}
-
-function renderStabilityGovernance(payload, data) {
-  const overview = data.overview || {};
-  const metric = (label, value, tone = "") => `<article class="observability-metric"><div class="observability-metric-label"><span>${escapeHtml(label)}</span></div><strong>${escapeHtml(value)}</strong></article>`;
-  const pct = (value) => value == null ? "暂无数据" : `${(Number(value) * 100).toFixed(2)}%`;
-  el("stabilityMetrics").innerHTML = [
-    metric("全部请求", Number(overview.totalRequests || 0).toLocaleString("zh-CN")),
-    metric("纳入统计错误", Number(overview.stabilityErrorCount || 0).toLocaleString("zh-CN")),
-    metric("稳定性错误率", pct(overview.stabilityErrorRate)),
-    metric("429 额度事件", `${Number(overview.rateLimitCount || 0).toLocaleString("zh-CN")} · ${pct(overview.rateLimitRate)}`),
-  ].join("");
-  renderObservabilityContext("stabilityContext", payload, data, "stability");
-  const codes = data.errorCodes || [];
-  const max = Math.max(1, ...codes.map((item) => Number(item.count) || 0));
-  el("stabilityRanking").innerHTML = codes.length ? `<div class="observability-ranking-list">${codes.map((item, index) => `<button class="observability-rank-card is-${index < 2 ? "repair" : "observe"}" type="button" data-stability-error-code="${escapeHtml(item.errorCode || "")}" data-stability-scenario="" data-stability-model=""><span class="observability-rank-badge ${index < 3 ? "is-leading" : ""}">${index + 1}</span><div class="observability-rank-identity"><strong class="observability-rank-model">${escapeHtml(item.errorCode || "NO_CODE")}</strong><div class="observability-rank-score"><span>错误次数</span><div class="observability-rank-track"><div class="observability-rank-fill" style="width:${Math.max(3, Number(item.count || 0) / max * 100)}%"></div></div><strong>${Number(item.count || 0).toLocaleString("zh-CN")}</strong></div></div><div class="observability-rank-metrics"><span class="observability-rank-metric"><span>错误占比</span><strong>${escapeHtml(pct(item.errorShare))}</strong></span><span class="observability-rank-metric"><span>总量占比</span><strong>${escapeHtml(pct(item.totalShare))}</strong></span><span class="observability-rank-metric"><span>治理</span><strong title="${escapeHtml(item.action || "")}">${escapeHtml(item.meaning || "")}</strong></span></div><span class="observability-rank-status">查看样本</span></button>`).join("")}</div>` : observabilityEmptyState("暂无错误码数据", "当前窗口没有可审计的稳定性错误。", []);
-  const daily = data.daily || [];
-  renderStabilityTrendChart(el("stabilityTrend"), daily.map((item) => ({ date: item.date, upstreamExceptionCount: item.errorCount, finalRequestFailureCount: item.errorCount })));
-  el("stabilityScenarioRanking").innerHTML = (data.governanceActions || codes.slice(0, 5)).map((item, index) => `<article class="stability-scenario-card"><span class="bar-rank ${index < 3 ? "is-leading" : ""}">${index + 1}</span><div class="stability-scenario-identity"><strong class="stability-scenario-name">${escapeHtml(item.errorCode || "NO_CODE")}</strong><small>${escapeHtml(item.action || "按错误字段下钻定位")}</small></div><span class="stability-scenario-action">P${index < 2 ? "0" : "1"}</span></article>`).join("") || observabilityEmptyState("暂无治理动作", "当前没有需要处理的错误码。", []);
-  renderStabilityErrorCodeRanking(data);
-  renderObservabilityQuality("stabilityQuality", payload, "stability");
 }
 
 async function loadStabilityOverview(forceRefresh = false) {

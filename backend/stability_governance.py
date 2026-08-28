@@ -5,11 +5,20 @@ from typing import Any, Iterable
 
 
 ERROR_MEANINGS = {
-    "NO_CODE": ("未标准化的内部、超时或资源异常", "补充合成错误码并按消息聚类，恢复资源池或修复阻断 Key"),
-    "400": ("模型、Prompt 或参数不合法", "请求前校验模型、参数和上下文，统一模型别名"),
-    "401": ("Key 缺失、失效或未注册", "校验认证格式并轮换失效 Key，审计异常客户端"),
-    "403": ("模型权限或策略拒绝", "对齐模型权限与发布前探测，收敛访问策略"),
-    "500": ("上游内部异常或连接失败", "短重试并切换备用来源，隔离异常来源后复盘"),
+    "NO_CODE": ("Key blocked、无 deployment、超时或内部异常未标准编码", "补 synthetic code；按 message 聚类；恢复资源池或修复 blocked Key"),
+    "400": ("模型名、Prompt 长度或参数不合法", "模型/参数/上下文前置校验；统一 alias；压缩或截断上下文"),
+    "401": ("Key 缺失、格式错误、过期或未注册", "校验 Bearer 与 sk- 格式；轮换 Key；审计异常客户端"),
+    "403": ("Key 无模型访问权限或策略拒绝", "对齐 alias 与 allowed_models；增加发布前权限探测"),
+    "500": ("上游内部异常、空流或连接失败", "短重试 + fallback；隔离异常 provider/account；按 request_id 复盘"),
+    "200 / failure": ("业务错误被记录成 HTTP 200", "修正状态码归一化；把上下文超限映射为标准 4xx"),
+    "408": ("连接或响应超时", "分离 connect/read timeout；备用路由；监控 TTFT/P99"),
+    "invalid_request_error": ("消息结构不完整", "请求前执行消息 schema 校验；拒绝空 assistant message"),
+    "404": ("Endpoint 或资源不存在", "校验 responses/chat 路由及 provider adapter"),
+    "400001": ("模型参数限制", "建立按模型的参数兼容层"),
+    "504": ("上游 idle timeout", "provider fallback；慢供应商降权或摘除"),
+    "invalid_parameter_error": ("Tool schema 缺必填字段", "工具注册时执行 JSON Schema 校验"),
+    "invalid_argument": ("工具类型或参数类型不合法", "统一 tool type=function；增加契约测试"),
+    "502": ("上游 provider unavailable", "熔断故障 provider，切备用供应商并做恢复探测"),
 }
 
 
