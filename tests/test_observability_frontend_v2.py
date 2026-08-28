@@ -62,18 +62,6 @@ def test_stability_dashboard_keeps_observability_drilldown_without_governance_ac
     assert "低覆盖 TTFT 不参与稳定判定" in markup
 
 
-def test_stability_dashboard_renders_partial_spendlog_error_statistics() -> None:
-    markup, source = sources()
-
-    assert 'id="stabilitySpendlogStats"' in markup
-    for label in ("近14天请求与错误码", "总请求", "失败次数", "错误率", "错误码"):
-        assert label in markup or label in source
-    assert "errorCodeStats" in source
-    assert "sourceScope" in source
-    assert "阿里云未纳入" in source
-    assert "仅含 198 生产库 SpendLogs" in source
-
-
 def test_top_stability_scenario_metric_separates_name_and_count() -> None:
     markup, source = sources()
 

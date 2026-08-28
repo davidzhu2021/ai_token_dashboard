@@ -22,16 +22,6 @@ def test_stability_terminal_attempt_query_projects_only_required_columns():
     assert ") *" not in query
 
 
-def test_stability_overview_includes_spendlog_error_code_aggregate_query():
-    start = USAGE_STORE.index("async def stability_overview_aggregates")
-    end = USAGE_STORE.index("async def stability_scenario_samples", start)
-    query = USAGE_STORE[start:end]
-
-    assert "error_code" in query
-    assert "GROUP BY error_code" in query
-    assert "error_code_count" in query
-
-
 def test_stability_cold_placeholder_is_shape_compatible_and_non_error():
     payload = _observability_pending_payload(
         "stability",

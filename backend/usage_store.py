@@ -5290,17 +5290,6 @@ class UsageStore:
             """,
             *args,
         )
-        error_codes_query = pool.fetch(
-            f"""
-            SELECT COALESCE(NULLIF(error_code, ''), '未标注') AS error_code,
-                   COUNT(*)::bigint AS error_code_count
-            FROM usage_event_attribution
-            WHERE {base} AND COALESCE(error_code, '') <> ''
-            GROUP BY error_code
-            ORDER BY error_code_count DESC, error_code
-            """,
-            *args,
-        )
         attempt_args = args
         attempt_base = """
             event_date BETWEEN $1::date AND $2::date
@@ -5369,8 +5358,8 @@ class UsageStore:
             FROM overall
             """, *attempt_args,
         )
-        overall, daily, models, scenarios, error_codes, attempt_summary = await asyncio.gather(
-            overall_query, daily_query, models_query, scenarios_query, error_codes_query, attempt_summary_query,
+        overall, daily, models, scenarios, attempt_summary = await asyncio.gather(
+            overall_query, daily_query, models_query, scenarios_query, attempt_summary_query,
         )
         summary = dict(attempt_summary or {})
 
@@ -5390,7 +5379,6 @@ class UsageStore:
             "daily": [dict(item) for item in daily],
             "models": [dict(item) for item in models],
             "scenarios": [dict(item) for item in scenarios],
-            "errorCodes": [dict(item) for item in error_codes],
             "attempts": dict(attempts or {}),
             "dailyAttempts": [dict(item) for item in daily_attempts],
             "modelAttempts": [dict(item) for item in model_attempts],

@@ -10079,20 +10079,6 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
                 "sampleRequests": [{"requestId": item} for item in sample_ids],
                 **_stability_metrics_from_aggregate(row, None, period=metric_period, as_of=end_date),
             })
-        request_stats = {
-            "totalRequests": int(overall_row.get("request_count") or 0),
-            "failedRequests": overview.get("finalRequestFailureCount"),
-            "errorRate": overview.get("finalRequestFailureRate"),
-        }
-        total_requests = request_stats["totalRequests"]
-        error_code_stats = [
-            {
-                "errorCode": str(row.get("error_code") or "未标注"),
-                "count": int(row.get("error_code_count") or 0),
-                "rate": (int(row.get("error_code_count") or 0) / total_requests) if total_requests else None,
-            }
-            for row in aggregates.get("errorCodes") or []
-        ]
         sync_states = await store.stability_sync_states()
         event_count = int(overall_row.get("request_count") or 0)
         window_covered, missing_reasons = _stability_missing_reasons(
@@ -10105,16 +10091,13 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
                 "daily": daily,
                 "modelRankings": sorted(rankings, key=_stability_model_ranking_key),
                 "topScenarios": scenarios,
-                "requestStats": request_stats,
-                "errorCodeStats": error_code_stats,
-                "sourceScope": "仅含 198 生产库 SpendLogs",
                 "attemptEventsAvailableFrom": attempts.get("available_from"),
                 "ttftDiagnostics": _stability_ttft_diagnostics(overview),
                 "quality": _stability_quality(overview),
                 "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
             },
             freshness={"status": "available" if event_count else "empty", "latestCollectedAt": overall_row.get("latest_collected_at")},
-            coverage={"partial": True, "incomplete": True, "eventCount": event_count, "window": {"startDate": start_date, "endDate": end_date}, "syncStates": sync_states, "missingReasons": list(dict.fromkeys([*missing_reasons, "阿里云侧跳板不可达，未纳入统计"])), "sourceScope": "仅含 198 生产库 SpendLogs", "definitionsVersion": STABILITY_DEFINITIONS_VERSION},
+            coverage={"partial": not window_covered, "incomplete": not window_covered, "eventCount": event_count, "window": {"startDate": start_date, "endDate": end_date}, "syncStates": sync_states, "missingReasons": missing_reasons, "definitionsVersion": STABILITY_DEFINITIONS_VERSION},
             source="稳定性事件快照",
         ) | {"startDate": start_date, "endDate": end_date, "model": model}
     events = await _admin_stability_events(start_date, end_date, model)
@@ -10202,37 +10185,19 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
         "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
     }
     freshness = {"status": "available" if events else "empty", "latestCollectedAt": max((str(item.get("collected_at") or "") for item in events), default=None)}
-    request_stats = {
-        "totalRequests": len(events),
-        "failedRequests": overview.get("finalRequestFailureCount"),
-        "errorRate": overview.get("finalRequestFailureRate"),
-    }
-    code_counts: dict[str, int] = {}
-    for event in events:
-        code = str(event.get("error_code") or "").strip()
-        if not code:
-            continue
-        code_counts[code] = code_counts.get(code, 0) + 1
-    error_code_stats = [
-        {"errorCode": code, "count": count, "rate": count / len(events) if events else None}
-        for code, count in sorted(code_counts.items(), key=lambda item: (-item[1], item[0]))
-    ]
     return _observability_envelope(
         {
             "overview": overview,
             "daily": daily,
             "modelRankings": sorted(rankings, key=_stability_model_ranking_key),
             "topScenarios": scenarios,
-            "requestStats": request_stats,
-            "errorCodeStats": error_code_stats,
-            "sourceScope": "仅含 198 生产库 SpendLogs",
             "attemptEventsAvailableFrom": min((str(item.get("started_at") or item.get("event_time") or "") for item in attempt_events), default=None),
             "ttftDiagnostics": _stability_ttft_diagnostics(overview),
             "quality": _stability_quality(overview),
             "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
         },
         freshness=freshness,
-        coverage={**covered, "partial": True, "incomplete": True, "missingReasons": list(dict.fromkeys([*missing_reasons, "阿里云侧跳板不可达，未纳入统计"])), "sourceScope": "仅含 198 生产库 SpendLogs"},
+        coverage=covered,
         source="稳定性事件快照",
     ) | {"startDate": start_date, "endDate": end_date, "model": model}
 
