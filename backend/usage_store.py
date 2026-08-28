@@ -5300,7 +5300,11 @@ class UsageStore:
                 backend_id,
                 COALESCE(NULLIF(trace_id,''), NULLIF(request_id,''), event_id),
                 COALESCE(NULLIF(attempt_id,''), attempt_index::text || ':' || actual_model || ':' || route_name)
-            ) *
+            )
+                backend_id, event_id, event_date, requested_model_group,
+                actual_model, trace_id, request_id, attempt_id, attempt_index,
+                route_name, status, event_type, fallback_from, fallback_to,
+                is_fallback, is_retry, started_at, event_time, ended_at
             FROM stability_attempt_events WHERE {attempt_base}
             ORDER BY backend_id,
                      COALESCE(NULLIF(trace_id,''), NULLIF(request_id,''), event_id),

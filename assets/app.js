@@ -223,6 +223,7 @@ let costOverviewLoadError = "";
 let stabilityOverviewRequestId = 0;
 let costOverviewRequestId = 0;
 let stabilityOverviewController = null;
+let stabilityOverviewRefreshTimer = null;
 let costOverviewController = null;
 let stabilityScenarioRequestId = 0;
 let costLedgerRequestId = 0;
@@ -8857,6 +8858,10 @@ function renderStabilityOverview() {
 async function loadStabilityOverview(forceRefresh = false) {
   if (!canViewStability()) return;
   const requestId = ++stabilityOverviewRequestId;
+  if (stabilityOverviewRefreshTimer) {
+    globalThis.clearTimeout(stabilityOverviewRefreshTimer);
+    stabilityOverviewRefreshTimer = null;
+  }
   stabilityOverviewController?.abort();
   stabilityOverviewController = new AbortController();
   isStabilityLoading = true;
@@ -8890,6 +8895,12 @@ async function loadStabilityOverview(forceRefresh = false) {
     }
     if (requestId !== stabilityOverviewRequestId) return;
     stabilityOverview = nextOverview;
+    if (nextOverview?.cache?.state === "refreshing" && nextOverview?.freshness?.status === "pending" && !nextOverview?.cache?.lastRefreshError) {
+      stabilityOverviewRefreshTimer = globalThis.setTimeout(() => {
+        stabilityOverviewRefreshTimer = null;
+        if (requestId === stabilityOverviewRequestId && ["stability", "governance-workbench"].includes(currentView)) loadStabilityOverview(false);
+      }, 2000);
+    }
   } catch (error) {
     if (error.name !== "AbortError" && requestId === stabilityOverviewRequestId) {
       stabilityLoadError = error.message || "稳定性看板加载失败";
@@ -10105,6 +10116,8 @@ function showLogin() {
   stabilityScenarioRequestId += 1;
   costLedgerRequestId += 1;
   stabilityOverviewController?.abort();
+  if (stabilityOverviewRefreshTimer) globalThis.clearTimeout(stabilityOverviewRefreshTimer);
+  stabilityOverviewRefreshTimer = null;
   costOverviewController?.abort();
   stabilityOverviewController = null;
   costOverviewController = null;

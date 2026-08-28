@@ -356,6 +356,7 @@ team_member_usage_cache = TTLCache()
 _observability_refresh_tasks: dict[str, asyncio.Task[Any]] = {}
 _observability_refresh_lock = asyncio.Lock()
 _observability_memory_snapshots: dict[str, dict[str, Any]] = {}
+_observability_refresh_failures: dict[str, tuple[float, str]] = {}
 try:
     _observability_drilldown_ttl = max(1, int(os.getenv("OBSERVABILITY_DRILLDOWN_CACHE_SECONDS", "60")))
 except ValueError:
@@ -449,6 +450,40 @@ def _snapshot_payload(record: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _observability_pending_payload(dashboard_type: str, key_payload: dict[str, Any], *, error: str = "") -> dict[str, Any]:
+    """Return a shape-compatible placeholder while a cold snapshot builds."""
+
+    if dashboard_type == "stability":
+        data = {
+            "overview": {},
+            "daily": [],
+            "modelRankings": [],
+            "topScenarios": [],
+            "ttftDiagnostics": {},
+            "quality": {},
+            "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
+        }
+    else:
+        data = {}
+    payload = _observability_envelope(data, freshness={"status": "pending"}, coverage={"partial": True, "incomplete": True}, source="后台生成中")
+    payload.update({
+        "startDate": key_payload.get("startDate"),
+        "endDate": key_payload.get("endDate"),
+        "model": key_payload.get("model", ""),
+    })
+    payload["cache"] = {
+        "state": "refreshing",
+        "refreshing": True,
+        "generatedAt": None,
+        "ageSeconds": None,
+        "lastRefreshError": error,
+        "dataRevision": "",
+        "layer": "rebuild",
+        "responseBytes": _observability_response_bytes(payload),
+    }
+    return payload
+
+
 async def _observability_refresh(
     dashboard_type: str,
     snapshot_key: str,
@@ -480,6 +515,7 @@ async def _observability_refresh(
             }
         memory_key = f"{dashboard_type}:{snapshot_key}"
         _observability_memory_snapshots[memory_key] = dict(record)
+        _observability_refresh_failures.pop(memory_key, None)
         response_bytes = _observability_response_bytes(payload)
         logger.info(
             "observability refresh dashboard=%s total_ms=%.0f cache_state=stored",
@@ -488,6 +524,10 @@ async def _observability_refresh(
         )
         return {**payload, "cache": _observability_cache_meta(record, state="fresh", layer="rebuild", response_bytes=response_bytes)}
     except Exception as exc:
+        _observability_refresh_failures[f"{dashboard_type}:{snapshot_key}"] = (
+            asyncio.get_running_loop().time(),
+            exc.__class__.__name__,
+        )
         await _call_store_optional(
             store,
             ("mark_observability_snapshot_refresh",),
@@ -524,6 +564,9 @@ async def _start_observability_refresh(
             _observability_refresh(dashboard_type, snapshot_key, builder),
             name=f"observability-refresh-{dashboard_type}",
         )
+        # Cold stability requests return before this task completes; consume
+        # failures explicitly so asyncio does not report an unhandled task.
+        task.add_done_callback(lambda completed: completed.exception() if not completed.cancelled() else None)
         _observability_refresh_tasks[task_key] = task
         return task
 
@@ -562,7 +605,16 @@ async def _cached_observability_dashboard(
         payload = _snapshot_payload(record)
         payload["cache"] = _observability_cache_meta(record, state="refreshing" if not task.done() else "stale", refreshing=not task.done(), layer=layer, response_bytes=_observability_response_bytes(payload))
         return payload
+    failure_key = f"{dashboard_type}:{snapshot_key}"
+    failure = _observability_refresh_failures.get(failure_key)
+    if failure and asyncio.get_running_loop().time() - failure[0] < 10:
+        return _observability_pending_payload(dashboard_type, key_payload, error=failure[1])
     task = await _start_observability_refresh(dashboard_type, snapshot_key, builder)
+    # A cold stability query can legitimately take longer than the request
+    # budget. Keep the request responsive and let the single-flight task fill
+    # the snapshot for the next request instead of returning a timeout error.
+    if dashboard_type == "stability":
+        return _observability_pending_payload(dashboard_type, key_payload)
     budget_name = "STABILITY_COLD_QUERY_BUDGET_MS" if dashboard_type == "stability" else "OBSERVABILITY_COLD_QUERY_BUDGET_MS"
     default_budget = 4000 if dashboard_type == "stability" else 1500
     budget = max(100, env_int(budget_name, default_budget)) / 1000
@@ -592,6 +644,8 @@ async def _invalidate_observability_dashboard(dashboard_type: str) -> None:
     prefix = f"{dashboard_type}:"
     for key in [item for item in _observability_memory_snapshots if item.startswith(prefix)]:
         _observability_memory_snapshots.pop(key, None)
+    for key in [item for item in _observability_refresh_failures if item.startswith(prefix)]:
+        _observability_refresh_failures.pop(key, None)
     await _call_store_optional(
         _admin_observability_store(),
         ("delete_observability_snapshots",),
