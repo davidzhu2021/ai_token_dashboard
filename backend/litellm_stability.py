@@ -42,11 +42,12 @@ class LiteLLMStabilityReader:
         end = datetime.fromisoformat(end_date).replace(tzinfo=timezone(timedelta(hours=8))) + timedelta(days=1)
         columns = ["request_id", "api_key", "model", "model_group", "custom_llm_provider", "startTime", "endTime", "status", "metadata", "request_tags", "api_base", "user", "team_id", "organization_id"]
         select = ", ".join(f'"{column}"' if column in self.available_columns else f'NULL AS "{column}"' for column in columns)
+        model_filter = '"model" = $3' if "model_group" not in self.available_columns else '"model" = $3 OR COALESCE("model_group", \'\') = $3'
         query = f"""
             SELECT {select}
             FROM "LiteLLM_SpendLogs"
             WHERE "startTime" >= $1 AND "startTime" < $2
-              AND ($3 = '' OR "model" = $3 OR COALESCE("model_group", '') = $3)
+              AND ($3 = '' OR {model_filter})
             ORDER BY "startTime" DESC
         """
         try:
