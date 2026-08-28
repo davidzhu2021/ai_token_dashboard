@@ -127,6 +127,13 @@ def test_top_stability_scenarios_use_ranked_drilldown_cards() -> None:
         assert f">{label}<" in source
     assert "rankingBadge(index)" in source
     assert "data-stability-scenario=" in source
+
+
+def test_stability_two_level_breakdown_renders_model_and_error_code_drilldown() -> None:
+    source = Path("assets/app.js").read_text(encoding="utf-8")
+    assert "data.stabilityTwoLevel" in source or "data.twoLevel" in source
+    assert "stability-two-level" in source
+    assert "data-stability-drill-model" in source
     assert "data-stability-model=" in source
     assert "data-stability-error-code=" in source
 

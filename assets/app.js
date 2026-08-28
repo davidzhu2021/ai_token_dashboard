@@ -226,6 +226,7 @@ let stabilityOverviewController = null;
 let stabilityOverviewRefreshTimer = null;
 let costOverviewController = null;
 let stabilityScenarioRequestId = 0;
+let stabilityDrillModel = "";
 let costLedgerRequestId = 0;
 let selectedCostModelSeries = "";
 let costModelShareReturnFocus = null;
@@ -8780,6 +8781,25 @@ function renderStabilityTrendChart(container, daily) {
   bindChartTooltipEvents(container.querySelector("svg"));
 }
 
+function renderStabilityTwoLevel(payload, data) {
+  const breakdown = data.twoLevel || {};
+  const models = Array.isArray(breakdown.models) ? breakdown.models : [];
+  const selected = models.some((item) => item.model === stabilityDrillModel) ? stabilityDrillModel : "";
+  stabilityDrillModel = selected;
+  const modelTarget = el("stabilityRanking");
+  const errorTarget = el("stabilityScenarioRanking");
+  if (!modelTarget || !errorTarget) return;
+  modelTarget.innerHTML = `<div class="stability-two-level"><div class="stability-two-level-head"><strong>一级 · 按模型统计</strong>${selected ? `<button class="ghost-btn" type="button" data-stability-drill-clear>返回全量</button>` : ""}</div>${models.length ? `<div class="stability-two-level-list">${models.map((item, index) => `<button class="stability-two-level-row${item.model === selected ? " is-selected" : ""}" type="button" data-stability-drill-model="${escapeHtml(item.model)}"><span class="bar-rank ${index < 3 ? "is-leading" : ""}">${index + 1}</span><strong>${escapeHtml(item.model)}</strong><span>${Number(item.errorCount || 0).toLocaleString("zh-CN")} 次异常</span><span>${item.errorShare == null ? "暂无占比" : `${(Number(item.errorShare) * 100).toFixed(2)}%`}</span></button>`).join("")}</div>` : observabilityEmptyState("暂无模型统计", "当前窗口没有可下钻的异常模型。", [])}</div>`;
+  const errorCodes = Array.isArray(breakdown.errorCodes) ? breakdown.errorCodes : [];
+  const quotaEvents = Array.isArray(breakdown.quotaEvents) ? breakdown.quotaEvents : [];
+  const scenarios = (data.topScenarios || []).filter((item) => !selected || (item.requestedModelGroup || item.model) === selected).slice(0, 3);
+  const scenarioMarkup = scenarios.length ? `<div class="stability-two-level-list">${scenarios.map((item) => `<button class="stability-two-level-row" type="button" data-stability-scenario="${escapeHtml(item.scenario || "")}" data-stability-model="${escapeHtml(item.requestedModelGroup || item.model || "")}" data-stability-error-code="${escapeHtml(item.errorCode || "")}"><strong>${escapeHtml(item.scenario || "未知场景")}</strong><span>${Number(item.count || 0).toLocaleString("zh-CN")} 次</span><span>查看样本</span></button>`).join("")}</div>` : "";
+  const countChip = el("stabilityScenarioCount");
+  if (countChip) countChip.textContent = `${errorCodes.length} 个错误码`;
+  errorTarget.innerHTML = `<div class="stability-two-level"><div class="stability-two-level-head"><strong>二级 · 错误码 Top 5${selected ? ` · ${escapeHtml(selected)}` : ""}</strong><span class="chip">${selected ? "模型下钻" : "全量"}</span></div>${errorCodes.length ? `<div class="stability-two-level-list">${errorCodes.map((item, index) => `<button class="stability-two-level-row" type="button" data-stability-error-code="${escapeHtml(item.errorCode)}" data-stability-model="${escapeHtml(selected)}" data-stability-scenario=""><span class="bar-rank ${index < 3 ? "is-leading" : ""}">${index + 1}</span><strong>${escapeHtml(item.errorCode || "NO_CODE")}</strong><span>${Number(item.count || 0).toLocaleString("zh-CN")} 次</span><span>${item.errorShare == null ? "暂无占比" : `${(Number(item.errorShare) * 100).toFixed(2)}%`}</span></button>`).join("")}</div>` : observabilityEmptyState("暂无错误码数据", "当前模型或窗口没有可审计的稳定性错误。", [])}${quotaEvents.length ? `<p class="hint">429 额度事件单列：${Number(quotaEvents[0].count || 0).toLocaleString("zh-CN")} 次，不计入稳定性错误率。</p>` : ""}${scenarioMarkup ? `<div class="stability-two-level-head"><strong>异常场景</strong></div>${scenarioMarkup}` : ""}</div>`;
+  renderObservabilityContext("stabilityContext", payload, data, "stability");
+}
+
 function renderStabilityOverview() {
   const payload = stabilityOverview;
   if (!payload) {
@@ -8790,6 +8810,10 @@ function renderStabilityOverview() {
     return;
   }
   const data = payload.data || {};
+  if (data.twoLevel) {
+    renderStabilityTwoLevel(payload, data);
+    return;
+  }
   if (Array.isArray(data.errorCodes)) {
     renderStabilityGovernance(payload, data);
     return;
@@ -11144,6 +11168,11 @@ el("stabilityScenarioResetButton")?.addEventListener("click", () => {
   loadStabilityScenarioSamples(filters, 1);
 });
 el("stabilityScenarioRanking")?.addEventListener("click", (event) => {
+  const errorCodeButton = event.target.closest("[data-stability-error-code]");
+  if (errorCodeButton && errorCodeButton.dataset.stabilityScenario === "") {
+    openStabilityScenario(errorCodeButton);
+    return;
+  }
   const scenarioButton = event.target.closest("[data-stability-scenario]");
   if (scenarioButton) {
     openStabilityScenario(scenarioButton);
@@ -11167,6 +11196,18 @@ el("stabilityRequestList")?.addEventListener("click", (event) => {
   }
 });
 el("stabilityRanking")?.addEventListener("click", (event) => {
+  const clear = event.target.closest("[data-stability-drill-clear]");
+  if (clear) {
+    stabilityDrillModel = "";
+    renderStabilityOverview();
+    return;
+  }
+  const drillModel = event.target.closest("[data-stability-drill-model]");
+  if (drillModel) {
+    stabilityDrillModel = drillModel.dataset.stabilityDrillModel || "";
+    renderStabilityOverview();
+    return;
+  }
   const button = event.target.closest("[data-stability-model]");
   if (button) openStabilityScenario({ dataset: { stabilityModel: button.dataset.stabilityModel, stabilityScenario: "", stabilityErrorCode: "" } });
 });

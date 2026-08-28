@@ -1,4 +1,4 @@
-from backend.main import _stability_model_attempt_metrics, _stability_model_ranking_key, _stability_ranking_attempt_fields
+from backend.main import _stability_model_attempt_metrics, _stability_model_ranking_key, _stability_ranking_attempt_fields, _stability_two_level_breakdown
 
 
 def test_stability_model_attempt_metrics_tracks_fallback_status_per_model() -> None:
@@ -106,3 +106,21 @@ def test_stability_model_ranking_merges_attempt_fields_without_overriding_failur
     assert merged["fallbackRecoveryCount"] == 1
     assert merged["fallbackRecoveryRate"] == 0.5
     assert merged["fallbackRecoveryStatus"] == "observed"
+
+
+def test_stability_two_level_breakdown_excludes_429_from_error_rate_but_keeps_it_separate() -> None:
+    result = _stability_two_level_breakdown(
+        [
+            {"model": "gpt-5", "error_code": "400", "count": 4},
+            {"model": "gpt-5", "error_code": "429", "count": 6},
+            {"model": "claude", "error_code": "401", "count": 2},
+        ],
+        total_requests=100,
+    )
+    assert result["selectedModel"] == ""
+    assert result["models"][0]["model"] == "gpt-5"
+    assert result["models"][0]["errorCount"] == 4
+    assert result["errorCodes"][0]["errorCode"] == "400"
+    assert result["errorCodes"][0]["count"] == 4
+    assert result["quotaEvents"][0]["count"] == 6
+    assert all(item["errorCode"] != "429" for item in result["errorCodes"])

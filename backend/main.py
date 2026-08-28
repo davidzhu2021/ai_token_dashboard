@@ -10026,6 +10026,51 @@ def _stability_ranking_attempt_fields(item: dict[str, Any] | None) -> dict[str, 
     }
 
 
+def _stability_two_level_breakdown(rows: list[dict[str, Any]], total_requests: int = 0, selected_model: str = "") -> dict[str, Any]:
+    """Normalize model/error aggregates for the two-level stability drilldown."""
+    model_rows: dict[str, dict[str, Any]] = {}
+    error_rows: dict[str, dict[str, Any]] = {}
+    quota_rows: dict[str, dict[str, Any]] = {}
+    for raw in rows or []:
+        model_name = str(raw.get("model") or raw.get("requested_model_group") or "unknown")
+        code = str(raw.get("error_code") or raw.get("errorCode") or "NO_CODE")
+        count = max(0, int(raw.get("count") or 0))
+        target = quota_rows if code == "429" else error_rows
+        bucket = target.setdefault(code, {"errorCode": code, "count": 0, "models": {}})
+        bucket["count"] += count
+        bucket["models"][model_name] = bucket["models"].get(model_name, 0) + count
+        if code != "429":
+            model_bucket = model_rows.setdefault(model_name, {"model": model_name, "errorCount": 0, "errorCodes": {}})
+            model_bucket["errorCount"] += count
+            model_bucket["errorCodes"][code] = model_bucket["errorCodes"].get(code, 0) + count
+
+    denominator = sum(item["count"] for item in error_rows.values())
+    models = []
+    for item in model_rows.values():
+        codes = item.pop("errorCodes")
+        item["errorCodeCount"] = len(codes)
+        item["topErrorCode"] = max(codes, key=codes.get) if codes else None
+        item["errorShare"] = item["errorCount"] / denominator if denominator else None
+        item["totalShare"] = item["errorCount"] / total_requests if total_requests else None
+        models.append(item)
+    models.sort(key=lambda item: (-item["errorCount"], item["model"]))
+
+    def finalize(source: dict[str, dict[str, Any]], include_error_share: bool) -> list[dict[str, Any]]:
+        result = []
+        for item in source.values():
+            count = item["count"]
+            result.append({"errorCode": item["errorCode"], "count": count, "errorShare": count / denominator if denominator and include_error_share else None, "totalShare": count / total_requests if total_requests else None, "modelCount": len(item["models"])})
+        return sorted(result, key=lambda item: (-item["count"], item["errorCode"]))
+
+    selected = selected_model.strip()
+    if selected:
+        filtered = [row for row in rows if str(row.get("model") or row.get("requested_model_group") or "unknown") == selected]
+        selected_errors = _stability_two_level_breakdown(filtered, total_requests, "")["errorCodes"]
+    else:
+        selected_errors = finalize(error_rows, True)
+    return {"selectedModel": selected, "models": models, "errorCodes": selected_errors[:5], "quotaEvents": finalize(quota_rows, False)}
+
+
 async def _build_stability_overview(start_date: str, end_date: str, model: str) -> dict[str, Any]:
     if _litellm_stability_reader is not None and _litellm_stability_reader.pool is not None:
         try:
@@ -10045,6 +10090,11 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
                     "topScenarios": [],
                     "modelRankings": [],
                     "governanceActions": governance["errorCodes"][:5],
+                    "twoLevel": _stability_two_level_breakdown([
+                        {"model": row.get("model_group") or row.get("model"), "error_code": row.get("error_code"), "count": 1}
+                        for row in rows
+                        if row.get("error_code") or row.get("status_code")
+                    ], total_requests=overview.get("totalRequests") or 0, selected_model=model),
                     "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
                     "dataSource": {"type": "litellm", "status": "available", "table": "LiteLLM_SpendLogs"},
                 },
@@ -10116,6 +10166,7 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
                 "sampleRequests": [{"requestId": item} for item in sample_ids],
                 **_stability_metrics_from_aggregate(row, None, period=metric_period, as_of=end_date),
             })
+        event_count = int(overall_row.get("request_count") or 0)
         error_codes = []
         error_denominator = sum(int(item.get("count") or 0) for item in scenarios if str(item.get("errorCode") or "") != "429")
         for item in scenarios:
@@ -10143,8 +10194,18 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
             item["errorShare"] = item["count"] / error_denominator if error_denominator else None
             item["totalShare"] = item["count"] / event_count if event_count else None
         error_codes = sorted(merged_codes.values(), key=lambda item: (-item["count"], item["errorCode"]))
+        two_level = _stability_two_level_breakdown(
+            [{"model": item.get("requestedModelGroup"), "error_code": item.get("errorCode"), "count": item.get("count")} for item in scenarios],
+            total_requests=event_count,
+            selected_model=model,
+        )
+        error_by_model = {item["model"]: item for item in two_level["models"]}
+        for ranking in rankings:
+            name = str(ranking.get("model") or ranking.get("requestedModelGroup") or "unknown")
+            if name not in error_by_model:
+                two_level["models"].append({"model": name, "errorCount": 0, "errorCodeCount": 0, "topErrorCode": None, "errorShare": 0, "totalShare": 0})
+        two_level["models"].sort(key=lambda item: (-item["errorCount"], item["model"]))
         sync_states = await store.stability_sync_states()
-        event_count = int(overall_row.get("request_count") or 0)
         window_covered, missing_reasons = _stability_missing_reasons(
             sync_states, start_date=start_date, end_date=end_date,
             configured_backends=set(usage_backend_ids()), event_count=event_count,
@@ -10157,6 +10218,7 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
                 "topScenarios": scenarios,
                 "errorCodes": error_codes,
                 "governanceActions": error_codes[:5],
+                "twoLevel": two_level,
                 "attemptEventsAvailableFrom": attempts.get("available_from"),
                 "ttftDiagnostics": _stability_ttft_diagnostics(overview),
                 "quality": _stability_quality(overview),
@@ -10234,6 +10296,17 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
             ],
             **stability_metrics(items, scenario_attempts, period=metric_period, as_of=end_date),
         })
+    two_level = _stability_two_level_breakdown(
+        [{"model": item.get("requestedModelGroup"), "error_code": item.get("errorCode"), "count": item.get("count")} for item in scenarios],
+        total_requests=len(events),
+        selected_model=model,
+    )
+    error_by_model = {item["model"]: item for item in two_level["models"]}
+    for ranking in rankings:
+        name = str(ranking.get("model") or ranking.get("requestedModelGroup") or "unknown")
+        if name not in error_by_model:
+            two_level["models"].append({"model": name, "errorCount": 0, "errorCodeCount": 0, "topErrorCode": None, "errorShare": 0, "totalShare": 0})
+    two_level["models"].sort(key=lambda item: (-item["errorCount"], item["model"]))
     window_covered, missing_reasons = _stability_missing_reasons(
         sync_states,
         start_date=start_date,
@@ -10257,6 +10330,7 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
             "daily": daily,
             "modelRankings": sorted(rankings, key=_stability_model_ranking_key),
             "topScenarios": scenarios,
+            "twoLevel": two_level,
             "attemptEventsAvailableFrom": min((str(item.get("started_at") or item.get("event_time") or "") for item in attempt_events), default=None),
             "ttftDiagnostics": _stability_ttft_diagnostics(overview),
             "quality": _stability_quality(overview),
