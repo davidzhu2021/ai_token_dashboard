@@ -166,6 +166,8 @@ def test_stability_error_code_cards_use_compact_explanation_column() -> None:
     assert "stability-error-code-metrics" in source
     assert ".stability-error-code-row > .observability-rank-status" in markup
     assert "grid-column:5" in markup
+    assert "min-height:96px; align-items:stretch" in markup
+    assert "align-content:center" in markup
 
 
 def test_stability_model_ranking_hides_zero_and_full_failure_rates() -> None:
