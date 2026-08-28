@@ -131,11 +131,21 @@ def test_top_stability_scenarios_use_ranked_drilldown_cards() -> None:
 
 def test_stability_two_level_breakdown_renders_model_and_error_code_drilldown() -> None:
     source = Path("assets/app.js").read_text(encoding="utf-8")
-    assert "data.stabilityTwoLevel" in source or "data.twoLevel" in source
-    assert "stability-two-level" in source
-    assert "data-stability-drill-model" in source
+    assert "function renderStabilityErrorCodeRanking" in source
+    assert 'el("stabilityErrorCodeRanking")' in source
     assert "data-stability-model=" in source
     assert "data-stability-error-code=" in source
+
+
+def test_stability_error_code_ranking_is_an_additional_panel_and_preserves_existing_panels() -> None:
+    markup, source = sources()
+    assert 'id="stabilityErrorCodeRanking"' in markup
+    assert "二级 · 错误码频次排名（Top 5）" in markup
+    assert "Top 异常场景" in markup
+    assert "模型排名" in markup
+    assert "function renderStabilityErrorCodeRanking" in source
+    assert 'el("stabilityErrorCodeRanking")' in source
+    assert 'data-stability-error-code=' in source
 
 
 def test_stability_model_ranking_hides_zero_and_full_failure_rates() -> None:
