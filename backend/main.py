@@ -103,6 +103,8 @@ from .observability import (
     verified_savings,
 )
 from .key_vault import KeyVault, KeyVaultError
+from .litellm_stability import configured_litellm_reader, LiteLLMStabilityReader
+from .stability_governance import build_error_governance
 
 
 def _model_optimization_space(daily_spends: list[float]) -> tuple[float, float | None]:
@@ -219,9 +221,16 @@ async def app_lifespan(_app: FastAPI):
     await start_billing_store()
     await start_organization_service()
     await start_usage_sync()
+    if _litellm_stability_reader is not None:
+        try:
+            await _litellm_stability_reader.start()
+        except Exception:
+            logger.exception("LiteLLM stability reader unavailable")
     try:
         yield
     finally:
+        if _litellm_stability_reader is not None:
+            await _litellm_stability_reader.close()
         await close_litellm_client()
 
 
@@ -380,6 +389,7 @@ _billing_store: BillingStore | None = BillingStore.from_environment()
 _mock_runtime: MockRuntime | None = None
 _auth_store: AuthStore | None = None
 _organization_store: OrganizationStore | PostgreSQLOrganizationRepository | None = None
+_litellm_stability_reader: LiteLLMStabilityReader | None = configured_litellm_reader()
 _organization_capability_status: dict[str, Any] = {
     "mode": "disabled",
     "status": "disabled",
@@ -10017,6 +10027,33 @@ def _stability_ranking_attempt_fields(item: dict[str, Any] | None) -> dict[str, 
 
 
 async def _build_stability_overview(start_date: str, end_date: str, model: str) -> dict[str, Any]:
+    if _litellm_stability_reader is not None and _litellm_stability_reader.pool is not None:
+        try:
+            rows = await _litellm_stability_reader.fetch_rows(start_date, end_date, model)
+            governance = build_error_governance(rows)
+            overview = governance["overview"]
+            return _observability_envelope(
+                {
+                    "overview": {
+                        **overview,
+                        "requestCount": overview["totalRequests"],
+                        "userVisibleFailureRate": overview["stabilityErrorRate"],
+                        "finalRequestFailureRate": overview["stabilityErrorRate"],
+                    },
+                    "errorCodes": governance["errorCodes"],
+                    "daily": governance["daily"],
+                    "topScenarios": [],
+                    "modelRankings": [],
+                    "governanceActions": governance["errorCodes"][:5],
+                    "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
+                    "dataSource": {"type": "litellm", "status": "available", "table": "LiteLLM_SpendLogs"},
+                },
+                freshness={"status": "available", "latestCollectedAt": end_date},
+                coverage={"partial": False, "incomplete": False, "eventCount": len(rows), "window": {"startDate": start_date, "endDate": end_date}},
+                source="稳定性生产数据源",
+            ) | {"startDate": start_date, "endDate": end_date, "model": model}
+        except Exception as exc:
+            logger.warning("LiteLLM stability query failed: %s", str(exc))
     store = _admin_observability_store()
     aggregate_query = getattr(store, "stability_overview_aggregates", None)
     if callable(aggregate_query):
