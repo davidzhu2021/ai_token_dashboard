@@ -3229,6 +3229,13 @@
       .observability-rank-card.is-stable .observability-rank-status { background:#e8f7ee; color:#19734c; }
       .observability-rank-card.is-observe .observability-rank-status { background:#fff3dd; color:#97620a; }
       .observability-rank-card.is-repair .observability-rank-status { background:#ffebe9; color:#a4403b; }
+      /* Keep the error-code panel on the same fixed grid as the approved preview. */
+      .observability-rank-card.stability-error-code-row { grid-template-columns:42px minmax(250px,1.05fr) minmax(150px,.48fr) minmax(0,1.25fr) 78px; gap:16px; align-items:center; padding:14px 14px 13px 12px; }
+      .observability-rank-card.stability-error-code-row > .observability-rank-badge { grid-column:1; grid-row:1; align-self:center; }
+      .observability-rank-card.stability-error-code-row > .observability-rank-identity { grid-column:2; grid-row:1; align-self:center; }
+      .observability-rank-card.stability-error-code-row > .stability-error-code-metrics { grid-column:3; grid-row:1; align-self:center; }
+      .observability-rank-card.stability-error-code-row > .stability-error-code-explanation { grid-column:4; grid-row:1; align-self:stretch; }
+      .observability-rank-card.stability-error-code-row > .observability-rank-status { grid-column:5; grid-row:1; align-self:center; justify-self:end; }
       .observability-rank-row-button:focus-visible,.observability-model-row:focus-visible,.observability-sample-row:focus-visible { outline:2px solid var(--brand,#0673d2); outline-offset:2px; }
       .observability-rank-model { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ink,#14243a); }
       .observability-action-list { display:grid; gap:10px; }
@@ -6701,6 +6708,16 @@
           animation-iteration-count: 1 !important;
           transition-duration: 0.01ms !important;
         }
+      }
+      @media (max-width:560px) {
+        .observability-rank-card.stability-error-code-row { grid-template-columns:30px minmax(0,1fr) auto; gap:9px; padding:12px 10px; }
+        .observability-rank-card.stability-error-code-row > .observability-rank-badge { grid-column:1; grid-row:1; }
+        .observability-rank-card.stability-error-code-row > .observability-rank-identity { grid-column:2; grid-row:1; }
+        .observability-rank-card.stability-error-code-row > .observability-rank-status { grid-column:3; grid-row:1; }
+        .observability-rank-card.stability-error-code-row > .stability-error-code-metrics,
+        .observability-rank-card.stability-error-code-row > .stability-error-code-explanation { grid-column:2 / -1; }
+        .observability-rank-card.stability-error-code-row > .stability-error-code-metrics { grid-row:2; }
+        .observability-rank-card.stability-error-code-row > .stability-error-code-explanation { grid-row:3; }
       }
     </style>
   </head>
