@@ -77,7 +77,7 @@ class UsageRealtimeWorker:
                 getattr(
                     realtime,
                     "lock_ttl_seconds",
-                    _env_int("USAGE_REALTIME_LOCK_TTL_SECONDS", 300),
+                    _env_int("USAGE_REALTIME_LOCK_TTL_SECONDS", 60),
                 )
             ),
         )

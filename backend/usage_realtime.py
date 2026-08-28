@@ -107,7 +107,7 @@ return {1, revision}
             3600, _env_int("USAGE_REALTIME_EVENT_TTL_SECONDS", 259200)
         )
         self.lock_ttl_seconds = max(
-            60, _env_int("USAGE_REALTIME_LOCK_TTL_SECONDS", 300)
+            30, _env_int("USAGE_REALTIME_LOCK_TTL_SECONDS", 60)
         )
         self.consumer_name = f"{socket.gethostname()}-{os.getpid()}"
         self._ingest_script: Any | None = None
