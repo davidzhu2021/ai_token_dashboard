@@ -166,8 +166,12 @@ def test_stability_error_code_cards_use_compact_explanation_column() -> None:
     assert "stability-error-code-metrics" in source
     assert ".stability-error-code-row > .observability-rank-status" in markup
     assert "grid-column:5" in markup
-    assert "min-height:96px; align-items:stretch" in markup
     assert "align-content:center" in markup
+
+
+def test_stability_error_code_card_matches_preview_alignment_grid() -> None:
+    markup, _ = sources()
+    assert ".stability-error-code-row { grid-template-columns:42px minmax(250px,1.05fr) minmax(150px,.48fr) minmax(0,1.25fr) 78px; gap:16px; align-items:center; padding:14px 14px 13px 12px;" in markup
 
 
 def test_stability_model_ranking_hides_zero_and_full_failure_rates() -> None:
