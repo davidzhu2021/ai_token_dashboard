@@ -8800,6 +8800,17 @@ function renderStabilityOverview() {
     observabilityMetricCard({ label: "TTFT P95", metric: ttft, formatter: (value) => `${(Number(value) / 1000).toFixed(2)}s`, action: "stability-ttft" }),
     stabilityScenarioMetricCard({ metric: topScenarioMetric, scenario: topScenario?.scenario, action: "stability-top-scenario" }),
   ].join("");
+  const requestStats = data.requestStats || {};
+  const sourceScope = payload.coverage?.sourceScope || data.sourceScope || "仅含 198 生产库 SpendLogs";
+  const errorCodes = Array.isArray(data.errorCodeStats) ? data.errorCodeStats : [];
+  const spendlogBody = el("stabilitySpendlogBody");
+  if (spendlogBody) {
+    const total = Number(requestStats.totalRequests || 0);
+    const failed = requestStats.failedRequests == null ? null : Number(requestStats.failedRequests);
+    const rate = requestStats.errorRate == null ? null : Number(requestStats.errorRate);
+    const maxCodeCount = Math.max(1, ...errorCodes.map((item) => Number(item.count || 0)));
+    spendlogBody.innerHTML = `<p class="panel-desc">${escapeHtml(sourceScope)}；阿里云未纳入，不代表全链路。</p><div class="stability-spendlog-grid"><div class="stability-spendlog-stat"><span>总请求</span><strong>${total.toLocaleString("zh-CN")}</strong></div><div class="stability-spendlog-stat"><span>失败次数</span><strong>${failed == null ? "暂无数据" : failed.toLocaleString("zh-CN")}</strong></div><div class="stability-spendlog-stat"><span>错误率</span><strong>${rate == null ? "暂无数据" : observabilityPercent(rate)}</strong></div></div><div class="stability-error-code-list">${errorCodes.length ? errorCodes.slice(0, 10).map((item) => { const count = Number(item.count || 0); return `<div class="stability-error-code-row"><strong title="${escapeHtml(item.errorCode || "未标注")}">${escapeHtml(item.errorCode || "未标注")}</strong><div class="stability-error-code-track" aria-hidden="true"><div class="stability-error-code-fill" style="width:${Math.max(2, count / maxCodeCount * 100)}%"></div></div><span>${count.toLocaleString("zh-CN")} · ${item.rate == null ? "暂无" : observabilityPercent(Number(item.rate))}</span></div>`; }).join("") : '<p class="empty">暂无错误码统计</p>'}</div>`;
+  }
   renderObservabilityContext("stabilityContext", payload, data, "stability");
   renderStabilityTrendChart(el("stabilityTrend"), data.daily || []);
   const stabilityRankings = data.modelRankings || [];
