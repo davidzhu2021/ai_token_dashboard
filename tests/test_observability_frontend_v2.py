@@ -156,6 +156,7 @@ def test_stability_error_code_panel_precedes_model_and_trend_panels() -> None:
     model_panel = markup.index('>模型排名<')
     trend_panel = markup.index('>趋势与异常<')
     assert error_panel < model_panel < trend_panel
+    assert ".stability-error-code-panel-top { width:100%; grid-column:1 / -1;" in markup
 
 
 def test_stability_model_ranking_hides_zero_and_full_failure_rates() -> None:
