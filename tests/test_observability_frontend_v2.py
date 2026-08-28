@@ -150,6 +150,14 @@ def test_stability_error_code_ranking_is_an_additional_panel_and_preserves_exist
         assert label in source
 
 
+def test_stability_error_code_panel_precedes_model_and_trend_panels() -> None:
+    markup, _ = sources()
+    error_panel = markup.index('class="panel stability-error-code-panel stability-error-code-panel-top"')
+    model_panel = markup.index('>模型排名<')
+    trend_panel = markup.index('>趋势与异常<')
+    assert error_panel < model_panel < trend_panel
+
+
 def test_stability_model_ranking_hides_zero_and_full_failure_rates() -> None:
     source = Path("assets/app.js").read_text(encoding="utf-8")
 
