@@ -36,6 +36,7 @@ let teamMemberCoverage = null;
 let adminUsageData = [];
 let adminSummaryData = [];
 let adminEmployees = [];
+let adminEmployeePickerOpen = false;
 let selectedAdminEmployee = "";
 let adminUsageScopeKey = "";
 let adminUsageLoadingScopeKey = "";
@@ -3225,8 +3226,108 @@ function renderDepartmentRanking(tableId, countId, departments, emptyText) {
     : `<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:26px">${emptyText}</td></tr>`;
 }
 
+function adminEmployeeName(item) {
+  return item.employeeName || item.employeeEmail || item.employeeId || "员工";
+}
+
+function adminEmployeeKey(item) {
+  return item.employeeEmail || item.employeeId || item.employeeName || "";
+}
+
+function filteredAdminEmployeeOptions() {
+  const keyword = el("adminEmployeeSearch").value.trim().toLowerCase();
+  if (!keyword) return adminEmployees.slice().sort((a, b) => adminEmployeeName(a).localeCompare(adminEmployeeName(b), "zh-CN"));
+  return adminEmployees
+    .filter((item) => [
+      item.employeeName,
+      item.employeeEmail,
+      item.employeeId,
+      item.fullPinyin,
+      item.pinyinInitials,
+    ].some((value) => String(value || "").toLowerCase().includes(keyword)))
+    .sort((a, b) => adminEmployeeName(a).localeCompare(adminEmployeeName(b), "zh-CN"));
+}
+
+function closeAdminEmployeePicker() {
+  adminEmployeePickerOpen = false;
+  el("adminEmployeeSearch")?.setAttribute("aria-expanded", "false");
+  el("adminEmployeeOptions")?.classList.add("hidden");
+}
+
+function renderAdminEmployeePickerOptions() {
+  const optionsEl = el("adminEmployeeOptions");
+  if (!optionsEl) return;
+  optionsEl.innerHTML = "";
+  if (!adminEmployeePickerOpen) return;
+
+  const allButton = document.createElement("button");
+  allButton.type = "button";
+  allButton.className = "department-option all";
+  allButton.setAttribute("role", "option");
+  allButton.innerHTML = "<strong>全部员工</strong><span>查看所有员工汇总排行</span>";
+  allButton.addEventListener("click", () => selectAllAdminEmployees());
+  optionsEl.appendChild(allButton);
+
+  const options = filteredAdminEmployeeOptions();
+  if (!options.length) {
+    const empty = document.createElement("div");
+    empty.className = "department-option";
+    empty.innerHTML = "<strong>暂无匹配员工</strong><span>请尝试姓名、邮箱、账号或拼音</span>";
+    optionsEl.appendChild(empty);
+    return;
+  }
+  options.forEach((item) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "department-option";
+    button.setAttribute("role", "option");
+    const title = document.createElement("strong");
+    title.textContent = adminEmployeeName(item);
+    const meta = document.createElement("span");
+    const identity = item.employeeEmail || item.employeeId || "未绑定账号";
+    const departments = employeeDepartmentText(item);
+    meta.textContent = `${identity} · ${departments} · Token：${formatTokens(item.totalTokens || 0)}`;
+    button.append(title, meta);
+    button.addEventListener("click", () => selectAdminEmployeeOption(item));
+    optionsEl.appendChild(button);
+  });
+}
+
+function openAdminEmployeePicker() {
+  adminEmployeePickerOpen = true;
+  el("adminEmployeeSearch")?.setAttribute("aria-expanded", "true");
+  el("adminEmployeeOptions")?.classList.remove("hidden");
+  renderAdminEmployeePickerOptions();
+}
+
+async function selectAdminEmployeeOption(item) {
+  selectedAdminEmployee = adminEmployeeKey(item);
+  el("adminEmployeeSearch").value = adminEmployeeName(item);
+  closeAdminEmployeePicker();
+  const loading = loadAdminData();
+  scrollToDetailCard("adminDetailCard");
+  await loading;
+}
+
+async function selectAllAdminEmployees() {
+  selectedAdminEmployee = "";
+  el("adminEmployeeSearch").value = "";
+  closeAdminEmployeePicker();
+  await loadAdminData();
+}
+
+async function runAdminSearch() {
+  const search = el("adminEmployeeSearch").value.trim();
+  if (!search) return selectAllAdminEmployees();
+  const match = filteredAdminEmployeeOptions()[0];
+  if (match) return selectAdminEmployeeOption(match);
+  closeAdminEmployeePicker();
+  await loadAdminData();
+}
+
 function renderAdminUsers() {
   renderEmployeeRanking("adminUserTable", "adminUserCount", adminEmployees, "当前筛选范围暂无员工用量");
+  renderAdminEmployeePickerOptions();
 }
 
 function renderDepartmentUsers() {
@@ -6059,6 +6160,7 @@ function resetOrganizationUsageViews() {
   departmentUsageScopeKey = "";
   departmentUsageLoadingScopeKey = "";
   el("adminEmployeeSearch").value = "";
+  closeAdminEmployeePicker();
   el("departmentEmployeeSearch").value = "";
   closeDepartmentPicker();
 }
@@ -11598,14 +11700,24 @@ el("refreshButton").addEventListener("click", async () => {
 });
 
 el("adminSearchButton").addEventListener("click", async () => {
+  await runAdminSearch();
+});
+
+el("adminEmployeeSearch").addEventListener("input", () => {
   selectedAdminEmployee = "";
-  await loadAdminData();
+  openAdminEmployeePicker();
+});
+
+el("adminEmployeeSearch").addEventListener("focus", () => {
+  openAdminEmployeePicker();
 });
 
 el("adminEmployeeSearch").addEventListener("keydown", async (event) => {
   if (event.key === "Enter") {
-    selectedAdminEmployee = "";
-    await loadAdminData();
+    event.preventDefault();
+    await runAdminSearch();
+  } else if (event.key === "Escape") {
+    closeAdminEmployeePicker();
   }
 });
 
@@ -11614,6 +11726,7 @@ el("adminUserTable").addEventListener("click", async (event) => {
   if (!row) return;
   selectedAdminEmployee = row.dataset.employee;
   el("adminEmployeeSearch").value = "";
+  closeAdminEmployeePicker();
   const loading = loadAdminData();
   scrollToDetailCard("adminDetailCard");
   await loading;
@@ -11622,6 +11735,7 @@ el("adminUserTable").addEventListener("click", async (event) => {
 el("adminClearEmployee").addEventListener("click", async () => {
   selectedAdminEmployee = "";
   el("adminEmployeeSearch").value = "";
+  closeAdminEmployeePicker();
   await loadAdminData();
 });
 
@@ -11647,6 +11761,9 @@ el("departmentEmployeeSearch").addEventListener("input", () => {
 });
 
 document.addEventListener("click", (event) => {
+  if (!el("adminEmployeePicker")?.contains(event.target) && event.target !== el("adminSearchButton")) {
+    closeAdminEmployeePicker();
+  }
   if (!el("departmentDepartmentPicker").contains(event.target) && event.target !== el("departmentSearchButton")) {
     closeDepartmentPicker();
   }

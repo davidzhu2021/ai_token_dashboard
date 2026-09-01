@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - optional for local development
 
 from .litellm_client import (
     department_search_indexes,
+    employee_search_indexes,
     department_key,
     normalize_model_display_name,
     normalize_team_text,
@@ -4010,6 +4011,7 @@ class UsageStore:
                     list(record["user_ids"] or []),
                 ),
                 "teamRole": "user",
+                **employee_search_indexes(record["employee_name"] or record["employee_id"]),
             }
             for record in employee_records
         ]

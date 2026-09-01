@@ -51,7 +51,7 @@ from .organization_validation import (
     OrganizationValidationError,
     OrganizationValidationMixin,
 )
-from .litellm_client import department_search_indexes
+from .litellm_client import department_search_indexes, employee_search_indexes
 
 _SEED_TIMESTAMP = "2026-01-01T00:00:00+00:00"
 _USAGE_SOURCES = (
@@ -2012,6 +2012,7 @@ class InMemoryOrganizationStore(OrganizationValidationMixin):
                     "userIds": [member_id],
                     "departmentNames": [department.name] if department else [],
                     "teamRole": "admin" if member and member.team_role == "leader" else "user",
+                    **employee_search_indexes(row.get("employeeName") or member_id),
                     **self._empty_metrics(),
                     "primarySource": "其他",
                 },

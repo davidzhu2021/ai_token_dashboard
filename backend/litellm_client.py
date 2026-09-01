@@ -51,6 +51,11 @@ def department_search_indexes(name: str) -> dict[str, str]:
     return {"fullPinyin": "".join(full_parts).casefold(), "pinyinInitials": "".join(initial_parts).casefold()}
 
 
+def employee_search_indexes(name: str) -> dict[str, str]:
+    """Build the same searchable pinyin indexes for employee names."""
+    return department_search_indexes(name)
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
@@ -4594,7 +4599,10 @@ class LiteLLMClient:
             "summaryRows": summary_rows or rows,
             "departments": department_summaries,
             "departmentOptions": sorted(department_options.values(), key=lambda item: (str(item["departmentName"]).casefold(), str(item["departmentId"]))),
-            "employees": self._admin_employee_summaries(rows, employees),
+            "employees": [
+                {**employee, **employee_search_indexes(employee.get("employeeName"))}
+                for employee in self._admin_employee_summaries(rows, employees)
+            ],
             "pageLimit": max_pages,
             "pageSize": page_size,
             "pagesRead": pages_read,
@@ -4888,7 +4896,10 @@ class LiteLLMClient:
         return {
             "rows": merged_rows,
             "summaryRows": sorted(grouped_rows.values(), key=lambda row: (str(row.get("date")), str(row.get("source")), str(row.get("model")))),
-            "employees": sorted(employee_groups.values(), key=lambda item: (-_as_number(item.get("totalTokens")), -_as_number(item.get("spend")), str(item.get("employeeName") or "").casefold())),
+            "employees": [
+                {**employee, **employee_search_indexes(employee.get("employeeName"))}
+                for employee in sorted(employee_groups.values(), key=lambda item: (-_as_number(item.get("totalTokens")), -_as_number(item.get("spend")), str(item.get("employeeName") or "").casefold()))
+            ],
             "team": {"id": anchor.get("id"), "name": team_name, "memberCount": len(employee_groups), "backend": anchor.get("backend")},
             "pageLimit": max((_as_int(payload.get("pageLimit")) for payload in valid), default=0),
             "pageSize": max((_as_int(payload.get("pageSize")) for payload in valid), default=0),

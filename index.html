@@ -7678,7 +7678,10 @@
             </div>
             <div class="admin-toolbar">
               <div class="admin-search">
-                <input id="adminEmployeeSearch" class="input" type="search" placeholder="搜索姓名、邮箱或账号" aria-label="搜索员工" />
+                <div id="adminEmployeePicker" class="department-picker">
+                  <input id="adminEmployeeSearch" class="input" type="search" placeholder="搜索姓名、邮箱、账号或拼音" aria-label="搜索员工" autocomplete="off" aria-expanded="false" aria-controls="adminEmployeeOptions" />
+                  <div id="adminEmployeeOptions" class="department-options hidden" role="listbox" aria-label="员工选择"></div>
+                </div>
                 <button id="adminSearchButton" class="ghost-btn" type="button">搜索</button>
               </div>
               <span id="adminLimitHint" class="hint">按当前筛选范围统计</span>
