@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover - optional for local development
     asyncpg = None  # type: ignore[assignment]
 
 from .litellm_client import (
+    department_search_indexes,
     department_key,
     normalize_model_display_name,
     normalize_team_text,
@@ -3088,6 +3089,7 @@ class UsageStore:
                 "departmentKey": department_key(str(row["department_id"]), str(row["department_name"] or row["department_id"])),
                 "departmentId": str(row["department_id"]),
                 "departmentName": str(row["department_name"] or row["department_id"]),
+                **department_search_indexes(str(row["department_name"] or row["department_id"])),
                 "organizationId": str(row["organization_id"] or ""),
                 "status": str(row["status"] or "active"),
             }

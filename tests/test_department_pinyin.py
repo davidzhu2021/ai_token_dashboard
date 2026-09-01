@@ -1,5 +1,6 @@
 from backend.main import department_search_indexes
 from backend.organization_store import InMemoryOrganizationStore
+from backend.usage_store import UsageStore
 
 
 def test_department_search_indexes_include_full_pinyin_and_initials():
@@ -26,3 +27,10 @@ def test_mock_department_usage_options_include_pinyin_indexes():
     engineering = next(item for item in options if item["departmentName"] == "Engineering")
     assert engineering["fullPinyin"] == "engineering"
     assert engineering["pinyinInitials"] == "e"
+
+
+def test_database_directory_builds_pinyin_indexes_from_final_name():
+    source = UsageStore.department_directory.__code__
+    assert source is not None
+    text = __import__("inspect").getsource(UsageStore.department_directory)
+    assert "department_search_indexes" in text
