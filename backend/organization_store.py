@@ -51,6 +51,7 @@ from .organization_validation import (
     OrganizationValidationError,
     OrganizationValidationMixin,
 )
+from .litellm_client import department_search_indexes
 
 _SEED_TIMESTAMP = "2026-01-01T00:00:00+00:00"
 _USAGE_SOURCES = (
@@ -2089,6 +2090,15 @@ class InMemoryOrganizationStore(OrganizationValidationMixin):
         employee: str | None,
         selected_department_id: str | None = None,
     ) -> dict[str, Any]:
+        department_options = [
+            {
+                "departmentKey": item["departmentKey"],
+                "departmentId": item["departmentId"],
+                "departmentName": item["departmentName"],
+                **department_search_indexes(item["departmentName"]),
+            }
+            for item in self._department_summaries(state, rows)
+        ]
         return {
             "organization": self._organization_payload(state),
             "rows": rows,
@@ -2097,6 +2107,7 @@ class InMemoryOrganizationStore(OrganizationValidationMixin):
             "departments": self._department_summaries(
                 state, rows, selected_department_id=selected_department_id
             ),
+            "departmentOptions": department_options,
             "startDate": start_date,
             "endDate": end_date,
             "source": str(source or "all"),
