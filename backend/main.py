@@ -84,6 +84,7 @@ from .billing_store import (
 )
 from .litellm_client import (
     LiteLLMClient,
+    department_search_indexes,
     default_date_range,
     department_key,
     mask_key,
@@ -2772,9 +2773,11 @@ async def real_organization_department_usage_payload(
             "primarySource": "",
             "activeEmployees": 0,
         }
+        option.update(department_search_indexes(option["departmentName"]))
         option.update(usage_by_id.get(upstream_team_id, {}))
         option["departmentName"] = str(item.get("name") or option["departmentName"])
         option["departmentKey"] = department_key(upstream_team_id, option["departmentName"])
+        option.update(department_search_indexes(option["departmentName"]))
         department_options.append(option)
     matched_ids: set[str] = set()
     if department:

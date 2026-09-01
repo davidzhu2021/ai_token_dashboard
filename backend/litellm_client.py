@@ -16,11 +16,39 @@ from urllib.parse import quote
 
 import httpx
 from fastapi import HTTPException
+from pypinyin import Style, lazy_pinyin
 
 from .cache import TTLCache
 
 
 logger = logging.getLogger("ai-token-dashboard.litellm")
+
+
+def department_search_indexes(name: str) -> dict[str, str]:
+    """Build lowercase full-pinyin and initial indexes for department search."""
+    text = str(name or "").strip()
+    full_parts: list[str] = []
+    initial_parts: list[str] = []
+    ascii_token: list[str] = []
+
+    def flush_ascii() -> None:
+        if ascii_token:
+            token = "".join(ascii_token).casefold()
+            full_parts.append(token)
+            initial_parts.append(token[0])
+            ascii_token.clear()
+
+    for char in text:
+        if "\u4e00" <= char <= "\u9fff":
+            flush_ascii()
+            full_parts.append(lazy_pinyin(char, style=Style.NORMAL)[0])
+            initial_parts.append(lazy_pinyin(char, style=Style.FIRST_LETTER)[0])
+        elif char.isalnum():
+            ascii_token.append(char)
+        else:
+            flush_ascii()
+    flush_ascii()
+    return {"fullPinyin": "".join(full_parts).casefold(), "pinyinInitials": "".join(initial_parts).casefold()}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -4466,6 +4494,7 @@ class LiteLLMClient:
                         "departmentName": team_name,
                         "organizationId": str(_first(team, "organization_id", "organizationId", "org_id", "orgId", default="") or ""),
                         "status": "active",
+                        **department_search_indexes(team_name),
                     })
             except Exception:
                 logger.debug("failed to load department directory for backend %s", backend.id, exc_info=True)

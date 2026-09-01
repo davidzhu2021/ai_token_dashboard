@@ -3028,7 +3028,9 @@ function filteredDepartmentOptions() {
   return options.filter((item) => {
     const name = String(item.departmentName || "").toLowerCase();
     const id = String(item.departmentId || "").toLowerCase();
-    return name.includes(keyword) || id.includes(keyword);
+    const fullPinyin = String(item.fullPinyin || "").toLowerCase();
+    const pinyinInitials = String(item.pinyinInitials || "").toLowerCase();
+    return name.includes(keyword) || id.includes(keyword) || fullPinyin.includes(keyword) || pinyinInitials.includes(keyword);
   });
 }
 
