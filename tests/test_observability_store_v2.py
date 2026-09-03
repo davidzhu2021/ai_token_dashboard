@@ -42,6 +42,9 @@ class _Pool:
     async def fetch(self, sql, *args):
         return await self.connection.fetch(sql, *args)
 
+    async def fetchrow(self, sql, *args):
+        return await self.connection.fetchrow(sql, *args)
+
 
 def test_schema_contains_auditable_stability_and_cost_entities() -> None:
     for table in (
@@ -147,6 +150,24 @@ def test_cost_ledger_page_prefers_request_level_attribution() -> None:
     run(store.cost_ledger_page("2026-08-01", "2026-08-12"))
     assert "FROM usage_event_attribution" in connection.sql
     assert "request_id" in connection.sql
+
+
+def test_upsert_cost_budget_binds_month_as_date() -> None:
+    class Connection:
+        async def fetchrow(self, sql, *args):
+            self.sql = sql
+            self.args = args
+            return {"month": date(2026, 9, 1), "budget_usd": 200000, "daily_target_usd": 2000}
+
+    connection = Connection()
+    store = UsageStore("postgresql://unused")
+    store.pool = _Pool(connection)
+    result = run(store.upsert_cost_budget("2026-09", 200000, 2000))
+
+    assert result["month"] == date(2026, 9, 1)
+    assert connection.args[0] == date(2026, 9, 1)
+    assert connection.args[1] == "200000"
+    assert connection.args[2] == "2000"
 
 
 def test_cost_ledger_union_keeps_api_and_manual_rows_same_shape() -> None:

@@ -6002,6 +6002,7 @@ class UsageStore:
         return [dict(record) for record in records]
 
     async def upsert_cost_budget(self, month: str, budget_usd: float, daily_target_usd: float) -> dict[str, Any]:
+        month_date = date.fromisoformat(f"{month}-01")
         record = await self._require_pool().fetchrow(
             """
             INSERT INTO cost_budgets (month, budget_usd, daily_target_usd, updated_at)
@@ -6010,7 +6011,7 @@ class UsageStore:
                 daily_target_usd=EXCLUDED.daily_target_usd, updated_at=EXCLUDED.updated_at
             RETURNING *
             """,
-            f"{month}-01", str(budget_usd), str(daily_target_usd), datetime.now(timezone.utc),
+            month_date, str(budget_usd), str(daily_target_usd), datetime.now(timezone.utc),
         )
         return dict(record)
 
