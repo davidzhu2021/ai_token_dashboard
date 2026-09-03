@@ -78,6 +78,23 @@ def test_custom_range_validation_and_reload_are_wired() -> None:
     assert "closeCustomRangePanel();" in source
 
 
+def test_observability_custom_range_has_a_valid_pending_window() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    selected = source[source.index("function selectedObservabilityRange(") : source.index("function currentCostWindow(")]
+
+    # 选择 custom 但尚未点击“应用”时，不能把字符串 custom 转成 NaN。
+    assert 'select?.value === "custom"' in selected
+    assert "Number(select?.value || 7)" not in selected
+    assert "Number(select?.value)" in selected
+    assert "Number.isFinite" in selected
+
+    # 稳定性与费用两个面板都必须接到同一套安全的打开逻辑。
+    open_block = source[source.index("function openObservabilityRangePanel(") : source.index("function closeObservabilityRangePanel(")]
+    assert "selectedObservabilityRange(scope)" in open_block
+    assert 'el(ids.start).value = current.startDate;' in open_block
+    assert 'el(ids.end).value = current.endDate;' in open_block
+
+
 def test_static_asset_version_follows_custom_range_change() -> None:
     markup = INDEX_HTML.read_text(encoding="utf-8")
 

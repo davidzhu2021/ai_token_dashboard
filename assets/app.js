@@ -8691,7 +8691,10 @@ function selectedObservabilityRange(scope) {
   const select = el(`${scope}RangeSelect`);
   const custom = scope === "stability" ? stabilityCustomDateRange : costCustomDateRange;
   if (select?.value === "custom" && custom) return { ...custom, days: daysBetween(custom.startDate, custom.endDate) };
-  const days = Number(select?.value || 7);
+  // 选中“自定义”但尚未应用日期时，select 的值不是数字；回退到默认窗口，
+  // 避免 NaN 传入 Date.setDate 后生成 Invalid Date。
+  const selectedDays = Number(select?.value);
+  const days = Number.isFinite(selectedDays) && selectedDays > 0 ? selectedDays : 7;
   const end = new Date();
   const start = new Date(end);
   start.setDate(end.getDate() - days + 1);
