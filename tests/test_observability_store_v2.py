@@ -61,6 +61,34 @@ def test_schema_contains_auditable_stability_and_cost_entities() -> None:
     assert "SET status='pending_evidence'" in USAGE_SCHEMA
 
 
+def test_schema_contains_spendlog_mirror_with_no_secret_or_content_columns() -> None:
+    start = USAGE_SCHEMA.index("CREATE TABLE IF NOT EXISTS stability_spendlog_mirror")
+    end = USAGE_SCHEMA.index("CREATE TABLE IF NOT EXISTS stability_spendlog_mirror_sync_state")
+    fragment = USAGE_SCHEMA[start:end]
+    assert "source_request_id TEXT NOT NULL" in fragment
+    assert "PRIMARY KEY (source, source_request_id)" in fragment
+    assert "api_key" not in fragment.lower()
+    assert "prompt TEXT" not in fragment
+    assert "response TEXT" not in fragment
+
+
+def test_spendlog_mirror_record_rejects_sensitive_fields_and_normalizes_payload() -> None:
+    with pytest.raises(ValueError, match="禁止字段"):
+        UsageStore._spendlog_mirror_record({"sourceRequestId": "r1", "api_key": "secret"})
+    record = UsageStore._spendlog_mirror_record({
+        "sourceRequestId": "r1",
+        "eventTime": "2026-09-03T00:00:00Z",
+        "model": "gpt-5.6-sol",
+        "status": "failure",
+        "errorCode": "401",
+        "errorMessage": "Bearer sk-secret",
+        "totalTokens": 12,
+    })
+    assert record[1] == "r1"
+    assert record[4] == "gpt-5.6-sol"
+    assert "sk-secret" not in record
+
+
 def test_stability_overview_aggregates_attempts_by_requested_model() -> None:
     source = Path("backend/usage_store.py").read_text(encoding="utf-8")
     start = source.index("async def stability_overview_aggregates")

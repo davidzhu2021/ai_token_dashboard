@@ -3572,24 +3572,34 @@ class LiteLLMClient:
                         "request_id",
                         "requestId",
                         "litellm_call_id",
-                        "id",
+                        "call_id",
+                        "callId",
+                        "trace_id",
+                        "traceId",
                         default="",
                     )
                 )
                 if not request_id:
+                    # Pagination can return the same event with mutable
+                    # metadata/tags added later. Keep the fallback identity
+                    # limited to billing and timing fields so those copies
+                    # cannot inflate spend.
+                    stable_identity = {
+                        "backend": backend.id,
+                        "eventTime": event_time,
+                        "endTime": _first(log, "endTime", "end_time", default=""),
+                        "userId": user_id,
+                        "source": source,
+                        "model": model,
+                        "keyId": attribution["keyId"],
+                        "spend": _first(log, "spend", "cost", "total_spend"),
+                        "promptTokens": _first(log, "prompt_tokens", "promptTokens", "total_prompt_tokens"),
+                        "completionTokens": _first(log, "completion_tokens", "completionTokens", "total_completion_tokens"),
+                        "totalTokens": _first(log, "total_tokens", "totalTokens"),
+                    }
                     request_id = hashlib.sha256(
                         json.dumps(
-                            {
-                                "backend": backend.id,
-                                "eventTime": event_time,
-                                "userId": user_id,
-                                "source": source,
-                                "model": model,
-                                "keyId": attribution["keyId"],
-                                "spend": _first(log, "spend", "cost", "total_spend"),
-                                "tokens": _first(log, "total_tokens", "totalTokens"),
-                                "rawLog": log,
-                            },
+                            stable_identity,
                             sort_keys=True,
                             separators=(",", ":"),
                             default=str,
@@ -3752,18 +3762,35 @@ class LiteLLMClient:
                     or ""
                 )
                 request_id = _clean_text(
-                    _first(log, "request_id", "requestId", "litellm_call_id", "id", default="")
+                    _first(
+                        log,
+                        "request_id",
+                        "requestId",
+                        "litellm_call_id",
+                        "call_id",
+                        "callId",
+                        "trace_id",
+                        "traceId",
+                        default="",
+                    )
                 )
                 if not request_id:
+                    stable_identity = {
+                        "backend": backend.id,
+                        "eventTime": event_time,
+                        "endTime": _first(log, "endTime", "end_time", default=""),
+                        "userId": user_id,
+                        "source": source,
+                        "model": model,
+                        "keyId": _clean_text(_first(log, "api_key", "apiKey", "key_id", "keyId", default="")),
+                        "spend": _first(log, "spend", "cost", "total_spend"),
+                        "promptTokens": _first(log, "prompt_tokens", "promptTokens", "total_prompt_tokens"),
+                        "completionTokens": _first(log, "completion_tokens", "completionTokens", "total_completion_tokens"),
+                        "totalTokens": _first(log, "total_tokens", "totalTokens"),
+                    }
                     request_id = hashlib.sha256(
                         json.dumps(
-                            {
-                                "backend": backend.id,
-                                "eventTime": event_time,
-                                "userId": user_id,
-                                "model": model,
-                                "log": log,
-                            },
+                            stable_identity,
                             sort_keys=True,
                             separators=(",", ":"),
                             default=str,

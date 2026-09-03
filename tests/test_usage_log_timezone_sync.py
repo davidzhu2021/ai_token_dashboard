@@ -219,6 +219,44 @@ def test_log_sync_deduplicates_request_repeated_on_overlapping_pages(monkeypatch
     assert len(rows.events) == 2
 
 
+def test_log_sync_deduplicates_missing_id_records_with_mutating_metadata(monkeypatch) -> None:
+    """同一无 ID 请求跨页字段变化时也只能计费一次。"""
+    monkeypatch.setenv("USAGE_TIMEZONE_OFFSET_MINUTES", "-480")
+    first = _log("cursor-alice", "2026-07-28T02:00:00+00:00", 100, "1.0")
+    duplicate = dict(first)
+    duplicate["metadata"] = {"trace": "added-by-upstream"}
+    duplicate["request_tags"] = ["cursor"]
+
+    rows, complete = asyncio.run(
+        _LogClient([[first], [duplicate]]).sync_rows_from_logs(
+            "2026-07-28", "2026-07-28", PRIMARY
+        )
+    )
+
+    assert complete is True
+    assert rows["cursor-alice"][0]["spend"] == pytest.approx(1.0)
+    assert rows["cursor-alice"][0]["requestCount"] == 1
+
+
+def test_log_sync_does_not_treat_log_row_id_as_request_identity(monkeypatch) -> None:
+    """分页副本只有日志行 id 不同时，仍应按同一次调用去重。"""
+    monkeypatch.setenv("USAGE_TIMEZONE_OFFSET_MINUTES", "-480")
+    first = _log("cursor-alice", "2026-07-28T02:00:00+00:00", 100, "1.0")
+    first["id"] = "log-row-a"
+    duplicate = dict(first)
+    duplicate["id"] = "log-row-b"
+
+    rows, complete = asyncio.run(
+        _LogClient([[first], [duplicate]]).sync_rows_from_logs(
+            "2026-07-28", "2026-07-28", PRIMARY
+        )
+    )
+
+    assert complete is True
+    assert rows["cursor-alice"][0]["spend"] == pytest.approx(1.0)
+    assert rows["cursor-alice"][0]["requestCount"] == 1
+
+
 def test_log_sync_can_filter_by_stable_key_hash(monkeypatch) -> None:
     monkeypatch.setenv("USAGE_TIMEZONE_OFFSET_MINUTES", "-480")
     key_hash = "a" * 64

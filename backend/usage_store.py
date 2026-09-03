@@ -23,6 +23,7 @@ from .litellm_client import (
     normalize_team_text,
     team_identity_key,
 )
+from .observability import redact_error_message
 
 
 logger = logging.getLogger("ai-token-dashboard.usage-store")
@@ -529,6 +530,45 @@ CREATE TABLE IF NOT EXISTS stability_attempt_events (
     received_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (backend_id, event_id)
 );
+CREATE TABLE IF NOT EXISTS stability_spendlog_mirror (
+    source TEXT NOT NULL,
+    source_request_id TEXT NOT NULL,
+    event_time TIMESTAMPTZ NOT NULL,
+    usage_date DATE NOT NULL,
+    requested_model TEXT NOT NULL DEFAULT '',
+    actual_model TEXT NOT NULL DEFAULT '',
+    model_group TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'unknown',
+    status_code TEXT NOT NULL DEFAULT '',
+    error_code TEXT NOT NULL DEFAULT '',
+    error_class TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    team_id TEXT NOT NULL DEFAULT '',
+    organization_id TEXT NOT NULL DEFAULT '',
+    principal_hash TEXT NOT NULL DEFAULT '',
+    request_duration_ms DOUBLE PRECISION,
+    ttft_ms DOUBLE PRECISION,
+    prompt_tokens BIGINT NOT NULL DEFAULT 0,
+    completion_tokens BIGINT NOT NULL DEFAULT 0,
+    total_tokens BIGINT NOT NULL DEFAULT 0,
+    collected_at TIMESTAMPTZ,
+    batch_id TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (source, source_request_id)
+);
+CREATE INDEX IF NOT EXISTS stability_spendlog_mirror_date_model_idx
+    ON stability_spendlog_mirror (usage_date, model_group, error_code, event_time DESC);
+CREATE TABLE IF NOT EXISTS stability_spendlog_mirror_sync_state (
+    source TEXT PRIMARY KEY,
+    watermark TIMESTAMPTZ,
+    status TEXT NOT NULL DEFAULT 'unknown',
+    event_count BIGINT NOT NULL DEFAULT 0,
+    last_received_at TIMESTAMPTZ,
+    last_success_at TIMESTAMPTZ,
+    last_error TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMPTZ NOT NULL
+);
 CREATE INDEX IF NOT EXISTS stability_attempt_events_date_model_idx
     ON stability_attempt_events (event_date, requested_model_group, scenario, error_code, event_time DESC);
 CREATE INDEX IF NOT EXISTS stability_attempt_events_request_idx
@@ -807,6 +847,16 @@ def _as_float(value: Any) -> float:
         return 0.0
 
 
+def _optional_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result == result and abs(result) != float("inf") else None
+
+
 def _as_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -935,6 +985,73 @@ class UsageStore:
         self.read_only = read_only
         self.pool: Any = None
         self._connect_lock = asyncio.Lock()
+
+    @staticmethod
+    def _spendlog_mirror_record(event: dict[str, Any], *, now: datetime | None = None) -> tuple[Any, ...]:
+        forbidden = {"api_key", "apiKey", "authorization", "token", "secret", "prompt", "messages", "response", "completion", "content", "body"}
+        found = forbidden.intersection(event)
+        if found:
+            raise ValueError(f"禁止字段: {sorted(found)[0]}")
+        source = _clean_text(_input_value(event, "source", default="litellm-198"))[:64]
+        request_id = _clean_text(_input_value(event, "source_request_id", "sourceRequestId", "request_id", "requestId"))[:512]
+        if not source or not request_id:
+            raise ValueError("source 和 sourceRequestId 必填")
+        event_time = _as_datetime(_input_value(event, "event_time", "eventTime", "startTime"))
+        status = _clean_text(_input_value(event, "status", default="unknown")).lower()[:64] or "unknown"
+        collected_at = _optional_datetime(_input_value(event, "collected_at", "collectedAt"))
+        usage_date = event_time.astimezone(timezone(timedelta(hours=8))).date()
+        return (
+            source, request_id, event_time, usage_date, _clean_text(_input_value(event, "model", "requested_model", "requestedModel"))[:256],
+            _clean_text(_input_value(event, "actual_model", "actualModel"))[:256], _clean_text(_input_value(event, "model_group", "modelGroup"))[:256],
+            _clean_text(event.get("provider"))[:160], status, _clean_text(_input_value(event, "status_code", "statusCode"))[:32],
+            _clean_text(_input_value(event, "error_code", "errorCode"))[:120], _clean_text(_input_value(event, "error_class", "errorClass"))[:160],
+            redact_error_message(_input_value(event, "error_message", "errorMessage"))[:300], _clean_text(event.get("team_id", event.get("teamId")))[:256],
+            _clean_text(event.get("organization_id", event.get("organizationId")))[:256], _clean_text(event.get("principal_hash", event.get("principalHash")))[:128],
+            _optional_float(_input_value(event, "request_duration_ms", "requestDurationMs")), _optional_float(_input_value(event, "ttft_ms", "ttftMs")),
+            _as_int(_input_value(event, "prompt_tokens", "promptTokens")), _as_int(_input_value(event, "completion_tokens", "completionTokens")),
+            _as_int(_input_value(event, "total_tokens", "totalTokens")), collected_at, _clean_text(event.get("batch_id", event.get("batchId")))[:256], now or datetime.now(timezone.utc),
+        )
+
+    async def insert_spendlog_mirror_events(self, events: list[dict[str, Any]], *, batch_id: str = "") -> dict[str, int]:
+        records = [self._spendlog_mirror_record({**event, "batch_id": batch_id or event.get("batch_id", event.get("batchId", ""))}) for event in events]
+        if not records:
+            return {"received": 0, "inserted": 0, "duplicates": 0}
+        inserted = 0
+        async with self._require_pool().acquire() as connection:
+            async with connection.transaction():
+                for record in records:
+                    result = await connection.execute(
+                        """
+                        INSERT INTO stability_spendlog_mirror (
+                            source, source_request_id, event_time, usage_date, requested_model,
+                            actual_model, model_group, provider, status, status_code, error_code,
+                            error_class, error_message, team_id, organization_id, principal_hash,
+                            request_duration_ms, ttft_ms, prompt_tokens, completion_tokens,
+                            total_tokens, collected_at, batch_id, created_at
+                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+                        ON CONFLICT (source, source_request_id) DO NOTHING
+                        """,
+                        *record,
+                    )
+                    inserted += int(result.endswith(" 1"))
+        return {"received": len(records), "inserted": inserted, "duplicates": len(records) - inserted}
+
+    async def stability_spendlog_events(self, start_date: str, end_date: str, model: str = "") -> list[dict[str, Any]]:
+        rows = await self._require_pool().fetch(
+            """
+            SELECT source AS backend_id, source_request_id AS request_id, event_time, usage_date,
+                   usage_date AS event_date,
+                   requested_model AS model, actual_model, model_group, provider, status,
+                   status_code, error_code, error_class, error_message, team_id, organization_id,
+                   request_duration_ms, ttft_ms, collected_at
+            FROM stability_spendlog_mirror
+            WHERE usage_date BETWEEN $1::date AND $2::date
+              AND ($3='' OR requested_model=$3 OR actual_model=$3 OR model_group=$3)
+            ORDER BY event_time DESC
+            """,
+            _as_date(start_date), _as_date(end_date), _clean_text(model),
+        )
+        return [dict(row) for row in rows]
 
     @classmethod
     def from_environment(cls) -> UsageStore | None:

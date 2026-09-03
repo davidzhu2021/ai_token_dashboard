@@ -14,6 +14,11 @@ let currentUser = null;
 let currentView = "dashboard";
 let usageData = [];
 let usageSummary = null;
+let dashboardModelOptions = [];
+let selectedDashboardModels = new Set();
+let dashboardModelFilterInitialized = false;
+const dashboardSourceOptions = ["Cursor", "Claude Code", "Her", "其他"];
+let selectedDashboardSources = new Set(dashboardSourceOptions);
 let usageTableFilters = { date: "all", model: "all", status: "all", keyword: "" };
 let lastPersonalUsageCacheHit = false;
 let lastAdminUsageCacheHit = false;
@@ -2024,8 +2029,41 @@ function modelRankGroup(mode = "personal") {
 }
 
 function sourceText() {
-  const source = el("sourceSelect").value;
-  return source === "all" ? "全部来源" : displaySource(source);
+  const selected = [...selectedDashboardSources];
+  return !selected.length || selected.length === dashboardSourceOptions.length ? "全部来源" : selected.map(displaySource).join("、");
+}
+
+function dashboardSourceQueryValues() { return selectedDashboardSources.size ? [...selectedDashboardSources].sort() : ["__none__"]; }
+function updateDashboardSourceFilter() {
+  const container = el("sourceFilterOptions");
+  if (container) container.innerHTML = dashboardSourceOptions.map((name) => `<label><input type="checkbox" value="${escapeHtml(name)}" ${selectedDashboardSources.has(name) ? "checked" : ""}> <span>${escapeHtml(displaySource(name))}</span></label>`).join("");
+  const button = el("sourceFilterButton");
+  if (button) button.textContent = !selectedDashboardSources.size || selectedDashboardSources.size === dashboardSourceOptions.length ? "全部来源" : `已选 ${selectedDashboardSources.size} 个来源`;
+}
+
+function selectedDashboardModelValues() { return [...selectedDashboardModels].sort(); }
+function dashboardModelQueryValues() {
+  if (!dashboardModelFilterInitialized) return [];
+  const values = selectedDashboardModelValues();
+  return values.length ? values : ["__none__"];
+}
+function applyDashboardModelFilter(rows) {
+  const selected = selectedDashboardModelValues();
+  return selected.length ? rows.filter((row) => selected.includes(String(row.model || "未知模型"))) : rows;
+}
+function updateDashboardModelFilterOptions(rows, optionNames = null) {
+  const names = [...new Set((optionNames || rows.map((row) => String(row.model || "未知模型"))).map(String))].sort();
+  dashboardModelOptions = names;
+  if (!dashboardModelFilterInitialized) {
+    selectedDashboardModels = new Set(names);
+    dashboardModelFilterInitialized = true;
+  } else {
+    selectedDashboardModels = new Set(names.filter((name) => selectedDashboardModels.has(name)));
+  }
+  const container = el("modelFilterOptions");
+  if (container) container.innerHTML = names.length ? names.map((name) => `<label><input type="checkbox" value="${escapeHtml(name)}" ${selectedDashboardModels.has(name) ? "checked" : ""}> <span>${escapeHtml(name)}</span></label>`).join("") : '<span class="muted">暂无模型</span>';
+  const button = el("modelFilterButton");
+  if (button) button.textContent = !selectedDashboardModels.size || selectedDashboardModels.size === names.length ? "全部模型" : `已选 ${selectedDashboardModels.size} 个模型`;
 }
 
 function scrollToDetailCard(id) {
@@ -9804,8 +9842,9 @@ function loadDashboardData(forceRefresh = false) {
     return Promise.resolve();
   }
   const { startDate, endDate } = selectedDateRange();
-  const source = el("sourceSelect").value;
-  const queryKey = `${startDate}|${endDate}|${source}`;
+  const source = dashboardSourceQueryValues().join(",");
+  const models = dashboardModelQueryValues();
+  const queryKey = `${startDate}|${source}|${models.join(",")}`;
   if (dashboardInFlight && dashboardRequestKey === queryKey) return dashboardInFlight;
   dashboardRequestController?.abort();
   const controller = new AbortController();
@@ -9817,12 +9856,13 @@ function loadDashboardData(forceRefresh = false) {
   const request = (async () => {
     try {
       const payload = await api(
-        `/api/me/usage?start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&source=${encodeURIComponent(source)}${forceRefresh ? "&refresh=1" : ""}`,
+        `/api/me/usage?start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&source=${encodeURIComponent(source)}${models.map((model) => `&model=${encodeURIComponent(model)}`).join("")}${forceRefresh ? "&refresh=1" : ""}`,
         { signal: controller.signal },
       );
       if (requestId !== dashboardRequestId || dashboardRequestKey !== queryKey) return;
-      usageData = payload.rows || [];
-      usageSummary = payload.summary || null;
+      updateDashboardModelFilterOptions(payload.rows || [], payload.modelOptions);
+      usageData = applyDashboardModelFilter(payload.rows || []);
+      usageSummary = usageData.length ? null : payload.summary || null;
       personalDataFreshness = payload.dataFreshness || null;
       personalDataQuality = payload.dataQuality || null;
       personalCoverage = payload.coverage || null;
@@ -9846,10 +9886,11 @@ function loadAdminData(forceRefresh = false) {
   const scopeKey = organizationUsageScopeKey();
   if (!canViewAdminUsage()) return Promise.resolve();
   const { startDate, endDate } = selectedDateRange();
-  const source = el("sourceSelect").value;
+  const source = dashboardSourceQueryValues().join(",");
   const search = el("adminEmployeeSearch").value.trim();
   const employee = selectedAdminEmployee || search;
   const query = new URLSearchParams({ start_date: startDate, end_date: endDate, source });
+  dashboardModelQueryValues().forEach((model) => query.append("model", model));
   if (employee) query.set("employee", employee);
   if (forceRefresh) query.set("refresh", "1");
   const scope = organizationUsageScope();
@@ -9868,8 +9909,9 @@ function loadAdminData(forceRefresh = false) {
     try {
       const payload = await api(`${usagePath}?${query.toString()}`, { signal: controller.signal });
       if (requestId !== adminUsageRequestId || scopeKey !== organizationUsageScopeKey()) return;
-      adminUsageData = payload.rows || [];
-      adminSummaryData = payload.summaryRows || adminUsageData;
+      updateDashboardModelFilterOptions(payload.summaryRows || payload.rows || [], payload.modelOptions);
+      adminUsageData = applyDashboardModelFilter(payload.rows || []);
+      adminSummaryData = applyDashboardModelFilter(payload.summaryRows || adminUsageData);
       adminEmployees = payload.employees || [];
       adminDataFreshness = payload.dataFreshness || null;
       adminDataQuality = payload.dataQuality || null;
@@ -9901,10 +9943,11 @@ function loadDepartmentData(forceRefresh = false) {
   const scopeKey = organizationUsageScopeKey();
   if (!canViewDepartmentUsage()) return Promise.resolve();
   const { startDate, endDate } = selectedDateRange();
-  const source = el("sourceSelect").value;
+  const source = dashboardSourceQueryValues().join(",");
   const search = el("departmentEmployeeSearch").value.trim();
   const department = selectedDepartment || search;
   const query = new URLSearchParams({ start_date: startDate, end_date: endDate, source });
+  dashboardModelQueryValues().forEach((model) => query.append("model", model));
   if (department) query.set("department", department);
   if (forceRefresh) query.set("refresh", "1");
   const scope = organizationUsageScope();
@@ -9923,8 +9966,9 @@ function loadDepartmentData(forceRefresh = false) {
     try {
       const payload = await api(`${usagePath}?${query.toString()}`, { signal: controller.signal });
       if (requestId !== departmentUsageRequestId || scopeKey !== organizationUsageScopeKey()) return;
-      departmentUsageData = payload.rows || [];
-      departmentSummaryData = payload.summaryRows || departmentUsageData;
+      updateDashboardModelFilterOptions(payload.summaryRows || payload.rows || [], payload.modelOptions);
+      departmentUsageData = applyDashboardModelFilter(payload.rows || []);
+      departmentSummaryData = applyDashboardModelFilter(payload.summaryRows || departmentUsageData);
       departmentRankings = payload.departments || [];
       departmentEmployees = payload.employees || [];
       if (selectedDepartmentEmployee) {
@@ -9973,16 +10017,17 @@ async function loadTeamRankingData(forceRefresh = false) {
   renderTeam();
 
   const { startDate, endDate } = selectedDateRange();
-  const source = el("sourceSelect").value;
+  const source = dashboardSourceQueryValues().join(",");
   const query = new URLSearchParams({
     start_date: startDate,
     end_date: endDate,
     source,
     include_member_rankings: "true",
   });
+  dashboardModelQueryValues().forEach((model) => query.append("model", model));
   if (selectedTeamRef) query.set("team_ref", selectedTeamRef);
   if (forceRefresh) query.set("refresh", "1");
-  const cacheKey = `${organizationUsageScopeKey()}|${selectedTeamRef}|${startDate}|${endDate}|${source}`;
+  const cacheKey = `${organizationUsageScopeKey()}|${selectedTeamRef}|${startDate}|${endDate}|${source}|${selectedDashboardModelValues().join(",")}`;
   const cached = !forceRefresh ? teamUsagePayloadCache.get(cacheKey) : null;
 
   try {
@@ -10030,16 +10075,17 @@ async function loadTeamData(forceRefresh = false) {
   renderTeam();
 
   const { startDate, endDate } = selectedDateRange();
-  const source = el("sourceSelect").value;
+  const source = dashboardSourceQueryValues().join(",");
   const query = new URLSearchParams({
     start_date: startDate,
     end_date: endDate,
     source,
     include_member_rankings: "true",
   });
+  dashboardModelQueryValues().forEach((model) => query.append("model", model));
   if (selectedTeamRef) query.set("team_ref", selectedTeamRef);
   if (forceRefresh) query.set("refresh", "1");
-  const cacheKey = `${organizationUsageScopeKey()}|${selectedTeamRef}|${startDate}|${endDate}|${source}`;
+  const cacheKey = `${organizationUsageScopeKey()}|${selectedTeamRef}|${startDate}|${endDate}|${source}|${selectedDashboardModelValues().join(",")}`;
   const cached = !forceRefresh ? teamUsagePayloadCache.get(cacheKey) : null;
 
   if (cached) {
@@ -10076,6 +10122,7 @@ function loadTeamMemberData(employee, forceRefresh = false, scrollToCard = true)
   const { startDate, endDate } = selectedDateRange();
   const source = el("sourceSelect").value;
   const query = new URLSearchParams({ start_date: startDate, end_date: endDate, source, employee });
+  dashboardModelQueryValues().forEach((model) => query.append("model", model));
   if (selectedTeamRef) query.set("team_ref", selectedTeamRef);
   if (forceRefresh) query.set("refresh", "1");
   const queryKey = `${organizationUsageScopeKey()}|${selectedTeamRef}|${query.toString()}`;
@@ -11695,7 +11742,25 @@ document.addEventListener("mousedown", (event) => {
   });
 });
 
-el("sourceSelect").addEventListener("change", reloadForFilterChange);
+updateDashboardSourceFilter();
+el("sourceFilterButton")?.addEventListener("click", () => { const panel = el("sourceFilterPanel"); panel?.classList.toggle("hidden"); el("sourceFilterButton")?.setAttribute("aria-expanded", String(!panel?.classList.contains("hidden"))); });
+el("sourceFilterOptions")?.addEventListener("change", async (event) => { const input = event.target.closest("input[type=checkbox]"); if (!input) return; if (input.checked) selectedDashboardSources.add(input.value); else selectedDashboardSources.delete(input.value); updateDashboardSourceFilter(); await reloadForFilterChange(); });
+el("sourceFilterSelectAll")?.addEventListener("click", async () => { selectedDashboardSources = new Set(dashboardSourceOptions); updateDashboardSourceFilter(); await reloadForFilterChange(); });
+el("sourceFilterClear")?.addEventListener("click", async () => { selectedDashboardSources.clear(); updateDashboardSourceFilter(); await reloadForFilterChange(); });
+el("modelFilterButton")?.addEventListener("click", () => {
+  const panel = el("modelFilterPanel");
+  panel?.classList.toggle("hidden");
+  el("modelFilterButton")?.setAttribute("aria-expanded", String(!panel?.classList.contains("hidden")));
+});
+el("modelFilterOptions")?.addEventListener("change", async (event) => {
+  const input = event.target.closest("input[type=checkbox]");
+  if (!input) return;
+  if (input.checked) selectedDashboardModels.add(input.value); else selectedDashboardModels.delete(input.value);
+  updateDashboardModelFilterOptions(dashboardModelOptions.map((model) => ({ model })));
+  await reloadForFilterChange();
+});
+el("modelFilterSelectAll")?.addEventListener("click", async () => { selectedDashboardModels = new Set(dashboardModelOptions); updateDashboardModelFilterOptions(dashboardModelOptions.map((model) => ({ model }))); await reloadForFilterChange(); });
+el("modelFilterClear")?.addEventListener("click", async () => { selectedDashboardModels.clear(); updateDashboardModelFilterOptions(dashboardModelOptions.map((model) => ({ model }))); await reloadForFilterChange(); });
 
 ["usageDetailDateFilter", "usageDetailModelFilter", "usageDetailStatusFilter"].forEach((id) => {
   el(id).addEventListener("change", updateUsageTableFilters);

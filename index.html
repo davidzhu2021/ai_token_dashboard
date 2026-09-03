@@ -4652,6 +4652,13 @@
           max-width: 145px;
         }
       }
+      .model-filter { position: relative; }
+      .model-filter-button { min-width: 126px; text-align: left; }
+      .model-filter-panel { position: absolute; right: 0; top: calc(100% + 8px); z-index: 30; min-width: 220px; max-height: 320px; overflow: auto; padding: 10px; border: 1px solid #d8e1eb; border-radius: 12px; background: #fff; box-shadow: 0 14px 32px rgba(29, 48, 75, .16); }
+      .model-filter-actions { display: flex; justify-content: space-between; padding-bottom: 8px; border-bottom: 1px solid #edf1f5; }
+      .model-filter-actions button { border: 0; background: transparent; color: #1769aa; cursor: pointer; font-weight: 700; }
+      .model-filter-options { display: grid; gap: 8px; padding-top: 8px; }
+      .model-filter-options label { display: flex; gap: 8px; align-items: center; color: #33475f; font-size: 13px; }
 
       @media (max-width: 1366px) {
         .global-nav {
@@ -7269,13 +7276,20 @@
                     </div>
                   </div>
                 </div>
-                <select id="sourceSelect" class="select" aria-label="来源筛选">
-                  <option value="all">全部来源</option>
-                  <option value="Cursor">Codex</option>
-                  <option value="Claude Code">Claude Code</option>
-                  <option value="Her">Her</option>
-                  <option value="其他">其他</option>
-                </select>
+                <div id="sourceFilter" class="model-filter">
+                  <button id="sourceFilterButton" class="select model-filter-button" type="button" aria-haspopup="true" aria-expanded="false">全部来源</button>
+                  <div id="sourceFilterPanel" class="model-filter-panel hidden" role="menu" aria-label="来源筛选">
+                    <div class="model-filter-actions"><button id="sourceFilterSelectAll" type="button">全选</button><button id="sourceFilterClear" type="button">清空</button></div>
+                    <div id="sourceFilterOptions" class="model-filter-options"></div>
+                  </div>
+                </div>
+                <div id="modelFilter" class="model-filter">
+                  <button id="modelFilterButton" class="select model-filter-button" type="button" aria-haspopup="true" aria-expanded="false">全部模型</button>
+                  <div id="modelFilterPanel" class="model-filter-panel hidden" role="menu" aria-label="模型筛选">
+                    <div class="model-filter-actions"><button id="modelFilterSelectAll" type="button">全选</button><button id="modelFilterClear" type="button">清空</button></div>
+                    <div id="modelFilterOptions" class="model-filter-options"></div>
+                  </div>
+                </div>
               </div>
               <div id="stabilityTopFilters" class="dashboard-filters hidden" aria-label="稳定性筛选">
                 <div class="range-picker"><select id="stabilityRangeSelect" class="select" aria-label="稳定性时间范围"><option value="1">近 1 天</option><option value="7" selected>近 7 天</option><option value="14">近 14 天</option><option value="30">近 30 天</option><option value="custom">自定义…</option></select><div id="stabilityRangePanel" class="range-panel hidden" role="dialog" aria-label="稳定性自定义时间范围"><div class="range-panel-field"><label for="stabilityRangeStart">开始日期</label><input id="stabilityRangeStart" class="input" type="date" /></div><div class="range-panel-field"><label for="stabilityRangeEnd">结束日期</label><input id="stabilityRangeEnd" class="input" type="date" /></div><p id="stabilityRangeHint" class="range-panel-hint"></p><div class="range-panel-actions"><button id="stabilityRangeCancel" class="ghost-btn" type="button">取消</button><button id="stabilityRangeApply" class="primary-btn" type="button">应用</button></div></div></div>

@@ -4104,6 +4104,74 @@ def usage_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def usage_model_filter(models: list[str] | None) -> set[str]:
+    return {
+        item.strip()
+        for value in (models or [])
+        for item in str(value or "").split(",")
+        if item.strip()
+    }
+
+
+def normalize_usage_sources(sources: str | list[str] | None) -> set[str]:
+    if isinstance(sources, str):
+        sources = [sources]
+    return {
+        item.strip()
+        for value in (sources or [])
+        for item in str(value or "").split(",")
+        if item.strip() and item.strip() != "all"
+    }
+
+
+def apply_usage_source_filter(payload: dict[str, Any], sources: list[str] | None) -> dict[str, Any]:
+    selected = normalize_usage_sources(sources)
+    if not selected:
+        return payload
+    result = dict(payload)
+    for key in ("rows", "summaryRows"):
+        if isinstance(result.get(key), list):
+            result[key] = [row for row in result[key] if str(row.get("source") or "其他") in selected]
+    if isinstance(result.get("rows"), list):
+        result["summary"] = usage_summary(result["rows"])
+    result["sourceOptions"] = sorted({str(row.get("source") or "其他") for row in (payload.get("summaryRows") or payload.get("rows") or [])})
+    return result
+
+
+def apply_usage_model_filter(payload: dict[str, Any], models: list[str] | None) -> dict[str, Any]:
+    selected = usage_model_filter(models)
+    if not selected:
+        return payload
+    result = dict(payload)
+    for key in ("rows", "summaryRows"):
+        if isinstance(result.get(key), list):
+            result[key] = [row for row in result[key] if str(row.get("model") or "未知模型") in selected]
+    if isinstance(result.get("rows"), list):
+        result["summary"] = usage_summary(result["rows"])
+        for key, identity_fields in (("employees", ("employeeId", "employeeEmail")), ("departments", ("departmentKey", "departmentId"))):
+            if not isinstance(result.get(key), list):
+                continue
+            grouped: dict[tuple[str, ...], dict[str, Any]] = {}
+            for row in result["rows"]:
+                identity = tuple(str(row.get(field) or "").lower() for field in identity_fields)
+                if not any(identity):
+                    continue
+                bucket = grouped.get(identity)
+                if bucket is None:
+                    bucket = next((item for item in result[key] if tuple(str(item.get(field) or "").lower() for field in identity_fields) == identity), None)
+                    if bucket is None:
+                        continue
+                    bucket = dict(bucket)
+                    for metric in ("promptTokens", "completionTokens", "totalTokens", "requestCount", "successCount", "failureCount", "spend"):
+                        bucket[metric] = 0
+                    grouped[identity] = bucket
+                for metric in ("promptTokens", "completionTokens", "totalTokens", "requestCount", "successCount", "failureCount", "spend"):
+                    bucket[metric] += float(row.get(metric) or 0)
+            result[key] = sorted(grouped.values(), key=lambda item: (-float(item.get("totalTokens") or 0), -float(item.get("spend") or 0)))
+    result["modelOptions"] = sorted({str(row.get("model") or "未知模型") for row in (payload.get("summaryRows") or payload.get("rows") or [])})
+    return result
+
+
 def feishu_direct_url(casdoor_authorize_url: str) -> str:
     app_id = os.getenv("FEISHU_APP_ID", "").strip()
     redirect_uri = os.getenv("FEISHU_REDIRECT_URI", "").strip()
@@ -9339,12 +9407,15 @@ async def my_usage(
     start_date: str | None = None,
     end_date: str | None = None,
     source: str = Query("all"),
+    model: list[str] = Query(default=[]),
     refresh: bool = Query(False),
 ) -> dict[str, Any]:
     app_user = require_user(request)
+    source_filter = normalize_usage_sources(source)
+    query_source = next(iter(source_filter), "all") if len(source_filter) <= 1 else "all"
     if organization_real_enabled() and await active_real_organization_membership(app_user):
         start_date, end_date = resolve_usage_range(start_date, end_date)
-        return await personal_usage_payload(app_user, start_date, end_date, source, refresh)
+        return apply_usage_source_filter(apply_usage_model_filter(await personal_usage_payload(app_user, start_date, end_date, query_source, refresh), model), list(source_filter)) if source_filter else apply_usage_model_filter(await personal_usage_payload(app_user, start_date, end_date, query_source, refresh), model)
     if await is_demo_customer_user(app_user):
         start_date, end_date = resolve_usage_range(start_date, end_date)
         memberships = await organization_memberships_for_user(app_user)
@@ -9362,7 +9433,7 @@ async def my_usage(
             source=source,
             email=str(app_user.get("email") or ""),
         )
-        return {"user": app_user, "startDate": start_date, "endDate": end_date, "source": source, **payload}
+        return {"user": app_user, "startDate": start_date, "endDate": end_date, "source": source, **apply_usage_source_filter(apply_usage_model_filter(payload, model), list(source_filter))}
     await require_non_inactive_demo_identity(app_user)
     if app_user.get("id"):
         local_user = await auth_store_call("get_user", str(app_user["id"]))
@@ -9374,7 +9445,7 @@ async def my_usage(
         app_user = await auth_user_payload(local_user)
         require_active_local_entitlement(app_user)
     start_date, end_date = resolve_usage_range(start_date, end_date)
-    return await personal_usage_payload(app_user, start_date, end_date, source, refresh)
+    return apply_usage_model_filter(await personal_usage_payload(app_user, start_date, end_date, source, refresh), model)
 
 
 @app.get("/api/team/usage")
@@ -9383,11 +9454,14 @@ async def team_usage(
     start_date: str | None = None,
     end_date: str | None = None,
     source: str = Query("all"),
+    model: list[str] = Query(default=[]),
     team_ref: str | None = None,
     refresh: bool = Query(False),
     include_member_rankings: bool = Query(True),
 ) -> dict[str, Any]:
     app_user = require_user(request)
+    source_filter = normalize_usage_sources(source)
+    source = next(iter(source_filter), "all") if len(source_filter) <= 1 else "all"
     if await is_demo_customer_user(app_user):
         start_date, end_date = resolve_usage_range(start_date, end_date)
         memberships = await organization_memberships_for_user(app_user)
@@ -9407,7 +9481,7 @@ async def team_usage(
             team_ref=(team_ref or "").strip(),
             include_member_rankings=include_member_rankings,
         )
-        return {"leader": {"email": app_user["email"], "name": app_user["name"]}, "startDate": start_date, "endDate": end_date, "source": source, "teamRef": payload.get("teamRef") or team_ref or "", **payload}
+        return {"leader": {"email": app_user["email"], "name": app_user["name"]}, "startDate": start_date, "endDate": end_date, "source": source, "teamRef": payload.get("teamRef") or team_ref or "", **apply_usage_source_filter(apply_usage_model_filter(payload, model), list(source_filter))}
     await require_non_inactive_demo_identity(app_user)
     if app_user.get("id") and not organization_real_enabled():
         # Password and enterprise SSO accounts remain separate identities.  Only a
@@ -9422,7 +9496,7 @@ async def team_usage(
         "endDate": end_date,
         "source": source,
         "teamRef": payload.get("team", {}).get("teamRef", team_ref or ""),
-        **payload,
+        **apply_usage_source_filter(apply_usage_model_filter(payload, model), list(source_filter)),
     }
 
 
@@ -9432,11 +9506,14 @@ async def team_member_usage(
     start_date: str | None = None,
     end_date: str | None = None,
     source: str = Query("all"),
+    model: list[str] = Query(default=[]),
     team_ref: str | None = None,
     employee: str | None = None,
     refresh: bool = Query(False),
 ) -> dict[str, Any]:
     app_user = require_user(request)
+    source_filter = normalize_usage_sources(source)
+    source = next(iter(source_filter), "all") if len(source_filter) <= 1 else "all"
     if await is_demo_customer_user(app_user):
         start_date, end_date = resolve_usage_range(start_date, end_date)
         if not employee:
@@ -9458,7 +9535,7 @@ async def team_member_usage(
             team_ref=(team_ref or "").strip(),
             employee=employee,
         )
-        return {"leader": {"email": app_user["email"], "name": app_user["name"]}, "startDate": start_date, "endDate": end_date, "source": source, "teamRef": payload.get("teamRef") or team_ref or "", **payload}
+        return {"leader": {"email": app_user["email"], "name": app_user["name"]}, "startDate": start_date, "endDate": end_date, "source": source, "teamRef": payload.get("teamRef") or team_ref or "", **apply_usage_source_filter(apply_usage_model_filter(payload, model), list(source_filter))}
     await require_non_inactive_demo_identity(app_user)
     if app_user.get("id") and not organization_real_enabled():
         # Local accounts never inherit team scopes from a same-email SSO user; the
@@ -9474,7 +9551,7 @@ async def team_member_usage(
         "endDate": end_date,
         "source": source,
         "teamRef": payload.get("team", {}).get("teamRef", team_ref or ""),
-        **payload,
+        **apply_usage_source_filter(apply_usage_model_filter(payload, model), list(source_filter)),
     }
 
 
@@ -9548,19 +9625,22 @@ async def admin_usage(
     start_date: str | None = None,
     end_date: str | None = None,
     source: str = Query("all"),
+    model: list[str] = Query(default=[]),
     employee: str | None = None,
     refresh: bool = Query(False),
 ) -> dict[str, Any]:
     admin = require_admin(request)
+    source_filter = normalize_usage_sources(source)
+    source = next(iter(source_filter), "all") if len(source_filter) <= 1 else "all"
     start_date, end_date = resolve_usage_range(start_date, end_date)
-    payload = await admin_usage_payload(admin, start_date, end_date, source, employee, refresh)
+    payload = apply_usage_source_filter(apply_usage_model_filter(await admin_usage_payload(admin, start_date, end_date, source, employee, refresh), model), list(source_filter))
     return {
         "admin": {"email": admin["email"], "name": admin["name"]},
         "startDate": start_date,
         "endDate": end_date,
         "source": source,
         "employee": employee or "",
-        **payload,
+        **apply_usage_model_filter(payload, model),
     }
 
 
@@ -9585,19 +9665,22 @@ async def admin_departments_usage(
     start_date: str | None = None,
     end_date: str | None = None,
     source: str = Query("all"),
+    model: list[str] = Query(default=[]),
     department: str | None = None,
     refresh: bool = Query(False),
 ) -> dict[str, Any]:
     admin = require_admin(request)
+    source_filter = normalize_usage_sources(source)
+    source = next(iter(source_filter), "all") if len(source_filter) <= 1 else "all"
     start_date, end_date = resolve_usage_range(start_date, end_date)
-    payload = await department_usage_payload(admin, start_date, end_date, source, department, refresh)
+    payload = apply_usage_source_filter(apply_usage_model_filter(await department_usage_payload(admin, start_date, end_date, source, department, refresh), model), list(source_filter))
     return {
         "admin": {"email": admin["email"], "name": admin["name"]},
         "startDate": start_date,
         "endDate": end_date,
         "source": source,
         "department": department or "",
-        **payload,
+        **apply_usage_model_filter(payload, model),
     }
 
 
@@ -9813,6 +9896,64 @@ _OBSERVABILITY_CAMEL_TO_SNAKE = {
     "routeName": "route_name", "fallbackFrom": "fallback_from", "fallbackTo": "fallback_to",
     "errorMessage": "error_message",
 }
+_SPENDLOG_MIRROR_ALLOWED_FIELDS = {
+    "sourceRequestId", "source_request_id", "requestId", "request_id", "eventTime", "event_time",
+    "model", "requestedModel", "requested_model", "actualModel", "actual_model", "modelGroup", "model_group",
+    "provider", "status", "statusCode", "status_code", "errorCode", "error_code", "errorClass", "error_class",
+    "errorMessage", "error_message", "teamId", "team_id", "organizationId", "organization_id", "principalHash", "principal_hash",
+    "requestDurationMs", "request_duration_ms", "ttftMs", "ttft_ms", "promptTokens", "prompt_tokens",
+    "completionTokens", "completion_tokens", "totalTokens", "total_tokens", "collectedAt", "collected_at",
+}
+_SPENDLOG_MIRROR_FORBIDDEN_FIELDS = _OBSERVABILITY_FORBIDDEN_EVENT_FIELDS | {"metadata", "request_tags", "user", "end_user"}
+
+
+@app.post("/api/internal/observability/spendlogs")
+async def internal_observability_spendlogs(request: Request) -> dict[str, Any]:
+    secret = os.getenv("OBSERVABILITY_INGEST_HMAC_SECRET", "").strip()
+    if not secret:
+        raise HTTPException(status_code=404, detail="采集接口尚未启用")
+    max_body = max(1024, int(os.getenv("OBSERVABILITY_INGEST_MAX_BODY_BYTES", "262144")))
+    body = await request.body()
+    if len(body) > max_body:
+        raise HTTPException(status_code=413, detail="事件批次过大")
+    timestamp = request.headers.get("x-observability-timestamp", "").strip()
+    signature = request.headers.get("x-observability-signature", "").strip().removeprefix("sha256=").lower()
+    try:
+        observed_at = int(timestamp)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="采集签名时间戳无效") from exc
+    if abs(int(datetime.now(timezone.utc).timestamp()) - observed_at) > int(os.getenv("OBSERVABILITY_INGEST_MAX_SKEW_SECONDS", "300")):
+        raise HTTPException(status_code=401, detail="采集签名已过期")
+    digest = hashlib.sha256(body).hexdigest()
+    expected = hmac.new(secret.encode("utf-8"), f"{timestamp}.{digest}".encode("ascii"), hashlib.sha256).hexdigest()
+    if not signature or not hmac.compare_digest(expected, signature):
+        raise HTTPException(status_code=401, detail="采集签名无效")
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="事件批次必须是 JSON") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("events"), list) or not payload["events"] or len(payload["events"]) > 500:
+        raise HTTPException(status_code=400, detail="events 必须是 1-500 条事件的数组")
+    batch_id = str(payload.get("batchId") or payload.get("batch_id") or "").strip()[:256]
+    events = []
+    for raw in payload["events"]:
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail="每条事件必须是对象")
+        forbidden = _SPENDLOG_MIRROR_FORBIDDEN_FIELDS.intersection(raw)
+        unknown = set(raw).difference(_SPENDLOG_MIRROR_ALLOWED_FIELDS)
+        if forbidden:
+            raise HTTPException(status_code=400, detail=f"事件包含禁止字段: {sorted(forbidden)[0]}")
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"事件包含未知字段: {sorted(unknown)[0]}")
+        events.append(raw)
+    store = usage_store()
+    if store is None:
+        raise HTTPException(status_code=503, detail="事件存储暂不可用")
+    try:
+        result = await store.insert_spendlog_mirror_events(events, batch_id=batch_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _observability_envelope(result, coverage={"partial": False, "incomplete": False}, source="198 LiteLLM SpendLogs 镜像")
 
 
 @app.post("/api/internal/observability/events")
@@ -10049,7 +10190,7 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
                     "modelRankings": [],
                     "governanceActions": governance["errorCodes"][:5],
                     "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
-                    "dataSource": {"type": "litellm", "status": "available", "table": "LiteLLM_SpendLogs"},
+                "dataSource": {"type": "litellm", "status": "available", "source": "198生产LiteLLM SpendLogs", "table": "LiteLLM_SpendLogs", "fallback": False},
                 },
                 freshness={"status": "available", "latestCollectedAt": end_date},
                 coverage={"partial": False, "incomplete": False, "eventCount": len(rows), "window": {"startDate": start_date, "endDate": end_date}},
@@ -10058,6 +10199,41 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
         except Exception as exc:
             logger.warning("LiteLLM stability query failed: %s", str(exc))
     store = _admin_observability_store()
+    mirror_query = getattr(store, "stability_spendlog_events", None)
+    if callable(mirror_query):
+        try:
+            mirror_rows = await mirror_query(start_date, end_date, model)
+            if mirror_rows:
+                governance = build_error_governance(mirror_rows)
+                overview = governance["overview"]
+                return _observability_envelope(
+                    {
+                        "overview": {
+                            **overview,
+                            "requestCount": overview["totalRequests"],
+                            "userVisibleFailureRate": overview["stabilityErrorRate"],
+                            "finalRequestFailureRate": overview["stabilityErrorRate"],
+                        },
+                        "errorCodes": governance["errorCodes"],
+                        "daily": governance["daily"],
+                        "topScenarios": [],
+                        "modelRankings": [],
+                        "governanceActions": governance["errorCodes"][:5],
+                        "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
+                        "dataSource": {
+                            "type": "litellm_spendlog_mirror",
+                            "status": "available",
+                            "source": "198生产LiteLLM SpendLogs",
+                            "table": "stability_spendlog_mirror",
+                            "fallback": False,
+                        },
+                    },
+                    freshness={"status": "available", "latestCollectedAt": mirror_rows[0].get("collected_at")},
+                    coverage={"partial": False, "incomplete": False, "eventCount": len(mirror_rows), "window": {"startDate": start_date, "endDate": end_date}},
+                    source="198 LiteLLM SpendLogs 镜像",
+                ) | {"startDate": start_date, "endDate": end_date, "model": model}
+        except Exception as exc:
+            logger.warning("SpendLogs mirror query failed: %s", str(exc))
     aggregate_query = getattr(store, "stability_overview_aggregates", None)
     if callable(aggregate_query):
         metric_period = _metric_period(start_date, end_date)
@@ -10165,6 +10341,13 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
                 "ttftDiagnostics": _stability_ttft_diagnostics(overview),
                 "quality": _stability_quality(overview),
                 "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
+                "dataSource": {
+                    "type": "dashboard_local_attribution",
+                    "status": "fallback",
+                    "source": "项目本地归因数据",
+                    "fallback": True,
+                    "fallbackReason": "198 SpendLogs 镜像不可用或当前窗口无数据",
+                },
             },
             freshness={"status": "available" if event_count else "empty", "latestCollectedAt": overall_row.get("latest_collected_at")},
             coverage={"partial": not window_covered, "incomplete": not window_covered, "eventCount": event_count, "window": {"startDate": start_date, "endDate": end_date}, "syncStates": sync_states, "missingReasons": missing_reasons, "definitionsVersion": STABILITY_DEFINITIONS_VERSION},
@@ -10263,9 +10446,16 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
             "topScenarios": scenarios,
             "attemptEventsAvailableFrom": min((str(item.get("started_at") or item.get("event_time") or "") for item in attempt_events), default=None),
             "ttftDiagnostics": _stability_ttft_diagnostics(overview),
-            "quality": _stability_quality(overview),
-            "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
+        "quality": _stability_quality(overview),
+        "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
+        "dataSource": {
+            "type": "dashboard_local_attribution",
+            "status": "fallback",
+            "source": "项目本地归因数据",
+            "fallback": True,
+            "fallbackReason": "198 SpendLogs 镜像不可用或当前窗口无数据",
         },
+    },
         freshness=freshness,
         coverage=covered,
         source="稳定性事件快照",
