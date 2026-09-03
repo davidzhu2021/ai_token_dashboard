@@ -11742,15 +11742,32 @@ document.addEventListener("mousedown", (event) => {
   });
 });
 
+function setDashboardFilterPanel(panelId, buttonId, open) {
+  const panel = el(panelId);
+  const button = el(buttonId);
+  if (!panel || !button) return;
+  panel.classList.toggle("hidden", !open);
+  button.setAttribute("aria-expanded", String(open));
+}
+
+function closeDashboardFilterPanels() {
+  setDashboardFilterPanel("sourceFilterPanel", "sourceFilterButton", false);
+  setDashboardFilterPanel("modelFilterPanel", "modelFilterButton", false);
+}
+
 updateDashboardSourceFilter();
-el("sourceFilterButton")?.addEventListener("click", () => { const panel = el("sourceFilterPanel"); panel?.classList.toggle("hidden"); el("sourceFilterButton")?.setAttribute("aria-expanded", String(!panel?.classList.contains("hidden"))); });
+el("sourceFilterButton")?.addEventListener("click", () => {
+  const open = el("sourceFilterPanel")?.classList.contains("hidden");
+  closeDashboardFilterPanels();
+  setDashboardFilterPanel("sourceFilterPanel", "sourceFilterButton", open);
+});
 el("sourceFilterOptions")?.addEventListener("change", async (event) => { const input = event.target.closest("input[type=checkbox]"); if (!input) return; if (input.checked) selectedDashboardSources.add(input.value); else selectedDashboardSources.delete(input.value); updateDashboardSourceFilter(); await reloadForFilterChange(); });
 el("sourceFilterSelectAll")?.addEventListener("click", async () => { selectedDashboardSources = new Set(dashboardSourceOptions); updateDashboardSourceFilter(); await reloadForFilterChange(); });
 el("sourceFilterClear")?.addEventListener("click", async () => { selectedDashboardSources.clear(); updateDashboardSourceFilter(); await reloadForFilterChange(); });
 el("modelFilterButton")?.addEventListener("click", () => {
-  const panel = el("modelFilterPanel");
-  panel?.classList.toggle("hidden");
-  el("modelFilterButton")?.setAttribute("aria-expanded", String(!panel?.classList.contains("hidden")));
+  const open = el("modelFilterPanel")?.classList.contains("hidden");
+  closeDashboardFilterPanels();
+  setDashboardFilterPanel("modelFilterPanel", "modelFilterButton", open);
 });
 el("modelFilterOptions")?.addEventListener("change", async (event) => {
   const input = event.target.closest("input[type=checkbox]");
@@ -11761,6 +11778,12 @@ el("modelFilterOptions")?.addEventListener("change", async (event) => {
 });
 el("modelFilterSelectAll")?.addEventListener("click", async () => { selectedDashboardModels = new Set(dashboardModelOptions); updateDashboardModelFilterOptions(dashboardModelOptions.map((model) => ({ model }))); await reloadForFilterChange(); });
 el("modelFilterClear")?.addEventListener("click", async () => { selectedDashboardModels.clear(); updateDashboardModelFilterOptions(dashboardModelOptions.map((model) => ({ model }))); await reloadForFilterChange(); });
+
+document.addEventListener("mousedown", (event) => {
+  const target = event.target;
+  if (target.closest("#sourceFilter, #modelFilter")) return;
+  closeDashboardFilterPanels();
+});
 
 ["usageDetailDateFilter", "usageDetailModelFilter", "usageDetailStatusFilter"].forEach((id) => {
   el(id).addEventListener("change", updateUsageTableFilters);
