@@ -20,3 +20,6 @@ def test_apply_usage_source_filter_recomputes_rows_and_summary() -> None:
     assert [row["source"] for row in filtered["rows"]] == ["Cursor"]
     assert filtered["summaryRows"][0]["source"] == "Cursor"
 
+
+def test_normalize_usage_sources_accepts_all_source_selection() -> None:
+    assert normalize_usage_sources("Cursor,Claude Code,Her,其他") == {"Cursor", "Claude Code", "Her", "其他"}

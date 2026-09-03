@@ -9430,10 +9430,10 @@ async def my_usage(
             organization_id,
             start_date=start_date,
             end_date=end_date,
-            source=source,
+            source=query_source,
             email=str(app_user.get("email") or ""),
         )
-        return {"user": app_user, "startDate": start_date, "endDate": end_date, "source": source, **apply_usage_source_filter(apply_usage_model_filter(payload, model), list(source_filter))}
+        return {"user": app_user, "startDate": start_date, "endDate": end_date, "source": query_source, **apply_usage_source_filter(apply_usage_model_filter(payload, model), list(source_filter))}
     await require_non_inactive_demo_identity(app_user)
     if app_user.get("id"):
         local_user = await auth_store_call("get_user", str(app_user["id"]))
@@ -9445,7 +9445,7 @@ async def my_usage(
         app_user = await auth_user_payload(local_user)
         require_active_local_entitlement(app_user)
     start_date, end_date = resolve_usage_range(start_date, end_date)
-    return apply_usage_model_filter(await personal_usage_payload(app_user, start_date, end_date, source, refresh), model)
+    return apply_usage_source_filter(apply_usage_model_filter(await personal_usage_payload(app_user, start_date, end_date, query_source, refresh), model), list(source_filter))
 
 
 @app.get("/api/team/usage")
