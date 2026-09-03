@@ -621,10 +621,10 @@ async def _cached_observability_dashboard(
     if failure and asyncio.get_running_loop().time() - failure[0] < 10:
         return _observability_pending_payload(dashboard_type, key_payload, error=failure[1])
     task = await _start_observability_refresh(dashboard_type, snapshot_key, builder)
-    # A cold stability query can legitimately take longer than the request
-    # budget. Keep the request responsive and let the single-flight task fill
-    # the snapshot for the next request instead of returning a timeout error.
-    if dashboard_type == "stability":
+    # Cold dashboards must remain responsive. The single-flight task fills the
+    # snapshot for the next request while this request renders a compatible
+    # pending shell instead of waiting on a potentially large aggregation.
+    if dashboard_type in {"stability", "cost"}:
         return _observability_pending_payload(dashboard_type, key_payload)
     budget_name = "STABILITY_COLD_QUERY_BUDGET_MS" if dashboard_type == "stability" else "OBSERVABILITY_COLD_QUERY_BUDGET_MS"
     default_budget = 4000 if dashboard_type == "stability" else 1500
@@ -11414,7 +11414,13 @@ async def _build_costs_overview(
                     key=lambda item: item[1], reverse=True
                 )
             ],
-            "ledger": {"rows": ledger_rows, "total": len(ledger_rows)},
+            # Keep overview responses bounded; the paginated ledger endpoint is
+            # the source of truth for full-detail browsing.
+            "ledger": {
+                "rows": ledger_rows[: max(1, env_int("OBSERVABILITY_OVERVIEW_LEDGER_LIMIT", 1000))],
+                "total": len(ledger_rows),
+                "truncated": len(ledger_rows) > max(1, env_int("OBSERVABILITY_OVERVIEW_LEDGER_LIMIT", 1000)),
+            },
             # Keep the legacy overview fields while the dedicated endpoints migrate consumers.
             "costItems": [_cost_item_payload(item) for item in items],
             "savingsActions": actions,

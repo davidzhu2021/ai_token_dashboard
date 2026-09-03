@@ -226,6 +226,7 @@ let costOverviewRequestId = 0;
 let stabilityOverviewController = null;
 let stabilityOverviewRefreshTimer = null;
 let costOverviewController = null;
+let costOverviewRefreshTimer = null;
 let stabilityScenarioRequestId = 0;
 let costLedgerRequestId = 0;
 let selectedCostModelSeries = "";
@@ -8320,6 +8321,10 @@ function switchView(view) {
     closeOrganizationTopupModal({ force: true });
     closeOrganizationCreditAdjustmentModal({ force: true });
   }
+  if (!["cost-control", "governance-workbench"].includes(view) && costOverviewRefreshTimer) {
+    globalThis.clearTimeout(costOverviewRefreshTimer);
+    costOverviewRefreshTimer = null;
+  }
   currentView = view;
   setGlobalPage(view === "models" ? "models" : "console");
   el("appShell").classList.toggle("models-layout", view === "models");
@@ -9328,6 +9333,10 @@ function openGovernanceWorkbench(tab) {
 async function loadCostOverview(forceRefresh = false) {
   if (!canViewCosts()) return;
   const requestId = ++costOverviewRequestId;
+  if (costOverviewRefreshTimer) {
+    globalThis.clearTimeout(costOverviewRefreshTimer);
+    costOverviewRefreshTimer = null;
+  }
   costOverviewController?.abort();
   costOverviewController = new AbortController();
   isCostOverviewLoading = true;
@@ -9344,10 +9353,34 @@ async function loadCostOverview(forceRefresh = false) {
     const recognitionStatus = el("costRecognition")?.value || "";
     const asOf = localDate(new Date());
     const query = `start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&as_of=${encodeURIComponent(asOf)}&category=${encodeURIComponent(category)}&cost_bucket=${encodeURIComponent(costBucket)}&model=${encodeURIComponent(model)}&vendor=${encodeURIComponent(vendor)}&provider=${encodeURIComponent(provider)}&account_id=${encodeURIComponent(accountId)}&reconciliation_status=${encodeURIComponent(reconciliationStatus)}&recognition_status=${encodeURIComponent(recognitionStatus)}${forceRefresh ? "&refresh=1" : ""}`;
-    const nextOverview = await api(`/api/admin/costs/overview?${query}`, { signal: costOverviewController.signal });
+    let nextOverview;
+    let retryAttempt = 0;
+    while (true) {
+      try {
+        nextOverview = await api(`/api/admin/costs/overview?${query}`, { signal: costOverviewController.signal });
+        break;
+      } catch (error) {
+        if (error.name === "AbortError" || error.status !== 503 || retryAttempt >= STABILITY_OVERVIEW_MAX_RETRIES) throw error;
+        retryAttempt += 1;
+        const retryDelay = Math.min(8000, error.retryAfter > 0 ? error.retryAfter * 1000 : 1000 * (2 ** (retryAttempt - 1)));
+        await new Promise((resolve, reject) => {
+          const timer = globalThis.setTimeout(resolve, retryDelay);
+          costOverviewController.signal.addEventListener("abort", () => {
+            globalThis.clearTimeout(timer);
+            reject(Object.assign(new Error("已取消"), { name: "AbortError" }));
+          }, { once: true });
+        });
+      }
+    }
     if (requestId !== costOverviewRequestId) return;
     costOverview = nextOverview;
     costBudgets = Array.isArray(nextOverview?.data?.budgets) ? nextOverview.data.budgets : costBudgets;
+    if (nextOverview?.cache?.state === "refreshing" && nextOverview?.freshness?.status === "pending" && !nextOverview?.cache?.lastRefreshError) {
+      costOverviewRefreshTimer = globalThis.setTimeout(() => {
+        costOverviewRefreshTimer = null;
+        if (requestId === costOverviewRequestId && ["cost-control", "governance-workbench"].includes(currentView)) loadCostOverview(false);
+      }, 2000);
+    }
   } catch (error) {
     if (error.name !== "AbortError" && requestId === costOverviewRequestId) {
       costOverviewLoadError = error.message || "费用看板加载失败";
@@ -10237,6 +10270,8 @@ function showLogin() {
   if (stabilityOverviewRefreshTimer) globalThis.clearTimeout(stabilityOverviewRefreshTimer);
   stabilityOverviewRefreshTimer = null;
   costOverviewController?.abort();
+  if (costOverviewRefreshTimer) globalThis.clearTimeout(costOverviewRefreshTimer);
+  costOverviewRefreshTimer = null;
   stabilityOverviewController = null;
   costOverviewController = null;
   stabilityDrawerReturnFocus = null;

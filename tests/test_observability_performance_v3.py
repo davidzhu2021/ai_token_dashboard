@@ -91,6 +91,29 @@ def test_stale_snapshot_is_returned_and_refresh_is_singleflight(monkeypatch) -> 
     asyncio.run(run())
 
 
+def test_cost_cold_request_returns_pending_without_waiting_for_builder(monkeypatch) -> None:
+    async def run() -> None:
+        store = SnapshotStore()
+        monkeypatch.setattr(main, "_admin_observability_store", lambda: store)
+        main._observability_refresh_tasks.clear()
+
+        async def builder():
+            await asyncio.sleep(60)
+            return {"data": {"value": 9}}
+
+        result = await asyncio.wait_for(
+            main._cached_observability_dashboard("cost", {"month": "2026-08"}, builder),
+            timeout=0.5,
+        )
+        assert result["cache"]["state"] == "refreshing"
+        assert result["freshness"]["status"] == "pending"
+        task = next(iter(main._observability_refresh_tasks.values()))
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
 def test_cost_frontend_uses_single_overview_request() -> None:
     source = open("assets/app.js", encoding="utf-8").read()
     start = source.index("async function loadCostOverview")
@@ -99,6 +122,16 @@ def test_cost_frontend_uses_single_overview_request() -> None:
     assert "/api/admin/costs/overview?" in loader
     assert "/api/admin/costs/annual?" not in loader
     assert 'api("/api/admin/costs/budgets")' not in loader
+
+
+def test_cost_frontend_retries_pending_snapshot() -> None:
+    source = open("assets/app.js", encoding="utf-8").read()
+    start = source.index("async function loadCostOverview")
+    end = source.index("function focusDrawer", start)
+    loader = source[start:end]
+    assert "STABILITY_OVERVIEW_MAX_RETRIES" in loader
+    assert 'nextOverview?.cache?.state === "refreshing"' in loader
+    assert "setTimeout" in loader
 
 
 def test_governance_workbench_does_not_preload_full_overviews() -> None:
