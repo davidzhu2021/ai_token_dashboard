@@ -11,7 +11,6 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import asyncpg
 import httpx
 
 LOG = logging.getLogger("spendlog-mirror-collector")
@@ -66,7 +65,8 @@ def signed_headers(body: bytes, secret: str, *, timestamp: int | None = None) ->
 
 
 async def collect_once() -> int:
-    dsn = os.environ["LITELLM_DATABASE_URL"]
+    base_url = os.environ["LITELLM_BASE_URL"].rstrip("/")
+    admin_key = os.environ["LITELLM_ADMIN_KEY"]
     url = os.environ["OBSERVABILITY_INGEST_URL"]
     secret = os.environ["OBSERVABILITY_INGEST_HMAC_SECRET"]
     source = os.getenv("OBSERVABILITY_BACKEND_ID", "litellm-198")
@@ -74,16 +74,28 @@ async def collect_once() -> int:
     days = max(1, int(os.getenv("OBSERVABILITY_COLLECTOR_LOOKBACK_DAYS", "2")))
     collected = datetime.now(timezone.utc)
     since = collected - timedelta(days=days)
-    conn = await asyncpg.connect(dsn)
-    try:
-        rows = await conn.fetch('SELECT request_id, "startTime", "endTime", "completionStartTime", model, model_group, custom_llm_provider, status, "user", team_id, organization_id, prompt_tokens, completion_tokens, total_tokens, metadata FROM "LiteLLM_SpendLogs" WHERE "startTime" >= $1 ORDER BY "startTime" ASC', since)
-    finally:
-        await conn.close()
-    events = [build_event(dict(row), source=source, principal_salt=salt, collected_at=collected) for row in rows]
-    events = [event for event in events if event.get("sourceRequestId")]
-    if not events:
-        return 0
+    rows: list[dict[str, Any]] = []
     async with httpx.AsyncClient(timeout=float(os.getenv("OBSERVABILITY_INGEST_TIMEOUT_SECONDS", "10"))) as client:
+        page = 1
+        while page <= 100:
+            response = await client.get(
+                f"{base_url}/spend/logs/v2",
+                params={"start_date": since.isoformat(), "end_date": collected.isoformat(), "page": page, "page_size": 100},
+                headers={"Authorization": f"Bearer {admin_key}"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            batch = payload.get("data") if isinstance(payload, dict) else payload
+            if not isinstance(batch, list) or not batch:
+                break
+            rows.extend(item for item in batch if isinstance(item, dict))
+            if len(batch) < 100:
+                break
+            page += 1
+        events = [build_event(row, source=source, principal_salt=salt, collected_at=collected) for row in rows]
+        events = [event for event in events if event.get("sourceRequestId")]
+        if not events:
+            return 0
         for offset in range(0, len(events), 100):
             body = json.dumps({"events": events[offset:offset + 100]}, separators=(",", ":")).encode()
             response = await client.post(url, content=body, headers=signed_headers(body, secret))
