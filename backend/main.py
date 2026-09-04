@@ -4146,16 +4146,20 @@ def apply_usage_model_filter(payload: dict[str, Any], models: list[str] | None) 
     for key in ("rows", "summaryRows"):
         if isinstance(result.get(key), list):
             result[key] = [row for row in result[key] if str(row.get("model") or "未知模型") in selected]
-    if isinstance(result.get("rows"), list):
+    # 部门总览为性能考虑会故意省略逐员工明细 rows，但仍会返回已经
+    # 按部门/员工聚合好的排行；此时不能用空 rows 覆盖这些结果。
+    if isinstance(result.get("rows"), list) and result["rows"]:
         result["summary"] = usage_summary(result["rows"])
         for key, identity_fields in (("employees", ("employeeId", "employeeEmail")), ("departments", ("departmentKey", "departmentId"))):
             if not isinstance(result.get(key), list):
                 continue
             grouped: dict[tuple[str, ...], dict[str, Any]] = {}
+            matched_identity = False
             for row in result["rows"]:
                 identity = tuple(str(row.get(field) or "").lower() for field in identity_fields)
                 if not any(identity):
                     continue
+                matched_identity = True
                 bucket = grouped.get(identity)
                 if bucket is None:
                     bucket = next((item for item in result[key] if tuple(str(item.get(field) or "").lower() for field in identity_fields) == identity), None)
@@ -4167,7 +4171,8 @@ def apply_usage_model_filter(payload: dict[str, Any], models: list[str] | None) 
                     grouped[identity] = bucket
                 for metric in ("promptTokens", "completionTokens", "totalTokens", "requestCount", "successCount", "failureCount", "spend"):
                     bucket[metric] += float(row.get(metric) or 0)
-            result[key] = sorted(grouped.values(), key=lambda item: (-float(item.get("totalTokens") or 0), -float(item.get("spend") or 0)))
+            if matched_identity:
+                result[key] = sorted(grouped.values(), key=lambda item: (-float(item.get("totalTokens") or 0), -float(item.get("spend") or 0)))
     result["modelOptions"] = sorted({str(row.get("model") or "未知模型") for row in (payload.get("summaryRows") or payload.get("rows") or [])})
     return result
 
