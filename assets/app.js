@@ -16,6 +16,7 @@ let usageData = [];
 let usageSummary = null;
 let dashboardModelOptions = [];
 let selectedDashboardModels = new Set();
+let dashboardModelFilterScopeKey = "";
 let dashboardModelFilterInitialized = false;
 const dashboardSourceOptions = ["Cursor", "Claude Code", "Her", "其他"];
 let selectedDashboardSources = new Set(dashboardSourceOptions);
@@ -2051,12 +2052,13 @@ function applyDashboardModelFilter(rows) {
   const selected = selectedDashboardModelValues();
   return selected.length ? rows.filter((row) => selected.includes(String(row.model || "未知模型"))) : rows;
 }
-function updateDashboardModelFilterOptions(rows, optionNames = null) {
+function updateDashboardModelFilterOptions(rows, optionNames = null, scopeKey = "") {
   const names = [...new Set((optionNames || rows.map((row) => String(row.model || "未知模型"))).map(String))].sort();
   dashboardModelOptions = names;
-  if (!dashboardModelFilterInitialized) {
+  if (!dashboardModelFilterInitialized || dashboardModelFilterScopeKey !== scopeKey) {
     selectedDashboardModels = new Set(names);
     dashboardModelFilterInitialized = true;
+    dashboardModelFilterScopeKey = scopeKey;
   } else {
     selectedDashboardModels = new Set(names.filter((name) => selectedDashboardModels.has(name)));
   }
@@ -3439,6 +3441,7 @@ function resetTeamMemberSelection() {
 }
 
 function applyTeamUsagePayload(payload, cacheKey = "") {
+  updateDashboardModelFilterOptions(payload.summaryRows || payload.rows || [], payload.modelOptions, "team");
   teamUsageData = Array.isArray(payload.rows) ? payload.rows : [];
   teamSummaryData = Array.isArray(payload.summaryRows) ? payload.summaryRows : teamUsageData;
   teamEmployees = Array.isArray(payload.employees) ? payload.employees : [];
@@ -9860,7 +9863,7 @@ function loadDashboardData(forceRefresh = false) {
         { signal: controller.signal },
       );
       if (requestId !== dashboardRequestId || dashboardRequestKey !== queryKey) return;
-      updateDashboardModelFilterOptions(payload.rows || [], payload.modelOptions);
+      updateDashboardModelFilterOptions(payload.rows || [], payload.modelOptions, "personal");
       usageData = applyDashboardModelFilter(payload.rows || []);
       usageSummary = usageData.length ? null : payload.summary || null;
       personalDataFreshness = payload.dataFreshness || null;
@@ -9909,7 +9912,7 @@ function loadAdminData(forceRefresh = false) {
     try {
       const payload = await api(`${usagePath}?${query.toString()}`, { signal: controller.signal });
       if (requestId !== adminUsageRequestId || scopeKey !== organizationUsageScopeKey()) return;
-      updateDashboardModelFilterOptions(payload.summaryRows || payload.rows || [], payload.modelOptions);
+      updateDashboardModelFilterOptions(payload.summaryRows || payload.rows || [], payload.modelOptions, "admin");
       adminUsageData = applyDashboardModelFilter(payload.rows || []);
       adminSummaryData = applyDashboardModelFilter(payload.summaryRows || adminUsageData);
       adminEmployees = payload.employees || [];
@@ -9966,7 +9969,7 @@ function loadDepartmentData(forceRefresh = false) {
     try {
       const payload = await api(`${usagePath}?${query.toString()}`, { signal: controller.signal });
       if (requestId !== departmentUsageRequestId || scopeKey !== organizationUsageScopeKey()) return;
-      updateDashboardModelFilterOptions(payload.summaryRows || payload.rows || [], payload.modelOptions);
+      updateDashboardModelFilterOptions(payload.summaryRows || payload.rows || [], payload.modelOptions, "department");
       departmentUsageData = applyDashboardModelFilter(payload.rows || []);
       departmentSummaryData = applyDashboardModelFilter(payload.summaryRows || departmentUsageData);
       departmentRankings = payload.departments || [];
