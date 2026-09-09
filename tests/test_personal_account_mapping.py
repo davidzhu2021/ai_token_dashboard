@@ -1,6 +1,7 @@
 import asyncio
 from typing import Any
 
+import pytest
 from fastapi import HTTPException
 
 from backend.litellm_client import LiteLLMBackend, LiteLLMClient
@@ -235,3 +236,28 @@ def test_partial_optional_her_index_failure_does_not_commit_partial_matches() ->
     user = asyncio.run(client.resolve_user("zhuyida@auto-link.com.cn", "朱奕达"))
 
     assert user["matched_user_ids"] == ["cursor-zhuyida"]
+
+
+def test_bare_mailbox_alias_cannot_bind_an_arbitrary_upstream_user() -> None:
+    client = make_client()
+
+    async def fake_request_backend(backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> Any:
+        if backend.id == "her":
+            raise HTTPException(status_code=404, detail="not found")
+        if path == "/user/list":
+            return {"users": [], "total_pages": 1}
+        if path == "/key/list":
+            params = kwargs["params"]
+            if params.get("key_alias") == "zhuyida":
+                return {"keys": [{"user_id": "carher-271", "key_alias": "zhuyida"}], "total_pages": 1}
+            return {"keys": [], "total_pages": 1}
+        if path == "/spend/logs/v2":
+            return {"logs": [], "total_pages": 1}
+        raise AssertionError(f"unexpected call {backend.id} {method} {path}")
+
+    client.request_backend = fake_request_backend  # type: ignore[assignment]
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(client.resolve_user("zhuyida@auto-link.com.cn", "朱奕达"))
+
+    assert exc_info.value.status_code == 404

@@ -2418,7 +2418,10 @@ class LiteLLMClient:
         backend = backend or self.backends[0]
         user_ids: list[str] = []
         seen: set[str] = set()
-        aliases = tool_account_aliases(email_prefix)
+        # The bare mailbox prefix is not an ownership proof: unrelated keys
+        # can legally reuse it as an alias. Only canonical tool aliases are
+        # safe fallback identities here.
+        aliases = [alias for alias in tool_account_aliases(email_prefix) if alias != email_prefix]
 
         def add_user_id(value: Any) -> None:
             user_id = str(value or "").strip()
