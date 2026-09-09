@@ -3156,6 +3156,7 @@ class LiteLLMClient:
         }
 
     async def keys_for_user_ids(self, user_ids: list[str], refresh: bool = False) -> list[dict[str, Any]]:
+        logger.info("personal key lookup accounts=%s refresh=%s", list(dict.fromkeys(str(item) for item in user_ids if item)), refresh)
         tasks = []
         for user_id in user_ids:
             backend, raw_user_id = self._decode_account_id(user_id)
@@ -3175,6 +3176,7 @@ class LiteLLMClient:
                 raise result
             batches.append(result)
         if not batches and missing_account_errors:
+            logger.warning("personal key lookup found no keys accounts=%s missing_count=%s", list(dict.fromkeys(str(item) for item in user_ids if item)), len(missing_account_errors))
             raise missing_account_errors[0]
         keys: list[dict[str, Any]] = []
         seen: set[str] = set()

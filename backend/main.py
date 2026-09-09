@@ -12111,6 +12111,7 @@ async def my_keys(
     user_ids = upstream_user_ids(upstream_user)
     if not user_ids:
         raise HTTPException(status_code=502, detail="上游员工记录缺少 user_id")
+    logger.info("personal key route resolved accounts=%s", user_ids)
     if include_models:
         primary_user_id = primary_upstream_user_id(upstream_user)
         # 模型权限与密钥列表相互独立，保留兼容调用方的并行加载。
