@@ -18,6 +18,7 @@ let dashboardModelOptions = [];
 let selectedDashboardModels = new Set();
 let dashboardModelFilterScopeKey = "";
 let dashboardModelFilterInitialized = false;
+const dashboardModelFilterStates = new Map();
 const dashboardSourceOptions = ["Cursor", "Claude Code", "Her", "其他"];
 let selectedDashboardSources = new Set(dashboardSourceOptions);
 let usageTableFilters = { date: "all", model: "all", status: "all", keyword: "" };
@@ -2047,29 +2048,66 @@ function updateDashboardSourceFilter() {
 }
 
 function selectedDashboardModelValues() { return [...selectedDashboardModels].sort(); }
+function dashboardModelFilterScope(view = currentView) {
+  if (view === "admin" || view === "team" || view === "department") return view;
+  return "personal";
+}
+function activateDashboardModelFilterScope(scopeKey = dashboardModelFilterScope()) {
+  const state = dashboardModelFilterStates.get(scopeKey) || { options: [], selected: new Set(), initialized: false, scopeKey, dataKey: "" };
+  dashboardModelFilterStates.set(scopeKey, state);
+  dashboardModelOptions = state.options;
+  selectedDashboardModels = state.selected;
+  dashboardModelFilterScopeKey = state.scopeKey;
+  dashboardModelFilterInitialized = state.initialized;
+  return state;
+}
+function syncDashboardModelFilterUi(scopeKey = dashboardModelFilterScope()) {
+  const state = activateDashboardModelFilterScope(scopeKey);
+  const names = state.options;
+  const container = el("modelFilterOptions");
+  if (container) container.innerHTML = names.length
+    ? names.map((name) => `<label><input type="checkbox" value="${escapeHtml(name)}" ${state.selected.has(name) ? "checked" : ""}> <span>${escapeHtml(name)}</span></label>`).join("")
+    : '<span class="muted">暂无模型</span>';
+  const button = el("modelFilterButton");
+  if (button) button.textContent = !names.length
+    ? "全部模型"
+    : !state.selected.size
+      ? "未选择模型"
+      : state.selected.size === names.length
+        ? "全部模型"
+        : `已选 ${state.selected.size} 个模型`;
+}
 function dashboardModelQueryValues() {
-  if (!dashboardModelFilterInitialized) return [];
-  const values = selectedDashboardModelValues();
+  const state = activateDashboardModelFilterScope();
+  if (!state.initialized) return [];
+  const values = [...state.selected].sort();
   return values.length ? values : ["__none__"];
 }
 function applyDashboardModelFilter(rows) {
-  const selected = selectedDashboardModelValues();
+  const selected = [...activateDashboardModelFilterScope().selected];
   return selected.length ? rows.filter((row) => selected.includes(String(row.model || "未知模型"))) : rows;
 }
-function updateDashboardModelFilterOptions(rows, optionNames = null, scopeKey = "") {
-  const names = [...new Set((optionNames || rows.map((row) => String(row.model || "未知模型"))).map(String))].sort();
-  dashboardModelOptions = names;
-  if (!dashboardModelFilterInitialized || dashboardModelFilterScopeKey !== scopeKey) {
-    selectedDashboardModels = new Set(names);
-    dashboardModelFilterInitialized = true;
-    dashboardModelFilterScopeKey = scopeKey;
+function updateDashboardModelFilterOptions(rows, optionNames = null, scopeKey = "", dataKey = "") {
+  const key = scopeKey || dashboardModelFilterScope();
+  const state = activateDashboardModelFilterScope(key);
+  const incoming = [...new Set((optionNames || rows.map((row) => String(row.model || "未知模型"))).map(String))].sort();
+  // An empty response can mean an intentionally empty selection; retain the option universe.
+  const contextChanged = Boolean(dataKey && state.dataKey && state.dataKey !== dataKey);
+  const names = !state.initialized || contextChanged
+    ? incoming
+    : !incoming.length || incoming.every((name) => state.options.includes(name))
+      ? state.options
+      : incoming;
+  state.options = names;
+  if (dataKey) state.dataKey = dataKey;
+  if (!state.initialized || contextChanged) {
+    state.selected = new Set(names);
+    state.initialized = true;
   } else {
-    selectedDashboardModels = new Set(names.filter((name) => selectedDashboardModels.has(name)));
+    state.selected = new Set(names.filter((name) => state.selected.has(name)));
   }
-  const container = el("modelFilterOptions");
-  if (container) container.innerHTML = names.length ? names.map((name) => `<label><input type="checkbox" value="${escapeHtml(name)}" ${selectedDashboardModels.has(name) ? "checked" : ""}> <span>${escapeHtml(name)}</span></label>`).join("") : '<span class="muted">暂无模型</span>';
-  const button = el("modelFilterButton");
-  if (button) button.textContent = !selectedDashboardModels.size || selectedDashboardModels.size === names.length ? "全部模型" : `已选 ${selectedDashboardModels.size} 个模型`;
+  dashboardModelFilterStates.set(key, state);
+  if (dashboardModelFilterScope() === key) syncDashboardModelFilterUi(key);
 }
 
 function scrollToDetailCard(id) {
@@ -3445,7 +3483,7 @@ function resetTeamMemberSelection() {
 }
 
 function applyTeamUsagePayload(payload, cacheKey = "") {
-  updateDashboardModelFilterOptions(payload.summaryRows || payload.rows || [], payload.modelOptions, "team");
+  updateDashboardModelFilterOptions(payload.summaryRows || payload.rows || [], payload.modelOptions, "team", cacheKey.split("|").slice(0, 5).join("|"));
   teamUsageData = Array.isArray(payload.rows) ? payload.rows : [];
   teamSummaryData = Array.isArray(payload.summaryRows) ? payload.summaryRows : teamUsageData;
   teamEmployees = Array.isArray(payload.employees) ? payload.employees : [];
@@ -8408,6 +8446,11 @@ function switchView(view) {
     costOverviewRefreshTimer = null;
   }
   currentView = view;
+  closeDashboardFilterPanels();
+  if (["dashboard", "admin", "team", "department"].includes(view)) {
+    activateDashboardModelFilterScope(dashboardModelFilterScope(view));
+    syncDashboardModelFilterUi(dashboardModelFilterScope(view));
+  }
   setGlobalPage(view === "models" ? "models" : "console");
   el("appShell").classList.toggle("models-layout", view === "models");
   el("dashboardView").classList.toggle("hidden", view !== "dashboard");
@@ -9904,7 +9947,7 @@ function loadDashboardData(forceRefresh = false) {
         { signal: controller.signal },
       );
       if (requestId !== dashboardRequestId || dashboardRequestKey !== queryKey) return;
-      updateDashboardModelFilterOptions(payload.rows || [], payload.modelOptions, "personal");
+      updateDashboardModelFilterOptions(payload.rows || [], payload.modelOptions, "personal", `${startDate}|${endDate}|${source}|personal`);
       usageData = applyDashboardModelFilter(payload.rows || []);
       usageSummary = usageData.length ? null : payload.summary || null;
       personalDataFreshness = payload.dataFreshness || null;
@@ -9953,7 +9996,7 @@ function loadAdminData(forceRefresh = false) {
     try {
       const payload = await api(`${usagePath}?${query.toString()}`, { signal: controller.signal });
       if (requestId !== adminUsageRequestId || scopeKey !== organizationUsageScopeKey()) return;
-      updateDashboardModelFilterOptions(payload.summaryRows || payload.rows || [], payload.modelOptions, "admin");
+      updateDashboardModelFilterOptions(payload.summaryRows || payload.rows || [], payload.modelOptions, "admin", `${scopeKey}|${usagePath}|${startDate}|${endDate}|${source}|${employee}`);
       adminUsageData = applyDashboardModelFilter(payload.rows || []);
       adminSummaryData = applyDashboardModelFilter(payload.summaryRows || adminUsageData);
       adminEmployees = payload.employees || [];
@@ -10010,7 +10053,7 @@ function loadDepartmentData(forceRefresh = false) {
     try {
       const payload = await api(`${usagePath}?${query.toString()}`, { signal: controller.signal });
       if (requestId !== departmentUsageRequestId || scopeKey !== organizationUsageScopeKey()) return;
-      updateDashboardModelFilterOptions(payload.summaryRows || payload.rows || [], payload.modelOptions, "department");
+      updateDashboardModelFilterOptions(payload.summaryRows || payload.rows || [], payload.modelOptions, "department", `${scopeKey}|${usagePath}|${startDate}|${endDate}|${source}|${selectedDepartment || ""}`);
       departmentUsageData = applyDashboardModelFilter(payload.rows || []);
       departmentSummaryData = applyDashboardModelFilter(payload.summaryRows || departmentUsageData);
       departmentRankings = payload.departments || [];
@@ -10400,6 +10443,11 @@ function showLogin() {
   departmentPickerOpen = false;
   usageData = [];
   usageSummary = null;
+  dashboardModelFilterStates.clear();
+  dashboardModelOptions = [];
+  selectedDashboardModels = new Set();
+  dashboardModelFilterScopeKey = "";
+  dashboardModelFilterInitialized = false;
   personalDataQuality = null;
   personalCoverage = null;
   dashboardRequestController?.abort();
@@ -11816,12 +11864,13 @@ el("modelFilterButton")?.addEventListener("click", () => {
 el("modelFilterOptions")?.addEventListener("change", async (event) => {
   const input = event.target.closest("input[type=checkbox]");
   if (!input) return;
-  if (input.checked) selectedDashboardModels.add(input.value); else selectedDashboardModels.delete(input.value);
-  updateDashboardModelFilterOptions(dashboardModelOptions.map((model) => ({ model })));
+  const state = activateDashboardModelFilterScope();
+  if (input.checked) state.selected.add(input.value); else state.selected.delete(input.value);
+  syncDashboardModelFilterUi();
   await reloadForFilterChange();
 });
-el("modelFilterSelectAll")?.addEventListener("click", async () => { selectedDashboardModels = new Set(dashboardModelOptions); updateDashboardModelFilterOptions(dashboardModelOptions.map((model) => ({ model }))); await reloadForFilterChange(); });
-el("modelFilterClear")?.addEventListener("click", async () => { selectedDashboardModels.clear(); updateDashboardModelFilterOptions(dashboardModelOptions.map((model) => ({ model }))); await reloadForFilterChange(); });
+el("modelFilterSelectAll")?.addEventListener("click", async () => { const state = activateDashboardModelFilterScope(); state.selected = new Set(state.options); syncDashboardModelFilterUi(); await reloadForFilterChange(); });
+el("modelFilterClear")?.addEventListener("click", async () => { const state = activateDashboardModelFilterScope(); state.selected.clear(); syncDashboardModelFilterUi(); await reloadForFilterChange(); });
 
 document.addEventListener("mousedown", (event) => {
   const target = event.target;
