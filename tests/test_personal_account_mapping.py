@@ -160,3 +160,28 @@ def test_suffix_key_alias_matching_rejects_unrelated_substrings() -> None:
     user_ids = asyncio.run(client.user_ids_from_key_alias("zhuyida"))
 
     assert user_ids == []
+
+
+def test_exact_key_alias_matching_rejects_upstream_ignored_filter() -> None:
+    client = make_client()
+
+    async def fake_request_backend(backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> Any:
+        if path == "/user/list":
+            return {"users": [], "total_pages": 1}
+        if path == "/key/list":
+            return {
+                "keys": [
+                    {"user_id": "other-user", "key_alias": "cursor-other"},
+                    {"user_id": "cursor-zhuyida", "key_alias": "cursor-zhuyida"},
+                ],
+                "total_pages": 1,
+            }
+        if path == "/spend/logs/v2":
+            return {"logs": [], "total_pages": 1}
+        raise AssertionError(f"unexpected call {backend.id} {method} {path}")
+
+    client.request_backend = fake_request_backend  # type: ignore[assignment]
+
+    user_ids = asyncio.run(client.user_ids_from_key_alias("zhuyida"))
+
+    assert user_ids == ["cursor-zhuyida"]

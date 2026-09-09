@@ -2415,7 +2415,13 @@ class LiteLLMClient:
                 params["substring_matching"] = "true"
             payload = await self.request_backend(backend, "GET", "/key/list", params=params)
             for key in _records(payload):
-                if substring_matching and not _tool_alias_matches(alias, key.get("key_alias")):
+                # Some proxy versions ignore key_alias filters. Re-check both
+                # exact and suffix matches locally before accepting ownership.
+                candidate = _clean_text(key.get("key_alias"))
+                if substring_matching:
+                    if not _tool_alias_matches(alias, candidate):
+                        continue
+                elif candidate != alias:
                     continue
                 add_user_id(key.get("user_id"))
 
