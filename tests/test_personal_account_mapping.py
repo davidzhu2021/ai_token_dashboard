@@ -185,3 +185,27 @@ def test_exact_key_alias_matching_rejects_upstream_ignored_filter() -> None:
     user_ids = asyncio.run(client.user_ids_from_key_alias("zhuyida"))
 
     assert user_ids == ["cursor-zhuyida"]
+
+
+def test_primary_identity_resolution_survives_unavailable_optional_her_index() -> None:
+    client = make_client()
+
+    async def fake_request_backend(backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> Any:
+        if backend.id == "her":
+            raise HTTPException(status_code=404, detail="not found")
+        if path == "/user/list":
+            params = kwargs["params"]
+            if params.get("user_email") == "zhuyida@auto-link.com.cn":
+                return {"users": [{"user_id": "cursor-zhuyida", "user_email": "zhuyida@auto-link.com.cn"}], "total_pages": 1}
+            return {"users": [], "total_pages": 1}
+        if path == "/key/list":
+            return {"keys": [], "total_pages": 1}
+        if path == "/spend/logs/v2":
+            return {"logs": [], "total_pages": 1}
+        raise AssertionError(f"unexpected call {backend.id} {method} {path}")
+
+    client.request_backend = fake_request_backend  # type: ignore[assignment]
+
+    user = asyncio.run(client.resolve_user("zhuyida@auto-link.com.cn", "朱奕达"))
+
+    assert user["matched_user_ids"] == ["cursor-zhuyida"]
