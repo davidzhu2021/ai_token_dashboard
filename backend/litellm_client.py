@@ -2382,8 +2382,14 @@ class LiteLLMClient:
                         add_user_id(backend, user_id, "recent_usage_log")
 
             if backend.source == "Her":
+                her_matches: list[tuple[Any, str]] = []
                 try:
-                    await self.add_her_index_matches(backend, email_lower, name, add_user_id)
+                    await self.add_her_index_matches(
+                        backend,
+                        email_lower,
+                        name,
+                        lambda user_id, source: her_matches.append((user_id, source)),
+                    )
                 except HTTPException as exc:
                     # Her is an optional secondary source. Its legacy index
                     # may be unavailable while the primary account directory
@@ -2391,6 +2397,9 @@ class LiteLLMClient:
                     if exc.status_code not in {404, 405, 501}:
                         raise
                     logger.warning("optional Her identity index unavailable status=%s", exc.status_code)
+                else:
+                    for user_id, source in her_matches:
+                        add_user_id(backend, user_id, source)
 
         if matched_user_ids:
             primary = matched_users[0].copy() if matched_users else {}
