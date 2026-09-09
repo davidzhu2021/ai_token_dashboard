@@ -12109,6 +12109,12 @@ async def my_keys(
     if not local_mock_enabled():
         require_active_local_entitlement(app_user)
     user_ids = upstream_user_ids(upstream_user)
+    logger.info(
+        "personal key route identity local_id=%s email_hash=%s account_count=%s",
+        str(app_user.get("id") or ""),
+        hashlib.sha256(str(app_user.get("email") or "").strip().lower().encode()).hexdigest()[:12],
+        len(user_ids),
+    )
     if not user_ids:
         raise HTTPException(status_code=502, detail="上游员工记录缺少 user_id")
     logger.info("personal key route resolved accounts=%s", user_ids)
