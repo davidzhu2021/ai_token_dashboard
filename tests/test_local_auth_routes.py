@@ -838,6 +838,67 @@ def test_personal_account_keeps_valid_local_mapping_without_email_fallback(monke
     assert upstream["matched_user_ids"] == ["upstream-valid-id"]
 
 
+def test_personal_account_falls_back_when_mapping_info_is_empty(monkeypatch) -> None:
+    monkeypatch.setenv("LOCAL_DATA_MODE", "real")
+    request = type(
+        "RequestStub",
+        (),
+        {
+            "session": {
+                "user": {
+                    "id": "local-user-empty-info",
+                    "accountType": "personal",
+                    "email": "person@example.com",
+                    "name": "Person",
+                }
+            }
+        },
+    )()
+
+    async def auth_call(method, *_args, **_kwargs):
+        if method == "get_user":
+            return {
+                "id": "local-user-empty-info",
+                "email": "person@example.com",
+                "name": "Person",
+                "status": "active",
+                "account_type": "personal",
+                "accountStatus": "provisioned",
+                "entitlementStatus": "active",
+            }
+        if method == "get_upstream_account":
+            return {"status": "provisioned", "upstream_user_id": "local-stale-id"}
+        if method == "set_provisioning_status":
+            assert _args[3] == "cursor-person"
+            return {"status": "provisioned", "upstream_user_id": "cursor-person"}
+        raise AssertionError(f"unexpected auth store call: {method}")
+
+    async def user_payload(user, **_kwargs):
+        return user
+
+    class FakeClient:
+        async def user_info(self, _user_id):
+            return {}
+
+        async def resolve_user(self, email, name=None):
+            assert (email, name) == ("person@example.com", "Person")
+            return {
+                "user_id": "cursor-person",
+                "user_email": email,
+                "matched_user_ids": ["cursor-person"],
+                "matched_accounts": [{"backend": "primary", "user_id": "cursor-person"}],
+                "matched_sources": {"cursor-person": ["user_email"]},
+            }
+
+    monkeypatch.setattr(main, "auth_store_call", auth_call)
+    monkeypatch.setattr(main, "auth_user_payload", user_payload)
+    monkeypatch.setattr(main, "client", lambda: FakeClient())
+
+    _app_user, upstream = asyncio.run(main.current_upstream_user(request))
+
+    assert upstream["matched_user_ids"] == ["cursor-person"]
+
+
 def test_personal_account_does_not_fallback_when_mapping_validation_has_non_404_failure(monkeypatch) -> None:
     monkeypatch.setenv("LOCAL_DATA_MODE", "real")
     request = type(

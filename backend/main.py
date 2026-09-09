@@ -5169,7 +5169,11 @@ async def current_upstream_user(request: Request, refresh: bool = False) -> tupl
         if not local_account_is_active(app_user):
             return app_user, local_scope
         try:
-            await client().user_info(upstream_user_id)
+            upstream_info = await client().user_info(upstream_user_id)
+            if not isinstance(upstream_info, dict) or not str(
+                upstream_info.get("user_id") or upstream_info.get("id") or ""
+            ).strip():
+                raise HTTPException(status_code=404, detail="上游用户记录为空")
         except HTTPException as exc:
             if exc.status_code != 404:
                 raise
