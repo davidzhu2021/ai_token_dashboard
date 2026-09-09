@@ -178,6 +178,10 @@ def csrf_headers(client: TestClient) -> dict[str, str]:
 @pytest.fixture()
 def leader_env(monkeypatch) -> tuple[TestClient, FakeStore, FakeClient, FakeVault]:
     main.team_auth_cache.clear()
+    main.team_member_directory_cache.clear()
+    main.team_member_key_cache.clear()
+    main._team_member_key_inflight.clear()
+    main._team_member_key_cache_versions.clear()
     store = FakeStore([TEAM])
     upstream = FakeClient()
     vault = FakeVault()
@@ -218,6 +222,47 @@ def test_team_keys_apply_search_and_status_filters(leader_env) -> None:
 
     filtered = client.get("/api/team/keys", params={"status": "已禁用"}).json()
     assert [item["id"] for item in filtered["keys"]] == ["key-bob-blocked"]
+
+
+def test_team_keys_reuses_team_snapshot_for_repeated_reads(leader_env) -> None:
+    client, store, upstream, _vault = leader_env
+
+    first = client.get("/api/team/keys")
+    second = client.get("/api/team/keys", params={"search": "Alice"})
+
+    assert first.status_code == second.status_code == 200
+    assert [item["id"] for item in second.json()["keys"]] == ["key-alice"]
+    assert len(store.directory_calls) == 1
+    assert len(upstream.list_calls) == 1
+
+
+def test_team_keys_collapses_concurrent_snapshot_loads(leader_env) -> None:
+    _client, store, upstream, _vault = leader_env
+
+    async def load_twice() -> None:
+        members = [dict(item) for item in MEMBERS if item["teamRole"] == "user"]
+        await asyncio.gather(
+            main.team_member_keys_cached(LEADER_EMAIL, TEAM, members, refresh=False),
+            main.team_member_keys_cached(LEADER_EMAIL, TEAM, members, refresh=False),
+        )
+
+    asyncio.run(load_twice())
+
+    assert len(upstream.list_calls) == 1
+    assert store.directory_calls == []
+
+
+def test_team_key_mutation_invalidates_team_snapshot(leader_env) -> None:
+    client, _store, upstream, _vault = leader_env
+
+    assert client.get("/api/team/keys").status_code == 200
+    response = client.post("/api/team/keys/key-alice/revoke", json={}, headers=csrf_headers(client))
+    assert response.status_code == 200
+    assert client.get("/api/team/keys").status_code == 200
+
+    # The mutation re-checks ownership with a fresh upstream read, then the
+    # following list must miss the invalidated team snapshot.
+    assert len(upstream.list_calls) == 3
 
 
 def test_team_keys_reject_non_leader(monkeypatch) -> None:

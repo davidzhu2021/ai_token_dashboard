@@ -132,6 +132,10 @@ let teamKeyFilters = { search: "", status: "all" };
 let isTeamKeysLoading = false;
 let teamKeyLoadError = "";
 let teamKeyRequestId = 0;
+let teamKeyListRequest = null;
+let teamKeyListRequestKey = "";
+let teamKeyRefreshRequest = null;
+let teamKeyRefreshRequestKey = "";
 let revokingTeamKeyId = "";
 let deletingTeamKeyId = "";
 let teamKeySearchTimer = null;
@@ -4663,6 +4667,39 @@ function renderTeamKeys() {
 }
 
 async function loadTeamKeys(forceRefresh = false) {
+  const requestKey = JSON.stringify([
+    selectedTeamKeyRef,
+    teamKeyFilters.search,
+    teamKeyFilters.status,
+    Boolean(forceRefresh),
+  ]);
+  const activeRequest = forceRefresh ? teamKeyRefreshRequest : teamKeyListRequest;
+  const activeRequestKey = forceRefresh ? teamKeyRefreshRequestKey : teamKeyListRequestKey;
+  if (activeRequest && activeRequestKey === requestKey) return activeRequest;
+  const request = loadTeamKeysInternal(forceRefresh);
+  if (forceRefresh) {
+    teamKeyRefreshRequest = request;
+    teamKeyRefreshRequestKey = requestKey;
+  } else {
+    teamKeyListRequest = request;
+    teamKeyListRequestKey = requestKey;
+  }
+  try {
+    return await request;
+  } finally {
+    if (forceRefresh) {
+      if (teamKeyRefreshRequest === request) {
+        teamKeyRefreshRequest = null;
+        teamKeyRefreshRequestKey = "";
+      }
+    } else if (teamKeyListRequest === request) {
+      teamKeyListRequest = null;
+      teamKeyListRequestKey = "";
+    }
+  }
+}
+
+async function loadTeamKeysInternal(forceRefresh = false) {
   if (!canManageTeamKeys()) {
     teamMemberKeys = [];
     renderTeamKeys();
@@ -4711,6 +4748,10 @@ function resetTeamKeyState() {
   isTeamKeysLoading = false;
   teamKeyLoadError = "";
   teamKeyRequestId += 1;
+  teamKeyListRequest = null;
+  teamKeyListRequestKey = "";
+  teamKeyRefreshRequest = null;
+  teamKeyRefreshRequestKey = "";
   revokingTeamKeyId = "";
   deletingTeamKeyId = "";
   isTeamKeyRevoking = false;

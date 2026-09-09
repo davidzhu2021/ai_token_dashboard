@@ -363,6 +363,10 @@ department_usage_cache = TTLCache()
 team_auth_cache = TTLCache()
 team_usage_cache = TTLCache()
 team_member_usage_cache = TTLCache()
+team_member_directory_cache = TTLCache()
+team_member_key_cache = TTLCache()
+_team_member_key_inflight: dict[tuple[str, int, bool], asyncio.Task[Any]] = {}
+_team_member_key_cache_versions: dict[str, int] = {}
 _observability_refresh_tasks: dict[str, asyncio.Task[Any]] = {}
 _observability_refresh_lock = asyncio.Lock()
 _observability_memory_snapshots: dict[str, dict[str, Any]] = {}
@@ -12262,6 +12266,7 @@ TEAM_KEY_DELETABLE_STATUSES = {"已禁用", "已过期"}
 async def team_member_accounts(
     app_user: dict[str, Any],
     team_ref_value: str | None,
+    refresh: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     """解析当前负责人可管理的团队与其中的普通成员。
 
@@ -12275,6 +12280,11 @@ async def team_member_accounts(
     if not scope.get("isTeamLeader"):
         raise HTTPException(status_code=403, detail="当前账号还没有团队负责人权限")
     team = select_authorized_team(scope, (team_ref_value or "").strip() or None)
+    directory_cache_key = team_member_key_cache_key(app_user["email"], team)
+    if not refresh:
+        hit, cached_members, _ = team_member_directory_cache.get(directory_cache_key)
+        if hit:
+            return scope, team, [dict(item) for item in cached_members]
     store = usage_store()
     directory_loader = getattr(store, "team_member_directory", None) if store is not None else None
     if not callable(directory_loader):
@@ -12294,6 +12304,11 @@ async def team_member_accounts(
         if str(row.get("teamRole") or "user").lower() != "admin"
         and str(row.get("employeeEmail") or "").strip().lower() != leader_email
     ]
+    team_member_directory_cache.set(
+        directory_cache_key,
+        members,
+        env_int("TEAM_MEMBER_KEY_CACHE_TTL_SECONDS", 30),
+    )
     return scope, team, members
 
 
@@ -12322,19 +12337,63 @@ async def team_member_keys(members: list[dict[str, Any]], refresh: bool) -> list
     return enriched
 
 
+def team_member_key_cache_key(email: str, team: dict[str, Any]) -> str:
+    return f"{str(email or '').strip().lower()}:{team_ref(team)}"
+
+
+def invalidate_team_member_key_cache(email: str, team: dict[str, Any]) -> None:
+    cache_key = team_member_key_cache_key(email, team)
+    _team_member_key_cache_versions[cache_key] = _team_member_key_cache_versions.get(cache_key, 0) + 1
+    team_member_key_cache.delete(cache_key)
+    team_member_directory_cache.delete(cache_key)
+
+
+async def team_member_keys_cached(
+    email: str,
+    team: dict[str, Any],
+    members: list[dict[str, Any]],
+    refresh: bool,
+) -> list[dict[str, Any]]:
+    """Cache and collapse the expensive team-wide upstream key aggregation."""
+
+    cache_key = team_member_key_cache_key(email, team)
+    if not refresh:
+        hit, value, _ = team_member_key_cache.get(cache_key)
+        if hit:
+            return [dict(item) for item in value]
+
+    version = _team_member_key_cache_versions.get(cache_key, 0)
+    # A forced refresh must not attach to an older non-refresh request that is
+    # still in flight; both requests may legitimately need different upstream data.
+    inflight_key = (cache_key, version, refresh)
+    task = _team_member_key_inflight.get(inflight_key)
+    if task is None:
+        task = asyncio.create_task(team_member_keys(members, refresh))
+        _team_member_key_inflight[inflight_key] = task
+        task.add_done_callback(
+            lambda finished, key=inflight_key: _team_member_key_inflight.pop(key, None)
+            if _team_member_key_inflight.get(key) is finished
+            else None
+        )
+    value = await asyncio.shield(task)
+    if _team_member_key_cache_versions.get(cache_key, 0) == version:
+        team_member_key_cache.set(cache_key, value, env_int("TEAM_MEMBER_KEY_CACHE_TTL_SECONDS", 30))
+    return [dict(item) for item in value]
+
+
 async def locate_team_member_key(
     app_user: dict[str, Any],
     team_ref_value: str | None,
     key_id: str,
-) -> tuple[dict[str, Any], str]:
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
     """重新在服务端推导密钥归属账号，浏览器只需提供团队标识与密钥 id。"""
 
-    _scope, _team, members = await team_member_accounts(app_user, team_ref_value)
-    keys = await team_member_keys(members, refresh=True)
+    _scope, _team, members = await team_member_accounts(app_user, team_ref_value, refresh=True)
+    keys = await team_member_keys_cached(app_user["email"], _team, members, refresh=True)
     owned = next((item for item in keys if str(item.get("id") or "") == key_id), None)
     if owned is None:
         raise HTTPException(status_code=403, detail="无权管理该密钥")
-    return owned, str(owned.pop("_accountId", ""))
+    return owned, str(owned.pop("_accountId", "")), _team
 
 
 @app.get("/api/team/keys")
@@ -12347,8 +12406,8 @@ async def team_keys(
 ) -> dict[str, Any]:
     app_user = require_user(request)
     await require_non_inactive_demo_identity(app_user)
-    scope, team, members = await team_member_accounts(app_user, team_ref)
-    keys = await team_member_keys(members, refresh)
+    scope, team, members = await team_member_accounts(app_user, team_ref, refresh=refresh)
+    keys = await team_member_keys_cached(app_user["email"], team, members, refresh)
     for key in keys:
         key.pop("_accountId", None)
     stats = {
@@ -12391,7 +12450,7 @@ async def revoke_team_key(
     await enforce_csrf(request)
     app_user = require_user(request)
     await require_non_inactive_demo_identity(app_user)
-    owned, account_id = await locate_team_member_key(app_user, (data.teamRef if data else None), key_id)
+    owned, account_id, team = await locate_team_member_key(app_user, (data.teamRef if data else None), key_id)
     if str(owned.get("status") or "") == "已禁用":
         raise HTTPException(status_code=409, detail="该密钥已经是停用状态")
     try:
@@ -12399,6 +12458,7 @@ async def revoke_team_key(
     except HTTPException:
         write_key_audit("team_revoke", app_user["email"], key_id, request, "failed")
         raise
+    invalidate_team_member_key_cache(app_user["email"], team)
     write_key_audit("team_revoke", app_user["email"], key_id, request, "success")
     return {"ok": True, "keyId": key_id}
 
@@ -12414,7 +12474,7 @@ async def delete_team_key(
     await enforce_csrf(request)
     app_user = require_user(request)
     await require_non_inactive_demo_identity(app_user)
-    owned, account_id = await locate_team_member_key(app_user, (data.teamRef if data else None), key_id)
+    owned, account_id, team = await locate_team_member_key(app_user, (data.teamRef if data else None), key_id)
     if str(owned.get("status") or "") not in TEAM_KEY_DELETABLE_STATUSES:
         raise HTTPException(status_code=409, detail="请先撤销该密钥再删除")
     try:
@@ -12422,6 +12482,7 @@ async def delete_team_key(
     except HTTPException:
         write_key_audit("team_delete", app_user["email"], key_id, request, "failed")
         raise
+    invalidate_team_member_key_cache(app_user["email"], team)
     backend_id, _, raw_user_id = account_id.partition(":")
     try:
         key_vault().delete(backend_id or "primary", raw_user_id, key_id)

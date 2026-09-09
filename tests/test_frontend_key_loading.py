@@ -41,6 +41,24 @@ def test_personal_key_requests_skip_models_and_reuse_inflight_work() -> None:
     assert "await pendingListRequest;" in load_keys
 
 
+def test_team_key_requests_reuse_non_refresh_and_refresh_inflight_work() -> None:
+    source = app_js()
+    team_loader = source[
+        source.index("async function loadTeamKeys(forceRefresh = false)")
+        : source.index("function scheduleTeamKeyReload()")
+    ]
+
+    assert "let teamKeyListRequest = null;" in source
+    assert "let teamKeyListRequestKey = \"\";" in source
+    assert "let teamKeyRefreshRequest = null;" in source
+    assert "let teamKeyRefreshRequestKey = \"\";" in source
+    assert "const activeRequest = forceRefresh ? teamKeyRefreshRequest : teamKeyListRequest;" in team_loader
+    assert "const activeRequestKey = forceRefresh ? teamKeyRefreshRequestKey : teamKeyListRequestKey;" in team_loader
+    assert "if (activeRequest && activeRequestKey === requestKey) return activeRequest;" in team_loader
+    assert "async function loadTeamKeysInternal(forceRefresh = false)" in team_loader
+    assert "teamKeyRefreshRequest = null;" in team_loader
+
+
 def test_personal_key_cache_restores_before_background_revalidation() -> None:
     source = app_js()
     load_keys = source[
