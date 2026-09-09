@@ -56,6 +56,19 @@ Do not expose any LiteLLM branding or implementation details in user-facing fron
 
 Before making code changes, review the relevant LiteLLM behavior against the local official project checkout at `D:\litellm` and the LiteLLM Proxy UI documentation at `https://docs.litellm.ai/docs/proxy/ui`. Prefer the local source for implementation details and the official documentation for product/API intent. Do not guess LiteLLM endpoint names, request fields, or response shapes when they can be confirmed from those sources.
 
+## Dual LiteLLM Source Rules
+
+`primary` and `Her` are separate identity domains, account directories, API capability sets, failure domains, and cache domains. Treat them independently by default; combine results only after each source independently proves ownership.
+
+- Keep user resolution, user-existence validation, `/user/list`, `/user/info`, `/key/list`, usage, key, model-permission, and cache reads scoped to one source at a time. Handle 404, 401, 403, 5xx, timeouts, and malformed responses per source.
+- A `primary` or `Her` failure must not block a healthy other source, turn into a global “user not found”, substitute an account from the other source, or commit partial matches from the failed source. Record only safe diagnostics: masked account identifiers, source, status code, and counts.
+- Combine source results only when each account has an exact normalized-email proof, or a locally revalidated canonical tool alias proof. Preserve `backend`, `source`, and `matchSources` for every account before and after merging.
+- Never treat a same name, bare email prefix, substring match, unchecked `key_alias` response, recent usage log, existence in another source, or an ID without match-source proof as personal-account ownership evidence.
+- Upstream success responses still require a valid account ID and expected structure. Empty objects, missing IDs, malformed payloads, and upstream filters that are ignored must be treated as unavailable or non-matching for that source; revalidate every identity filter locally.
+- Cache keys must include source/backend, account identifier, and business scope. Never reuse a cache entry across `primary` and `Her`.
+- Before writing a local upstream mapping, verify the target source and strong ownership proof. Do not write mappings based only on name, key alias, recent logs, or weak discovery; merge same-email tool accounts only after this verification.
+- Test identity and token changes adversarially: same-name different-email users, email case normalization, multiple canonical tool accounts, partial optional-source failures, ignored upstream filters, empty user-info payloads, weak-only match sources, cross-source cache isolation, and no cross-source account/key/usage contamination.
+
 ## LiteLLM Deployment Reference
 
 The upstream LiteLLM service is deployed separately from this dashboard. Do not confuse the LiteLLM cluster with this dashboard's production host `JSZX-AI-03 / 10.68.13.188`.
