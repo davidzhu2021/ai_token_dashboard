@@ -3162,7 +3162,20 @@ class LiteLLMClient:
             if backend.source:
                 continue
             tasks.append(self.keys_for_user(raw_user_id, backend, refresh))
-        batches = list(await asyncio.gather(*tasks))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        batches: list[list[dict[str, Any]]] = []
+        missing_account_errors: list[HTTPException] = []
+        for result in results:
+            if isinstance(result, BaseException):
+                if isinstance(result, HTTPException) and result.status_code == 404:
+                    # A stale mapped account must not hide keys belonging to
+                    # other valid accounts matched to the same employee.
+                    missing_account_errors.append(result)
+                    continue
+                raise result
+            batches.append(result)
+        if not batches and missing_account_errors:
+            raise missing_account_errors[0]
         keys: list[dict[str, Any]] = []
         seen: set[str] = set()
         for batch in batches:

@@ -716,6 +716,35 @@ def test_key_list_concurrent_cold_reads_share_one_upstream_request(monkeypatch) 
     assert first[0]["id"] == "hash-1"
 
 
+def test_key_list_skips_missing_secondary_accounts(monkeypatch) -> None:
+    client, _backend = make_client()
+
+    async def fake_keys_for_user(user_id, _backend=None, refresh=False):
+        if user_id == "stale-user":
+            raise HTTPException(status_code=404, detail="上游接口不存在或资源未找到")
+        return [{"id": "valid-key", "_userId": user_id}]
+
+    monkeypatch.setattr(client, "keys_for_user", fake_keys_for_user)
+
+    keys = asyncio.run(client.keys_for_user_ids(["valid-user", "stale-user"], refresh=False))
+
+    assert [item["id"] for item in keys] == ["valid-key"]
+
+
+def test_key_list_preserves_404_when_all_accounts_are_missing(monkeypatch) -> None:
+    client, _backend = make_client()
+
+    async def fake_keys_for_user(_user_id, _backend=None, refresh=False):
+        raise HTTPException(status_code=404, detail="上游接口不存在或资源未找到")
+
+    monkeypatch.setattr(client, "keys_for_user", fake_keys_for_user)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(client.keys_for_user_ids(["stale-user-1", "stale-user-2"], refresh=False))
+
+    assert exc_info.value.status_code == 404
+
+
 def test_key_list_cache_hit_skips_upstream_request(monkeypatch) -> None:
     client, backend = make_client()
     cached = [{"id": "cached-hash"}]
