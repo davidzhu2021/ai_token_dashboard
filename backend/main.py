@@ -4109,6 +4109,9 @@ def usage_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def usage_model_filter(models: list[str] | None) -> set[str]:
+    # Direct route calls may pass FastAPI's Query wrapper instead of its value.
+    if not isinstance(models, (list, tuple, set)):
+        models = getattr(models, "default", None)
     return {
         item.strip()
         for value in (models or [])
@@ -5120,6 +5123,14 @@ async def team_member_usage_payload(
 async def current_upstream_user(request: Request, refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
     app_user = require_user(request)
     if local_mock_enabled():
+        if str(app_user.get("accountType") or app_user.get("account_type") or "") == "enterprise_managed":
+            raise auth_http_error(
+                403,
+                "企业托管账号请使用企业令牌管理，不提供个人令牌操作",
+                "ORGANIZATION_UPSTREAM_FORBIDDEN",
+            )
+        if not str(app_user.get("email") or "").strip():
+            raise auth_http_error(403, "当前账号没有可用的个人邮箱身份", "ORGANIZATION_UPSTREAM_FORBIDDEN")
         upstream, _ = await cached_resolve_user(app_user["email"], app_user.get("name"), refresh)
         return app_user, upstream
     if await is_demo_customer_user(app_user):
@@ -5144,7 +5155,7 @@ async def current_upstream_user(request: Request, refresh: bool = False) -> tupl
         if not account or account.get("status") != "provisioned" or not account.get("upstream_user_id"):
             raise auth_http_error(409, "账号仍在开通中，请稍后重试", "AUTH_PROVISIONING_PENDING")
         upstream_user_id = str(account["upstream_user_id"])
-        return app_user, {
+        local_scope = {
             "user_id": upstream_user_id,
             "user_email": app_user["email"],
             "user_alias": app_user.get("name") or app_user["email"],
@@ -5155,8 +5166,96 @@ async def current_upstream_user(request: Request, refresh: bool = False) -> tupl
             "matched_sources": {upstream_user_id: ["local_mapping"]},
             "matched_by": "local_mapping",
         }
+        if not local_account_is_active(app_user):
+            return app_user, local_scope
+        try:
+            await client().user_info(upstream_user_id)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            resolved, _ = await cached_resolve_user(app_user["email"], app_user.get("name"), refresh=True)
+            resolved = strict_personal_upstream_scope(resolved)
+            primary_id = primary_upstream_user_id(resolved)
+            await auth_store_call("set_provisioning_status", local_user_id, "provisioned", "primary", primary_id, "")
+            return app_user, resolved
+
+        # Tool-account mappings can have sibling accounts for the same exact
+        # mailbox. Resolve those only for the canonical account ids used by
+        # the upstream account directory; arbitrary legacy ids stay local.
+        if upstream_user_id.startswith(("local-", "cursor-", "claude-code-")):
+            try:
+                resolved, _ = await cached_resolve_user(app_user["email"], app_user.get("name"), refresh=refresh)
+                resolved = strict_personal_upstream_scope(resolved)
+                return app_user, merge_personal_upstream_scopes(local_scope, resolved)
+            except HTTPException as exc:
+                if exc.status_code != 404:
+                    raise
+        return app_user, local_scope
     upstream, _ = await cached_resolve_user(app_user["email"], app_user.get("name"), refresh)
     return app_user, upstream
+
+
+def strict_personal_upstream_scope(upstream: dict[str, Any]) -> dict[str, Any]:
+    """Keep only identities proven by exact email or canonical tool aliases."""
+    sources = upstream.get("matched_sources") if isinstance(upstream.get("matched_sources"), dict) else {}
+    allowed_ids = {
+        str(user_id)
+        for user_id, matches in sources.items()
+        if isinstance(matches, list) and {str(item) for item in matches}.intersection({"user_email", "tool_account_alias"})
+    }
+    result = dict(upstream)
+    result["matched_user_ids"] = [
+        str(item) for item in upstream.get("matched_user_ids", []) if str(item) in allowed_ids
+    ]
+    result["matched_accounts"] = [
+        item for item in upstream.get("matched_accounts", [])
+        if isinstance(item, dict)
+        and str(item.get("account_id") or item.get("user_id") or "") in allowed_ids
+    ]
+    result["matched_sources"] = {
+        str(user_id): matches
+        for user_id, matches in sources.items()
+        if str(user_id) in allowed_ids
+    }
+    if not result["matched_user_ids"]:
+        raise HTTPException(status_code=404, detail="未找到当前员工对应的可信上游账号")
+    result["user_id"] = result["matched_user_ids"][0]
+    return result
+
+
+def merge_personal_upstream_scopes(local: dict[str, Any], resolved: dict[str, Any]) -> dict[str, Any]:
+    """Merge a valid local account with strictly verified sibling tool accounts."""
+    merged = dict(resolved)
+    ids: list[str] = []
+    accounts: list[dict[str, Any]] = []
+    sources: dict[str, list[str]] = {}
+    for scope in (local, resolved):
+        for user_id in scope.get("matched_user_ids", []):
+            text = str(user_id)
+            if text and text not in ids:
+                ids.append(text)
+        for account in scope.get("matched_accounts", []):
+            if not isinstance(account, dict):
+                continue
+            account_id = str(account.get("account_id") or account.get("user_id") or "")
+            if not account_id:
+                continue
+            existing = next((item for item in accounts if str(item.get("account_id") or item.get("user_id") or "") == account_id), None)
+            if existing is None:
+                accounts.append(dict(account))
+            else:
+                existing["matchSources"] = list(dict.fromkeys(
+                    list(existing.get("matchSources") or []) + list(account.get("matchSources") or [])
+                ))
+        for user_id, matches in (scope.get("matched_sources") or {}).items():
+            sources.setdefault(str(user_id), [])
+            sources[str(user_id)] = list(dict.fromkeys(sources[str(user_id)] + [str(item) for item in matches]))
+    merged["user_id"] = ids[0]
+    merged["matched_user_ids"] = ids
+    merged["matched_accounts"] = accounts
+    merged["matched_sources"] = sources
+    merged["matched_by"] = "local_mapping_and_email"
+    return merged
 
 
 def local_account_is_active(app_user: dict[str, Any]) -> bool:

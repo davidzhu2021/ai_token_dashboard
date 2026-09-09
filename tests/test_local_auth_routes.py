@@ -690,6 +690,215 @@ def test_managed_enterprise_account_cannot_use_personal_upstream_key_scope(
     assert exc_info.value.detail["code"] == "ORGANIZATION_UPSTREAM_FORBIDDEN"
 
 
+def test_personal_account_falls_back_to_strict_upstream_email_matches_when_mapping_is_stale(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LOCAL_DATA_MODE", "real")
+    request = type(
+        "RequestStub",
+        (),
+        {
+            "session": {
+                "user": {
+                    "id": "local-user-1",
+                    "authType": "password",
+                    "accountType": "personal",
+                    "email": "zhuyida@auto-link.com.cn",
+                    "name": "朱奕达",
+                }
+            }
+        },
+    )()
+    calls: list[tuple[str, object]] = []
+
+    async def false_demo(_user):
+        return False
+
+    async def no_inactive_membership(_user):
+        return None
+
+    async def auth_call(method, *_args, **_kwargs):
+        if method == "get_user":
+            return {
+                "id": "local-user-1",
+                "email": "zhuyida@auto-link.com.cn",
+                "name": "朱奕达",
+                "status": "active",
+                "account_type": "personal",
+                "accountStatus": "provisioned",
+                "entitlementStatus": "active",
+            }
+        if method == "get_upstream_account":
+            return {
+                "status": "provisioned",
+                "upstream_user_id": "local-stale-id",
+            }
+        if method == "set_provisioning_status":
+            assert _args == ("local-user-1", "provisioned", "primary", "cursor-zhuyida", "")
+            return {"status": "provisioned", "upstream_user_id": "cursor-zhuyida"}
+        raise AssertionError(f"unexpected auth store call: {method}")
+
+    async def user_payload(user, **_kwargs):
+        return user
+
+    class FakeClient:
+        async def user_info(self, user_id):
+            calls.append(("user_info", user_id))
+            raise HTTPException(status_code=404, detail="上游用户不存在")
+
+        async def resolve_user(self, email, name=None):
+            calls.append(("resolve_user", (email, name)))
+            return {
+                "user_id": "cursor-zhuyida",
+                "user_email": email,
+                "matched_user_ids": ["cursor-zhuyida", "claude-code-zhuyida"],
+                "matched_accounts": [
+                    {"backend": "primary", "user_id": "cursor-zhuyida"},
+                    {"backend": "primary", "user_id": "claude-code-zhuyida"},
+                ],
+                "matched_sources": {
+                    "cursor-zhuyida": ["user_email", "tool_account_alias"],
+                    "claude-code-zhuyida": ["user_email", "tool_account_alias"],
+                },
+            }
+
+    monkeypatch.setattr(main, "is_demo_customer_user", false_demo)
+    monkeypatch.setattr(main, "require_non_inactive_demo_identity", no_inactive_membership)
+    monkeypatch.setattr(main, "auth_store_call", auth_call)
+    monkeypatch.setattr(main, "auth_user_payload", user_payload)
+    monkeypatch.setattr(main, "client", lambda: FakeClient())
+
+    _app_user, upstream = asyncio.run(main.current_upstream_user(request))
+
+    assert upstream["matched_user_ids"] == ["cursor-zhuyida", "claude-code-zhuyida"]
+    assert calls == [
+        ("user_info", "local-stale-id"),
+        ("resolve_user", ("zhuyida@auto-link.com.cn", "朱奕达")),
+    ]
+
+
+def test_personal_account_keeps_valid_local_mapping_without_email_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("LOCAL_DATA_MODE", "real")
+    request = type(
+        "RequestStub",
+        (),
+        {
+            "session": {
+                "user": {
+                    "id": "local-user-2",
+                    "authType": "password",
+                    "accountType": "personal",
+                    "email": "person@example.com",
+                    "name": "Person",
+                }
+            }
+        },
+    )()
+
+    async def false_demo(_user):
+        return False
+
+    async def no_inactive_membership(_user):
+        return None
+
+    async def auth_call(method, *_args, **_kwargs):
+        if method == "get_user":
+            return {
+                "id": "local-user-2",
+                "email": "person@example.com",
+                "name": "Person",
+                "status": "active",
+                "account_type": "personal",
+                "accountStatus": "provisioned",
+                "entitlementStatus": "active",
+            }
+        if method == "get_upstream_account":
+            return {"status": "provisioned", "upstream_user_id": "upstream-valid-id"}
+        raise AssertionError(f"unexpected auth store call: {method}")
+
+    async def user_payload(user, **_kwargs):
+        return user
+
+    class FakeClient:
+        async def user_info(self, user_id):
+            assert user_id == "upstream-valid-id"
+            return {"user_id": user_id, "user_email": "person@example.com"}
+
+        async def resolve_user(self, *_args, **_kwargs):
+            raise AssertionError("valid local mapping must not fall back by email")
+
+    monkeypatch.setattr(main, "is_demo_customer_user", false_demo)
+    monkeypatch.setattr(main, "require_non_inactive_demo_identity", no_inactive_membership)
+    monkeypatch.setattr(main, "auth_store_call", auth_call)
+    monkeypatch.setattr(main, "auth_user_payload", user_payload)
+    monkeypatch.setattr(main, "client", lambda: FakeClient())
+
+    _app_user, upstream = asyncio.run(main.current_upstream_user(request))
+
+    assert upstream["matched_user_ids"] == ["upstream-valid-id"]
+
+
+def test_personal_account_does_not_fallback_when_mapping_validation_has_non_404_failure(monkeypatch) -> None:
+    monkeypatch.setenv("LOCAL_DATA_MODE", "real")
+    request = type(
+        "RequestStub",
+        (),
+        {
+            "session": {
+                "user": {
+                    "id": "local-user-3",
+                    "authType": "password",
+                    "accountType": "personal",
+                    "email": "person@example.com",
+                    "name": "Person",
+                }
+            }
+        },
+    )()
+
+    async def false_demo(_user):
+        return False
+
+    async def no_inactive_membership(_user):
+        return None
+
+    async def auth_call(method, *_args, **_kwargs):
+        if method == "get_user":
+            return {
+                "id": "local-user-3",
+                "email": "person@example.com",
+                "name": "Person",
+                "status": "active",
+                "account_type": "personal",
+                "accountStatus": "provisioned",
+                "entitlementStatus": "active",
+            }
+        if method == "get_upstream_account":
+            return {"status": "provisioned", "upstream_user_id": "local-unknown"}
+        raise AssertionError(f"unexpected auth store call: {method}")
+
+    async def user_payload(user, **_kwargs):
+        return user
+
+    class FakeClient:
+        async def user_info(self, _user_id):
+            raise HTTPException(status_code=503, detail="上游暂不可用")
+
+        async def resolve_user(self, *_args, **_kwargs):
+            raise AssertionError("non-404 validation failure must not fall back")
+
+    monkeypatch.setattr(main, "is_demo_customer_user", false_demo)
+    monkeypatch.setattr(main, "require_non_inactive_demo_identity", no_inactive_membership)
+    monkeypatch.setattr(main, "auth_store_call", auth_call)
+    monkeypatch.setattr(main, "auth_user_payload", user_payload)
+    monkeypatch.setattr(main, "client", lambda: FakeClient())
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(main.current_upstream_user(request))
+
+    assert exc_info.value.status_code == 503
+
+
 def test_managed_enterprise_account_without_active_membership_has_no_personal_usage(
     monkeypatch,
 ) -> None:
