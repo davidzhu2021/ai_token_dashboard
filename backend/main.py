@@ -4063,55 +4063,47 @@ def reaggregate_team_employees_after_model_filter(
 ) -> list[dict[str, Any]]:
     """Keep the full team roster while recalculating filtered usage totals."""
     metrics = ("promptTokens", "completionTokens", "totalTokens", "requestCount", "successCount", "failureCount", "spend")
-    totals_by_identity: dict[tuple[str, ...], dict[str, Any]] = {}
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        email = str(row.get("employeeEmail") or "").strip().casefold()
-        if email:
-            identity = ("email", email)
-        else:
-            backend = str(row.get("backend") or row.get("_backendId") or "").strip().casefold()
-            employee_id = str(row.get("employeeId") or row.get("userId") or row.get("_userId") or "").strip().casefold()
-            if not backend or not employee_id:
-                continue
-            identity = ("account", backend, employee_id)
-        bucket = totals_by_identity.setdefault(identity, empty_usage_totals())
-        add_usage_totals(bucket, row)
-
     result: list[dict[str, Any]] = []
-    account_identity_index: dict[str, list[tuple[str, ...]]] = {}
     safe_employees = [employee for employee in employees if isinstance(employee, dict)]
+
+    def account_identity(backend: Any, account_id: Any) -> tuple[str, str, str] | None:
+        normalized_backend = str(backend or "").strip().casefold()
+        normalized_id = str(account_id or "").strip().casefold()
+        if not normalized_backend or not normalized_id:
+            return None
+        prefix = f"{normalized_backend}:"
+        if normalized_id.startswith(prefix):
+            normalized_id = normalized_id[len(prefix):]
+        return ("account", normalized_backend, normalized_id)
+
+    safe_rows = [row for row in rows if isinstance(row, dict)]
     for employee in safe_employees:
+        item = dict(employee)
+        totals = empty_usage_totals()
+        employee_email = str(employee.get("employeeEmail") or "").strip().casefold()
+        employee_accounts: set[tuple[str, str, str]] = set()
         user_ids = employee.get("userIds") if isinstance(employee.get("userIds"), (list, tuple, set)) else []
         for value in user_ids:
             normalized = str(value).strip().casefold()
-            if normalized:
-                parts = normalized.split(":", 1)
-                if len(parts) == 2:
-                    account_identity_index.setdefault(normalized, []).append(("account", parts[0], parts[1]))
-    for employee in safe_employees:
-        item = dict(employee)
-        email = str(employee.get("employeeEmail") or "").strip().casefold()
-        if email:
-            identities = [("email", email)]
-        else:
-            user_ids = employee.get("userIds") if isinstance(employee.get("userIds"), (list, tuple, set)) else []
-            account_ids = [str(value).strip().casefold() for value in user_ids if str(value).strip()]
-            if not account_ids:
-                account_id = str(employee.get("employeeId") or employee.get("userId") or "").strip().casefold()
-                account_ids = [account_id] if account_id else []
-            candidates = [candidate for account_id in account_ids for candidate in account_identity_index.get(account_id, [])]
-            identities = list(dict.fromkeys(candidate for candidate in candidates if candidate in totals_by_identity))
-            if not identities and employee.get("backend") and employee.get("employeeId"):
-                employee_id = str(employee["employeeId"]).strip().casefold()
-                backend = str(employee["backend"]).strip().casefold()
-                if employee_id.startswith(f"{backend}:"):
-                    employee_id = employee_id.split(":", 1)[1]
-                identities = [("account", backend, employee_id)]
-        totals = empty_usage_totals()
-        for identity in identities:
-            add_usage_totals(totals, totals_by_identity.get(identity, {}))
+            parts = normalized.split(":", 1)
+            if len(parts) == 2:
+                identity = account_identity(parts[0], parts[1])
+                if identity:
+                    employee_accounts.add(identity)
+        fallback_account = account_identity(employee.get("backend"), employee.get("employeeId") or employee.get("userId"))
+        if fallback_account:
+            employee_accounts.add(fallback_account)
+        for row in safe_rows:
+            row_email = str(row.get("employeeEmail") or "").strip().casefold()
+            matches = bool(employee_email and row_email and employee_email == row_email)
+            if not row_email:
+                row_account = account_identity(
+                    row.get("backend") or row.get("_backendId"),
+                    row.get("employeeId") or row.get("userId") or row.get("_userId"),
+                )
+                matches = row_account in employee_accounts if row_account else False
+            if matches:
+                add_usage_totals(totals, row)
         for metric in metrics:
             item[metric] = totals.get(metric, 0.0 if metric == "spend" else 0)
         result.append(item)

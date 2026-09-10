@@ -115,6 +115,37 @@ def test_team_model_filter_aggregates_multiple_source_accounts_for_one_member() 
     assert result[0]["spend"] == 0.5
 
 
+def test_team_model_filter_uses_exact_accounts_when_usage_email_is_missing() -> None:
+    employees = [{
+        "employeeId": "alice@example.com",
+        "employeeName": "Alice",
+        "employeeEmail": "alice@example.com",
+        "userIds": ["primary:alice", "her:alice"],
+    }]
+    rows = [
+        {"backend": "primary", "employeeId": "alice", "employeeEmail": "", "totalTokens": 20},
+        {"backend": "her", "employeeId": "alice", "employeeEmail": "", "totalTokens": 30},
+    ]
+
+    result = reaggregate_team_employees_after_model_filter(employees, rows)
+
+    assert result[0]["totalTokens"] == 50
+
+
+def test_team_model_filter_normalizes_backend_prefixed_employee_id() -> None:
+    employees = [{
+        "employeeId": "her:alice",
+        "employeeName": "Alice",
+        "employeeEmail": "",
+        "backend": "her",
+    }]
+    rows = [{"backend": "her", "employeeId": "her:alice", "employeeEmail": "", "totalTokens": 12}]
+
+    result = reaggregate_team_employees_after_model_filter(employees, rows)
+
+    assert result[0]["totalTokens"] == 12
+
+
 def test_team_model_filter_handles_malformed_payload_without_cross_member_contamination() -> None:
     employees = [
         {"employeeId": "primary:alice", "employeeName": "Alice", "employeeEmail": "", "backend": "primary"},
