@@ -27,6 +27,23 @@ def test_trustworthy_observability_statuses_and_loading_lifecycle() -> None:
     assert "异常趋势暂不可用" in source
 
 
+def test_observability_loaders_reuse_same_window_and_keep_pending_payload() -> None:
+    _, source = sources()
+    assert "const OBSERVABILITY_OVERVIEW_TTL_MS = 300_000;" in source
+    assert "function observabilityOverviewIsFresh(" in source
+    assert "function hasUsableStabilityOverview(" in source
+    assert "function hasUsableCostOverview(" in source
+    switch_start = source.index('if (view === "stability")')
+    switch_end = source.index('if (view === "governance-workbench")', switch_start)
+    switch_block = source[switch_start:switch_end]
+    assert "if (!observabilityOverviewIsFresh(\"stability\")) loadStabilityOverview();" in switch_block
+    assert "if (!observabilityOverviewIsFresh(\"cost\")) loadCostOverview();" in switch_block
+    stability = source[source.index("async function loadStabilityOverview") : source.index("function renderCostOverview")]
+    cost = source[source.index("async function loadCostOverview") : source.index("function focusDrawer")]
+    assert "if (hasUsableStabilityOverview() && nextOverview?.freshness?.status === \"pending\")" in stability
+    assert "if (hasUsableCostOverview() && nextOverview?.freshness?.status === \"pending\")" in cost
+
+
 def test_stability_loading_retries_generation_response_without_failure_toast() -> None:
     _, source = sources()
     start = source.index("async function loadStabilityOverview")

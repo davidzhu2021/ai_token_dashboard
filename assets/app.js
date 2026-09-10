@@ -776,7 +776,12 @@ let customDateRange = null;
 let lastPresetRangeValue = "1";
 let stabilityCustomDateRange = null;
 const STABILITY_OVERVIEW_MAX_RETRIES = 4;
+const OBSERVABILITY_OVERVIEW_TTL_MS = 300_000;
 let costCustomDateRange = null;
+let stabilityOverviewWindowKey = "";
+let costOverviewWindowKey = "";
+let stabilityOverviewLoadedAt = 0;
+let costOverviewLoadedAt = 0;
 
 function daysBetween(startDate, endDate) {
   // 用 UTC 解析 YYYY-MM-DD 求含首尾天数，绕开本地时区与夏令时带来的偏移。
@@ -8534,11 +8539,11 @@ function switchView(view) {
   syncMobileViewPicker();
   if (view === "stability") {
     renderStabilityOverview();
-    if (!isStabilityLoading) loadStabilityOverview();
+    if (!observabilityOverviewIsFresh("stability")) loadStabilityOverview();
   }
   if (view === "cost-control") {
     renderCostOverview();
-    if (!isCostOverviewLoading) loadCostOverview();
+    if (!observabilityOverviewIsFresh("cost")) loadCostOverview();
   }
   if (view === "governance-workbench") {
     renderGovernanceWorkbench();
@@ -8833,6 +8838,47 @@ function currentCostWindow() {
 
 function currentCostMonth() {
   return currentCostWindow().endDate.slice(0, 7);
+}
+
+function observabilityOverviewWindowKey(scope) {
+  if (scope === "stability") {
+    const { startDate, endDate } = currentStabilityWindow();
+    const model = el("stabilityModel")?.value || "";
+    return `stability:${startDate}:${endDate}:${model}`;
+  }
+  const { startDate, endDate } = currentCostWindow();
+  const asOf = localDate(new Date());
+  const category = el("costCategory")?.value || "";
+  const costBucket = el("costBucket")?.value || "";
+  const model = el("costModel")?.value || "";
+  const vendor = el("costVendor")?.value || "";
+  const provider = el("costProvider")?.value || "";
+  const accountId = el("costAccount")?.value || "";
+  const reconciliationStatus = el("costReconciliation")?.value || "";
+  const recognitionStatus = el("costRecognition")?.value || "";
+  return `cost:${startDate}:${endDate}:${asOf}:${category}:${costBucket}:${model}:${vendor}:${provider}:${accountId}:${reconciliationStatus}:${recognitionStatus}`;
+}
+
+function hasUsableStabilityOverview() {
+  const overview = stabilityOverview?.data?.overview;
+  return Boolean(overview && Object.keys(overview).length);
+}
+
+function hasUsableCostOverview() {
+  return Boolean(costOverview?.data && (costOverview.data.metrics || costOverview.data.trend));
+}
+
+function observabilityOverviewIsFresh(scope) {
+  if (scope === "stability") {
+    return hasUsableStabilityOverview()
+      && stabilityOverviewWindowKey === observabilityOverviewWindowKey("stability")
+      && Date.now() - stabilityOverviewLoadedAt < OBSERVABILITY_OVERVIEW_TTL_MS
+      && !isStabilityLoading;
+  }
+  return hasUsableCostOverview()
+    && costOverviewWindowKey === observabilityOverviewWindowKey("cost")
+    && Date.now() - costOverviewLoadedAt < OBSERVABILITY_OVERVIEW_TTL_MS
+    && !isCostOverviewLoading;
 }
 
 function observabilityReasonCopy(payload, scope) {
@@ -9146,7 +9192,13 @@ async function loadStabilityOverview(forceRefresh = false) {
       }
     }
     if (requestId !== stabilityOverviewRequestId) return;
-    stabilityOverview = nextOverview;
+    if (hasUsableStabilityOverview() && nextOverview?.freshness?.status === "pending") {
+      renderObservabilityQuality("stabilityQuality", nextOverview, "stability");
+    } else {
+      stabilityOverview = nextOverview;
+      stabilityOverviewWindowKey = observabilityOverviewWindowKey("stability");
+      if (hasUsableStabilityOverview()) stabilityOverviewLoadedAt = Date.now();
+    }
     if (nextOverview?.cache?.state === "refreshing" && nextOverview?.freshness?.status === "pending" && !nextOverview?.cache?.lastRefreshError) {
       stabilityOverviewRefreshTimer = globalThis.setTimeout(() => {
         stabilityOverviewRefreshTimer = null;
@@ -9502,7 +9554,13 @@ async function loadCostOverview(forceRefresh = false) {
       }
     }
     if (requestId !== costOverviewRequestId) return;
-    costOverview = nextOverview;
+    if (hasUsableCostOverview() && nextOverview?.freshness?.status === "pending") {
+      renderObservabilityQuality("costQuality", nextOverview, "cost");
+    } else {
+      costOverview = nextOverview;
+      costOverviewWindowKey = observabilityOverviewWindowKey("cost");
+      if (hasUsableCostOverview()) costOverviewLoadedAt = Date.now();
+    }
     costBudgets = Array.isArray(nextOverview?.data?.budgets) ? nextOverview.data.budgets : costBudgets;
     if (nextOverview?.cache?.state === "refreshing" && nextOverview?.freshness?.status === "pending" && !nextOverview?.cache?.lastRefreshError) {
       costOverviewRefreshTimer = globalThis.setTimeout(() => {
@@ -10416,6 +10474,10 @@ function showLogin() {
   costDrawerReturnFocus = null;
   stabilityOverview = null;
   costOverview = null;
+  stabilityOverviewWindowKey = "";
+  costOverviewWindowKey = "";
+  stabilityOverviewLoadedAt = 0;
+  costOverviewLoadedAt = 0;
   costBudgets = [];
   governanceWorkbenchData = { planVersions: [], savingsMeasurements: [] };
   governanceWorkbenchLoading = false;

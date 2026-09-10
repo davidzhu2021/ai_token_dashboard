@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -72,10 +73,8 @@ def test_internal_ingest_verifies_hmac_whitelist_and_normalizes(monkeypatch) -> 
 
 def test_cost_actual_excludes_planned_and_as_of_is_explicit(monkeypatch) -> None:
     store = V2Store()
-    client = _client(monkeypatch, store)
-    response = client.get("/api/admin/costs/overview?month=2026-08&as_of=2026-08-12")
-    assert response.status_code == 200
-    payload = response.json()["data"]
+    _client(monkeypatch, store)
+    payload = asyncio.run(main._build_costs_overview(month="2026-08", as_of="2026-08-12"))["data"]
     assert payload["asOf"] == "2026-08-12"
     assert payload["metrics"]["actual"] == 112.0
     assert [item["id"] for item in payload["costItems"]] == ["actual"]

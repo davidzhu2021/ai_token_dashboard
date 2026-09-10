@@ -5636,17 +5636,44 @@ class UsageStore:
     ) -> list[dict[str, Any]]:
         records = await self._require_pool().fetch(
             """
-            SELECT usage_date, backend_id, user_id, organization_id, team_id,
-                   key_id, principal_id, source, model,
+            SELECT usage_date, source, model,
                    SUM(spend)::double precision AS spend
             FROM usage_query_daily
             WHERE usage_date BETWEEN $1::date AND $2::date
               AND ($3='' OR model=$3)
               AND ($4='' OR source=$4)
               AND ($5='' OR user_id=$5 OR key_id=$5 OR principal_id=$5)
-            GROUP BY usage_date, backend_id, user_id, organization_id, team_id,
-                     key_id, principal_id, source, model
+            GROUP BY usage_date, source, model
             ORDER BY usage_date, spend DESC
+            """,
+            _as_date(start_date),
+            _as_date(end_date),
+            _clean_text(model),
+            _clean_text(vendor),
+            _clean_text(account_id),
+        )
+        return [dict(record) for record in records]
+
+    async def api_cost_monthly_totals(
+        self,
+        start_date: str,
+        end_date: str,
+        *,
+        model: str = "",
+        vendor: str = "",
+        account_id: str = "",
+    ) -> list[dict[str, Any]]:
+        records = await self._require_pool().fetch(
+            """
+            SELECT to_char(usage_date, 'YYYY-MM') AS month,
+                   SUM(spend)::double precision AS spend
+            FROM usage_query_daily
+            WHERE usage_date BETWEEN $1::date AND $2::date
+              AND ($3='' OR model=$3)
+              AND ($4='' OR source=$4)
+              AND ($5='' OR user_id=$5 OR key_id=$5 OR principal_id=$5)
+            GROUP BY 1
+            ORDER BY 1
             """,
             _as_date(start_date),
             _as_date(end_date),

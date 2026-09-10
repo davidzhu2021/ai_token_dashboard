@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -90,13 +91,11 @@ def test_spendlog_mirror_record_rejects_sensitive_fields_and_normalizes_payload(
 
 
 def test_stability_overview_aggregates_attempts_by_requested_model() -> None:
-    source = Path("backend/usage_store.py").read_text(encoding="utf-8")
-    start = source.index("async def stability_overview_aggregates")
-    fragment = source[start : start + 9000]
+    source = inspect.getsource(UsageStore.stability_overview_aggregates)
 
-    assert "model_attempts_query" in fragment
-    assert "requested_model_group" in fragment
-    assert '"modelAttempts": [dict(item) for item in model_attempts]' in fragment
+    assert "requested_model_group" in source
+    assert '"modelAttempts": [dict(item) for item in model_attempts]' in source
+    assert "json_agg(by_model)" in source
 
 
 def test_attempt_event_record_is_content_free_and_derives_retry_fallback_flags() -> None:
@@ -147,6 +146,20 @@ def test_actual_cost_items_force_actual_status_and_as_of_cutoff() -> None:
     assert connection.args[0] == date(2026, 8, 12)
     assert connection.args[1] == "gpt-5"
     assert connection.args[5] == "actual"
+
+
+def test_api_cost_rows_groups_by_date_model_and_source() -> None:
+    source = inspect.getsource(UsageStore.api_cost_rows)
+    assert "GROUP BY usage_date, source, model" in source
+    assert "user_id, organization_id, team_id" not in source
+    assert "key_id, principal_id" not in source
+
+
+def test_api_cost_monthly_totals_sum_by_month() -> None:
+    source = inspect.getsource(UsageStore.api_cost_monthly_totals)
+    assert "date_trunc('month'" in source or "to_char(usage_date, 'YYYY-MM')" in source
+    assert "SUM(spend)" in source
+    assert "GROUP BY" in source
 
 
 def test_cost_ledger_page_paginates_in_sql() -> None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 from datetime import date, datetime, timezone
 
 from fastapi.testclient import TestClient
@@ -218,7 +220,7 @@ def test_stability_overview_and_request_metadata_are_admin_only(monkeypatch) -> 
     assert response.status_code == 200
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["Pragma"] == "no-cache"
-    payload = response.json()
+    payload = asyncio.run(main._build_stability_overview("2026-08-06", "2026-08-12", ""))
     assert payload["data"]["overview"]["retryRecoveryRate"] == 0.5
     assert payload["coverage"]["partial"] is False
     ranking = payload["data"]["modelRankings"][0]
@@ -255,14 +257,13 @@ def test_cost_overview_uses_configured_defaults(monkeypatch) -> None:
     monkeypatch.setenv("ADMIN_EMAILS", "admin@auto-link.com.cn")
     monkeypatch.setenv("COST_DEFAULT_MONTHLY_BUDGET_USD", "3000")
     monkeypatch.setenv("COST_DEFAULT_DAILY_TARGET_USD", "100")
-    client = _client(monkeypatch)
-    response = client.get("/api/admin/costs/overview?month=2026-08")
-    assert response.status_code == 200
-    payload = response.json()["data"]
+    _client(monkeypatch)
+    payload = asyncio.run(main._build_costs_overview(month="2026-08"))["data"]
     assert payload["metrics"]["budget"] == 3000
     assert payload["metrics"]["dailyTarget"] == 100
     assert payload["modelSplit"] == [{"model": "model-a", "spend": 120.0}]
-    assert response.json()["coverage"]["incomplete"] is True
+    coverage = asyncio.run(main._build_costs_overview(month="2026-08"))["coverage"]
+    assert coverage["incomplete"] is True
 
 
 def test_cost_overview_accepts_explicit_date_range_and_rejects_partial_or_invalid_ranges(monkeypatch) -> None:
@@ -271,7 +272,7 @@ def test_cost_overview_accepts_explicit_date_range_and_rejects_partial_or_invali
     client = _client(monkeypatch)
     response = client.get("/api/admin/costs/overview?start_date=2026-07-30&end_date=2026-08-02&as_of=2026-08-02")
     assert response.status_code == 200
-    data = response.json()["data"]
+    data = asyncio.run(main._build_costs_overview(start_date="2026-07-30", end_date="2026-08-02", as_of="2026-08-02"))["data"]
     assert data["startDate"] == "2026-07-30"
     assert data["endDate"] == "2026-08-02"
     assert client.get("/api/admin/costs/overview?start_date=2026-08-01").status_code == 400
@@ -293,7 +294,7 @@ def test_cost_overview_uses_usage_daily_source_when_cost_aggregate_is_partial(mo
     monkeypatch.setattr(main, "usage_store", lambda: PartialCostAggregateStore())
     monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True})
     monkeypatch.setenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "true")
-    payload = TestClient(main.app).get("/api/admin/costs/overview?start_date=2026-08-01&end_date=2026-08-02&as_of=2026-08-02").json()["data"]
+    payload = asyncio.run(main._build_costs_overview(start_date="2026-08-01", end_date="2026-08-02", as_of="2026-08-02"))["data"]
     assert payload["metrics"]["monthToDateActual"] == 200.0
 
 
@@ -301,7 +302,7 @@ def test_cost_overview_exposes_interval_actual_and_annual_actual_separately(monk
     monkeypatch.setattr(main, "usage_store", lambda: FakeCostLedgerStore())
     monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True})
     monkeypatch.setenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "true")
-    payload = TestClient(main.app).get("/api/admin/costs/overview?start_date=2026-08-12&end_date=2026-08-12&as_of=2026-08-12").json()["data"]
+    payload = asyncio.run(main._build_costs_overview(start_date="2026-08-12", end_date="2026-08-12", as_of="2026-08-12"))["data"]
     assert payload["metrics"]["intervalActual"] == 13.5
     assert payload["annual"]["actualToDate"] == 24.5
 
@@ -317,9 +318,7 @@ def test_cost_overview_prorates_cross_month_budget_and_anchors_annual_data_to_en
     monkeypatch.setattr(main, "usage_store", lambda: CrossMonthStore())
     monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True})
     monkeypatch.setenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "true")
-    payload = TestClient(main.app).get(
-        "/api/admin/costs/overview?start_date=2026-07-31&end_date=2026-08-02&as_of=2026-08-02"
-    ).json()["data"]
+    payload = asyncio.run(main._build_costs_overview(start_date="2026-07-31", end_date="2026-08-02", as_of="2026-08-02"))["data"]
     assert payload["metrics"]["intervalBudget"] == 500
     assert [item["budget"] for item in payload["trend"]] == [100, 200, 200]
     assert payload["annual"]["year"] == 2026
@@ -329,7 +328,7 @@ def test_cost_overview_returns_model_cost_share_and_daily_zero_fill(monkeypatch)
     monkeypatch.setattr(main, "usage_store", lambda: FakeModelCostShareStore())
     monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True})
     monkeypatch.setenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "true")
-    payload = TestClient(main.app).get("/api/admin/costs/overview?month=2026-08&as_of=2026-08-03").json()["data"]
+    payload = asyncio.run(main._build_costs_overview(start_date="2026-08-01", end_date="2026-08-03", as_of="2026-08-03"))["data"]
     assert payload["modelCostShare"] == [
         {
                 "model": "gpt 系列",
@@ -389,7 +388,7 @@ def test_cost_model_share_normalizes_equivalent_model_names_and_drills_into_all_
     monkeypatch.setenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "true")
     client = TestClient(main.app)
 
-    overview = client.get("/api/admin/costs/overview?month=2026-08&as_of=2026-08-02").json()["data"]
+    overview = asyncio.run(main._build_costs_overview(month="2026-08", as_of="2026-08-02"))["data"]
     by_model = {item["model"]: item for item in overview["modelCostShare"]}
     assert by_model["claude-opus-4-8"]["spend"] == 90.0
     assert by_model["claude-opus-4-8"]["rawModels"] == [
@@ -419,16 +418,16 @@ def test_cost_overview_filters_api_and_manual_costs_consistently(monkeypatch) ->
     monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True})
     client = TestClient(main.app)
 
-    by_model = client.get("/api/admin/costs/overview?month=2026-08&model=model-a&as_of=2026-08-12").json()["data"]
+    by_model = asyncio.run(main._build_costs_overview(month="2026-08", model="model-a", as_of="2026-08-12"))["data"]
     assert by_model["metrics"]["actual"] == 132.0
     assert by_model["modelSplit"] == [{"model": "model-a", "spend": 120.0}]
     assert [item["id"] for item in by_model["costItems"]] == ["item-a"]
 
-    api_only = client.get("/api/admin/costs/overview?month=2026-08&category=API%20Token&as_of=2026-08-12").json()["data"]
+    api_only = asyncio.run(main._build_costs_overview(month="2026-08", category="API Token", as_of="2026-08-12"))["data"]
     assert api_only["metrics"]["actual"] == 200.0
     assert api_only["costItems"] == []
 
-    by_vendor = client.get("/api/admin/costs/overview?month=2026-08&vendor=Vendor%20A&as_of=2026-08-12").json()["data"]
+    by_vendor = asyncio.run(main._build_costs_overview(month="2026-08", vendor="Vendor A", as_of="2026-08-12"))["data"]
     assert by_vendor["metrics"]["actual"] == 12.0
     assert by_vendor["modelSplit"] == []
 
@@ -437,9 +436,7 @@ def test_cost_overview_adds_full_bucket_and_savings_metrics(monkeypatch) -> None
     monkeypatch.setattr(main, "usage_store", lambda: FakeCostLedgerStore())
     monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True})
     monkeypatch.setenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "true")
-    response = TestClient(main.app).get("/api/admin/costs/overview?month=2026-08&as_of=2026-08-12")
-    assert response.status_code == 200
-    payload = response.json()["data"]
+    payload = asyncio.run(main._build_costs_overview(month="2026-08", as_of="2026-08-12"))["data"]
     assert payload["metrics"]["actual"] == 24.5
     assert payload["metrics"]["verifiedSavings"] == 0
     assert payload["metrics"]["forecastSavingsRemaining"] >= 0
@@ -448,6 +445,8 @@ def test_cost_overview_adds_full_bucket_and_savings_metrics(monkeypatch) -> None
     assert payload["summary"]["accountSplit"][0]["accountId"] in {"acct-1", "acct-api"}
     assert payload["summary"]["reconciliationSummary"]
     assert payload["ledger"]["total"] == 13
+    assert payload["ledger"]["rows"] == []
+    assert payload["ledger"]["truncated"] is True
     assert payload["costItems"][0]["voucherNo"] == "V-1"
 
 
@@ -469,6 +468,36 @@ def test_cost_ledger_is_paginated_and_filters_reconciliation(monkeypatch) -> Non
     ).json()["data"]
     assert matched["total"] == 12
     assert all(item["reconciliationStatus"] == "matched" for item in matched["items"])
+
+
+def test_cost_overview_builder_omits_embedded_ledger_rows() -> None:
+    source = inspect.getsource(main._build_costs_overview)
+    assert '"rows": []' in source
+    assert "OBSERVABILITY_OVERVIEW_LEDGER_LIMIT" not in source
+
+
+def test_cost_annual_prefers_monthly_totals_without_rescanning_daily_rows(monkeypatch) -> None:
+    class MonthlyStore(FakeCostLedgerStore):
+        def __init__(self) -> None:
+            self.daily_calls = 0
+            self.monthly_calls = 0
+
+        async def api_cost_monthly_totals(self, start_date: str, end_date: str, **kwargs):
+            self.monthly_calls += 1
+            return [{"month": "2026-08", "spend": 12.5}]
+
+        async def api_cost_rows(self, start_date: str, end_date: str, **kwargs):
+            self.daily_calls += 1
+            raise AssertionError("annual must not scan daily api cost rows")
+
+    store = MonthlyStore()
+    monkeypatch.setattr(main, "usage_store", lambda: store)
+    monkeypatch.setattr(main, "require_observability_dashboard", lambda request: {"email": "admin@auto-link.com.cn", "isPlatformAdmin": True})
+    monkeypatch.setenv("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", "true")
+    payload = TestClient(main.app).get("/api/admin/costs/annual?year=2026&as_of=2026-08-12").json()["data"]
+    assert store.monthly_calls == 1
+    assert store.daily_calls == 0
+    assert payload["actual"] >= 12.5
 
 
 def test_cost_annual_returns_twelve_months(monkeypatch) -> None:

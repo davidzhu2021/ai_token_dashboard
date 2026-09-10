@@ -41,6 +41,7 @@ def test_fresh_snapshot_returns_without_rebuild(monkeypatch) -> None:
             "last_refresh_error": "",
         })
         monkeypatch.setattr(main, "_admin_observability_store", lambda: store)
+        main._observability_memory_snapshots.clear()
         calls = 0
 
         async def builder():
@@ -65,7 +66,14 @@ def test_stale_snapshot_is_returned_and_refresh_is_singleflight(monkeypatch) -> 
             "last_refresh_error": "",
         })
         monkeypatch.setattr(main, "_admin_observability_store", lambda: store)
+        original_env_int = main.env_int
+        monkeypatch.setattr(
+            main,
+            "env_int",
+            lambda name, default: 30 if name == "OBSERVABILITY_CACHE_FRESH_SECONDS" else original_env_int(name, default),
+        )
         main._observability_refresh_tasks.clear()
+        main._observability_memory_snapshots.clear()
         started = asyncio.Event()
         release = asyncio.Event()
         calls = 0
@@ -77,16 +85,21 @@ def test_stale_snapshot_is_returned_and_refresh_is_singleflight(monkeypatch) -> 
             await release.wait()
             return {"data": {"value": 2}}
 
-        first, second = await asyncio.gather(
-            main._cached_observability_dashboard("cost", {"month": "2026-08"}, builder),
-            main._cached_observability_dashboard("cost", {"month": "2026-08"}, builder),
-        )
-        await started.wait()
-        assert first["data"]["value"] == second["data"]["value"] == 1
-        assert first["cache"]["refreshing"] is True
-        assert calls == 1
-        release.set()
-        await asyncio.gather(*list(main._observability_refresh_tasks.values()))
+        try:
+            first, second = await asyncio.gather(
+                main._cached_observability_dashboard("cost", {"month": "2026-08"}, builder),
+                main._cached_observability_dashboard("cost", {"month": "2026-08"}, builder),
+            )
+            await asyncio.wait_for(started.wait(), timeout=1)
+            assert first["data"]["value"] == second["data"]["value"] == 1
+            assert first["cache"]["refreshing"] is True
+            assert calls == 1
+            release.set()
+        finally:
+            tasks = list(main._observability_refresh_tasks.values())
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     asyncio.run(run())
 
@@ -96,6 +109,7 @@ def test_cost_cold_request_returns_pending_without_waiting_for_builder(monkeypat
         store = SnapshotStore()
         monkeypatch.setattr(main, "_admin_observability_store", lambda: store)
         main._observability_refresh_tasks.clear()
+        main._observability_memory_snapshots.clear()
 
         async def builder():
             await asyncio.sleep(60)
@@ -134,6 +148,46 @@ def test_cost_frontend_retries_pending_snapshot() -> None:
     assert "setTimeout" in loader
 
 
+def test_observability_warmup_uses_default_seven_day_windows(monkeypatch) -> None:
+    async def run() -> None:
+        store = SnapshotStore()
+        monkeypatch.setattr(main, "_admin_observability_store", lambda: store)
+        monkeypatch.setattr(main, "env_bool", lambda name, default=False: True if name == "ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED" else default)
+        monkeypatch.setattr(main, "usage_today", lambda: datetime(2026, 9, 10, tzinfo=timezone.utc).date())
+        main._observability_refresh_tasks.clear()
+        main._observability_memory_snapshots.clear()
+        started: list[tuple[str, dict]] = []
+
+        async def cached(dashboard_type, key_payload, builder, *, refresh=False):
+            started.append((dashboard_type, dict(key_payload)))
+            await builder()
+            return {"cache": {"state": "fresh"}}
+
+        monkeypatch.setattr(main, "_cached_observability_dashboard", cached)
+        monkeypatch.setattr(main, "_build_stability_overview", lambda *args, **kwargs: asyncio.sleep(0, result={"ok": True}))
+        monkeypatch.setattr(main, "_build_costs_overview", lambda *args, **kwargs: asyncio.sleep(0, result={"ok": True}))
+        await main.warmup_default_observability_snapshots()
+        kinds = {item[0] for item in started}
+        assert kinds == {"stability", "cost"}
+        stability_key = next(item[1] for item in started if item[0] == "stability")
+        cost_key = next(item[1] for item in started if item[0] == "cost")
+        assert stability_key["startDate"] == "2026-09-04"
+        assert stability_key["endDate"] == "2026-09-10"
+        assert cost_key["startDate"] == "2026-09-04"
+        assert cost_key["endDate"] == "2026-09-10"
+        assert cost_key["asOf"] == "2026-09-10"
+
+    asyncio.run(run())
+
+
+def test_observability_warmup_is_skipped_without_usage_store(monkeypatch) -> None:
+    monkeypatch.setattr(main, "env_bool", lambda name, default=False: True if name == "ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED" else default)
+    monkeypatch.setattr(main, "usage_store", lambda: None)
+    main._observability_warmup_task = None
+    main.start_observability_warmup()
+    assert main._observability_warmup_task is None
+
+
 def test_governance_workbench_does_not_preload_full_overviews() -> None:
     source = open("assets/app.js", encoding="utf-8").read()
     start = source.index('if (view === "governance-workbench")')
@@ -149,12 +203,21 @@ def test_stability_cold_budget_uses_stability_specific_override(monkeypatch) -> 
         store = SnapshotStore()
         monkeypatch.setattr(main, "_admin_observability_store", lambda: store)
         monkeypatch.setattr(main, "env_int", lambda name, default: 2200 if name == "STABILITY_COLD_QUERY_BUDGET_MS" else default)
+        main._observability_refresh_tasks.clear()
+        main._observability_memory_snapshots.clear()
 
         async def builder():
             return {"data": {"value": 3}}
 
-        result = await main._cached_observability_dashboard("stability", {"day": "2026-08-25"}, builder)
-        assert result["data"]["value"] == 3
+        result = await asyncio.wait_for(
+            main._cached_observability_dashboard("stability", {"day": "2026-08-25"}, builder),
+            timeout=0.5,
+        )
+        assert result["cache"]["state"] == "refreshing"
+        assert result["freshness"]["status"] == "pending"
+        task = next(iter(main._observability_refresh_tasks.values()))
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(run())
 

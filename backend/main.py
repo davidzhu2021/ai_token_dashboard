@@ -105,7 +105,7 @@ from .observability import (
 )
 from .key_vault import KeyVault, KeyVaultError
 from .litellm_stability import configured_litellm_reader, LiteLLMStabilityReader
-from .stability_governance import ERROR_MEANINGS, build_error_governance
+from .stability_governance import ERROR_MEANINGS
 
 
 def _model_optimization_space(daily_spends: list[float]) -> tuple[float, float | None]:
@@ -227,9 +227,11 @@ async def app_lifespan(_app: FastAPI):
             await _litellm_stability_reader.start()
         except Exception:
             logger.exception("LiteLLM stability reader unavailable")
+    start_observability_warmup()
     try:
         yield
     finally:
+        await stop_observability_warmup()
         if _litellm_stability_reader is not None:
             await _litellm_stability_reader.close()
         await close_litellm_client()
@@ -413,6 +415,8 @@ _usage_sync_stop: asyncio.Event | None = None
 _organization_outbox_task: asyncio.Task[Any] | None = None
 _organization_outbox_stop: asyncio.Event | None = None
 _usage_sync_status: dict[str, Any] = {"status": "disabled", "lastRun": None}
+_observability_warmup_task: asyncio.Task[Any] | None = None
+_observability_warmup_stop: asyncio.Event | None = None
 
 
 def _observability_snapshot_key(payload: dict[str, Any]) -> str:
@@ -653,6 +657,99 @@ async def _cached_observability_dashboard(
             detail="看板数据暂不可用，后台刷新仍在重试",
             headers={"Retry-After": "5"},
         ) from exc
+
+
+def _default_observability_window(days: int = 7) -> tuple[str, str]:
+    end = usage_today()
+    start = end - timedelta(days=max(1, days) - 1)
+    return start.isoformat(), end.isoformat()
+
+
+async def warmup_default_observability_snapshots() -> None:
+    if not env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False):
+        return
+    start_date, end_date = _default_observability_window()
+    try:
+        await _cached_observability_dashboard(
+            "stability",
+            {
+                "startDate": start_date,
+                "endDate": end_date,
+                "model": "",
+                "definition": STABILITY_DEFINITIONS_VERSION,
+                "ranking": STABILITY_RANKING_AGGREGATION_VERSION,
+            },
+            lambda: _build_stability_overview(start_date, end_date, ""),
+        )
+    except Exception:
+        logger.exception("stability overview warmup failed")
+    try:
+        await _cached_observability_dashboard(
+            "cost",
+            {
+                "month": end_date[:7],
+                "startDate": start_date,
+                "endDate": end_date,
+                "asOf": end_date,
+                "category": "",
+                "costBucket": "",
+                "model": "",
+                "vendor": "",
+                "provider": "",
+                "accountId": "",
+                "reconciliation": "",
+                "recognition": "",
+                "definition": "cost-v2",
+            },
+            lambda: _build_costs_overview(
+                month=end_date[:7],
+                start_date=start_date,
+                end_date=end_date,
+                as_of=end_date,
+            ),
+        )
+    except Exception:
+        logger.exception("cost overview warmup failed")
+
+
+async def _observability_warmup_loop() -> None:
+    stop = _observability_warmup_stop
+    last_day = None
+    while stop is not None and not stop.is_set():
+        today = usage_today()
+        if last_day != today:
+            await warmup_default_observability_snapshots()
+            last_day = today
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=60)
+        except asyncio.TimeoutError:
+            continue
+
+
+def start_observability_warmup() -> None:
+    global _observability_warmup_task, _observability_warmup_stop
+    if not env_bool("ADMIN_OBSERVABILITY_DASHBOARDS_ENABLED", False):
+        return
+    if usage_store() is None:
+        return
+    if _observability_warmup_task is not None and not _observability_warmup_task.done():
+        return
+    _observability_warmup_stop = asyncio.Event()
+    _observability_warmup_task = asyncio.create_task(
+        _observability_warmup_loop(), name="observability-warmup"
+    )
+
+
+async def stop_observability_warmup() -> None:
+    global _observability_warmup_task, _observability_warmup_stop
+    if _observability_warmup_stop is not None:
+        _observability_warmup_stop.set()
+    task = _observability_warmup_task
+    _observability_warmup_task = None
+    _observability_warmup_stop = None
+    if task is not None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def _invalidate_observability_dashboard(dashboard_type: str) -> None:
@@ -10343,69 +10440,7 @@ def _stability_ranking_attempt_fields(item: dict[str, Any] | None) -> dict[str, 
 
 
 async def _build_stability_overview(start_date: str, end_date: str, model: str) -> dict[str, Any]:
-    if _litellm_stability_reader is not None and _litellm_stability_reader.pool is not None:
-        try:
-            rows = await _litellm_stability_reader.fetch_rows(start_date, end_date, model)
-            governance = build_error_governance(rows)
-            overview = governance["overview"]
-            return _observability_envelope(
-                {
-                    "overview": {
-                        **overview,
-                        "requestCount": overview["totalRequests"],
-                        "userVisibleFailureRate": overview["stabilityErrorRate"],
-                        "finalRequestFailureRate": overview["stabilityErrorRate"],
-                    },
-                    "errorCodes": governance["errorCodes"],
-                    "daily": governance["daily"],
-                    "topScenarios": [],
-                    "modelRankings": [],
-                    "governanceActions": governance["errorCodes"][:5],
-                    "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
-                "dataSource": {"type": "litellm", "status": "available", "source": "198生产LiteLLM SpendLogs", "table": "LiteLLM_SpendLogs", "fallback": False},
-                },
-                freshness={"status": "available", "latestCollectedAt": end_date},
-                coverage={"partial": False, "incomplete": False, "eventCount": len(rows), "window": {"startDate": start_date, "endDate": end_date}},
-                source="稳定性生产数据源",
-            ) | {"startDate": start_date, "endDate": end_date, "model": model}
-        except Exception as exc:
-            logger.warning("LiteLLM stability query failed: %s", str(exc))
     store = _admin_observability_store()
-    mirror_query = getattr(store, "stability_spendlog_events", None)
-    if callable(mirror_query):
-        try:
-            mirror_rows = await mirror_query(start_date, end_date, model)
-            if mirror_rows:
-                governance = build_error_governance(mirror_rows)
-                overview = governance["overview"]
-                return _observability_envelope(
-                    {
-                        "overview": {
-                            **overview,
-                            "requestCount": overview["totalRequests"],
-                            "userVisibleFailureRate": overview["stabilityErrorRate"],
-                            "finalRequestFailureRate": overview["stabilityErrorRate"],
-                        },
-                        "errorCodes": governance["errorCodes"],
-                        "daily": governance["daily"],
-                        "topScenarios": [],
-                        "modelRankings": [],
-                        "governanceActions": governance["errorCodes"][:5],
-                        "definitionsVersion": STABILITY_DEFINITIONS_VERSION,
-                        "dataSource": {
-                            "type": "litellm_spendlog_mirror",
-                            "status": "available",
-                            "source": "198生产LiteLLM SpendLogs",
-                            "table": "stability_spendlog_mirror",
-                            "fallback": False,
-                        },
-                    },
-                    freshness={"status": "available", "latestCollectedAt": mirror_rows[0].get("collected_at")},
-                    coverage={"partial": False, "incomplete": False, "eventCount": len(mirror_rows), "window": {"startDate": start_date, "endDate": end_date}},
-                    source="198 LiteLLM SpendLogs 镜像",
-                ) | {"startDate": start_date, "endDate": end_date, "model": model}
-        except Exception as exc:
-            logger.warning("SpendLogs mirror query failed: %s", str(exc))
     aggregate_query = getattr(store, "stability_overview_aggregates", None)
     if callable(aggregate_query):
         metric_period = _metric_period(start_date, end_date)
@@ -11779,9 +11814,9 @@ async def _build_costs_overview(
             # Keep overview responses bounded; the paginated ledger endpoint is
             # the source of truth for full-detail browsing.
             "ledger": {
-                "rows": ledger_rows[: max(1, env_int("OBSERVABILITY_OVERVIEW_LEDGER_LIMIT", 1000))],
+                "rows": [],
                 "total": len(ledger_rows),
-                "truncated": len(ledger_rows) > max(1, env_int("OBSERVABILITY_OVERVIEW_LEDGER_LIMIT", 1000)),
+                "truncated": bool(ledger_rows),
             },
             # Keep the legacy overview fields while the dedicated endpoints migrate consumers.
             "costItems": [_cost_item_payload(item) for item in items],
@@ -11988,18 +12023,43 @@ async def _build_costs_annual(
         raise HTTPException(status_code=400, detail="as_of 格式应为 YYYY-MM-DD") from exc
     today = min(cutoff, end)
     store = _admin_observability_store()
-    api_rows, api_dimensions_complete = await _cost_api_rows(store, start, today, model=model, provider=provider, account_id=account_id)
+    monthly_query = getattr(store, "api_cost_monthly_totals", None)
+    monthly: dict[str, float] = defaultdict(float)
+    api_dimensions_complete = False
+    api_rows: list[dict[str, Any]] = []
+    if callable(monthly_query) and not provider:
+        try:
+            kwargs = {key: value for key, value in (("model", model), ("account_id", account_id), ("vendor", vendor)) if value}
+            monthly_rows = await monthly_query(start.isoformat(), today.isoformat(), **kwargs)
+        except TypeError:
+            monthly_rows = await monthly_query(start.isoformat(), today.isoformat())
+        for row in monthly_rows or []:
+            month_key = str(row.get("month") or "")[:7]
+            if month_key:
+                monthly[month_key] += float(row.get("spend") or 0)
+        if monthly:
+            api_rows = [{"usage_date": f"{month}-01", "spend": spend} for month, spend in monthly.items()]
+    if not monthly:
+        api_rows, api_dimensions_complete = await _cost_api_rows(store, start, today, model=model, provider=provider, account_id=account_id)
     all_items = [item for item in await store.list_cost_items() if bool(item.get("enabled"))]
     actual_items = await _cost_actual_items(store, today, model=model, provider=provider, account_id=account_id, cost_bucket=cost_bucket)
-    api_rows, actual_items = _filter_cost_sources(
-        api_rows, actual_items, category=category, cost_bucket=cost_bucket, model=model,
-        vendor=vendor, provider=provider, account_id=account_id,
-        reconciliation_status=reconciliation_status,
-        recognition_status="actual" if recognition_status in {"", "actual"} else recognition_status,
-    )
-    monthly: dict[str, float] = defaultdict(float)
-    for row in api_rows:
-        monthly[str(row.get("usage_date"))[:7]] += float(row.get("spend") or 0)
+    recognition = "actual" if recognition_status in {"", "actual"} else recognition_status
+    if not monthly:
+        api_rows, actual_items = _filter_cost_sources(
+            api_rows, actual_items, category=category, cost_bucket=cost_bucket, model=model,
+            vendor=vendor, provider=provider, account_id=account_id,
+            reconciliation_status=reconciliation_status,
+            recognition_status=recognition,
+        )
+        for row in api_rows:
+            monthly[str(row.get("usage_date"))[:7]] += float(row.get("spend") or 0)
+    else:
+        _, actual_items = _filter_cost_sources(
+            [], actual_items, category=category, cost_bucket=cost_bucket, model=model,
+            vendor=vendor, provider=provider, account_id=account_id,
+            reconciliation_status=reconciliation_status,
+            recognition_status=recognition,
+        )
     for item in actual_items:
         for row in _manual_cost_ledger_rows(item, start, today):
             monthly[str(row.get("date") or "")[:7]] += float(row.get("amountUsd") or 0)

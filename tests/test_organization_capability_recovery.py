@@ -104,6 +104,7 @@ def test_lifespan_registers_organization_service_before_usage_sync(monkeypatch):
     events = []
 
     monkeypatch.setattr(main, "validate_runtime_auth_config", lambda: events.append("validate"))
+    monkeypatch.setattr(main, "local_data_mode", lambda: "real")
 
     async def fake_start_billing_store():
         events.append("billing")
@@ -120,6 +121,12 @@ def test_lifespan_registers_organization_service_before_usage_sync(monkeypatch):
     monkeypatch.setattr(main, "start_billing_store", fake_start_billing_store)
     monkeypatch.setattr(main, "start_organization_service", fake_start_organization_service)
     monkeypatch.setattr(main, "start_usage_sync", fake_start_usage_sync)
+    monkeypatch.setattr(main, "start_observability_warmup", lambda: None)
+
+    async def fake_stop_warmup():
+        return None
+
+    monkeypatch.setattr(main, "stop_observability_warmup", fake_stop_warmup)
     monkeypatch.setattr(main, "close_litellm_client", fake_close)
 
     async def exercise_lifespan():
