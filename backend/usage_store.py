@@ -1970,6 +1970,7 @@ class UsageStore:
             row = self._aggregated_usage_row(record)
             row.update(
                 {
+                    "backend": record["backend_id"],
                     "employeeId": record["user_id"],
                     "employeeName": record["employee_name"] or record["user_id"],
                     "employeeEmail": record["employee_email"] or "",
@@ -1983,7 +1984,7 @@ class UsageStore:
             email = str(row.get("employeeEmail") or "").strip().lower()
             identity = f"email:{email}" if email else f"id:{record['backend_id']}:{record['user_id']}"
             public_id = row["employeeId"] if email else f"{record['backend_id']}:{record['user_id']}"
-            item = employees_by_identity.setdefault(identity, {"employeeId": public_id, "employeeName": row["employeeName"], "employeeEmail": email, "bindStatus": row["bindStatus"], **empty_totals(), "primarySource": "其他", "userIds": [], "teamRole": "user"})
+            item = employees_by_identity.setdefault(identity, {"backend": record["backend_id"], "employeeId": public_id, "employeeName": row["employeeName"], "employeeEmail": email, "bindStatus": row["bindStatus"], **empty_totals(), "primarySource": "其他", "userIds": [], "teamRole": "user"})
             add_totals(item, row)
             source_totals[identity][str(row.get("source") or "其他")] += _as_int(row.get("totalTokens"))
             account_id = f"{record['backend_id']}:{record['user_id']}"
@@ -4759,9 +4760,10 @@ class UsageStore:
             item = (employee_by_user_id.get(f"email:{member_email}") if member_email else None) or employee_by_user_id.get(f"id:{backend_id}:{member['user_id']}") or employee_by_user_id.get(str(member["user_id"]))
             if item is None:
                 account_id = f"{backend_id}:{member['user_id']}"
-                item = {"employeeId": member["user_id"] if member_email else account_id, "employeeName": member["employee_name"] or member["user_id"], "employeeEmail": member["employee_email"] or "", "bindStatus": _record_bind_status(member), **empty_totals(), "primarySource": "其他", "userIds": [account_id], "teamRole": member["team_role"] or "user"}
+                item = {"backend": backend_id, "employeeId": member["user_id"] if member_email else account_id, "employeeName": member["employee_name"] or member["user_id"], "employeeEmail": member["employee_email"] or "", "bindStatus": _record_bind_status(member), **empty_totals(), "primarySource": "其他", "userIds": [account_id], "teamRole": member["team_role"] or "user"}
             else:
                 item = dict(item)
+                item.setdefault("backend", backend_id)
                 item["teamRole"] = member["team_role"] or item.get("teamRole") or "user"
             email = str(item.get("employeeEmail") or member["employee_email"] or "").strip().lower()
             identity = f"email:{email}" if email else f"id:{backend_id}:{str(member['user_id']).strip().lower()}"

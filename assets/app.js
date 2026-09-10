@@ -3486,13 +3486,14 @@ function applyTeamUsagePayload(payload, cacheKey = "") {
   updateDashboardModelFilterOptions(payload.summaryRows || payload.rows || [], payload.modelOptions, "team", cacheKey.split("|").slice(0, 5).join("|"));
   teamUsageData = Array.isArray(payload.rows) ? payload.rows : [];
   teamSummaryData = Array.isArray(payload.summaryRows) ? payload.summaryRows : teamUsageData;
-  teamEmployees = Array.isArray(payload.employees) ? payload.employees : [];
+  const hasMemberRoster = Array.isArray(payload.employees);
+  teamEmployees = hasMemberRoster ? payload.employees : [];
   teamInfo = payload.team || currentUser?.team || teamInfo;
   teamDataFreshness = payload.dataFreshness || null;
   teamDataQuality = payload.dataQuality || null;
   teamCoverage = payload.coverage || null;
   lastTeamUsageCacheHit = Boolean(payload.cache?.hit);
-  teamRankingError = "";
+  teamRankingError = hasMemberRoster ? "" : "成员排行数据不完整，请重试";
   teamRankingHint = "";
   if (cacheKey) teamUsagePayloadCache.set(cacheKey, payload);
 }
