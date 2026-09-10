@@ -1954,9 +1954,19 @@ class UsageStore:
              WHERE u.backend_id = ANY($1::text[])
                AND u.usage_date BETWEEN $3::date AND $4::date
                AND ($5 = 'all' OR u.source = $5)
-               AND EXISTS (
-                   SELECT 1 FROM scope s
-                   WHERE s.backend_id=u.backend_id AND s.team_id=u.team_id
+               AND (
+                   EXISTS (
+                       SELECT 1 FROM scope s
+                       WHERE s.backend_id=u.backend_id AND s.team_id=u.team_id
+                   )
+                   OR EXISTS (
+                       SELECT 1
+                       FROM usage_team_membership_daily m
+                       JOIN scope s ON s.backend_id=m.backend_id AND s.team_id=m.team_id
+                       WHERE m.backend_id=u.backend_id
+                         AND m.user_id=u.user_id
+                         AND m.snapshot_date <= u.usage_date
+                   )
                )
              GROUP BY u.backend_id, u.usage_date, u.user_id, u.team_id, u.source, {model_sql}
             ORDER BY kind, usage_date NULLS FIRST, backend_id, user_id, source, model_name
