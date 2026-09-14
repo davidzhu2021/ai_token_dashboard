@@ -2222,6 +2222,10 @@ class UsageStore:
         *,
         events: list[dict[str, Any]] | None = None,
         departments: list[dict[str, Any]] | None = None,
+        events_complete: bool | None = None,
+        event_window_complete: bool | None = None,
+        event_replace_start_date: str | None = None,
+        event_replace_end_date: str | None = None,
     ) -> int:
         pool = self._require_pool()
         collected_at = datetime.now(timezone.utc)
@@ -2236,6 +2240,16 @@ class UsageStore:
             for row in (events or [])
             if (record := self._event_record(backend_id, row, collected_at))
         ]
+        event_completion = (
+            event_window_complete
+            if event_window_complete is not None
+            else events_complete
+        )
+        # Preserve the legacy assumption for callers that only provide an event
+        # list; explicit partial markers must opt out of window replacement.
+        replace_events = events is not None and event_completion is not False
+        event_start = event_replace_start_date or start_date
+        event_end = event_replace_end_date or end_date
         async with pool.acquire() as connection:
             async with connection.transaction():
                 await connection.execute(
@@ -2281,14 +2295,14 @@ class UsageStore:
                     _as_date(start_date),
                     _as_date(end_date),
                 )
-                if events is not None:
+                if replace_events:
                     await connection.execute(
                         "DELETE FROM usage_event_attribution WHERE backend_id=$1 "
                         "AND usage_date BETWEEN $2::date AND $3::date "
                         "AND attribution_source <> 'legacy_report_only'",
                         backend_id,
-                        _as_date(start_date),
-                        _as_date(end_date),
+                        _as_date(event_start),
+                        _as_date(event_end),
                     )
                 if usage_records:
                     await connection.executemany(
@@ -2434,18 +2448,24 @@ class UsageStore:
         final_attempt_records = [
             record
             for row in events
-            if (record := self._stability_final_request_record(backend_id, row, collected_at)) is not None
+            if (
+                record := self._stability_final_request_record(
+                    {**row, "backend_id": backend_id}, collected_at
+                )
+            )
+            is not None
         ]
         async with pool.acquire() as connection:
             async with connection.transaction():
-                await connection.execute(
-                    "DELETE FROM usage_event_attribution WHERE backend_id=$1 "
-                    "AND usage_date BETWEEN $2::date AND $3::date "
-                    "AND attribution_source <> 'legacy_report_only'",
-                    backend_id,
-                    _as_date(replace_start_date),
-                    _as_date(replace_end_date),
-                )
+                if complete:
+                    await connection.execute(
+                        "DELETE FROM usage_event_attribution WHERE backend_id=$1 "
+                        "AND usage_date BETWEEN $2::date AND $3::date "
+                        "AND attribution_source <> 'legacy_report_only'",
+                        backend_id,
+                        _as_date(replace_start_date),
+                        _as_date(replace_end_date),
+                    )
                 if records:
                     await connection.executemany(
                         """
@@ -2489,14 +2509,15 @@ class UsageStore:
                     )
                 # 窗口内由 spend log 生成的 final_request 尝试事件整体替换；
                 # event_type='final_request' 过滤保证外部推送的 attempt 事件不被清掉。
-                await connection.execute(
-                    "DELETE FROM stability_attempt_events WHERE backend_id=$1 "
-                    "AND event_date BETWEEN $2::date AND $3::date "
-                    "AND event_type='final_request'",
-                    backend_id,
-                    _as_date(replace_start_date),
-                    _as_date(replace_end_date),
-                )
+                if complete:
+                    await connection.execute(
+                        "DELETE FROM stability_attempt_events WHERE backend_id=$1 "
+                        "AND event_date BETWEEN $2::date AND $3::date "
+                        "AND event_type='final_request'",
+                        backend_id,
+                        _as_date(replace_start_date),
+                        _as_date(replace_end_date),
+                    )
                 if final_attempt_records:
                     await connection.executemany(
                         """
@@ -2615,6 +2636,12 @@ class UsageStore:
                 if record is not None:
                     event_records_by_key[(str(record[0]), str(record[1]))] = record
         event_records = list(event_records_by_key.values())
+        def snapshot_event_completion(snapshot: Any) -> bool | None:
+            marker = getattr(snapshot, "event_window_complete", None)
+            if marker is None:
+                marker = getattr(snapshot, "events_complete", None)
+            return marker
+
         event_windows = {
             str(snapshot.backend_id): (
                 str(getattr(snapshot, "event_replace_start_date", None) or getattr(snapshot, "event_start_date", None) or start_date),
@@ -2622,6 +2649,7 @@ class UsageStore:
             )
             for snapshot in snapshots
             if getattr(snapshot, "events", None) is not None
+            and snapshot_event_completion(snapshot) is not False
         }
         department_records_by_key: dict[tuple[str, str], tuple[Any, ...]] = {}
         for snapshot in snapshots:
@@ -2643,6 +2671,7 @@ class UsageStore:
             str(snapshot.backend_id)
             for snapshot in snapshots
             if getattr(snapshot, "events", None) is not None
+            and snapshot_event_completion(snapshot) is not False
         )
         department_backends = sorted(
             str(snapshot.backend_id)
@@ -2846,13 +2875,10 @@ class UsageStore:
                         )
                         raise
                 for snapshot in snapshots:
-                    if getattr(snapshot, "events_complete", None) is None:
+                    event_completion = snapshot_event_completion(snapshot)
+                    if event_completion is None:
                         continue
-                    state_complete = bool(
-                        getattr(snapshot, "event_window_complete", None)
-                        if getattr(snapshot, "event_window_complete", None) is not None
-                        else getattr(snapshot, "events_complete", False)
-                    )
+                    state_complete = bool(event_completion)
                     state_start = getattr(snapshot, "event_start_date", None) or start_day
                     state_end = getattr(snapshot, "event_end_date", None) or end_day
                     event_count = int(

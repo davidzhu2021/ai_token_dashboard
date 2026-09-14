@@ -371,6 +371,7 @@ _team_member_key_inflight: dict[tuple[str, int, bool], asyncio.Task[Any]] = {}
 _team_member_key_cache_versions: dict[str, int] = {}
 _observability_refresh_tasks: dict[str, asyncio.Task[Any]] = {}
 _observability_refresh_lock = asyncio.Lock()
+_stability_refresh_slot = asyncio.Semaphore(1)
 _observability_memory_snapshots: dict[str, dict[str, Any]] = {}
 _observability_refresh_failures: dict[str, tuple[float, str]] = {}
 try:
@@ -433,16 +434,9 @@ def _observability_cache_meta(
     response_bytes: int | None = None,
 ) -> dict[str, Any]:
     generated = record.get("generated_at") if record else None
-    if isinstance(generated, datetime):
-        generated_at = generated.astimezone(timezone.utc).isoformat()
-        age_seconds = max(0, int((datetime.now(timezone.utc) - generated).total_seconds()))
-    else:
-        generated_at = str(generated or "") or None
-        try:
-            parsed = datetime.fromisoformat(str(generated).replace("Z", "+00:00"))
-            age_seconds = max(0, int((datetime.now(timezone.utc) - parsed).total_seconds()))
-        except (TypeError, ValueError):
-            age_seconds = None
+    parsed = _parse_generated_at(generated)
+    generated_at = parsed.isoformat() if parsed else (str(generated or "") or None)
+    age_seconds = max(0, int((datetime.now(timezone.utc) - parsed).total_seconds())) if parsed else None
     return {
         "state": state,
         "generatedAt": generated_at,
@@ -453,6 +447,21 @@ def _observability_cache_meta(
         "layer": layer,
         "responseBytes": response_bytes,
     }
+
+
+def _parse_generated_at(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif value:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _observability_response_bytes(payload: dict[str, Any]) -> int:
@@ -511,9 +520,16 @@ async def _observability_refresh(
     store = _admin_observability_store()
     started = asyncio.get_running_loop().time()
     try:
-        payload = jsonable_encoder(await asyncio.wait_for(
-            builder(), timeout=max(1, env_int("OBSERVABILITY_REFRESH_TIMEOUT_SECONDS", 30))
-        ))
+        timeout_name = "STABILITY_REFRESH_TIMEOUT_SECONDS" if dashboard_type == "stability" else "OBSERVABILITY_REFRESH_TIMEOUT_SECONDS"
+        timeout_default = 120 if dashboard_type == "stability" else 30
+        if dashboard_type == "stability":
+            async with _stability_refresh_slot:
+                built = await asyncio.wait_for(builder(), timeout=max(1, env_int(timeout_name, timeout_default)))
+        else:
+            built = await asyncio.wait_for(builder(), timeout=max(1, env_int(timeout_name, timeout_default)))
+        payload = jsonable_encoder(built)
+        build_ms = (asyncio.get_running_loop().time() - started) * 1000
+        save_started = asyncio.get_running_loop().time()
         state = await _call_store_optional(store, ("snapshot_state",), default={})
         revision = str((state or {}).get("revision") or (state or {}).get("snapshotRevision") or "")
         record = await _call_store_optional(
@@ -532,28 +548,53 @@ async def _observability_refresh(
                 "data_revision": revision,
                 "last_refresh_error": "",
             }
+        save_ms = (asyncio.get_running_loop().time() - save_started) * 1000
         memory_key = f"{dashboard_type}:{snapshot_key}"
         _observability_memory_snapshots[memory_key] = dict(record)
         _observability_refresh_failures.pop(memory_key, None)
         response_bytes = _observability_response_bytes(payload)
         logger.info(
-            "observability refresh dashboard=%s total_ms=%.0f cache_state=stored",
+            "observability refresh dashboard=%s start_date=%s end_date=%s model=%s eventCount=%s aggregateRows=%s build_ms=%.0f save_ms=%.0f total_ms=%.0f cache_state=stored",
             dashboard_type,
+            payload.get("startDate") if dashboard_type == "stability" else "",
+            payload.get("endDate") if dashboard_type == "stability" else "",
+            payload.get("model") if dashboard_type == "stability" else "",
+            ((payload.get("coverage") or {}).get("eventCount") if dashboard_type == "stability" else None),
+            (
+                sum(
+                    len((payload.get("data") or {}).get(key) or [])
+                    for key in ("daily", "modelRankings", "topScenarios")
+                )
+                if dashboard_type == "stability"
+                else None
+            ),
+            build_ms,
+            save_ms,
             (asyncio.get_running_loop().time() - started) * 1000,
         )
         return {**payload, "cache": _observability_cache_meta(record, state="fresh", layer="rebuild", response_bytes=response_bytes)}
     except Exception as exc:
-        _observability_refresh_failures[f"{dashboard_type}:{snapshot_key}"] = (
+        error_type = exc.__class__.__name__
+        memory_key = f"{dashboard_type}:{snapshot_key}"
+        _observability_refresh_failures[memory_key] = (
             asyncio.get_running_loop().time(),
-            exc.__class__.__name__,
+            error_type,
         )
+        # Keep the last-known-good payload and timestamp while surfacing the
+        # failed refresh in subsequent stale responses.
+        prior = _observability_memory_snapshots.get(memory_key)
+        if prior:
+            failed_record = dict(prior)
+            failed_record["last_refresh_error"] = error_type
+            failed_record["refreshing"] = False
+            _observability_memory_snapshots[memory_key] = failed_record
         await _call_store_optional(
             store,
             ("mark_observability_snapshot_refresh",),
             dashboard_type,
             snapshot_key,
             refreshing=False,
-            error=exc.__class__.__name__,
+            error=error_type,
             default=None,
         )
         logger.exception("observability refresh failed dashboard=%s", dashboard_type)
@@ -612,9 +653,38 @@ async def _cached_observability_dashboard(
     fresh_seconds = max(1, env_int("OBSERVABILITY_CACHE_FRESH_SECONDS", 300))
     stale_seconds = max(fresh_seconds, env_int("OBSERVABILITY_CACHE_STALE_MAX_SECONDS", 86400))
     age = None
-    if record and isinstance(record.get("generated_at"), datetime):
-        age = (datetime.now(timezone.utc) - record["generated_at"]).total_seconds()
+    parsed_generated = _parse_generated_at(record.get("generated_at")) if record else None
+    if parsed_generated:
+        age = (datetime.now(timezone.utc) - parsed_generated).total_seconds()
+    failure_key = f"{dashboard_type}:{snapshot_key}"
+    failure = _observability_refresh_failures.get(failure_key)
+    if (
+        record
+        and failure
+        and not refresh
+        and asyncio.get_running_loop().time() - failure[0] < 10
+    ):
+        payload = _snapshot_payload(record)
+        payload["cache"] = _observability_cache_meta(
+            record,
+            state="stale",
+            refreshing=False,
+            layer=layer,
+            response_bytes=_observability_response_bytes(payload),
+        )
+        return payload
     if record and age is not None and age <= fresh_seconds and not refresh:
+        if record.get("last_refresh_error"):
+            task = await _start_observability_refresh(dashboard_type, snapshot_key, builder)
+            payload = _snapshot_payload(record)
+            payload["cache"] = _observability_cache_meta(
+                record,
+                state="refreshing" if not task.done() else "stale",
+                refreshing=not task.done(),
+                layer=layer,
+                response_bytes=_observability_response_bytes(payload),
+            )
+            return payload
         payload = _snapshot_payload(record)
         payload["cache"] = _observability_cache_meta(record, state="fresh", layer=layer, response_bytes=_observability_response_bytes(payload))
         logger.info("observability overview dashboard=%s snapshot_ms=%.0f total_ms=%.0f cache_layer=%s cache_state=fresh response_bytes=%s", dashboard_type, (asyncio.get_running_loop().time() - lookup_started) * 1000, (asyncio.get_running_loop().time() - lookup_started) * 1000, layer, payload["cache"]["responseBytes"])
@@ -624,7 +694,6 @@ async def _cached_observability_dashboard(
         payload = _snapshot_payload(record)
         payload["cache"] = _observability_cache_meta(record, state="refreshing" if not task.done() else "stale", refreshing=not task.done(), layer=layer, response_bytes=_observability_response_bytes(payload))
         return payload
-    failure_key = f"{dashboard_type}:{snapshot_key}"
     failure = _observability_refresh_failures.get(failure_key)
     if failure and asyncio.get_running_loop().time() - failure[0] < 10:
         return _observability_pending_payload(dashboard_type, key_payload, error=failure[1])
@@ -10441,6 +10510,7 @@ def _stability_ranking_attempt_fields(item: dict[str, Any] | None) -> dict[str, 
 
 async def _build_stability_overview(start_date: str, end_date: str, model: str) -> dict[str, Any]:
     store = _admin_observability_store()
+    started = asyncio.get_running_loop().time()
     aggregate_query = getattr(store, "stability_overview_aggregates", None)
     if callable(aggregate_query):
         metric_period = _metric_period(start_date, end_date)
@@ -10536,6 +10606,12 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
             sync_states, start_date=start_date, end_date=end_date,
             configured_backends=set(usage_backend_ids()), event_count=event_count,
         )
+        logger.info(
+            "stability overview stage=aggregate start_date=%s end_date=%s model=%s eventCount=%s aggregateRows=%s stage_ms=%.0f",
+            start_date, end_date, model, event_count,
+            sum(len(aggregates.get(key) or []) for key in ("daily", "models", "scenarios")),
+            (asyncio.get_running_loop().time() - started) * 1000,
+        )
         return _observability_envelope(
             {
                 "overview": overview,
@@ -10566,6 +10642,11 @@ async def _build_stability_overview(start_date: str, end_date: str, model: str) 
     attempt_events = await _stability_attempt_events(store, start_date, end_date, model=model)
     metric_period = _metric_period(start_date, end_date)
     overview = stability_metrics(events, attempt_events, period=metric_period, as_of=end_date)
+    logger.info(
+        "stability overview stage=python_fallback start_date=%s end_date=%s model=%s eventCount=%s stage_ms=%.0f",
+        start_date, end_date, model, len(events),
+        (asyncio.get_running_loop().time() - started) * 1000,
+    )
     by_day: dict[str, list[dict[str, Any]]] = {}
     by_model: dict[str, list[dict[str, Any]]] = {}
     by_scenario: dict[tuple[str, str, str], list[dict[str, Any]]] = {}

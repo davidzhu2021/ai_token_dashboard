@@ -914,6 +914,7 @@ class UsageSynchronizer:
                     departments = getattr(snapshot, "departments", None)
                     supports_events = True
                     supports_departments = False
+                    signature = None
                     try:
                         signature = inspect.signature(replace_snapshot)
                         supports_events = "events" in signature.parameters or any(
@@ -929,6 +930,17 @@ class UsageSynchronizer:
                     kwargs = {}
                     if supports_events and events is not None:
                         kwargs["events"] = events
+                        for name in (
+                            "events_complete",
+                            "event_window_complete",
+                            "event_replace_start_date",
+                            "event_replace_end_date",
+                        ):
+                            if hasattr(snapshot, name) and signature and (
+                                name in signature.parameters
+                                or any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
+                            ):
+                                kwargs[name] = getattr(snapshot, name)
                     if supports_departments:
                         kwargs["departments"] = departments
                     row_count += await replace_snapshot(

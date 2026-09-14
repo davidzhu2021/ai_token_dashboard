@@ -235,8 +235,12 @@ let costOverviewLoadError = "";
 let stabilityOverviewRequestId = 0;
 let costOverviewRequestId = 0;
 let stabilityOverviewController = null;
+let stabilityOverviewInFlight = null;
+let stabilityOverviewInFlightWindowKey = "";
 let stabilityOverviewRefreshTimer = null;
 let costOverviewController = null;
+let costOverviewInFlight = null;
+let costOverviewInFlightWindowKey = "";
 let costOverviewRefreshTimer = null;
 let stabilityScenarioRequestId = 0;
 let costLedgerRequestId = 0;
@@ -8800,8 +8804,8 @@ function resetObservabilityFilters(scope) {
     if (input) input.value = "";
   });
   renderObservabilityFilterState(scope);
-  if (scope === "stability") loadStabilityOverview();
-  else loadCostOverview();
+  if (scope === "stability") loadStabilityOverview(true);
+  else loadCostOverview(true);
 }
 
 function clearObservabilityFilter(scope, id) {
@@ -8810,8 +8814,8 @@ function clearObservabilityFilter(scope, id) {
   const input = el(id);
   if (input) input.value = "";
   renderObservabilityFilterState(scope);
-  if (scope === "stability") loadStabilityOverview();
-  else loadCostOverview();
+  if (scope === "stability") loadStabilityOverview(true);
+  else loadCostOverview(true);
 }
 
 function currentStabilityWindow() {
@@ -8870,15 +8874,25 @@ function hasUsableCostOverview() {
 
 function observabilityOverviewIsFresh(scope) {
   if (scope === "stability") {
+    const freshnessStatus = String(stabilityOverview?.freshness?.status || "").toLowerCase();
+    const coverage = stabilityOverview?.coverage || {};
     return hasUsableStabilityOverview()
       && stabilityOverviewWindowKey === observabilityOverviewWindowKey("stability")
       && Date.now() - stabilityOverviewLoadedAt < OBSERVABILITY_OVERVIEW_TTL_MS
-      && !isStabilityLoading;
+      && !isStabilityLoading
+      && !["pending", "partial", "unavailable"].includes(freshnessStatus)
+      && !coverage.partial
+      && !coverage.incomplete;
   }
+  const freshnessStatus = String(costOverview?.freshness?.status || "").toLowerCase();
+  const coverage = costOverview?.coverage || {};
   return hasUsableCostOverview()
     && costOverviewWindowKey === observabilityOverviewWindowKey("cost")
     && Date.now() - costOverviewLoadedAt < OBSERVABILITY_OVERVIEW_TTL_MS
-    && !isCostOverviewLoading;
+    && !isCostOverviewLoading
+    && !["pending", "partial", "unavailable"].includes(freshnessStatus)
+    && !coverage.partial
+    && !coverage.incomplete;
 }
 
 function observabilityReasonCopy(payload, scope) {
@@ -8921,9 +8935,6 @@ function observabilityReasonCopy(payload, scope) {
     no_events_or_filter_match: "当前窗口无事件或筛选无结果",
     field_missing: "上游记录缺少必要字段",
   };
-  if (scope === "stability" && (reasons.length || coverage.incomplete || coverage.partial)) {
-    return null;
-  }
   if (reasons.length) {
     return {
       title: scope === "stability" ? "稳定性数据覆盖提示" : "费用数据覆盖提示",
@@ -9147,21 +9158,33 @@ function renderStabilityOverview() {
   renderObservabilityQuality("stabilityQuality", payload, "stability");
   const models = [...new Set((data.modelRankings || []).map((item) => item.model))];
   const select = el("stabilityModel");
-  const selected = select.value;
-  select.innerHTML = `<option value="">全部模型</option>${models.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("")}`;
-  select.value = models.includes(selected) ? selected : "";
+  const preservePendingModelOptions = payload?.freshness?.status === "pending"
+    && hasUsableStabilityOverview()
+    && stabilityOverviewWindowKey === observabilityOverviewWindowKey("stability");
+  if (select && !preservePendingModelOptions && !(models.length === 0 && select.value)) {
+    const selected = select.value;
+    select.innerHTML = `<option value="">全部模型</option>${models.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("")}`;
+    select.value = models.includes(selected) ? selected : "";
+  }
   renderObservabilityFilterState("stability");
 }
 
 async function loadStabilityOverview(forceRefresh = false) {
   if (!canViewStability()) return;
+  const windowKey = observabilityOverviewWindowKey("stability");
+  if (!forceRefresh && stabilityOverviewInFlight && stabilityOverviewInFlightWindowKey === windowKey) return stabilityOverviewInFlight;
   const requestId = ++stabilityOverviewRequestId;
   if (stabilityOverviewRefreshTimer) {
     globalThis.clearTimeout(stabilityOverviewRefreshTimer);
     stabilityOverviewRefreshTimer = null;
   }
-  stabilityOverviewController?.abort();
-  stabilityOverviewController = new AbortController();
+  if (forceRefresh) stabilityOverviewController?.abort();
+  const controller = new AbortController();
+  stabilityOverviewController = controller;
+  let resolveInFlight;
+  stabilityOverviewInFlight = new Promise((resolve) => { resolveInFlight = resolve; });
+  stabilityOverviewInFlightWindowKey = windowKey;
+  const inFlightPromise = stabilityOverviewInFlight;
   isStabilityLoading = true;
   stabilityLoadError = "";
   renderObservabilityQuality("stabilityQuality", stabilityOverview, "stability");
@@ -9173,7 +9196,7 @@ async function loadStabilityOverview(forceRefresh = false) {
     let nextOverview;
     while (true) {
       try {
-        nextOverview = await api(`/api/admin/stability/overview?start_date=${startDate}&end_date=${endDate}&model=${encodeURIComponent(model)}${forceRefresh ? "&refresh=1" : ""}`, { signal: stabilityOverviewController.signal, cache: "no-store" });
+        nextOverview = await api(`/api/admin/stability/overview?start_date=${startDate}&end_date=${endDate}&model=${encodeURIComponent(model)}${forceRefresh ? "&refresh=1" : ""}`, { signal: controller.signal, cache: "no-store" });
         break;
       } catch (error) {
         if (error.name === "AbortError" || error.status !== 503 || retryAttempt >= maxRetries) throw error;
@@ -9184,7 +9207,7 @@ async function loadStabilityOverview(forceRefresh = false) {
         showToast("稳定性数据正在生成，请稍候");
         await new Promise((resolve, reject) => {
           const timer = globalThis.setTimeout(resolve, retryDelay);
-          stabilityOverviewController.signal.addEventListener("abort", () => {
+          controller.signal.addEventListener("abort", () => {
             globalThis.clearTimeout(timer);
             reject(Object.assign(new Error("已取消"), { name: "AbortError" }));
           }, { once: true });
@@ -9192,14 +9215,20 @@ async function loadStabilityOverview(forceRefresh = false) {
       }
     }
     if (requestId !== stabilityOverviewRequestId) return;
-    if (hasUsableStabilityOverview() && nextOverview?.freshness?.status === "pending") {
-      renderObservabilityQuality("stabilityQuality", nextOverview, "stability");
+    if (
+      hasUsableStabilityOverview()
+      && stabilityOverviewWindowKey === windowKey
+      && nextOverview?.freshness?.status === "pending"
+    ) {
+      // Keep the last complete data snapshot while surfacing the new pending state.
+      stabilityOverview = { ...stabilityOverview, freshness: nextOverview.freshness, cache: nextOverview.cache, coverage: nextOverview.coverage };
+      renderObservabilityQuality("stabilityQuality", stabilityOverview, "stability");
     } else {
       stabilityOverview = nextOverview;
       stabilityOverviewWindowKey = observabilityOverviewWindowKey("stability");
-      if (hasUsableStabilityOverview()) stabilityOverviewLoadedAt = Date.now();
+      if (hasUsableStabilityOverview() && nextOverview?.cache?.state !== "refreshing") stabilityOverviewLoadedAt = Date.now();
     }
-    if (nextOverview?.cache?.state === "refreshing" && nextOverview?.freshness?.status === "pending" && !nextOverview?.cache?.lastRefreshError) {
+    if (nextOverview?.cache?.state === "refreshing" && !nextOverview?.cache?.lastRefreshError) {
       stabilityOverviewRefreshTimer = globalThis.setTimeout(() => {
         stabilityOverviewRefreshTimer = null;
         if (requestId === stabilityOverviewRequestId && ["stability", "governance-workbench"].includes(currentView)) loadStabilityOverview(false);
@@ -9215,6 +9244,11 @@ async function loadStabilityOverview(forceRefresh = false) {
       isStabilityLoading = false;
       renderStabilityOverview();
       if (currentView === "governance-workbench") renderGovernanceWorkbench();
+    }
+    resolveInFlight?.();
+    if (stabilityOverviewInFlight === inFlightPromise) {
+      stabilityOverviewInFlight = null;
+      stabilityOverviewInFlightWindowKey = "";
     }
   }
 }
@@ -9265,9 +9299,13 @@ function renderCostOverview() {
   el("costPlanVersions").innerHTML = planVersions.map((item) => `<article class="observability-action"><div><strong>${escapeHtml(item.name || item.version || `${item.year || ""} 基准计划`)}</strong><p class="hint">${escapeHtml(item.scenario || "基准")} · ${escapeHtml(item.status || "未知状态")}${item.asOf ? ` · 截止 ${escapeHtml(item.asOf)}` : ""}${item.approvedBy ? ` · ${escapeHtml(item.approvedBy)} 批准` : ""}</p></div><div class="observability-table-actions"><span class="chip ${item.active || item.status === "active" || item.status === "approved" ? "green" : "gold"}">${item.active ? "生效中" : escapeHtml(item.status || "草稿")}</span>${canManageCosts() ? `<button class="ghost-btn" type="button" data-edit-cost-plan="${escapeHtml(item.id || "")}">编辑</button>${item.status === "draft" ? `<button class="ghost-btn" type="button" data-cost-plan-state="approve" data-cost-plan-id="${escapeHtml(item.id || "")}">批准</button>` : ""}${item.status === "approved" ? `<button class="ghost-btn" type="button" data-cost-plan-state="activate" data-cost-plan-id="${escapeHtml(item.id || "")}">激活</button>` : ""}${item.status !== "archived" ? `<button class="ghost-btn" type="button" data-cost-plan-state="archive" data-cost-plan-id="${escapeHtml(item.id || "")}">归档</button>` : ""}` : ""}</div></article>`).join("") || observabilityEmptyState("暂无计划版本", "创建并批准基准计划后，费用看板才会展示官方全年预测。", []);
   renderObservabilityQuality("costQuality", costOverview, "cost");
   const filters = data.filters || {};
+  const preservePendingFilters = costOverview?.freshness?.status === "pending"
+    && hasUsableCostOverview()
+    && costOverviewWindowKey === observabilityOverviewWindowKey("cost");
   [["costCategory", "全部成本项", filters.categories || []], ["costBucket", "全部成本桶", filters.costBuckets || filters.buckets || []], ["costModel", "全部模型", filters.models || []], ["costVendor", "全部来源", filters.vendors || []], ["costProvider", "全部供应渠道", filters.providers || []], ["costAccount", "全部账号", filters.accounts || []], ["costReconciliation", "全部对账状态", filters.reconciliationStatuses || []], ["costRecognition", "全部确认状态", filters.recognitionStatuses || []]].forEach(([id, label, options]) => {
     const select = el(id);
     if (!select) return;
+    if (preservePendingFilters && !options.length && select.options.length > 1) return;
     const selected = select.value;
     select.innerHTML = `<option value="">${label}</option>${options.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("")}`;
     select.value = options.includes(selected) ? selected : "";
@@ -9513,13 +9551,20 @@ function openGovernanceWorkbench(tab) {
 
 async function loadCostOverview(forceRefresh = false) {
   if (!canViewCosts()) return;
+  const windowKey = observabilityOverviewWindowKey("cost");
+  if (!forceRefresh && costOverviewInFlight && costOverviewInFlightWindowKey === windowKey) return costOverviewInFlight;
   const requestId = ++costOverviewRequestId;
   if (costOverviewRefreshTimer) {
     globalThis.clearTimeout(costOverviewRefreshTimer);
     costOverviewRefreshTimer = null;
   }
-  costOverviewController?.abort();
-  costOverviewController = new AbortController();
+  if (forceRefresh) costOverviewController?.abort();
+  const controller = new AbortController();
+  costOverviewController = controller;
+  let resolveInFlight;
+  costOverviewInFlight = new Promise((resolve) => { resolveInFlight = resolve; });
+  costOverviewInFlightWindowKey = windowKey;
+  const inFlightPromise = costOverviewInFlight;
   isCostOverviewLoading = true;
   costOverviewLoadError = "";
   try {
@@ -9538,7 +9583,7 @@ async function loadCostOverview(forceRefresh = false) {
     let retryAttempt = 0;
     while (true) {
       try {
-        nextOverview = await api(`/api/admin/costs/overview?${query}`, { signal: costOverviewController.signal });
+        nextOverview = await api(`/api/admin/costs/overview?${query}`, { signal: controller.signal });
         break;
       } catch (error) {
         if (error.name === "AbortError" || error.status !== 503 || retryAttempt >= STABILITY_OVERVIEW_MAX_RETRIES) throw error;
@@ -9546,7 +9591,7 @@ async function loadCostOverview(forceRefresh = false) {
         const retryDelay = Math.min(8000, error.retryAfter > 0 ? error.retryAfter * 1000 : 1000 * (2 ** (retryAttempt - 1)));
         await new Promise((resolve, reject) => {
           const timer = globalThis.setTimeout(resolve, retryDelay);
-          costOverviewController.signal.addEventListener("abort", () => {
+          controller.signal.addEventListener("abort", () => {
             globalThis.clearTimeout(timer);
             reject(Object.assign(new Error("已取消"), { name: "AbortError" }));
           }, { once: true });
@@ -9554,15 +9599,21 @@ async function loadCostOverview(forceRefresh = false) {
       }
     }
     if (requestId !== costOverviewRequestId) return;
-    if (hasUsableCostOverview() && nextOverview?.freshness?.status === "pending") {
-      renderObservabilityQuality("costQuality", nextOverview, "cost");
+    if (
+      hasUsableCostOverview()
+      && costOverviewWindowKey === windowKey
+      && nextOverview?.freshness?.status === "pending"
+    ) {
+      // Keep the last complete data snapshot while surfacing the new pending state.
+      costOverview = { ...costOverview, freshness: nextOverview.freshness, cache: nextOverview.cache, coverage: nextOverview.coverage };
+      renderObservabilityQuality("costQuality", costOverview, "cost");
     } else {
       costOverview = nextOverview;
       costOverviewWindowKey = observabilityOverviewWindowKey("cost");
-      if (hasUsableCostOverview()) costOverviewLoadedAt = Date.now();
+      if (hasUsableCostOverview() && nextOverview?.cache?.state !== "refreshing") costOverviewLoadedAt = Date.now();
     }
     costBudgets = Array.isArray(nextOverview?.data?.budgets) ? nextOverview.data.budgets : costBudgets;
-    if (nextOverview?.cache?.state === "refreshing" && nextOverview?.freshness?.status === "pending" && !nextOverview?.cache?.lastRefreshError) {
+    if (nextOverview?.cache?.state === "refreshing" && !nextOverview?.cache?.lastRefreshError) {
       costOverviewRefreshTimer = globalThis.setTimeout(() => {
         costOverviewRefreshTimer = null;
         if (requestId === costOverviewRequestId && ["cost-control", "governance-workbench"].includes(currentView)) loadCostOverview(false);
@@ -9578,6 +9629,11 @@ async function loadCostOverview(forceRefresh = false) {
       isCostOverviewLoading = false;
       renderCostOverview();
       if (currentView === "governance-workbench") renderGovernanceWorkbench();
+    }
+    resolveInFlight?.();
+    if (costOverviewInFlight === inFlightPromise) {
+      costOverviewInFlight = null;
+      costOverviewInFlightWindowKey = "";
     }
   }
 }
@@ -9925,12 +9981,12 @@ async function saveCostPlan(event) {
   event.preventDefault();
   const id = el("costPlanId").value;
   const body = { year: Number(el("costPlanYear").value), version: el("costPlanVersion").value.trim(), scenario: el("costPlanScenario").value, asOf: el("costPlanAsOf").value, status: "draft", coverageComplete: el("costPlanCoverageComplete").value === "true", notes: el("costPlanNotes").value.trim() };
-  try { await ensureCsrfToken(); await api(id ? `/api/admin/costs/plan-versions/${encodeURIComponent(id)}` : "/api/admin/costs/plan-versions", { method: id ? "PATCH" : "POST", body: JSON.stringify(body) }); closeGovernanceModal("costPlanModal", "costPlanForm"); await loadGovernanceWorkbench(true); await loadCostOverview(); showToast("计划草稿已保存"); } catch (error) { showToast(error.message || "计划草稿保存失败"); }
+  try { await ensureCsrfToken(); await api(id ? `/api/admin/costs/plan-versions/${encodeURIComponent(id)}` : "/api/admin/costs/plan-versions", { method: id ? "PATCH" : "POST", body: JSON.stringify(body) }); closeGovernanceModal("costPlanModal", "costPlanForm"); await loadGovernanceWorkbench(true); await loadCostOverview(true); showToast("计划草稿已保存"); } catch (error) { showToast(error.message || "计划草稿保存失败"); }
 }
 
 async function changeCostPlanState(planId, operation) {
   const copy = { approve: "批准", activate: "激活", archive: "归档" }[operation] || operation;
-  try { await ensureCsrfToken(); await api(`/api/admin/costs/plan-versions/${encodeURIComponent(planId)}/${operation}`, { method: "POST", body: JSON.stringify({}) }); await loadGovernanceWorkbench(true); await loadCostOverview(); showToast(`计划已${copy}`); } catch (error) { showToast(error.message || `计划${copy}失败`); }
+  try { await ensureCsrfToken(); await api(`/api/admin/costs/plan-versions/${encodeURIComponent(planId)}/${operation}`, { method: "POST", body: JSON.stringify({}) }); await loadGovernanceWorkbench(true); await loadCostOverview(true); showToast(`计划已${copy}`); } catch (error) { showToast(error.message || `计划${copy}失败`); }
 }
 
 async function saveSavingsMeasurement(event) {
@@ -9938,7 +9994,7 @@ async function saveSavingsMeasurement(event) {
   const id = el("savingsMeasurementId").value;
   const reviewedAt = el("savingsMeasurementReviewedAt").value;
   const body = { actionId: el("savingsMeasurementActionId").value.trim(), scope: el("savingsMeasurementScope").value.trim(), provider: el("savingsMeasurementProvider").value.trim(), model: el("savingsMeasurementModel").value.trim(), costBucket: el("savingsMeasurementBucket").value.trim(), baselineStart: el("savingsMeasurementBaselineStart").value, baselineEnd: el("savingsMeasurementBaselineEnd").value, measurementStart: el("savingsMeasurementStart").value, measurementEnd: el("savingsMeasurementEnd").value, baselineAmountUsd: Number(el("savingsMeasurementBaselineAmount").value), actualAmountUsd: Number(el("savingsMeasurementActualAmount").value), evidenceUrl: el("savingsMeasurementEvidence").value.trim(), financeReviewer: el("savingsMeasurementReviewer").value.trim(), reviewedAt: reviewedAt ? new Date(reviewedAt).toISOString() : null, status: el("savingsMeasurementStatus").value, notes: el("savingsMeasurementNotes").value.trim() };
-  try { await ensureCsrfToken(); await api(id ? `/api/admin/costs/savings-measurements/${encodeURIComponent(id)}` : "/api/admin/costs/savings-measurements", { method: id ? "PATCH" : "POST", body: JSON.stringify(body) }); closeGovernanceModal("savingsMeasurementModal", "savingsMeasurementForm"); await loadGovernanceWorkbench(true); await loadCostOverview(); showToast("降本核验已保存"); } catch (error) { showToast(error.message || "降本核验保存失败"); }
+  try { await ensureCsrfToken(); await api(id ? `/api/admin/costs/savings-measurements/${encodeURIComponent(id)}` : "/api/admin/costs/savings-measurements", { method: id ? "PATCH" : "POST", body: JSON.stringify(body) }); closeGovernanceModal("savingsMeasurementModal", "savingsMeasurementForm"); await loadGovernanceWorkbench(true); await loadCostOverview(true); showToast("降本核验已保存"); } catch (error) { showToast(error.message || "降本核验保存失败"); }
 }
 
 async function saveCostItem(event) {
@@ -9950,7 +10006,7 @@ async function saveCostItem(event) {
     await ensureCsrfToken();
     await api(id ? `/api/admin/costs/items/${encodeURIComponent(id)}` : "/api/admin/costs/items", { method: id ? "PATCH" : "POST", body: JSON.stringify(body) });
     closeCostItemModal();
-    await loadCostOverview();
+    await loadCostOverview(true);
     showToast("成本项已保存");
   } catch (error) { showToast(error.message || "成本项保存失败"); }
 }
@@ -9964,7 +10020,7 @@ async function saveSavingsAction(event) {
     await ensureCsrfToken();
     await api(id ? `/api/admin/costs/savings-actions/${encodeURIComponent(id)}` : "/api/admin/costs/savings-actions", { method: id ? "PATCH" : "POST", body: JSON.stringify(body) });
     closeSavingsActionModal();
-    await loadCostOverview();
+    await loadCostOverview(true);
     showToast("降本动作已保存");
   } catch (error) { showToast(error.message || "降本动作保存失败"); }
 }
@@ -9976,7 +10032,7 @@ async function saveCostBudget(event) {
   try {
     await ensureCsrfToken();
     await api(`/api/admin/costs/budgets/${encodeURIComponent(month)}`, { method: "PUT", body: JSON.stringify({ budgetUsd: Number(el("costBudgetAmount").value), dailyTargetUsd: Number(el("costDailyTarget").value) }) });
-    await loadCostOverview();
+    await loadCostOverview(true);
     showToast("预算已保存");
   } catch (error) { showToast(error.message || "预算保存失败"); }
 }
@@ -10469,7 +10525,11 @@ function showLogin() {
   if (costOverviewRefreshTimer) globalThis.clearTimeout(costOverviewRefreshTimer);
   costOverviewRefreshTimer = null;
   stabilityOverviewController = null;
+  stabilityOverviewInFlight = null;
+  stabilityOverviewInFlightWindowKey = "";
   costOverviewController = null;
+  costOverviewInFlight = null;
+  costOverviewInFlightWindowKey = "";
   stabilityDrawerReturnFocus = null;
   costDrawerReturnFocus = null;
   stabilityOverview = null;
@@ -11425,7 +11485,7 @@ document.querySelectorAll("[data-view]").forEach((button) => button.addEventList
 el("stabilityRangeSelect")?.addEventListener("change", () => handleObservabilityRangeChange("stability"));
 el("stabilityModel")?.addEventListener("change", () => {
   renderObservabilityFilterState("stability");
-  loadStabilityOverview();
+  loadStabilityOverview(true);
 });
 el("costRangeSelect")?.addEventListener("change", () => handleObservabilityRangeChange("cost"));
 ["stability", "cost"].forEach((scope) => {
@@ -11441,19 +11501,19 @@ el("costRangeSelect")?.addEventListener("change", () => handleObservabilityRange
 });
 el("costCategory")?.addEventListener("change", () => {
   renderObservabilityFilterState("cost");
-  loadCostOverview();
+  loadCostOverview(true);
 });
 el("costModel")?.addEventListener("change", () => {
   renderObservabilityFilterState("cost");
-  loadCostOverview();
+  loadCostOverview(true);
 });
 el("costVendor")?.addEventListener("change", () => {
   renderObservabilityFilterState("cost");
-  loadCostOverview();
+  loadCostOverview(true);
 });
 ["costBucket", "costProvider", "costAccount", "costReconciliation", "costRecognition"].forEach((id) => el(id)?.addEventListener("change", () => {
   renderObservabilityFilterState("cost");
-  loadCostOverview();
+  loadCostOverview(true);
 }));
 el("costFiltersButton")?.addEventListener("click", () => setObservabilityFilterPanel("cost", !costFiltersOpen));
 el("stabilityResetFiltersButton")?.addEventListener("click", () => resetObservabilityFilters("stability"));
@@ -11656,8 +11716,8 @@ el("costItemBody")?.addEventListener("click", (event) => {
 document.querySelectorAll("#stabilityQuality, #costQuality").forEach((container) => container.addEventListener("click", (event) => {
   const button = event.target.closest("[data-observability-retry]");
   if (!button) return;
-  if (button.dataset.observabilityRetry === "stability") loadStabilityOverview();
-  else if (costOverviewLoadError) loadCostOverview();
+  if (button.dataset.observabilityRetry === "stability") loadStabilityOverview(true);
+  else if (costOverviewLoadError) loadCostOverview(true);
   else openCostLedger({}, button);
 }));
 el("savingsActionList")?.addEventListener("click", (event) => {
@@ -11753,8 +11813,8 @@ async function handleObservabilityRangeChange(scope) {
   setObservabilityRangeState(scope, null);
   el(ids.select).querySelector('option[value="custom"]').textContent = "自定义…";
   closeObservabilityRangePanel(scope);
-  if (scope === "stability") await loadStabilityOverview();
-  else await loadCostOverview();
+  if (scope === "stability") await loadStabilityOverview(true);
+  else await loadCostOverview(true);
 }
 
 async function applyObservabilityCustomRange(scope) {
@@ -11772,8 +11832,8 @@ async function applyObservabilityCustomRange(scope) {
   el(ids.select).value = "custom";
   el(ids.select).querySelector('option[value="custom"]').textContent = `${startDate} ～ ${endDate}`;
   closeObservabilityRangePanel(scope);
-  if (scope === "stability") await loadStabilityOverview();
-  else await loadCostOverview();
+  if (scope === "stability") await loadStabilityOverview(true);
+  else await loadCostOverview(true);
 }
 
 function setCustomRangeHint(message, isError = false) {

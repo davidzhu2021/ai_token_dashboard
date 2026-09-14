@@ -40,8 +40,51 @@ def test_observability_loaders_reuse_same_window_and_keep_pending_payload() -> N
     assert "if (!observabilityOverviewIsFresh(\"cost\")) loadCostOverview();" in switch_block
     stability = source[source.index("async function loadStabilityOverview") : source.index("function renderCostOverview")]
     cost = source[source.index("async function loadCostOverview") : source.index("function focusDrawer")]
-    assert "if (hasUsableStabilityOverview() && nextOverview?.freshness?.status === \"pending\")" in stability
-    assert "if (hasUsableCostOverview() && nextOverview?.freshness?.status === \"pending\")" in cost
+    assert "hasUsableStabilityOverview()" in stability and "nextOverview?.freshness?.status === \"pending\"" in stability
+    assert "hasUsableCostOverview()" in cost and "nextOverview?.freshness?.status === \"pending\"" in cost
+
+
+def test_observability_loaders_reuse_same_window_inflight_without_abort_restart() -> None:
+    _, source = sources()
+    assert "let stabilityOverviewInFlight = null;" in source
+    assert "let stabilityOverviewInFlightWindowKey = \"\";" in source
+    assert "let costOverviewInFlight = null;" in source
+    assert "let costOverviewInFlightWindowKey = \"\";" in source
+    stability = source[source.index("async function loadStabilityOverview") : source.index("function renderCostOverview")]
+    cost = source[source.index("async function loadCostOverview") : source.index("function focusDrawer")]
+    assert "if (!forceRefresh && stabilityOverviewInFlight && stabilityOverviewInFlightWindowKey === windowKey) return stabilityOverviewInFlight;" in stability
+    assert "if (!forceRefresh && costOverviewInFlight && costOverviewInFlightWindowKey === windowKey) return costOverviewInFlight;" in cost
+    assert "stabilityOverviewController?.abort();" in stability
+    assert "costOverviewController?.abort();" in cost
+
+
+def test_observability_filter_changes_explicitly_force_refresh_and_cancel_previous_window() -> None:
+    _, source = sources()
+    assert 'loadStabilityOverview(true);' in source
+    assert 'loadCostOverview(true);' in source
+
+
+def test_observability_timeout_keeps_previous_snapshot_visible() -> None:
+    _, source = sources()
+    for loader_name, snapshot_name in (("loadStabilityOverview", "stabilityOverview"), ("loadCostOverview", "costOverview")):
+        start = source.index(f"async function {loader_name}")
+        end = source.index("\nfunction ", start)
+        loader = source[start:end]
+        assert f"if (error.name !== \"AbortError\"" in loader
+        assert f"{snapshot_name}" in loader
+    assert "TimeoutError" in source
+
+
+def test_observability_retry_wait_uses_request_local_controller() -> None:
+    _, source = sources()
+    stability = source[source.index("async function loadStabilityOverview") : source.index("function renderCostOverview")]
+    cost = source[source.index("async function loadCostOverview") : source.index("function focusDrawer")]
+    for loader in (stability, cost):
+        assert "const controller = new AbortController();" in loader
+        assert "{ signal: controller.signal" in loader
+        assert "controller.signal.addEventListener(\"abort\"" in loader
+    assert "stabilityOverviewController = controller;" in stability
+    assert "costOverviewController = controller;" in cost
 
 
 def test_stability_loading_retries_generation_response_without_failure_toast() -> None:
@@ -55,15 +98,25 @@ def test_stability_loading_retries_generation_response_without_failure_toast() -
     assert "error.status !== 503" in loader
 
 
-def test_stability_dashboard_does_not_render_coverage_notice() -> None:
-    """稳定性指标卡在覆盖不完整时仍保持展示，不额外占用提示区域。"""
+def test_stability_dashboard_renders_coverage_notice_for_partial_windows() -> None:
+    """稳定性快照保留可用指标，同时把部分覆盖原因显示在质量区域。"""
     _, source = sources()
 
     start = source.index("function observabilityReasonCopy(payload, scope)")
     end = source.index("\nfunction renderObservabilityQuality", start)
     reason_copy = source[start:end]
 
-    assert "if (scope === \"stability\" && (reasons.length || coverage.incomplete || coverage.partial)) {\n    return null;\n  }" in reason_copy
+    assert "if (reasons.length) {" in reason_copy
+    assert "if (coverage.incomplete || coverage.partial) {" in reason_copy
+    assert "当前窗口覆盖不足" in reason_copy
+
+
+def test_observability_pending_snapshot_requires_matching_window_key() -> None:
+    _, source = sources()
+    stability = source[source.index("async function loadStabilityOverview") : source.index("function renderCostOverview")]
+    cost = source[source.index("async function loadCostOverview") : source.index("function focusDrawer")]
+    assert "stabilityOverviewWindowKey === windowKey" in stability
+    assert "costOverviewWindowKey === windowKey" in cost
 
 
 def test_stability_dashboard_keeps_observability_drilldown_without_governance_actions() -> None:
