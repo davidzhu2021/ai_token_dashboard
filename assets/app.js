@@ -4914,6 +4914,7 @@ async function refreshEntitlementAfterTopup() {
     currentUser = await api("/api/auth/me");
     renderAccountAccessState();
     updateHomeCard();
+    await loadKeys(true, { silent: true });
   } catch {
     // 刷新失败不影响充值结果，下次进页面会自然纠正。
   }
@@ -5692,7 +5693,9 @@ async function submitTopup(event) {
     });
     pendingTopupTradeNo = String(payload.tradeNo || "");
     if (payload.channel === "mock") {
-      showToast("模拟充值已完成，未发起真实付款。额度已立即到账。");
+      showToast(payload.keyProvisioned === false
+        ? "充值已到账，但访问 Key 正在补偿生成，请稍后刷新或联系管理员。"
+        : "模拟充值已完成，未发起真实付款。额度已立即到账，访问 Key 已刷新。");
       await refreshEntitlementAfterTopup();
     } else if (payload.channel === "manual_qr") {
       showManualPayPanel(payload);
@@ -9327,7 +9330,8 @@ async function openPersonalCustomer(id) {
   const retry = ["pending", "provisioning", "provisioning_failed"].includes(selectedPersonalCustomer.provisioningStatus)
     ? `<button class="ghost-btn" type="button" data-personal-customer-retry="${escapeHtml(selectedPersonalCustomer.id)}">重试开通</button>` : "";
   const orderRows = orders.length ? orders.slice(0, 10).map((order) => `<tr><td>${escapeHtml(order.orderNo || order.id || "-")}</td><td>${escapeHtml(money.format(order.amountUsd || order.amount || 0))}</td><td>${escapeHtml(order.status || "-")}</td></tr>`).join("") : `<tr><td colspan="3">暂无充值订单</td></tr>`;
-  el("personalCustomerDetailBody").innerHTML = `<div class="organization-stats"><div class="organization-stat"><span>账号状态</span><strong>${escapeHtml(selectedPersonalCustomer.status || "-")}</strong></div><div class="organization-stat"><span>邮箱验证</span><strong>${selectedPersonalCustomer.emailVerified ? "已验证" : "未验证"}</strong></div><div class="organization-stat"><span>上游开通</span><strong>${escapeHtml(selectedPersonalCustomer.provisioningStatus || "-")}</strong></div><div class="organization-stat"><span>累计充值</span><strong>${escapeHtml(money.format(selectedPersonalCustomer.topupTotalUsd || 0))}</strong></div><div class="organization-stat"><span>已消耗</span><strong>${escapeHtml(money.format(selectedPersonalCustomer.spentUsd || 0))}</strong></div><div class="organization-stat"><span>剩余额度</span><strong>${escapeHtml(money.format(selectedPersonalCustomer.balanceUsd || 0))}</strong></div></div><div class="customer-directory-card-actions">${retry}</div><p class="organization-modal-note">停用后会阻断登录和个人 API 访问；重新启用不会自动恢复历史访问密钥。</p><h4>最近充值订单</h4><div class="table-wrap"><table class="data-table"><thead><tr><th>订单号</th><th>金额</th><th>状态</th></tr></thead><tbody>${orderRows}</tbody></table></div>`;
+  const upstream = selectedPersonalCustomer.upstream || {};
+  el("personalCustomerDetailBody").innerHTML = `<div class="organization-stats"><div class="organization-stat"><span>账号状态</span><strong>${escapeHtml(selectedPersonalCustomer.status || "-")}</strong></div><div class="organization-stat"><span>邮箱验证</span><strong>${selectedPersonalCustomer.emailVerified ? "已验证" : "未验证"}</strong></div><div class="organization-stat"><span>上游开通</span><strong>${escapeHtml(selectedPersonalCustomer.provisioningStatus || "-")}</strong></div><div class="organization-stat"><span>上游账号</span><strong>${upstream.exists ? "已存在" : "不可用"}</strong></div><div class="organization-stat"><span>访问 Key</span><strong>${escapeHtml(upstream.keyCount == null ? "不可用" : `${upstream.keyCount} 个`)}</strong></div><div class="organization-stat"><span>模型权限</span><strong>${escapeHtml(upstream.modelAccess || "不可用")}</strong></div><div class="organization-stat"><span>累计充值</span><strong>${escapeHtml(money.format(selectedPersonalCustomer.topupTotalUsd || 0))}</strong></div><div class="organization-stat"><span>已消耗</span><strong>${escapeHtml(money.format(selectedPersonalCustomer.spentUsd || 0))}</strong></div><div class="organization-stat"><span>剩余额度</span><strong>${escapeHtml(money.format(selectedPersonalCustomer.balanceUsd || 0))}</strong></div></div><div class="customer-directory-card-actions">${retry}</div><p class="organization-modal-note">停用后会阻断登录和个人 API 访问；重新启用不会自动恢复历史访问密钥。</p><h4>最近充值订单</h4><div class="table-wrap"><table class="data-table"><thead><tr><th>订单号</th><th>金额</th><th>状态</th></tr></thead><tbody>${orderRows}</tbody></table></div>`;
 }
 
 async function retryPersonalCustomerProvision(id) {

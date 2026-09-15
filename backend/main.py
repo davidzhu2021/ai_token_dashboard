@@ -5406,11 +5406,33 @@ async def current_upstream_user(request: Request, refresh: bool = False) -> tupl
         except HTTPException as exc:
             if exc.status_code != 404:
                 raise
-            resolved, _ = await cached_resolve_user(app_user["email"], app_user.get("name"), refresh=True)
-            resolved = strict_personal_upstream_scope(resolved)
-            primary_id = primary_upstream_user_id(resolved)
-            await auth_store_call("set_provisioning_status", local_user_id, "provisioned", "primary", primary_id, "")
-            return app_user, resolved
+            # A local mapping is authoritative only after the mapped upstream
+            # user exists. Never replace a missing local account with a weak
+            # same-email match from the upstream directory.
+            await auth_store_call(
+                "set_provisioning_status",
+                local_user_id,
+                "provisioning_failed",
+                "primary",
+                upstream_user_id,
+                "上游个人账号不存在，等待重新开通",
+            )
+            repaired = await provision_local_user(local_user)
+            if repaired.get("status") != "provisioned":
+                raise auth_http_error(
+                    409,
+                    "账号开通异常，请稍后重试或联系管理员",
+                    "AUTH_PROVISIONING_FAILED",
+                )
+            refreshed_id = str(repaired.get("upstream_user_id") or repaired.get("upstreamUserId") or upstream_user_id)
+            upstream_info = await client().user_info(refreshed_id)
+            if not isinstance(upstream_info, dict) or not str(upstream_info.get("user_id") or upstream_info.get("id") or "").strip():
+                raise auth_http_error(409, "账号开通异常，请稍后重试或联系管理员", "AUTH_PROVISIONING_FAILED")
+            local_scope["user_id"] = refreshed_id
+            local_scope["matched_user_ids"] = [refreshed_id]
+            local_scope["matched_accounts"] = [{"backend": "primary", "source": "通衢 API", "user_id": refreshed_id, "account_id": refreshed_id, "matchSources": ["local_mapping"]}]
+            local_scope["matched_sources"] = {refreshed_id: ["local_mapping"]}
+            return app_user, local_scope
 
         # Tool-account mappings can have sibling accounts for the same exact
         # mailbox. Resolve those only for the canonical account ids used by
@@ -10046,6 +10068,7 @@ def _platform_personal_customer_summary(user: dict[str, Any]) -> dict[str, Any]:
         "lastLoginAt": user.get("lastLoginAt"),
         "provisioningStatus": upstream.get("status") or "pending",
         "provisioningError": str(upstream.get("last_error") or upstream.get("lastError") or "")[:300],
+        "upstreamUserId": upstream.get("upstream_user_id") or upstream.get("upstreamUserId"),
         "upstreamAvailable": bool(upstream.get("upstream_user_id") or upstream.get("upstreamUserId")),
     }
 
@@ -10103,6 +10126,19 @@ async def platform_personal_customer_detail(user_id: str, request: Request) -> d
     events = await auth_store_call("list_audit_events", user_id, 50)
     orders: dict[str, Any] = {"items": [], "total": 0}
     account: dict[str, Any] = {"balanceUsd": None, "topupTotalUsd": None}
+    upstream_state: dict[str, Any] = {"exists": False, "keyCount": None, "modelAccess": "unavailable"}
+    upstream_id = str(summary.get("upstreamUserId") or "")
+    if upstream_id:
+        try:
+            info, keys = await asyncio.gather(client().user_info(upstream_id), client().keys_for_user_ids([upstream_id], refresh=True))
+            models = info.get("models") if isinstance(info, dict) else []
+            upstream_state = {
+                "exists": bool(info and info.get("user_id")),
+                "keyCount": len(keys or []),
+                "modelAccess": "active" if any(str(model) != "no-default-models" for model in (models or [])) else "inactive",
+            }
+        except Exception as exc:
+            upstream_state["error"] = f"{exc.__class__.__name__}: {exc}"[:300]
     store = billing_store()
     if store is not None and store.pool is not None:
         try:
@@ -10110,7 +10146,7 @@ async def platform_personal_customer_detail(user_id: str, request: Request) -> d
             orders = await store.list_user_orders(user_id, limit=20, offset=0)
         except Exception:
             pass
-    return {"customer": {**summary, **account}, "account": account, "orders": orders, "auditEvents": events}
+    return {"customer": {**summary, **account, "upstream": upstream_state}, "account": account, "orders": orders, "auditEvents": events}
 
 
 @app.post("/api/platform/customers/personal/{user_id}/status")
@@ -10156,10 +10192,31 @@ async def platform_personal_customer_provision_retry(user_id: str, request: Requ
     if not user:
         raise HTTPException(status_code=404, detail="个人客户不存在")
     summary = _platform_personal_customer_summary(user)
-    if summary["provisioningStatus"] not in {"provisioning", "provisioning_failed", "pending"}:
+    if summary["provisioningStatus"] not in {"provisioning", "provisioning_failed", "pending", "provisioned"}:
         raise HTTPException(status_code=409, detail="当前账号无需重试开通")
-    await retry_local_provisioning(user)
+    if summary["provisioningStatus"] == "provisioned":
+        upstream_id = str(summary.get("upstreamUserId") or "")
+        try:
+            info = await client().user_info(upstream_id)
+            if not isinstance(info, dict) or not info.get("user_id"):
+                raise HTTPException(status_code=404, detail="上游用户记录为空")
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            await auth_store_call("set_provisioning_status", user_id, "provisioning_failed", "primary", upstream_id, "上游个人账号不存在，等待重新开通")
+    await retry_local_provisioning(await auth_store_call("get_user", user_id) or user)
     refreshed = await auth_store_call("get_user", user_id) or user
+    refreshed_account = await auth_store_call("get_upstream_account", user_id, "primary") or {}
+    refreshed_upstream_id = str(refreshed_account.get("upstream_user_id") or "")
+    store = billing_store()
+    if refreshed_account.get("status") == "provisioned" and refreshed_upstream_id and store is not None and store.pool is not None:
+        try:
+            account = await store.get_account(user_id)
+            if float(account.get("topupTotalUsd") or 0) > 0:
+                await billing.sync_upstream_entitlement(client(), refreshed_upstream_id, float(account["topupTotalUsd"]))
+                await ensure_personal_key_after_entitlement(user_id, refreshed_upstream_id)
+        except Exception:
+            logger.exception("personal customer entitlement repair failed user_id=%s", user_id)
     return {"ok": True, "customer": _platform_personal_customer_summary(refreshed)}
 
 
@@ -13003,8 +13060,19 @@ async def billing_identity(request: Request) -> tuple[dict[str, Any], str]:
     upstream_user_id = str((account or {}).get("upstream_user_id") or "")
     if not account or account.get("status") != "provisioned" or not upstream_user_id:
         raise auth_http_error(409, "账号仍在开通中，请稍后重试", "AUTH_PROVISIONING_PENDING")
+    try:
+        info = await client().user_info(upstream_user_id)
+        if not isinstance(info, dict) or not str(info.get("user_id") or info.get("id") or "").strip():
+            raise HTTPException(status_code=404, detail="上游用户记录为空")
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        await auth_store_call("set_provisioning_status", local_user_id, "provisioning_failed", "primary", upstream_user_id, "上游个人账号不存在，等待重新开通")
+        repaired = await provision_local_user(local_user)
+        if repaired.get("status") != "provisioned":
+            raise auth_http_error(409, "账号开通异常，请稍后重试或联系管理员", "AUTH_PROVISIONING_FAILED")
+        upstream_user_id = str(repaired.get("upstream_user_id") or repaired.get("upstreamUserId") or upstream_user_id)
     return app_user, upstream_user_id
-
 
 async def apply_topup_entitlement(trade_no: str, user_id: str, upstream_user_id: str) -> dict[str, Any]:
     """把已落账的充值同步到上游额度。
@@ -13026,7 +13094,32 @@ async def apply_topup_entitlement(trade_no: str, user_id: str, upstream_user_id:
     await store.mark_sync_state(trade_no, SYNC_DONE, "")
     # 权限可能刚被放开，清缓存让前端立刻看到可用状态。
     local_entitlement_cache.delete(f"local-entitlement:{upstream_user_id}")
-    return {"synced": True, **result}
+    try:
+        key_result = await ensure_personal_key_after_entitlement(user_id, upstream_user_id)
+    except Exception as exc:
+        error = f"key_provisioning:{exc.__class__.__name__}: {exc}"[:500]
+        await store.mark_sync_state(trade_no, SYNC_PENDING, error)
+        logger.exception("topup key provisioning failed trade_no=%s user_id=%s", trade_no, user_id)
+        return {"synced": True, "keyProvisioned": False, "keyProvisionError": error, **result}
+    return {"synced": True, "keyProvisioned": True, **key_result, **result}
+
+
+async def ensure_personal_key_after_entitlement(user_id: str, upstream_user_id: str) -> dict[str, Any]:
+    """Create the single customer key after entitlement is granted, idempotently."""
+    keys = await client().keys_for_user_ids([upstream_user_id], refresh=True)
+    active_keys = [item for item in keys if str(item.get("status") or "正常") not in {"已停用", "已删除", "blocked"}]
+    if active_keys:
+        return {"created": False, "keyCount": len(active_keys)}
+    created = await client().create_key(
+        upstream_user_id,
+        "个人充值访问密钥",
+        "topup",
+        "never",
+        billing.topup_default_models(),
+        "billing-provisioning",
+    )
+    warning = store_created_key(upstream_user_id, created)
+    return {"created": True, "keyCount": 1, "keyId": created.get("id"), "warning": warning}
 
 
 async def retry_pending_billing_sync(limit: int = 20) -> int:
