@@ -77,6 +77,7 @@ from .billing_store import (
     BillingStore,
     BillingStoreError,
     CHANNEL_EPAY,
+    CHANNEL_MOCK,
     CHANNEL_MANUAL_QR,
     ORDER_PENDING,
     SYNC_DONE,
@@ -2307,7 +2308,9 @@ def organization_access_fields(
         "organizationRole": role,
         "canViewOrganizationUsage": can_view_usage,
         "canViewOrganizationBilling": can_view_billing,
-        "canSimulateOrganizationTopup": bool(organization_demo_enabled() and can_view_billing),
+        "canSimulateOrganizationTopup": bool(
+            can_view_billing and (organization_demo_enabled() or billing.mock_payment_enabled())
+        ),
         "canManageOrganizationTokens": bool(enabled and role == "admin"),
         "canAdjustOrganizationCredit": bool(enabled and user.get("isPlatformAdmin")),
         "canManageOrganization": bool(enabled and role == "admin"),
@@ -5652,8 +5655,8 @@ class RedeemRequest(BaseModel):
 
 class CreateTopupOrderRequest(BaseModel):
     amount: float = Field(gt=0)
-    paymentMethod: Literal["alipay", "wxpay"] = "alipay"
-    channel: Literal["epay", "manual_qr"] = "epay"
+    paymentMethod: Literal["", "alipay", "wxpay", "mock"] = ""
+    channel: Literal["epay", "manual_qr", "mock"] = "epay"
 
 
 class SubmitManualPaymentRequest(BaseModel):
@@ -7333,12 +7336,13 @@ async def organization_current_billing(
     user = await require_organization_billing_viewer(request)
     organization_id = organization_identifier(organization_current_member(user))
     try:
-        return await organization_scoped_store_call(
+        payload = await organization_scoped_store_call(
             organization_id,
             "billing_payload",
             page=page,
             page_size=pageSize,
         )
+        return {**payload, "mockTopupEnabled": billing.mock_payment_enabled()}
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
 
@@ -7352,21 +7356,42 @@ async def organization_current_billing_topup(
 ) -> dict[str, Any]:
     """Credit only the session-derived customer balance; never take payment."""
 
-    if organization_real_enabled():
-        raise auth_http_error(410, "企业模拟充值已下线，请联系平台运营授信", "ORGANIZATION_TOPUP_DISABLED")
+    if not billing.mock_payment_enabled() and organization_real_enabled():
+        raise auth_http_error(410, "企业模拟充值未启用，请联系平台运营授信", "ORGANIZATION_TOPUP_DISABLED")
     await enforce_csrf(request)
     user = await require_organization_billing_topup_operator(request)
     organization_id = organization_identifier(organization_current_member(user))
     try:
-        result = await organization_scoped_store_call(
-            organization_id,
-            "simulate_billing_topup",
-            data.amountUsd,
-            operator=str(user.get("name") or user.get("email") or "Customer administrator"),
-            operator_email=str(user.get("email") or ""),
-            page=page,
-            page_size=pageSize,
-        )
+        operator = str(user.get("name") or user.get("email") or "Customer administrator")
+        operator_email = str(user.get("email") or "")
+        if organization_real_enabled():
+            store = organization_store()
+            if not isinstance(store, PostgreSQLOrganizationRepository):
+                raise auth_http_error(503, "企业额度服务暂不可用", "ORGANIZATION_BILLING_UNAVAILABLE")
+            mock_trade_no = billing.generate_trade_no(organization_id)
+            record = await store.adjust_billing(
+                organization_id,
+                operation="grant",
+                amount_usd=data.amountUsd,
+                reason="模拟充值，仅用于功能联调，不产生真实支付",
+                operator=operator,
+                operator_email=operator_email,
+                external_reference=mock_trade_no,
+                idempotency_key=f"mock-topup:{mock_trade_no}",
+            )
+            result = await store.billing_payload(organization_id, page=page, page_size=pageSize)
+            result = {**result, "record": record, "mockTopupEnabled": True, "syncQueued": True}
+        else:
+            result = await organization_scoped_store_call(
+                organization_id,
+                "simulate_billing_topup",
+                data.amountUsd,
+                operator=operator,
+                operator_email=operator_email,
+                page=page,
+                page_size=pageSize,
+            )
+            result = {**result, "mockTopupEnabled": billing.mock_payment_enabled()}
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
     return {"ok": True, **result}
@@ -12930,8 +12955,10 @@ async def redeem_code(data: RedeemRequest, request: Request) -> dict[str, Any]:
 async def create_topup_order(data: CreateTopupOrderRequest, request: Request) -> dict[str, Any]:
     await enforce_csrf(request)
     store = require_billing_store()
-    app_user, _ = await billing_identity(request)
+    app_user, upstream_user_id = await billing_identity(request)
     channel = data.channel
+    if channel == CHANNEL_MOCK and not billing.mock_payment_enabled():
+        raise HTTPException(status_code=503, detail="模拟充值暂未开放")
     if channel == CHANNEL_EPAY and not billing.epay_enabled():
         # 自动支付未开通时优先退到收款码渠道，别把用户堵在死路上。
         channel = CHANNEL_MANUAL_QR if billing.manual_qr_enabled() else channel
@@ -12943,8 +12970,8 @@ async def create_topup_order(data: CreateTopupOrderRequest, request: Request) ->
         amount = billing.normalize_amount(data.amount)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    money = billing.money_for_amount(amount)
-    if money < 0.01:
+    money = 0.0 if channel == CHANNEL_MOCK else billing.money_for_amount(amount)
+    if channel != CHANNEL_MOCK and money < 0.01:
         raise HTTPException(status_code=400, detail="充值金额过小，请提高充值额度")
     if channel == CHANNEL_MANUAL_QR:
         allowed = {item["method"] for item in billing.manual_qr_methods()}
@@ -12975,7 +13002,7 @@ async def create_topup_order(data: CreateTopupOrderRequest, request: Request) ->
             amount,
             money,
             billing.exchange_rate(),
-            data.paymentMethod,
+            "mock" if channel == CHANNEL_MOCK else data.paymentMethod,
         )
     except BillingStoreError as exc:
         raise HTTPException(status_code=500, detail="创建充值订单失败，请稍后重试") from exc
@@ -12984,9 +13011,26 @@ async def create_topup_order(data: CreateTopupOrderRequest, request: Request) ->
         "channel": channel,
         "amountUsd": amount,
         "moneyCny": money,
-        "paymentMethod": data.paymentMethod,
+        "paymentMethod": "mock" if channel == CHANNEL_MOCK else data.paymentMethod,
     }
-    if channel == CHANNEL_EPAY:
+    if channel == CHANNEL_MOCK:
+        result = await store.settle_order(
+            trade_no,
+            upstream_trade_no=f"mock:{trade_no}",
+            notify_payload=json.dumps({"channel": "mock"}, ensure_ascii=False),
+            reviewed_by="mock-payment",
+            review_note="模拟充值，仅用于功能联调，不产生真实支付",
+        )
+        sync = await apply_topup_entitlement(trade_no, str(app_user["id"]), upstream_user_id)
+        payload.update(
+            {
+                "order": result["order"],
+                "account": result["account"],
+                "entitlementSynced": bool(sync.get("synced")),
+                "notice": "模拟充值，仅用于功能联调，不产生真实支付",
+            }
+        )
+    elif channel == CHANNEL_EPAY:
         payload["submitUrl"] = submit_url
         payload["params"] = params
         payload["redirectUrl"] = billing.epay_redirect_url(params)

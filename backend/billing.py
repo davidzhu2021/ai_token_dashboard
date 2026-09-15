@@ -39,6 +39,11 @@ def billing_enabled() -> bool:
     return env_bool("BILLING_ENABLED", False)
 
 
+def mock_payment_enabled() -> bool:
+    """Enable non-payment settlement for local integration rehearsals."""
+    return env_bool("MOCK_PAYMENT_ENABLED", False)
+
+
 def exchange_rate() -> float:
     """人民币与 1 美元额度的兑换比例。"""
     rate = env_float("BILLING_EXCHANGE_RATE", 7.3)
@@ -158,6 +163,8 @@ def manual_qr_config() -> dict[str, Any]:
 
 def available_channels() -> list[str]:
     channels = ["redemption"]
+    if mock_payment_enabled():
+        channels.append("mock")
     if epay_enabled():
         channels.append("epay")
     if manual_qr_enabled():
@@ -324,6 +331,7 @@ def public_config() -> dict[str, Any]:
         "maxTopupUsd": max_topup_usd(),
         "amountOptions": topup_amount_options(),
         "channels": available_channels(),
+        "mockPaymentEnabled": mock_payment_enabled(),
         "currencySymbol": "¥",
         "manualPay": manual_qr_config(),
     }

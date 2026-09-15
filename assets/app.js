@@ -590,6 +590,7 @@ function isOrganizationCustomerIdentity(user = currentUser) {
 
 function syncOrganizationDemoChrome() {
   const demo = isDemoOrganizationMode();
+  const mockEnabled = Boolean(currentUser?.canSimulateOrganizationTopup && !demo);
   const realDescription = "企业账号、邀请与权限变更会写入正式业务数据。";
   document.querySelectorAll("[data-organization-demo-badge]").forEach((badge) => {
     badge.classList.toggle("hidden", !demo);
@@ -597,7 +598,7 @@ function syncOrganizationDemoChrome() {
   const resetButton = el("resetCustomerOrganizationsDemoButton");
   if (resetButton) resetButton.classList.toggle("hidden", !demo);
   const topupModal = el("organizationTopupModal");
-  if (topupModal && !demo) {
+  if (topupModal && !demo && !mockEnabled) {
     topupModal.classList.add("hidden");
     closeOrganizationTopupModal({ force: true });
   }
@@ -607,34 +608,34 @@ function syncOrganizationDemoChrome() {
       ? "为每家客户企业维护独立的部门、成员和访问状态。当前数据仅用于演示，不会创建真实账号或发送邮件。"
       : `为每家客户企业维护独立的部门、成员和访问状态。${realDescription}`;
   }
-  // Real customers receive credit from platform operations; only demo mode
-  // enables the local simulation form.
+  // Real customers may receive the temporary Mock form when the server
+  // explicitly advertises the capability; otherwise operations maintain credit.
   const topupButton = el("openOrganizationTopupModalButton");
-  if (topupButton && !demo) topupButton.classList.add("hidden");
-  setButtonLabel("openOrganizationTopupModalButton", demo ? "模拟充值" : "联系平台运营授信");
-  setText("organizationTopupModalTitle", demo ? "模拟充值" : "企业额度由平台运营维护");
+  if (topupButton && !demo && !mockEnabled) topupButton.classList.add("hidden");
+  setButtonLabel("openOrganizationTopupModalButton", demo || mockEnabled ? "模拟充值（仅联调）" : "联系平台运营授信");
+  setText("organizationTopupModalTitle", demo || mockEnabled ? "模拟充值（仅联调）" : "企业额度由平台运营维护");
   const topupDescription = document.querySelector("#organizationTopupModal form > p");
   if (topupDescription) {
-    topupDescription.textContent = demo
-      ? "立即为当前企业增加演示额度，不会调用支付、收款、邮件或任何真实充值服务。"
+    topupDescription.textContent = demo || mockEnabled
+      ? "模拟充值，仅用于功能联调，不产生真实支付；提交后企业额度立即到账。"
       : "真实模式不提供客户自助充值，请联系平台运营人员授予或调整企业额度。";
   }
   const topupOptions = el("organizationTopupOptions");
-  if (topupOptions) topupOptions.setAttribute("aria-label", demo ? "模拟充值快速金额" : "企业额度维护说明");
+  if (topupOptions) topupOptions.setAttribute("aria-label", demo || mockEnabled ? "模拟充值快速金额" : "企业额度维护说明");
   const topupAmount = el("organizationTopupAmount");
   if (topupAmount) {
-    topupAmount.placeholder = demo ? "请输入模拟充值金额" : "请联系平台运营授信";
-    topupAmount.disabled = !demo;
+    topupAmount.placeholder = demo || mockEnabled ? "请输入模拟充值金额" : "请联系平台运营授信";
+    topupAmount.disabled = !(demo || mockEnabled);
   }
   const topupNote = document.querySelector("#organizationTopupModal .organization-modal-note");
   if (topupNote) {
-    topupNote.textContent = demo
-      ? "金额范围为 $1.00 至 $100,000.00，最多两位小数。提交成功后余额和记录会立即刷新。"
+    topupNote.textContent = demo || mockEnabled
+      ? "模拟充值，仅用于功能联调，不产生真实支付。金额范围为 $1.00 至 $100,000.00。"
       : "真实模式下，企业额度由平台运营依据合同、订单或审批结果维护。";
   }
   const topupSubmit = el("submitOrganizationTopupButton");
-  setButtonLabel("submitOrganizationTopupButton", demo ? "确认模拟充值" : "联系平台运营授信");
-  if (topupSubmit) topupSubmit.disabled = !demo;
+  setButtonLabel("submitOrganizationTopupButton", demo || mockEnabled ? "确认模拟充值" : "联系平台运营授信");
+  if (topupSubmit) topupSubmit.disabled = !(demo || mockEnabled);
 }
 
 function replaceCurrentQuery(params) {
@@ -4917,6 +4918,7 @@ const BILLING_CHANNEL_LABELS = {
   epay: "在线支付",
   manual_qr: "扫码转账",
   manual: "人工补单",
+  mock: "模拟充值",
 };
 const BILLING_STATUS_LABELS = { success: "已到账", pending: "待支付", failed: "已失败", expired: "已过期" };
 const BILLING_METHOD_LABELS = { alipay: "支付宝", wxpay: "微信支付" };
@@ -4932,8 +4934,9 @@ function billingManualMethods() {
 }
 
 function billingChannel() {
-  // 有自动支付就优先用，否则退到收款码转账。
+  // Mock 用于联调时优先展示，但不影响真实渠道配置。
   const channels = Array.isArray(billingConfig?.channels) ? billingConfig.channels : [];
+  if (channels.includes("mock")) return "mock";
   if (channels.includes("epay")) return "epay";
   if (channels.includes("manual_qr")) return "manual_qr";
   return "";
@@ -4960,6 +4963,10 @@ function setFieldError(id, message) {
 }
 
 function updateTopupPayable() {
+  if (billingChannel() === "mock") {
+    setText("topupPayable", "无需付款 · 模拟充值");
+    return;
+  }
   const payable = topupPayableAmount();
   setText("topupPayable", payable > 0 ? `应付 ${formatCny(payable)}` : "应付 ¥0.00");
 }
@@ -5037,7 +5044,9 @@ function renderTopupMethods() {
   if (!row) return;
   const channel = billingChannel();
   const methods =
-    channel === "manual_qr"
+    channel === "mock"
+      ? [{ method: "mock", label: "模拟充值（仅联调）" }]
+      : channel === "manual_qr"
       ? billingManualMethods()
       : [
           { method: "alipay", label: "支付宝" },
@@ -5157,7 +5166,7 @@ function renderOrganizationBilling() {
   const today = organizationBillingUsage("today");
   const last7Days = organizationBillingUsage("last7Days");
   const last30Days = organizationBillingUsage("last30Days");
-  const canTopup = !context.readOnly && canSimulateOrganizationTopup();
+  const canTopup = !context.readOnly && canSimulateOrganizationTopup() && Boolean(organizationBillingData?.mockTopupEnabled || isDemoOrganizationMode());
   const demoMode = isDemoOrganizationMode();
   const organization = organizationBillingData?.organization || {};
   const name = String(organization?.name || context.name || "客户企业");
@@ -5181,7 +5190,7 @@ function renderOrganizationBilling() {
     "organizationBillingDescription",
     demoMode
       ? `${name} 的额度仅用于本地演示。演示用量不影响企业余额，也不会发起真实付款。`
-      : `${name} 的企业额度与实际用量均来自已接通的数据服务。`,
+      : `${name} 的企业额度与实际用量均来自已接通的数据服务。${organizationBillingData?.mockTopupEnabled ? " 当前开放模拟充值，仅用于功能联调，不产生真实支付。" : ""}`,
   );
   setText("organizationBillingTotalCreditsHint", demoMode ? "含初始企业额度与模拟充值" : "累计授予与退回的企业额度");
   setText("organizationBillingInitialCreditsHint", demoMode ? "每家演示企业独立初始化" : "企业开户及后续额度授予");
@@ -5190,7 +5199,9 @@ function renderOrganizationBilling() {
     "organizationBillingNoteText",
     demoMode
       ? "演示用量仅帮助查看企业使用情况，不会扣减企业账户余额。本页不包含支付方式、收款码、兑换码或真实订单。"
-      : "企业额度由平台运营人员维护；用量数据按实际调用汇总。本页不展示支付方式、收款码或个人充值订单。",
+      : organizationBillingData?.mockTopupEnabled
+        ? "企业额度支持模拟充值，仅用于功能联调，不产生真实支付；用量数据按实际调用汇总。"
+        : "企业额度由平台运营人员维护；用量数据按实际调用汇总。本页不展示支付方式、收款码或个人充值订单。",
   );
   setText(
     "organizationBillingRecordDescription",
@@ -5432,7 +5443,6 @@ async function submitOrganizationTopup(event) {
   event.preventDefault();
   const context = organizationBillingContext();
   if (!context || context.readOnly || !canSimulateOrganizationTopup() || isOrganizationTopupSaving) return;
-  if (!isDemoOrganizationMode()) return;
   const amount = Number(el("organizationTopupAmount")?.value || 0);
   setFieldError("organizationTopupError", "");
   if (!Number.isFinite(amount) || amount < 1 || amount > 100000 || Math.round(amount * 100) !== amount * 100) {
@@ -5449,7 +5459,7 @@ async function submitOrganizationTopup(event) {
     });
     closeOrganizationTopupModal({ force: true });
     await loadOrganizationBillingData(true);
-    showToast("模拟充值已完成，未发起真实付款。");
+    showToast("模拟充值已完成，未发起真实付款。企业额度已更新。");
   } catch (error) {
     setFieldError("organizationTopupError", error.message || "模拟充值失败，请稍后重试。");
   } finally {
@@ -5477,11 +5487,13 @@ function renderBilling() {
   if (onlinePanel) onlinePanel.classList.toggle("hidden", !channel);
   setText(
     "billingOnlineDesc",
-    channel === "manual_qr"
+    channel === "mock"
+      ? "模拟充值，仅用于功能联调，不产生真实支付；提交后立即到账。"
+      : channel === "manual_qr"
       ? "选择额度后扫码付款，提交凭证后由管理员确认到账。"
       : "选择额度后完成支付，额度到账即可使用。",
   );
-  setButtonLabel("topupSubmit", channel === "manual_qr" ? "生成付款二维码" : "立即充值");
+  setButtonLabel("topupSubmit", channel === "manual_qr" ? "生成付款二维码" : channel === "mock" ? "模拟充值并到账" : "立即充值");
 
   const minTopup = Number(billingConfig?.minTopupUsd || 0);
   const amountInput = el("topupAmount");
@@ -5489,7 +5501,9 @@ function renderBilling() {
   const minHint = minTopup > 0 ? `单笔最低 ${money.format(minTopup)}。` : "";
   setText(
     "topupHint",
-    channel === "manual_qr"
+    channel === "mock"
+      ? "模拟充值，仅用于功能联调，不产生真实支付。"
+      : channel === "manual_qr"
       ? `${minHint}扫码付款后请提交凭证，管理员核对收款后额度即到账。`
       : `${minHint}支付完成后请返回本页，系统会自动确认到账结果。`,
   );
@@ -5661,23 +5675,27 @@ async function submitTopup(event) {
   const methodRow = el("topupMethodRow");
   const method =
     methodRow?.querySelector('input[name="paymentMethod"]:checked')?.value || "alipay";
-  const originalLabel = channel === "manual_qr" ? "生成付款二维码" : "立即充值";
+  const originalLabel = channel === "manual_qr" ? "生成付款二维码" : channel === "mock" ? "模拟充值并到账" : "立即充值";
   isCreatingTopup = true;
   setButtonLabel("topupSubmit", "正在创建订单");
   el("topupSubmit").disabled = true;
   try {
     const payload = await api("/api/me/billing/orders", {
       method: "POST",
-      body: JSON.stringify({ amount, paymentMethod: method, channel }),
+      body: JSON.stringify({ amount, paymentMethod: channel === "mock" ? "mock" : method, channel }),
     });
     pendingTopupTradeNo = String(payload.tradeNo || "");
-    if (payload.channel === "manual_qr") {
+    if (payload.channel === "mock") {
+      showToast("模拟充值已完成，未发起真实付款。额度已立即到账。");
+      await refreshEntitlementAfterTopup();
+    } else if (payload.channel === "manual_qr") {
       showManualPayPanel(payload);
+      startTopupPolling();
     } else {
       // 用表单 POST 跳转收银台：部分网关不接受 GET 携带全部参数。
       submitGatewayForm(payload.submitUrl, payload.params);
     }
-    startTopupPolling();
+    if (payload.channel !== "mock") startTopupPolling();
     await loadBillingData(true);
   } catch (error) {
     setFieldError("topupError", error.message || "创建充值订单失败，请稍后重试");
@@ -6093,7 +6111,7 @@ function canViewOrganizationBilling() {
 }
 
 function canSimulateOrganizationTopup() {
-  return Boolean(isDemoOrganizationMode() && currentUser?.canSimulateOrganizationTopup);
+  return Boolean(currentUser?.canSimulateOrganizationTopup);
 }
 
 function organizationBillingContext() {

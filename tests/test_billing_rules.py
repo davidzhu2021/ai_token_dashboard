@@ -98,6 +98,20 @@ def test_channels_hide_epay_until_fully_configured(monkeypatch: pytest.MonkeyPat
     assert billing.available_channels() == ["redemption"]
 
 
+def test_mock_channel_is_opt_in_and_publicly_described(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MOCK_PAYMENT_ENABLED", "false")
+    assert billing.mock_payment_enabled() is False
+    assert "mock" not in billing.available_channels()
+
+    monkeypatch.setenv("MOCK_PAYMENT_ENABLED", "true")
+    assert billing.mock_payment_enabled() is True
+    assert billing.available_channels()[1] == "mock"
+    config = billing.public_config()
+    assert config["mockPaymentEnabled"] is True
+    assert "mock" in config["channels"]
+
+
+
 def test_public_config_never_leaks_merchant_secret(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BILLING_ENABLED", "true")
     monkeypatch.setenv("EPAY_ENABLED", "true")

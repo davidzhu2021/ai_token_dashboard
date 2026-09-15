@@ -81,6 +81,16 @@ def test_payment_methods_are_rendered_from_backend_config() -> None:
     assert 'name="paymentMethod" value="${escapeHtml(' in source
 
 
+def test_mock_payment_entry_is_explicit_and_settlement_aware() -> None:
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert "模拟充值，仅用于功能联调，不产生真实支付" in markup
+    assert 'channels.includes("mock")' in source
+    assert 'payload.channel === "mock"' in source
+    assert "startTopupPolling();" in source
+
+
 def test_frontend_calls_billing_endpoints() -> None:
     source = APP_JS.read_text(encoding="utf-8")
 
@@ -218,6 +228,12 @@ def test_polling_stops_when_leaving_billing_view() -> None:
     leaving_billing = source[source.index('if (currentView === "billing" && view !== "billing")') : source.index("currentView = view;")]
     assert "hideManualPayPanel();" in leaving_billing
     assert "closeOrganizationTopupModal({ force: true });" in leaving_billing
+
+
+def test_enterprise_mock_topup_is_available_in_real_mode_when_enabled() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    assert "mockTopupEnabled" in source
+    assert "模拟充值，仅用于功能联调，不产生真实支付" in source
     assert "stopTopupPolling();" in source[source.index("function hideManualPayPanel()") :][:200]
     # 人工确认比自动回调慢，轮询窗口相应放宽。
     assert "attempts > 100" in source

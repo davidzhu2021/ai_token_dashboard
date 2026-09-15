@@ -93,6 +93,7 @@ CHANNEL_REDEMPTION = "redemption"
 CHANNEL_EPAY = "epay"
 CHANNEL_MANUAL = "manual"
 CHANNEL_MANUAL_QR = "manual_qr"
+CHANNEL_MOCK = "mock"
 
 # 收款码订单没有独立的"待审核"状态：它仍是 pending，只是 submitted_at 非空。
 # 这样落账仍走 settle_order 上那一处 pending -> success 的 CAS，不必新增状态机分支。
