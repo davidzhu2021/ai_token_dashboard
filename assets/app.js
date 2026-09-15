@@ -190,6 +190,12 @@ let customerOrganizationsTotal = 0;
 let customerOrganizationsPage = 1;
 const customerOrganizationsPageSize = 12;
 let customerOrganizationsFilters = { search: "", status: "" };
+let personalCustomers = [];
+let personalCustomersTotal = 0;
+let personalCustomersPage = 1;
+let personalCustomersFilters = { search: "", status: "" };
+let selectedPersonalCustomer = null;
+const personalCustomersPageSize = 20;
 let isCustomerOrganizationsLoading = false;
 let customerOrganizationsLoadError = "";
 let customerOrganizationsSearchTimer = null;
@@ -6332,6 +6338,7 @@ function syncNavigationVisibility() {
   // 切换账号时先关闸，避免上一身份的入口短暂泄漏给下一身份。
   if (!isNavigationRevealed) return;
   const canBrowseCustomers = customerOrganizationsAvailable();
+  const canBrowsePersonalCustomers = isPlatformAdmin();
   const canManageCurrentOrganization = Boolean(currentUser?.canManageOrganization);
   const canViewAdmin = canViewAdminUsage();
   const canViewDepartments = canViewDepartmentUsage();
@@ -6344,6 +6351,7 @@ function syncNavigationVisibility() {
     : Boolean(billingAvailable);
   const remoteDemoSnapshotOnly = Boolean(authConfig.remoteDemoUsageSnapshotOnly || authConfig.remoteDemoReadOnly);
   el("customersTab").classList.toggle("hidden", !canBrowseCustomers);
+  el("personalCustomersTab")?.classList.toggle("hidden", !canBrowsePersonalCustomers);
   el("resetCustomerOrganizationsDemoButton")?.classList.toggle("hidden", !isDemoOrganizationMode());
   el("organizationTab")?.classList.toggle("hidden", !canManageCurrentOrganization);
   // 企业令牌是甲方管理员的一级目的地。乙方运营不在侧边栏出现，他们从客户企业
@@ -8452,6 +8460,7 @@ async function removeOrganizationMember(memberId) {
 
 function switchView(view) {
   if (view === "customers" && !customerOrganizationsAvailable()) view = "dashboard";
+  if (view === "personal-customers" && !isPlatformAdmin()) view = "dashboard";
   if (view === "admin" && !canViewAdminUsage()) view = "dashboard";
   if (view === "department" && !canViewDepartmentUsage()) view = "dashboard";
   if (view === "team" && !currentUser?.isTeamLeader) view = "dashboard";
@@ -8486,6 +8495,7 @@ function switchView(view) {
   el("teamView").classList.toggle("hidden", view !== "team");
   el("departmentView").classList.toggle("hidden", view !== "department");
   el("customersView").classList.toggle("hidden", view !== "customers");
+  el("personalCustomersView")?.classList.toggle("hidden", view !== "personal-customers");
   el("organizationView").classList.toggle("hidden", view !== "organization");
   el("organizationTokensView")?.classList.toggle("hidden", view !== "organization-tokens");
   el("keysView").classList.toggle("hidden", view !== "keys");
@@ -8541,6 +8551,7 @@ function switchView(view) {
   }
   if (view === "dashboard" && !usageData.length) loadDashboardData();
   if (view === "customers" && !isCustomerOrganizationsLoading) loadCustomerOrganizations();
+  if (view === "personal-customers") loadPersonalCustomers();
   if (view === "admin") {
     renderAdminBilling();
     if (!adminUsageData.length || adminUsageScopeKey !== organizationUsageScopeKey()) loadAdminData();
@@ -9269,6 +9280,68 @@ async function loadStabilityOverview(forceRefresh = false) {
       stabilityOverviewInFlightWindowKey = "";
     }
   }
+}
+
+function personalCustomersUrl() {
+  const params = new URLSearchParams({ page: String(personalCustomersPage), pageSize: String(personalCustomersPageSize) });
+  if (personalCustomersFilters.search) params.set("search", personalCustomersFilters.search);
+  if (personalCustomersFilters.status) params.set("status", personalCustomersFilters.status);
+  return `/api/platform/customers/personal?${params}`;
+}
+
+function renderPersonalCustomers() {
+  const grid = el("personalCustomerGrid");
+  if (!grid) return;
+  const totalPages = Math.max(1, Math.ceil(personalCustomersTotal / personalCustomersPageSize));
+  setText("personalCustomerCountChip", `${fmt.format(personalCustomersTotal)} 人`);
+  setText("personalCustomerPageInfo", `第 ${personalCustomersPage} / ${totalPages} 页`);
+  el("personalCustomerPreviousPageButton").disabled = personalCustomersPage <= 1;
+  el("personalCustomerNextPageButton").disabled = personalCustomersPage >= totalPages;
+  if (!personalCustomers.length) { grid.innerHTML = '<div class="customer-directory-empty">暂无符合条件的 C 端客户</div>'; return; }
+  grid.innerHTML = personalCustomers.map((item) => {
+    const status = item.status === "suspended" ? "已停用" : item.status === "active" ? "已启用" : item.status || "未知";
+    const provision = item.provisioningStatus === "provisioned" ? "已开通" : item.provisioningStatus || "开通中";
+    return `<article class="customer-organization-card"><div class="customer-organization-card-head"><div><h3>${escapeHtml(item.name || item.email || "未命名客户")}</h3><p>${escapeHtml(item.email || item.loginName || "-")}</p></div><span class="customer-organization-status">${escapeHtml(status)}</span></div><div class="customer-organization-metrics"><div><strong>${escapeHtml(provision)}</strong><span>上游状态</span></div><div><strong>${escapeHtml(money.format(item.balanceUsd || 0))}</strong><span>剩余额度</span></div><div><strong>${escapeHtml(organizationDate(item.lastLoginAt))}</strong><span>最近登录</span></div></div><div class="customer-organization-card-actions"><button class="primary-btn" type="button" data-personal-customer-open="${escapeHtml(item.id)}">查看详情</button>${item.status === "suspended" ? `<button class="ghost-btn" type="button" data-personal-customer-status="${escapeHtml(item.id)}" data-status="active">启用</button>` : `<button class="danger-outline-btn" type="button" data-personal-customer-status="${escapeHtml(item.id)}" data-status="suspended">停用</button>`}</div></article>`;
+  }).join("");
+}
+
+async function loadPersonalCustomers() {
+  if (!isPlatformAdmin()) return;
+  try {
+    const payload = await api(personalCustomersUrl());
+    personalCustomers = Array.isArray(payload.items) ? payload.items : [];
+    personalCustomersTotal = Number(payload.total || 0);
+    renderPersonalCustomers();
+  } catch (error) {
+    el("personalCustomerGrid").innerHTML = `<div class="customer-directory-empty">${escapeHtml(error.message || "C 端客户加载失败")}</div>`;
+  }
+}
+
+async function openPersonalCustomer(id) {
+  const payload = await api(`/api/platform/customers/personal/${encodeURIComponent(id)}`);
+  selectedPersonalCustomer = payload.customer;
+  el("personalCustomerDetailPanel").classList.remove("hidden");
+  setText("personalCustomerDetailTitle", selectedPersonalCustomer.name || selectedPersonalCustomer.email || "客户详情");
+  setText("personalCustomerDetailSummary", `${selectedPersonalCustomer.email || "-"} · ${selectedPersonalCustomer.provisioningStatus || "未知"}`);
+  const orders = Array.isArray(payload.orders?.items) ? payload.orders.items : [];
+  const retry = ["pending", "provisioning", "provisioning_failed"].includes(selectedPersonalCustomer.provisioningStatus)
+    ? `<button class="ghost-btn" type="button" data-personal-customer-retry="${escapeHtml(selectedPersonalCustomer.id)}">重试开通</button>` : "";
+  const orderRows = orders.length ? orders.slice(0, 10).map((order) => `<tr><td>${escapeHtml(order.orderNo || order.id || "-")}</td><td>${escapeHtml(money.format(order.amountUsd || order.amount || 0))}</td><td>${escapeHtml(order.status || "-")}</td></tr>`).join("") : `<tr><td colspan="3">暂无充值订单</td></tr>`;
+  el("personalCustomerDetailBody").innerHTML = `<div class="organization-stats"><div class="organization-stat"><span>账号状态</span><strong>${escapeHtml(selectedPersonalCustomer.status || "-")}</strong></div><div class="organization-stat"><span>邮箱验证</span><strong>${selectedPersonalCustomer.emailVerified ? "已验证" : "未验证"}</strong></div><div class="organization-stat"><span>上游开通</span><strong>${escapeHtml(selectedPersonalCustomer.provisioningStatus || "-")}</strong></div><div class="organization-stat"><span>累计充值</span><strong>${escapeHtml(money.format(selectedPersonalCustomer.topupTotalUsd || 0))}</strong></div><div class="organization-stat"><span>已消耗</span><strong>${escapeHtml(money.format(selectedPersonalCustomer.spentUsd || 0))}</strong></div><div class="organization-stat"><span>剩余额度</span><strong>${escapeHtml(money.format(selectedPersonalCustomer.balanceUsd || 0))}</strong></div></div><div class="customer-directory-card-actions">${retry}</div><p class="organization-modal-note">停用后会阻断登录和个人 API 访问；重新启用不会自动恢复历史访问密钥。</p><h4>最近充值订单</h4><div class="table-wrap"><table class="data-table"><thead><tr><th>订单号</th><th>金额</th><th>状态</th></tr></thead><tbody>${orderRows}</tbody></table></div>`;
+}
+
+async function retryPersonalCustomerProvision(id) {
+  await ensureCsrfToken();
+  await api(`/api/platform/customers/personal/${encodeURIComponent(id)}/provision/retry`, { method: "POST" });
+  await openPersonalCustomer(id);
+  await loadPersonalCustomers();
+}
+
+async function changePersonalCustomerStatus(id, status) {
+  if (status === "suspended" && !window.confirm("停用后会阻断登录和个人 API 访问，确认继续吗？")) return;
+  await ensureCsrfToken();
+  await api(`/api/platform/customers/personal/${encodeURIComponent(id)}/status`, { method: "POST", body: JSON.stringify({ status }) });
+  await loadPersonalCustomers();
 }
 
 function renderCostOverview() {
@@ -10633,6 +10706,12 @@ function showLogin() {
   teamMemberUsageSummary = null;
   teamMemberDataQuality = null;
   teamMemberCoverage = null;
+  personalCustomers = [];
+  personalCustomersTotal = 0;
+  personalCustomersPage = 1;
+  personalCustomersFilters = { search: "", status: "" };
+  selectedPersonalCustomer = null;
+  el("personalCustomerDetailPanel")?.classList.add("hidden");
   // 换账号时清空充值状态，避免上一个账号的余额与订单残留在页面上。
   stopTopupPolling();
   billingConfig = null;
@@ -11162,6 +11241,40 @@ el("customerOrganizationGrid").addEventListener("click", (event) => {
   const restoreButton = event.target.closest("[data-customer-organization-restore]");
   if (restoreButton) restoreCustomerOrganization(restoreButton.dataset.customerOrganizationRestore);
 });
+
+el("personalCustomerGrid")?.addEventListener("click", async (event) => {
+  const open = event.target.closest("[data-personal-customer-open]");
+  const status = event.target.closest("[data-personal-customer-status]");
+  try {
+    if (open) await openPersonalCustomer(open.dataset.personalCustomerOpen);
+    if (status) await changePersonalCustomerStatus(status.dataset.personalCustomerStatus, status.dataset.status);
+  } catch (error) { showToast(error.message || "客户操作失败"); }
+});
+el("personalCustomerDetailBody")?.addEventListener("click", async (event) => {
+  const retry = event.target.closest("[data-personal-customer-retry]");
+  if (!retry) return;
+  try { await retryPersonalCustomerProvision(retry.dataset.personalCustomerRetry); } catch (error) { showToast(error.message || "重试开通失败"); }
+});
+el("personalCustomerSearch")?.addEventListener("input", () => {
+  personalCustomersFilters.search = el("personalCustomerSearch").value.trim();
+  personalCustomersPage = 1;
+  loadPersonalCustomers();
+});
+el("personalCustomerStatusFilter")?.addEventListener("change", () => {
+  personalCustomersFilters.status = el("personalCustomerStatusFilter").value;
+  personalCustomersPage = 1;
+  loadPersonalCustomers();
+});
+el("resetPersonalCustomerFiltersButton")?.addEventListener("click", () => {
+  personalCustomersFilters = { search: "", status: "" };
+  personalCustomersPage = 1;
+  el("personalCustomerSearch").value = "";
+  el("personalCustomerStatusFilter").value = "";
+  loadPersonalCustomers();
+});
+el("personalCustomerPreviousPageButton")?.addEventListener("click", () => { if (personalCustomersPage > 1) { personalCustomersPage -= 1; loadPersonalCustomers(); } });
+el("personalCustomerNextPageButton")?.addEventListener("click", () => { if (personalCustomersPage * personalCustomersPageSize < personalCustomersTotal) { personalCustomersPage += 1; loadPersonalCustomers(); } });
+el("closePersonalCustomerDetailButton")?.addEventListener("click", () => el("personalCustomerDetailPanel")?.classList.add("hidden"));
 
 el("customerOrganizationSearch").addEventListener("input", () => {
   window.clearTimeout(customerOrganizationsSearchTimer);

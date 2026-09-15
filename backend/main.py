@@ -5677,6 +5677,11 @@ class ReviewOrderRequest(BaseModel):
         return value.strip()
 
 
+class PlatformPersonalCustomerStatusRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["active", "suspended"]
+
+
 class CreateRedemptionRequest(BaseModel):
     count: int = Field(default=1, ge=1, le=200)
     amount: float = Field(gt=0)
@@ -10020,6 +10025,142 @@ async def admin_users(
     start_date, end_date = resolve_usage_range(start_date, end_date)
     payload = await admin_usage_payload(admin, start_date, end_date, source, q, refresh)
     return {"users": payload["employees"], "total": len(payload["employees"]), "startDate": start_date, "endDate": end_date, "source": source, "cache": payload.get("cache", {"hit": False, "ttlSeconds": 0})}
+
+
+def _platform_personal_customer_summary(user: dict[str, Any]) -> dict[str, Any]:
+    account_type = str(user.get("accountType") or user.get("account_type") or "personal")
+    if account_type != "personal":
+        raise HTTPException(status_code=404, detail="个人客户不存在")
+    upstream = auth_store().get_upstream_account(str(user["id"]), "primary") or {}
+    return {
+        "id": str(user["id"]),
+        "email": user.get("email"),
+        "name": user.get("name"),
+        "loginName": user.get("loginName"),
+        "accountType": account_type,
+        "status": user.get("status"),
+        "emailVerified": bool(user.get("emailVerified")),
+        "identityStatus": user.get("identityStatus") or "verified",
+        "createdAt": user.get("createdAt"),
+        "updatedAt": user.get("updatedAt"),
+        "lastLoginAt": user.get("lastLoginAt"),
+        "provisioningStatus": upstream.get("status") or "pending",
+        "provisioningError": str(upstream.get("last_error") or upstream.get("lastError") or "")[:300],
+        "upstreamAvailable": bool(upstream.get("upstream_user_id") or upstream.get("upstreamUserId")),
+    }
+
+
+@app.get("/api/platform/customers/personal")
+async def platform_personal_customers(
+    request: Request,
+    page: int = Query(1, ge=1, le=100000),
+    pageSize: int = Query(20, ge=1, le=100),
+    search: str = Query("", max_length=120),
+    status: str = Query("", max_length=32),
+    entitlement: str = Query("", max_length=32),
+    sort: str = Query("created_at_desc", max_length=32),
+) -> dict[str, Any]:
+    require_platform_admin(request)
+    payload = await auth_store_call(
+        "list_personal_users", page=page, page_size=pageSize, search=search, status=status, sort=sort
+    )
+    store = billing_store()
+    items = []
+    for item in payload["items"]:
+        item = {**item, "entitlementStatus": "inactive", "spentUsd": None}
+        upstream_id = str(item.get("upstreamUserId") or "").strip()
+        if upstream_id and item.get("provisioningStatus") == "provisioned":
+            try:
+                info = await client().user_info(upstream_id)
+                models = info.get("models") if isinstance(info, dict) else None
+                blocked = bool(info.get("blocked")) if isinstance(info, dict) else False
+                item["entitlementStatus"] = "active" if not blocked and any(str(model) != "no-default-models" for model in (models or [])) else "inactive"
+                if isinstance(info, dict) and info.get("spend") is not None:
+                    item["spentUsd"] = float(info.get("spend") or 0.0)
+            except Exception:
+                item["entitlementStatus"] = "unavailable"
+        if store is not None and store.pool is not None:
+            try:
+                account = await store.get_account(str(item["id"]))
+                item.update({"topupTotalUsd": account.get("topupTotalUsd", 0.0), "balanceUsd": account.get("balanceUsd", 0.0), "updatedAt": account.get("updatedAt")})
+            except Exception:
+                item.update({"topupTotalUsd": None, "balanceUsd": None, "billingUnavailable": True})
+        else:
+            item.update({"topupTotalUsd": None, "balanceUsd": None, "billingUnavailable": True})
+        if entitlement and item["entitlementStatus"] != entitlement:
+            continue
+        items.append(item)
+    return {**payload, "items": items}
+
+
+@app.get("/api/platform/customers/personal/{user_id}")
+async def platform_personal_customer_detail(user_id: str, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    user = await auth_store_call("get_user", user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="个人客户不存在")
+    summary = _platform_personal_customer_summary(user)
+    events = await auth_store_call("list_audit_events", user_id, 50)
+    orders: dict[str, Any] = {"items": [], "total": 0}
+    account: dict[str, Any] = {"balanceUsd": None, "topupTotalUsd": None}
+    store = billing_store()
+    if store is not None and store.pool is not None:
+        try:
+            account = await store.get_account(user_id)
+            orders = await store.list_user_orders(user_id, limit=20, offset=0)
+        except Exception:
+            pass
+    return {"customer": {**summary, **account}, "account": account, "orders": orders, "auditEvents": events}
+
+
+@app.post("/api/platform/customers/personal/{user_id}/status")
+async def platform_personal_customer_status(
+    user_id: str, data: PlatformPersonalCustomerStatusRequest, request: Request
+) -> dict[str, Any]:
+    admin = require_platform_admin(request)
+    user = await auth_store_call("get_user", user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="个人客户不存在")
+    _platform_personal_customer_summary(user)
+    updated = await auth_store_call("set_user_status", user_id, data.status)
+    upstream_blocked = True
+    upstream_error = ""
+    if data.status == "suspended":
+        upstream = await auth_store_call("get_upstream_account", user_id, "primary") or {}
+        upstream_id = str(upstream.get("upstream_user_id") or upstream.get("upstreamUserId") or "")
+        if upstream_id:
+            try:
+                keys = await client().keys_for_user(upstream_id, client().backends[0], refresh=True)
+                for key in keys:
+                    key_id = str(key.get("id") or "")
+                    if key_id:
+                        await client().block_key(key_id, upstream_id, str(admin.get("email") or "platform-admin"))
+            except Exception as exc:
+                upstream_blocked = False
+                upstream_error = f"{exc.__class__.__name__}: {exc}"[:300]
+    await auth_store_call(
+        "record_audit_event", "platform_customer_status_changed", user_id,
+        str(updated.get("email") or "") if updated else None,
+        request_ip(request), True, {"status": data.status, "operator": admin.get("email", ""), "upstreamBlocked": upstream_blocked},
+    )
+    response = {"ok": True, "customer": _platform_personal_customer_summary(updated or user), "upstreamBlocked": upstream_blocked}
+    if upstream_error:
+        response["upstreamError"] = upstream_error
+    return response
+
+
+@app.post("/api/platform/customers/personal/{user_id}/provision/retry")
+async def platform_personal_customer_provision_retry(user_id: str, request: Request) -> dict[str, Any]:
+    require_platform_admin(request)
+    user = await auth_store_call("get_user", user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="个人客户不存在")
+    summary = _platform_personal_customer_summary(user)
+    if summary["provisioningStatus"] not in {"provisioning", "provisioning_failed", "pending"}:
+        raise HTTPException(status_code=409, detail="当前账号无需重试开通")
+    await retry_local_provisioning(user)
+    refreshed = await auth_store_call("get_user", user_id) or user
+    return {"ok": True, "customer": _platform_personal_customer_summary(refreshed)}
 
 
 @app.get("/api/admin/departments/usage")

@@ -634,6 +634,75 @@ class AuthStore:
                 )
         return self.get_user(user_id)
 
+    def list_personal_users(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+        search: str = "",
+        status: str = "",
+        sort: str = "created_at_desc",
+    ) -> dict[str, Any]:
+        """List customer-facing personal accounts without exposing credentials."""
+        page = max(1, int(page))
+        page_size = max(1, min(int(page_size), 100))
+        values: list[Any] = []
+        clauses = ["account_type = 'personal'"]
+        text = str(search or "").strip().casefold()
+        if text:
+            clauses.append("(lower(coalesce(email, '')) LIKE ? OR lower(name) LIKE ? OR lower(coalesce(login_name, '')) LIKE ?)")
+            pattern = f"%{text}%"
+            values.extend([pattern, pattern, pattern])
+        requested_status = str(status or "").strip().lower()
+        if requested_status in {"provisioning", "provisioning_failed", "pending", "provisioned"}:
+            clauses.append(
+                "EXISTS(SELECT 1 FROM auth_upstream_accounts ua "
+                "WHERE ua.user_id = auth_users.id AND ua.backend_id = 'primary' AND ua.status = ?)"
+            )
+            values.append(requested_status)
+        elif requested_status:
+            clauses.append("status = ?")
+            values.append(requested_status)
+        order = "created_at DESC"
+        if sort == "last_login_at_desc":
+            order = "last_login_at DESC, created_at DESC"
+        elif sort == "name_asc":
+            order = "name COLLATE NOCASE ASC, created_at DESC"
+        where = " AND ".join(clauses)
+        with self._connection() as connection:
+            total = int(connection.execute(f"SELECT count(*) FROM auth_users WHERE {where}", values).fetchone()[0])
+            offset = (page - 1) * page_size
+            rows = connection.execute(
+                f"SELECT id, email, login_name, name, email_verified, status, account_type, identity_status, identity_verified_at, created_at, updated_at, last_login_at FROM auth_users WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
+                [*values, page_size, offset],
+            ).fetchall()
+            upstream = {
+                str(row["user_id"]): dict(row)
+                for row in connection.execute("SELECT user_id, status, upstream_user_id, last_error, updated_at FROM auth_upstream_accounts WHERE backend_id = 'primary'").fetchall()
+            }
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            account = upstream.get(str(item["id"]), {})
+            item.update(
+                {
+                    "accountType": item.pop("account_type") or "personal",
+                    "emailVerified": bool(item.pop("email_verified")),
+                    "identityStatus": item.pop("identity_status") or "verified",
+                    "identityVerifiedAt": item.pop("identity_verified_at"),
+                    "createdAt": item.pop("created_at"),
+                    "updatedAt": item.pop("updated_at"),
+                    "lastLoginAt": item.pop("last_login_at"),
+                    "loginName": item.pop("login_name"),
+                    "provisioningStatus": account.get("status") or "pending",
+                    "provisioningError": str(account.get("last_error") or "")[:300],
+                    "upstreamUserId": account.get("upstream_user_id"),
+                    "upstreamAvailable": bool(account.get("upstream_user_id")),
+                }
+            )
+            items.append(item)
+        return {"items": items, "total": total, "page": page, "pageSize": page_size}
+
     def touch_last_login(self, user_id: str) -> None:
         now = self._now().isoformat()
         with self._lock, self._connection() as connection:
