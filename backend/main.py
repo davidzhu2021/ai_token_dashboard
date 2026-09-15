@@ -13072,6 +13072,16 @@ async def billing_identity(request: Request) -> tuple[dict[str, Any], str]:
         if repaired.get("status") != "provisioned":
             raise auth_http_error(409, "账号开通异常，请稍后重试或联系管理员", "AUTH_PROVISIONING_FAILED")
         upstream_user_id = str(repaired.get("upstream_user_id") or repaired.get("upstreamUserId") or upstream_user_id)
+    store = billing_store()
+    if store is not None and store.pool is not None:
+        try:
+            account_snapshot = await store.get_account(local_user_id)
+            topup_total = float(account_snapshot.get("topupTotalUsd") or 0)
+            if topup_total > 0:
+                await billing.sync_upstream_entitlement(client(), upstream_user_id, topup_total)
+                await ensure_personal_key_after_entitlement(local_user_id, upstream_user_id)
+        except Exception:
+            logger.exception("personal entitlement compensation check failed user_id=%s", local_user_id)
     return app_user, upstream_user_id
 
 async def apply_topup_entitlement(trade_no: str, user_id: str, upstream_user_id: str) -> dict[str, Any]:
