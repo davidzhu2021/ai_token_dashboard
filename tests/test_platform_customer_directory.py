@@ -50,5 +50,7 @@ def test_customer_directory_markup_has_personal_customer_workspace() -> None:
     source = Path(__file__).parents[1].joinpath("assets/app.js").read_text(encoding="utf-8")
     assert 'id="personalCustomersTab"' in markup
     assert 'id="personalCustomersView"' in markup
+    assert '<symbol id="icon-user"' in markup
     assert "/api/platform/customers/personal" in source
     assert "停用后会阻断登录和个人 API 访问" in source
+    assert "personal-customer-card-avatar" in source
