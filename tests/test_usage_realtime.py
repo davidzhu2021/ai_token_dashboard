@@ -1232,3 +1232,10 @@ def test_realtime_worker_defaults_are_live_friendly(monkeypatch) -> None:
     assert '_env_int("USAGE_REALTIME_POLL_SECONDS", 5)' in source
     assert '_env_int("USAGE_REALTIME_SETTLEMENT_DELAY_SECONDS", 60)' in source
     assert '_env_int("USAGE_REALTIME_LOCK_TTL_SECONDS", 60)' in source
+
+def test_realtime_archive_stream_is_length_capped() -> None:
+    script = UsageRealtimeStore._INGEST_LUA
+
+    assert "redis.call('XADD', stream_key" in script
+    assert "MAXLEN" in script
+    assert "~" in script

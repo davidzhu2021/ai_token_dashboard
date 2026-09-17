@@ -93,7 +93,7 @@ if latest == false or ARGV[24] > latest then
   redis.call('SET', latest_event_key, ARGV[24])
 end
 if ARGV[25] == '1' then
-  redis.call('XADD', stream_key, '*', 'event', ARGV[23])
+  redis.call('XADD', stream_key, 'MAXLEN', '~', '20000', '*', 'event', ARGV[23])
 end
 return {1, revision}
 """

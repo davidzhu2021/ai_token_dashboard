@@ -2,7 +2,7 @@ services:
   usage-redis:
     image: redis:7.4-alpine
     container_name: ai-token-dashboard-redis
-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory", "2gb", "--maxmemory-policy", "volatile-ttl"]
     volumes:
       - usage-redis-data:/data
     healthcheck:

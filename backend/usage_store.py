@@ -969,6 +969,79 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+
+def split_sql_statements(script: str) -> list[str]:
+    """Split a SQL script into statements without breaking dollar-quoted bodies."""
+
+    statements: list[str] = []
+    buf: list[str] = []
+    i = 0
+    in_single = False
+    dollar_tag: str | None = None
+    while i < len(script):
+        ch = script[i]
+        if dollar_tag is not None:
+            if script.startswith(dollar_tag, i):
+                buf.append(dollar_tag)
+                i += len(dollar_tag)
+                dollar_tag = None
+                continue
+            buf.append(ch)
+            i += 1
+            continue
+        if in_single:
+            buf.append(ch)
+            if ch == "'":
+                if i + 1 < len(script) and script[i + 1] == "'":
+                    buf.append("'")
+                    i += 2
+                    continue
+                in_single = False
+            i += 1
+            continue
+        if ch == "-" and i + 1 < len(script) and script[i + 1] == "-":
+            while i < len(script) and script[i] != "\n":
+                i += 1
+            continue
+        if ch == "$":
+            j = i + 1
+            while j < len(script) and (script[j].isalnum() or script[j] == "_"):
+                j += 1
+            if j < len(script) and script[j] == "$":
+                dollar_tag = script[i : j + 1]
+                buf.append(dollar_tag)
+                i = j + 1
+                continue
+        if ch == "'":
+            in_single = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ";":
+            statement = "".join(buf).strip()
+            if statement:
+                statements.append(statement)
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
+async def apply_usage_schema(pool: Any, schema: str = USAGE_SCHEMA) -> None:
+    """Apply DDL one statement at a time so a blocked ALTER cannot lock unrelated tables."""
+
+    statements = split_sql_statements(schema)
+    async with pool.acquire() as connection:
+        await connection.execute("SELECT set_config('lock_timeout', $1, false)", "3s")
+        for statement in statements:
+            await connection.execute(statement)
+
+
 class UsageStore:
     """Small PostgreSQL adapter for aggregated usage snapshots only."""
 
@@ -1093,7 +1166,7 @@ class UsageStore:
             )
             if not self.read_only:
                 try:
-                    await pool.execute(USAGE_SCHEMA)
+                    await apply_usage_schema(pool)
                 except Exception:
                     await pool.close()
                     raise
