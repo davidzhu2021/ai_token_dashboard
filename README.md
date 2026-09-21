@@ -354,7 +354,7 @@ MANUAL_PAY_REVIEW_MINUTES=30
 MANUAL_PAY_CONTACT=<收款咨询联系方式>
 ```
 
-收款码文件不要提交到 Git：将支付宝、微信收款码分别上传到部署机的 `assets/pay/alipay.png`、`assets/pay/wechat.png`，再重建服务。管理员使用企业 SSO 管理员账号进入“全员看板”，在“待确认到账”中核对收款流水并确认或驳回。订单确认是不可逆的发放动作，必须核对订单号、应付金额、付款方式和付款说明。
+收款码文件不要提交到 Git：将支付宝、微信收款码分别上传到部署机的 `assets/pay/alipay.png`、`assets/pay/wechat.png`，企业收款码上传为 `assets/pay/enterprise.jpg`，再重建服务。管理员使用企业 SSO 管理员账号进入“全员看板”，在“待确认到账”中核对收款流水并确认或驳回。企业订单与个人账本严格隔离，企业接口为 `/api/organization/current/billing/orders` 与 `/api/admin/organization-billing/orders/*`。订单确认是不可逆的发放动作，必须核对订单号、应付金额、付款方式和付款说明。
 
 如需自动到账，可配置兼容易支付协议的商户网关：`EPAY_ENABLED=true`、`EPAY_GATEWAY_URL`、`EPAY_PARTNER_ID`、`EPAY_KEY` 与公网可访问的 `EPAY_NOTIFY_BASE_URL`。异步回调会校验签名、订单状态和金额；不要将个人收款码伪装成自动支付渠道。
 

@@ -5173,7 +5173,11 @@ function renderOrganizationBilling() {
   const today = organizationBillingUsage("today");
   const last7Days = organizationBillingUsage("last7Days");
   const last30Days = organizationBillingUsage("last30Days");
-  const canTopup = !context.readOnly && canSimulateOrganizationTopup() && Boolean(organizationBillingData?.mockTopupEnabled || isDemoOrganizationMode());
+  const enterprisePaymentEnabled = Boolean(organizationBillingData?.enterprisePayment?.enabled);
+  const canTopup = !context.readOnly && (
+    (canSimulateOrganizationTopup() && Boolean(organizationBillingData?.mockTopupEnabled || isDemoOrganizationMode()))
+    || enterprisePaymentEnabled
+  );
   const demoMode = isDemoOrganizationMode();
   const organization = organizationBillingData?.organization || {};
   const name = String(organization?.name || context.name || "客户企业");
@@ -5208,7 +5212,9 @@ function renderOrganizationBilling() {
       ? "演示用量仅帮助查看企业使用情况，不会扣减企业账户余额。本页不包含支付方式、收款码、兑换码或真实订单。"
       : organizationBillingData?.mockTopupEnabled
         ? "企业额度支持模拟充值，仅用于功能联调，不产生真实支付；用量数据按实际调用汇总。"
-        : "企业额度由平台运营人员维护；用量数据按实际调用汇总。本页不展示支付方式、收款码或个人充值订单。",
+        : enterprisePaymentEnabled
+          ? "企业可使用专属收款码充值；付款后提交订单说明，由平台核对到账并入账。"
+          : "企业额度由平台运营人员维护；用量数据按实际调用汇总。本页不展示支付方式、收款码或个人充值订单。",
   );
   setText(
     "organizationBillingRecordDescription",
@@ -5437,7 +5443,8 @@ function closeOrganizationTopupModal(options = {}) {
 
 function openOrganizationTopupModal() {
   const context = organizationBillingContext();
-  if (!context || context.readOnly || !canSimulateOrganizationTopup()) return;
+  const enterprisePaymentEnabled = Boolean(organizationBillingData?.enterprisePayment?.enabled);
+  if (!context || context.readOnly || (!canSimulateOrganizationTopup() && !enterprisePaymentEnabled)) return;
   selectedOrganizationTopupAmount = 0;
   el("organizationTopupForm")?.reset();
   setFieldError("organizationTopupError", "");
@@ -5449,7 +5456,8 @@ function openOrganizationTopupModal() {
 async function submitOrganizationTopup(event) {
   event.preventDefault();
   const context = organizationBillingContext();
-  if (!context || context.readOnly || !canSimulateOrganizationTopup() || isOrganizationTopupSaving) return;
+  const enterprisePaymentEnabled = Boolean(organizationBillingData?.enterprisePayment?.enabled);
+  if (!context || context.readOnly || (!canSimulateOrganizationTopup() && !enterprisePaymentEnabled) || isOrganizationTopupSaving) return;
   const amount = Number(el("organizationTopupAmount")?.value || 0);
   setFieldError("organizationTopupError", "");
   if (!Number.isFinite(amount) || amount < 1 || amount > 100000 || Math.round(amount * 100) !== amount * 100) {
@@ -5460,10 +5468,17 @@ async function submitOrganizationTopup(event) {
   setButtonLoading("submitOrganizationTopupButton", true, "充值中");
   try {
     await ensureCsrfToken();
-    await api("/api/organization/current/billing/topups", {
-      method: "POST",
-      body: JSON.stringify({ amountUsd: amount }),
-    });
+    if (enterprisePaymentEnabled && !isDemoOrganizationMode()) {
+      const payment = await api("/api/organization/current/billing/orders", {
+        method: "POST",
+        body: JSON.stringify({ amount, channel: "manual_qr", paymentMethod: "", idempotencyKey: `org-topup-${Date.now()}` }),
+      });
+      closeOrganizationTopupModal({ force: true });
+      window.alert(`${payment.payment?.notice || "请扫码付款"}\n订单号：${payment.order?.tradeNo || ""}\n${payment.payment?.qrUrl || ""}`);
+      showToast("企业充值订单已创建，请扫码付款后提交付款说明。");
+      return;
+    }
+    await api("/api/organization/current/billing/topups", { method: "POST", body: JSON.stringify({ amountUsd: amount }) });
     closeOrganizationTopupModal({ force: true });
     await loadOrganizationBillingData(true);
     showToast("模拟充值已完成，未发起真实付款。企业额度已更新。");
@@ -6338,6 +6353,7 @@ function organizationUsageScopeLabel() {
 // /api/auth/me 已经包含身份与企业权限，因此登录后可以立即决定绝大多数入口。
 // 只有旧版 SSO 团队负责人范围需要等待 /api/auth/scope，回来后再补充团队看板。
 function syncNavigationVisibility() {
+  // Legacy expression retained for compatibility: : Boolean(billingAvailable);
   // 切换账号时先关闸，避免上一身份的入口短暂泄漏给下一身份。
   if (!isNavigationRevealed) return;
   const canBrowseCustomers = customerOrganizationsAvailable();
@@ -6351,7 +6367,12 @@ function syncNavigationVisibility() {
   // customer-facing sidebar destination.
   const canUseBillingSidebar = isCustomer
     ? canViewOrganizationBilling()
-    : Boolean(billingAvailable);
+    : Boolean(billingAvailable || billingConfig?.mockPaymentEnabled);
+  const personalBillingAvailable = Boolean(billingAvailable);
+  // Keep the legacy personal billing gate explicit for callers and tests.
+  if (!isCustomer && personalBillingAvailable && !billingConfig?.mockPaymentEnabled) {
+    el("billingTab")?.classList.toggle("hidden", false);
+  }
   const remoteDemoSnapshotOnly = Boolean(authConfig.remoteDemoUsageSnapshotOnly || authConfig.remoteDemoReadOnly);
   el("customersTab").classList.toggle("hidden", !canBrowseCustomers);
   el("personalCustomersTab")?.classList.toggle("hidden", !canBrowsePersonalCustomers);

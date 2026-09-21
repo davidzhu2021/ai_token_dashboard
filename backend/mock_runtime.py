@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import copy
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -34,7 +34,26 @@ class MockClient:
         return {"user_id": user_id, "user_email": email, "user_alias": name or email, "matched_user_ids": [f"primary:{user_id}"], "matched_accounts": [{"backend": "primary", "user_id": user_id}]}
 
     async def user_info(self, user_id: str) -> dict[str, Any]:
-        return {"user_id": user_id, "spend": 12.84, "max_budget": 100.0}
+        account = self.runtime.entitlements.setdefault(user_id, {"budget": 0.0, "models": []})
+        return {"user_id": user_id, "spend": 0.0, "max_budget": account["budget"], "models": account["models"]}
+
+    async def set_user_budget(self, user_id: str, budget: float) -> dict[str, Any]:
+        self.runtime.entitlements.setdefault(user_id, {"budget": 0.0, "models": []})["budget"] = float(budget)
+        return {"user_id": user_id, "max_budget": float(budget)}
+
+    async def grant_default_models(self, user_id: str, models: list[str]) -> list[str]:
+        self.runtime.entitlements.setdefault(user_id, {"budget": 0.0, "models": []})["models"] = list(models)
+        return list(models)
+
+    async def raise_key_daily_budgets(self, user_id: str, budget: float) -> list[dict[str, Any]]:
+        return []
+
+    async def create_key(self, user_id: str, name: str, purpose: str, expires: str, models: list[str], changed_by: str) -> dict[str, Any]:
+        normalized = user_id if ":" in user_id else f"primary:{user_id}"
+        item = _key(f"mock-key-{len(self.runtime.keys.setdefault(normalized, [])) + 1:03d}", name)
+        item["models"] = list(models or [model["displayName"] for model in MODELS])
+        self.runtime.keys[normalized].append(item)
+        return {**item, "key": "sk-mock-local-preview"}
 
     async def models(self, usage_counts: dict[str, int] | None = None) -> list[dict[str, Any]]:
         return copy.deepcopy(MODELS)
@@ -109,13 +128,107 @@ class MockUsageStore:
 
 
 class MockBillingStore:
-    pool = None
+    pool = True
+
+    def __init__(self) -> None:
+        self.accounts: dict[str, dict[str, Any]] = {}
+        self.orders: dict[str, dict[str, Any]] = {}
+        self.organization_orders: dict[str, dict[str, Any]] = {}
 
     async def connect(self) -> None:
         return None
 
     async def close(self) -> None:
         return None
+
+    async def get_account(self, user_id: str) -> dict[str, Any]:
+        return copy.deepcopy(self.accounts.setdefault(str(user_id), {
+            "userId": str(user_id), "balanceUsd": 0.0, "topupTotalUsd": 0.0, "updatedAt": "",
+        }))
+
+    async def create_order(self, trade_no: str, user_id: str, channel: str, amount_usd: float, money_cny: float, exchange_rate: float, payment_method: str = "", status: str = "pending") -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        self.orders[str(trade_no)] = {
+            "tradeNo": str(trade_no), "userId": str(user_id), "channel": str(channel),
+            "amountUsd": float(amount_usd), "moneyCny": float(money_cny),
+            "exchangeRate": float(exchange_rate), "status": str(status),
+            "paymentMethod": str(payment_method), "upstreamTradeNo": "", "syncState": "",
+            "syncError": "", "payerNote": "", "reviewNote": "", "reviewedBy": "",
+            "submittedAt": "", "createdAt": now, "completedAt": "",
+        }
+        return {"tradeNo": str(trade_no), "status": str(status)}
+
+    async def list_user_orders(self, user_id: str, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        items = [copy.deepcopy(item) for item in self.orders.values() if item["userId"] == str(user_id)]
+        items.sort(key=lambda item: item["createdAt"], reverse=True)
+        return {"items": items[offset:offset + limit], "total": len(items)}
+
+    async def settle_order(self, trade_no: str, upstream_trade_no: str = "", notify_payload: str | None = None, reviewed_by: str = "", review_note: str = "") -> dict[str, Any]:
+        order = self.orders.get(str(trade_no))
+        if order is None:
+            raise RuntimeError("充值订单不存在")
+        settled = order["status"] == "pending"
+        if settled:
+            now = datetime.now(timezone.utc).isoformat()
+            order.update({"status": "success", "completedAt": now, "upstreamTradeNo": upstream_trade_no, "syncState": "pending", "reviewedBy": reviewed_by, "reviewNote": review_note})
+            account = self.accounts.setdefault(order["userId"], {"userId": order["userId"], "balanceUsd": 0.0, "topupTotalUsd": 0.0, "updatedAt": ""})
+            account["balanceUsd"] += order["amountUsd"]
+            account["topupTotalUsd"] += order["amountUsd"]
+            account["updatedAt"] = now
+        return {"settled": settled, "order": copy.deepcopy(order), "account": await self.get_account(order["userId"])}
+
+    async def mark_sync_state(self, trade_no: str, state: str, error: str = "") -> None:
+        order = self.orders.get(str(trade_no))
+        if order:
+            order["syncState"] = str(state)
+            order["syncError"] = str(error)
+
+    async def create_organization_order(self, trade_no, organization_id, operator_user_id, channel, amount_usd, money_cny, exchange_rate, payment_method, idempotency_key=""):
+        existing = next((item for item in self.organization_orders.values() if item["organizationId"] == str(organization_id) and idempotency_key and item["idempotencyKey"] == idempotency_key), None)
+        if existing:
+            return copy.deepcopy(existing)
+        now = datetime.now(timezone.utc).isoformat()
+        item = {"tradeNo": str(trade_no), "organizationId": str(organization_id), "operatorUserId": str(operator_user_id or ""), "channel": str(channel), "amountUsd": float(amount_usd), "moneyCny": float(money_cny), "exchangeRate": float(exchange_rate), "status": "pending", "paymentMethod": str(payment_method or ""), "upstreamTradeNo": "", "payerNote": "", "reviewNote": "", "reviewedBy": "", "externalReference": "", "idempotencyKey": str(idempotency_key or ""), "syncState": "", "syncError": "", "createdAt": now, "submittedAt": "", "completedAt": ""}
+        self.organization_orders[str(trade_no)] = item
+        return copy.deepcopy(item)
+
+    async def get_organization_order(self, trade_no):
+        return copy.deepcopy(self.organization_orders.get(str(trade_no)))
+
+    async def list_organization_orders(self, organization_id, limit=50, offset=0):
+        items = [copy.deepcopy(item) for item in self.organization_orders.values() if item["organizationId"] == str(organization_id)]
+        items.sort(key=lambda item: item["createdAt"], reverse=True)
+        return {"items": items[offset:offset + limit], "total": len(items), "limit": limit, "offset": offset}
+
+    async def list_all_organization_orders(self, keyword="", limit=50, offset=0):
+        needle = str(keyword or '').casefold()
+        items = [copy.deepcopy(item) for item in self.organization_orders.values() if not needle or needle in item["tradeNo"].casefold() or needle in item["organizationId"].casefold()]
+        items.sort(key=lambda item: item["createdAt"], reverse=True)
+        return {"items": items[offset:offset + limit], "total": len(items), "limit": limit, "offset": offset}
+
+    async def submit_organization_payment(self, trade_no, organization_id, payer_note):
+        item = self.organization_orders.get(str(trade_no))
+        if not item or item["organizationId"] != str(organization_id) or item["status"] != "pending":
+            raise RuntimeError("企业充值订单不存在或已处理")
+        item["payerNote"] = str(payer_note or "")[:500]
+        item["submittedAt"] = datetime.now(timezone.utc).isoformat()
+        return copy.deepcopy(item)
+
+    async def settle_organization_order(self, trade_no, *, reviewed_by="", review_note="", upstream_trade_no=""):
+        item = self.organization_orders.get(str(trade_no))
+        if not item:
+            raise RuntimeError("企业充值订单不存在")
+        if item["status"] != "pending":
+            return {"settled": False, "order": copy.deepcopy(item)}
+        item.update({"status": "success", "reviewedBy": str(reviewed_by or ""), "reviewNote": str(review_note or ""), "upstreamTradeNo": str(upstream_trade_no or ""), "completedAt": datetime.now(timezone.utc).isoformat(), "syncState": "pending"})
+        return {"settled": True, "order": copy.deepcopy(item)}
+
+    async def fail_organization_order(self, trade_no, *, reviewed_by="", review_note=""):
+        item = self.organization_orders.get(str(trade_no))
+        if not item or item["status"] != "pending":
+            return False
+        item.update({"status": "failed", "reviewedBy": str(reviewed_by or ""), "reviewNote": str(review_note or ""), "completedAt": datetime.now(timezone.utc).isoformat()})
+        return True
 
 
 class MockKeyVault:
@@ -138,4 +251,5 @@ class MockRuntime:
         self.reset()
 
     def reset(self) -> None:
+        self.entitlements: dict[str, dict[str, Any]] = {}
         self.keys: dict[str, list[dict[str, Any]]] = {"primary:owner": [_key("mock-key-owner-001", "本地 Codex 密钥"), _key("mock-key-owner-002", "本地 Claude Code 密钥")], "primary:admin": [_key("mock-key-admin-001", "管理脚本密钥")]}

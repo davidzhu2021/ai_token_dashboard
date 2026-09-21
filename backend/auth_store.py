@@ -474,6 +474,8 @@ class AuthStore:
         *,
         password: str | None = None,
         user_id: str | None = None,
+        account_type: str = "personal",
+        identity_status: str = "verified",
     ) -> dict[str, Any]:
         normalized = self.normalize_email(email)
         if password_hash is None and password is not None:
@@ -495,9 +497,10 @@ class AuthStore:
                         (id, email, name, password_hash, email_verified, status,
                          account_type, identity_status, identity_verified_at,
                          created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 'personal', 'verified', ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (identifier, normalized, display, password_hash, int(email_verified), status, now, now, now),
+                    (identifier, normalized, display, password_hash, int(email_verified), status,
+                     account_type, identity_status, now, now, now),
                 )
                 connection.execute("COMMIT")
         except sqlite3.IntegrityError as exc:
@@ -1389,6 +1392,8 @@ class AuthStore:
         *,
         status: str = "active",
         user_id: str | None = None,
+        account_type: str = "personal",
+        identity_status: str = "verified",
     ) -> dict[str, Any] | None:
         """Create one user and consume one valid code in the same transaction."""
         normalized = self.normalize_email(email)
@@ -1428,9 +1433,10 @@ class AuthStore:
                         (id, email, name, password_hash, email_verified, status,
                          account_type, identity_status, identity_verified_at,
                          created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 'personal', 'verified', ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (identifier, normalized, display, password_hash, 1, status, now, now, now),
+                    (identifier, normalized, display, password_hash, 1, status,
+                     account_type, identity_status, now, now, now),
                 )
                 connection.execute("COMMIT")
         except sqlite3.IntegrityError as exc:

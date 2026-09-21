@@ -126,6 +126,26 @@ def manual_qr_methods() -> list[dict[str, str]]:
     return methods
 
 
+def enterprise_qr_image() -> str:
+    raw = os.getenv("MANUAL_PAY_ENTERPRISE_QR", "").strip()
+    return raw if raw.startswith(("http://", "https://", "/")) else ""
+
+
+def enterprise_qr_enabled() -> bool:
+    return env_bool("MANUAL_PAY_ENTERPRISE_ENABLED", False) and bool(enterprise_qr_image())
+
+
+def enterprise_qr_config() -> dict[str, Any]:
+    return {
+        "enabled": enterprise_qr_enabled(),
+        "qrUrl": enterprise_qr_image(),
+        "label": os.getenv("MANUAL_PAY_ENTERPRISE_LABEL", "企业收款码").strip() or "企业收款码",
+        "notice": os.getenv("MANUAL_PAY_ENTERPRISE_NOTICE", manual_qr_notice()).strip(),
+        "contact": manual_qr_contact(),
+        "reviewMinutes": manual_review_minutes(),
+    }
+
+
 def manual_qr_enabled() -> bool:
     """收款码渠道是否可用：开关打开且至少配了一张收款码。"""
     return env_bool("MANUAL_PAY_ENABLED", False) and bool(manual_qr_methods())
@@ -322,16 +342,19 @@ async def sync_upstream_entitlement(
     return result
 
 
-def public_config() -> dict[str, Any]:
+def public_config(*, local_mock: bool = False) -> dict[str, Any]:
     """给前端的充值配置，不含任何商户密钥。"""
+    channels = available_channels()
+    if local_mock and "mock" not in channels:
+        channels.append("mock")
     return {
-        "enabled": billing_enabled(),
+        "enabled": billing_enabled() or local_mock,
         "exchangeRate": exchange_rate(),
         "minTopupUsd": min_topup_usd(),
         "maxTopupUsd": max_topup_usd(),
         "amountOptions": topup_amount_options(),
-        "channels": available_channels(),
-        "mockPaymentEnabled": mock_payment_enabled(),
+        "channels": channels,
+        "mockPaymentEnabled": mock_payment_enabled() or local_mock,
         "currencySymbol": "¥",
         "manualPay": manual_qr_config(),
     }

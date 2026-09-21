@@ -5593,6 +5593,19 @@ class RegisterRequest(BaseModel):
     turnstileToken: str = Field(default="", max_length=4096)
 
 
+class EnterpriseRegisterRequest(RegisterRequest):
+    email: str = Field(default="", max_length=320)
+    name: str = Field(default="", max_length=100)
+    adminEmail: str = Field(default="", max_length=320)
+    adminName: str = Field(default="", max_length=100)
+    organizationName: str = Field(min_length=2, max_length=128)
+
+    @field_validator("organizationName")
+    @classmethod
+    def strip_organization_name(cls, value: str) -> str:
+        return value.strip()
+
+
 class PasswordLoginRequest(BaseModel):
     identifier: str | None = Field(default=None, min_length=3, max_length=320)
     email: str | None = Field(default=None, min_length=3, max_length=320)
@@ -5696,6 +5709,20 @@ class ReviewOrderRequest(BaseModel):
     @field_validator("note")
     @classmethod
     def strip_note(cls, value: str) -> str:
+        return value.strip()
+
+
+class OrganizationTopupOrderRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    amount: float = Field(gt=0)
+    paymentMethod: Literal["", "alipay", "wxpay"] = ""
+    channel: Literal["manual_qr"] = "manual_qr"
+    idempotencyKey: str = Field(default="", max_length=128)
+
+    @field_validator("idempotencyKey", "paymentMethod")
+    @classmethod
+    def strip_order_text(cls, value: str) -> str:
         return value.strip()
 
 
@@ -6707,6 +6734,53 @@ async def register(data: RegisterRequest, request: Request) -> dict[str, Any]:
     return {"ok": True, "user": payload, "message": "注册成功，请登录"}
 
 
+@app.post("/api/auth/enterprise/register")
+async def enterprise_register(data: EnterpriseRegisterRequest, request: Request) -> dict[str, Any]:
+    """Create a verified enterprise administrator and a pending tenant."""
+    require_signup_ready()
+    await enforce_csrf(request)
+    await verify_turnstile(request, data.turnstileToken)
+    email = validate_public_signup_email(data.email or data.adminEmail)
+    admin_name = (data.name or data.adminName).strip()
+    if not admin_name:
+        raise auth_http_error(400, "请输入企业管理员姓名", "AUTH_INVALID_INPUT")
+    await enforce_rate_limit("register_ip", request_ip(request), 10, 3600)
+    if await auth_store_call("get_user_by_email", email):
+        raise auth_http_error(409, "该邮箱已注册，请直接登录", "AUTH_EMAIL_EXISTS")
+    try:
+        password_hash = await asyncio.to_thread(hash_password, data.password)
+        user = await auth_store_call(
+            "create_user_from_verification", email, admin_name, password_hash,
+            "signup", hash_auth_token(data.verificationCode.strip()), status="active",
+            account_type="enterprise_managed", identity_status="pending_approval",
+        )
+        if user is None:
+            raise auth_http_error(400, "验证码无效或已过期", "AUTH_CODE_INVALID")
+        organization = await organization_store_call(
+            "create_organization_with_admin", data.organizationName, admin_name, email,
+            _require_capability=False,
+        )
+        member = organization.get("member") or organization.get("admin") or {}
+        organization_id = str((organization.get("organization") or {}).get("id") or "")
+        member_id = str(member.get("id") or "")
+        if organization_real_enabled() and organization_id and member_id:
+            await organization_store_call(
+                "set_member_account", organization_id, member_id, str(user["id"]),
+                _require_capability=False,
+            )
+        await auth_store_call("record_audit_event", "enterprise_registered", str(user["id"]), email, request_ip(request), True, {"organizationId": organization_id})
+    except (DuplicateEmailError, OrganizationConflictError, DuplicateMemberEmailError) as exc:
+        raise auth_http_error(409, "企业名称或管理员邮箱已存在", "ENTERPRISE_ALREADY_EXISTS") from exc
+    except ValueError as exc:
+        raise auth_http_error(400, str(exc), "AUTH_INVALID_INPUT") from exc
+    return {
+        "ok": True,
+        "status": "pending_approval",
+        "organization": organization.get("organization"),
+        "message": "企业注册申请已提交，平台完成开通后即可登录使用",
+    }
+
+
 @app.post("/api/auth/login")
 async def password_login(data: PasswordLoginRequest, request: Request) -> dict[str, Any]:
     require_password_login_ready()
@@ -6859,6 +6933,11 @@ def self_service_billing_available(user: dict[str, Any]) -> bool:
     An SSO employee uses a department budget and never self-serves top-ups.
     """
 
+    if local_mock_enabled():
+        # Mock dev-login identities are personal by default; enterprise demo
+        # identities carry an organization id and keep the enterprise billing
+        # contract instead.
+        return not bool(user.get("organizationId") or user.get("organization_id"))
     if not billing.billing_enabled():
         return False
     store = billing_store()
@@ -6874,6 +6953,17 @@ def self_service_billing_available(user: dict[str, Any]) -> bool:
 @app.get("/api/auth/scope")
 async def auth_scope(request: Request) -> dict[str, Any]:
     user = require_user(request)
+    if local_mock_enabled() and not user.get("id"):
+        # Loopback mock customers have no durable auth row; keep the scope
+        # endpoint side-effect free while still exposing personal billing.
+        return {
+            "isTeamLeader": False,
+            "teamBoardStatus": "none",
+            "team": None,
+            "leaderTeams": [],
+            **(await organization_scope_fields_for_user(user)),
+            "billingAvailable": True,
+        }
     if organization_demo_enabled() and user.get("isPlatformAdmin"):
         # The seller's local customer-console demo is fully side-effect free.
         # Do not wait on the legacy upstream team resolver merely to bootstrap
@@ -7240,6 +7330,8 @@ async def accept_organization_claim(
 
 @app.get("/api/organization/current")
 async def organization_current(request: Request) -> dict[str, Any]:
+    if not organization_enabled():
+        raise HTTPException(status_code=404, detail="企业组织功能尚未启用")
     require_real_organization_capability()
     user = await require_organization_directory_viewer(request)
     return await organization_current_payload(user)
@@ -7359,6 +7451,8 @@ async def organization_current_billing(
 ) -> dict[str, Any]:
     """Return a customer administrator's isolated Mock enterprise credit balance."""
 
+    if not organization_enabled():
+        raise HTTPException(status_code=404, detail="企业组织功能尚未启用")
     require_real_organization_capability()
     user = await require_organization_billing_viewer(request)
     organization_id = organization_identifier(organization_current_member(user))
@@ -7369,7 +7463,7 @@ async def organization_current_billing(
             page=page,
             page_size=pageSize,
         )
-        return {**payload, "mockTopupEnabled": billing.mock_payment_enabled()}
+        return {**payload, "mockTopupEnabled": billing.mock_payment_enabled(), "enterprisePayment": billing.enterprise_qr_config()}
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
 
@@ -7422,6 +7516,51 @@ async def organization_current_billing_topup(
     except OrganizationStoreError as exc:
         raise organization_store_error(exc) from exc
     return {"ok": True, **result}
+
+
+@app.get("/api/organization/current/billing/orders")
+async def organization_billing_orders(
+    request: Request,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    user = await require_organization_billing_viewer(request)
+    store = require_billing_store()
+    organization_id = organization_identifier(organization_current_member(user))
+    orders = await store.list_organization_orders(organization_id, limit, offset)
+    return {"config": billing.enterprise_qr_config(), "orders": orders}
+
+
+@app.post("/api/organization/current/billing/orders")
+async def create_organization_billing_order(data: OrganizationTopupOrderRequest, request: Request) -> dict[str, Any]:
+    await enforce_csrf(request)
+    user = await require_organization_billing_topup_operator(request)
+    if not billing.enterprise_qr_enabled():
+        raise HTTPException(status_code=503, detail="企业收款码充值暂未开放")
+    try:
+        amount = billing.normalize_amount(data.amount)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    organization_id = organization_identifier(organization_current_member(user))
+    trade_no = billing.generate_trade_no(f"org:{organization_id}")
+    order = await require_billing_store().create_organization_order(
+        trade_no, organization_id, str(user.get("id") or ""), data.channel,
+        amount, billing.money_for_amount(amount), billing.exchange_rate(),
+        data.paymentMethod, data.idempotencyKey,
+    )
+    return {"ok": True, "order": order, "payment": billing.enterprise_qr_config()}
+
+
+@app.post("/api/organization/current/billing/orders/{trade_no}/submit")
+async def submit_organization_billing_order(trade_no: str, data: SubmitManualPaymentRequest, request: Request) -> dict[str, Any]:
+    await enforce_csrf(request)
+    user = await require_organization_billing_topup_operator(request)
+    organization_id = organization_identifier(organization_current_member(user))
+    try:
+        order = await require_billing_store().submit_organization_payment(trade_no, organization_id, data.payerNote)
+    except BillingStoreError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "order": order, "reviewMinutes": billing.manual_review_minutes()}
 
 
 @app.post("/api/organization/current/departments")
@@ -13038,6 +13177,10 @@ async def billing_identity(request: Request) -> tuple[dict[str, Any], str]:
     才能拿到权限，若在这里挡住，新用户永远无法自助开通。
     """
     app_user = require_user(request)
+    if local_mock_enabled() and not app_user.get("id"):
+        email = str(app_user.get("email") or "local.customer@example.com").strip().lower()
+        mock_id = f"mock:{email}"
+        return {**app_user, "id": mock_id, "accountType": "personal"}, email.split("@", 1)[0]
     if str(
         app_user.get("accountType") or app_user.get("account_type") or "personal"
     ) == "enterprise_managed":
@@ -13173,7 +13316,7 @@ async def my_billing(
         spent_usd = 0.0
     account["spentUsd"] = spent_usd
     account["balanceUsd"] = max(0.0, float(account["topupTotalUsd"]) - spent_usd)
-    return {"config": billing.public_config(), "account": account, "orders": orders}
+    return {"config": billing.public_config(local_mock=local_mock_enabled()), "account": account, "orders": orders}
 
 
 @app.post("/api/me/billing/redeem")
@@ -13201,7 +13344,7 @@ async def create_topup_order(data: CreateTopupOrderRequest, request: Request) ->
     store = require_billing_store()
     app_user, upstream_user_id = await billing_identity(request)
     channel = data.channel
-    if channel == CHANNEL_MOCK and not billing.mock_payment_enabled():
+    if channel == CHANNEL_MOCK and not (billing.mock_payment_enabled() or local_mock_enabled()):
         raise HTTPException(status_code=503, detail="模拟充值暂未开放")
     if channel == CHANNEL_EPAY and not billing.epay_enabled():
         # 自动支付未开通时优先退到收款码渠道，别把用户堵在死路上。
@@ -13526,6 +13669,67 @@ async def admin_retry_billing_sync(request: Request) -> dict[str, Any]:
     require_admin(request)
     repaired = await retry_pending_billing_sync()
     return {"ok": True, "repaired": repaired, "pendingSyncCount": await store.pending_sync_count()}
+
+
+@app.get("/api/admin/organization-billing/orders")
+async def admin_list_organization_billing_orders(
+    request: Request,
+    keyword: str = Query("", max_length=100),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    require_platform_admin(request)
+    return await require_billing_store().list_all_organization_orders(keyword, limit, offset)
+
+
+@app.post("/api/admin/organization-billing/orders/{trade_no}/complete")
+async def admin_complete_organization_billing_order(
+    trade_no: str, request: Request, data: ReviewOrderRequest | None = None
+) -> dict[str, Any]:
+    await enforce_csrf(request)
+    admin = require_platform_admin(request)
+    store = require_billing_store()
+    order = await store.get_organization_order(trade_no)
+    if order is None:
+        raise HTTPException(status_code=404, detail="企业充值订单不存在")
+    try:
+        result = await store.settle_organization_order(
+            trade_no,
+            reviewed_by=str(admin.get("email") or ""),
+            review_note=(data.note if data else "") or "管理员确认企业到账",
+        )
+    except BillingStoreError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if result.get("settled") or order.get("status") == "success":
+        ledger = organization_store()
+        if not isinstance(ledger, PostgreSQLOrganizationRepository):
+            raise HTTPException(status_code=503, detail="企业账本暂不可用")
+        try:
+            record = await ledger.adjust_billing(
+                order["organizationId"], operation="grant", amount_usd=order["amountUsd"],
+                reason="企业收款码充值到账", operator=str(admin.get("email") or "平台运营"),
+                operator_email=str(admin.get("email") or ""), external_reference=trade_no,
+                idempotency_key=f"enterprise-topup:{trade_no}",
+            )
+        except OrganizationStoreError as exc:
+            raise organization_store_error(exc) from exc
+        return {"ok": True, "settled": bool(result.get("settled")), "order": result["order"], "record": record}
+    return {"ok": True, "settled": False, "order": result["order"]}
+
+
+@app.post("/api/admin/organization-billing/orders/{trade_no}/reject")
+async def admin_reject_organization_billing_order(
+    trade_no: str, request: Request, data: ReviewOrderRequest | None = None
+) -> dict[str, Any]:
+    await enforce_csrf(request)
+    admin = require_platform_admin(request)
+    changed = await require_billing_store().fail_organization_order(
+        trade_no, reviewed_by=str(admin.get("email") or ""),
+        review_note=(data.note if data else "") or "管理员驳回企业充值订单",
+    )
+    if not changed:
+        raise HTTPException(status_code=400, detail="该订单已被处理或不存在")
+    return {"ok": True}
 
 
 @app.get("/api/models")

@@ -75,6 +75,38 @@ CREATE TABLE IF NOT EXISTS billing_redemption (
     used_at TIMESTAMPTZ
 );
 
+-- Enterprise orders are deliberately separate from personal billing_order.
+CREATE TABLE IF NOT EXISTS organization_billing_order (
+    trade_no TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL,
+    operator_user_id TEXT NOT NULL DEFAULT '',
+    channel TEXT NOT NULL,
+    amount_usd NUMERIC(16,6) NOT NULL,
+    money_cny NUMERIC(12,2) NOT NULL DEFAULT 0,
+    exchange_rate NUMERIC(10,4) NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    payment_method TEXT NOT NULL DEFAULT '',
+    upstream_trade_no TEXT NOT NULL DEFAULT '',
+    payer_note TEXT NOT NULL DEFAULT '',
+    review_note TEXT NOT NULL DEFAULT '',
+    reviewed_by TEXT NOT NULL DEFAULT '',
+    external_reference TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT NOT NULL DEFAULT '',
+    notify_payload JSONB,
+    sync_state TEXT NOT NULL DEFAULT '',
+    sync_error TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL,
+    submitted_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS organization_billing_order_idempotency_idx
+    ON organization_billing_order(organization_id, idempotency_key)
+    WHERE idempotency_key <> '';
+CREATE INDEX IF NOT EXISTS organization_billing_order_org_idx
+    ON organization_billing_order(organization_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS organization_billing_order_status_idx
+    ON organization_billing_order(status, created_at);
+
 CREATE INDEX IF NOT EXISTS billing_redemption_status_idx
     ON billing_redemption (status, created_at DESC);
 """
@@ -216,6 +248,112 @@ class BillingStore:
             "topupTotalUsd": _money(row["topup_total_usd"]),
             "updatedAt": _iso(row["updated_at"]),
         }
+
+    @staticmethod
+    def _organization_order_payload(row: Any) -> dict[str, Any]:
+        return {
+            "tradeNo": str(row["trade_no"]),
+            "organizationId": str(row["organization_id"]),
+            "operatorUserId": str(row["operator_user_id"] or ""),
+            "channel": str(row["channel"]),
+            "amountUsd": _money(row["amount_usd"]),
+            "moneyCny": _money(row["money_cny"]),
+            "exchangeRate": _money(row["exchange_rate"]),
+            "status": str(row["status"]),
+            "paymentMethod": str(row["payment_method"] or ""),
+            "upstreamTradeNo": str(row["upstream_trade_no"] or ""),
+            "payerNote": str(row["payer_note"] or ""),
+            "reviewNote": str(row["review_note"] or ""),
+            "reviewedBy": str(row["reviewed_by"] or ""),
+            "externalReference": str(row["external_reference"] or ""),
+            "idempotencyKey": str(row["idempotency_key"] or ""),
+            "syncState": str(row["sync_state"] or ""),
+            "syncError": str(row["sync_error"] or ""),
+            "createdAt": _iso(row["created_at"]),
+            "submittedAt": _iso(row["submitted_at"]),
+            "completedAt": _iso(row["completed_at"]),
+        }
+
+    async def create_organization_order(
+        self, trade_no: str, organization_id: str, operator_user_id: str,
+        channel: str, amount_usd: float, money_cny: float, exchange_rate: float,
+        payment_method: str, idempotency_key: str = "",
+    ) -> dict[str, Any]:
+        pool = self._require_pool()
+        try:
+            row = await pool.fetchrow(
+                """INSERT INTO organization_billing_order
+                (trade_no,organization_id,operator_user_id,channel,amount_usd,money_cny,
+                 exchange_rate,status,payment_method,idempotency_key,created_at)
+                VALUES($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,now())
+                ON CONFLICT (organization_id,idempotency_key) WHERE idempotency_key <> ''
+                DO UPDATE SET trade_no=organization_billing_order.trade_no
+                RETURNING *""",
+                trade_no, organization_id, operator_user_id, channel, amount_usd,
+                money_cny, exchange_rate, payment_method, idempotency_key,
+            )
+        except Exception as exc:
+            raise BillingStoreError("创建企业充值订单失败") from exc
+        return self._organization_order_payload(row)
+
+    async def get_organization_order(self, trade_no: str) -> dict[str, Any] | None:
+        row = await self._require_pool().fetchrow(
+            "SELECT * FROM organization_billing_order WHERE trade_no=$1", str(trade_no)
+        )
+        return self._organization_order_payload(row) if row else None
+
+    async def list_organization_orders(self, organization_id: str, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        pool = self._require_pool()
+        rows = await pool.fetch(
+            "SELECT * FROM organization_billing_order WHERE organization_id=$1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+            organization_id, limit, offset,
+        )
+        total = await pool.fetchval("SELECT count(*) FROM organization_billing_order WHERE organization_id=$1", organization_id)
+        return {"items": [self._organization_order_payload(row) for row in rows], "total": int(total or 0), "limit": limit, "offset": offset}
+
+    async def list_all_organization_orders(self, keyword: str = "", limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        pool = self._require_pool()
+        needle = f"%{str(keyword or '').strip()}%"
+        rows = await pool.fetch(
+            "SELECT * FROM organization_billing_order WHERE ($1='' OR trade_no ILIKE $2 OR organization_id ILIKE $2) ORDER BY created_at DESC LIMIT $3 OFFSET $4",
+            str(keyword or '').strip(), needle, limit, offset,
+        )
+        total = await pool.fetchval(
+            "SELECT count(*) FROM organization_billing_order WHERE ($1='' OR trade_no ILIKE $2 OR organization_id ILIKE $2)",
+            str(keyword or '').strip(), needle,
+        )
+        return {"items": [self._organization_order_payload(row) for row in rows], "total": int(total or 0), "limit": limit, "offset": offset}
+
+    async def submit_organization_payment(self, trade_no: str, organization_id: str, payer_note: str) -> dict[str, Any]:
+        row = await self._require_pool().fetchrow(
+            "UPDATE organization_billing_order SET payer_note=$3, submitted_at=now() WHERE trade_no=$1 AND organization_id=$2 AND status='pending' RETURNING *",
+            trade_no, organization_id, str(payer_note or '')[:500],
+        )
+        if row is None:
+            raise BillingStoreError("企业充值订单不存在或已处理")
+        return self._organization_order_payload(row)
+
+    async def settle_organization_order(self, trade_no: str, *, reviewed_by: str = "", review_note: str = "", upstream_trade_no: str = "") -> dict[str, Any]:
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow("SELECT * FROM organization_billing_order WHERE trade_no=$1 FOR UPDATE", trade_no)
+                if row is None:
+                    raise BillingStoreError("企业充值订单不存在")
+                if str(row["status"]) != ORDER_PENDING:
+                    return {"settled": False, "order": self._organization_order_payload(row)}
+                updated = await conn.fetchrow(
+                    "UPDATE organization_billing_order SET status='success', upstream_trade_no=$2, reviewed_by=$3, review_note=$4, completed_at=now(), sync_state='pending' WHERE trade_no=$1 RETURNING *",
+                    trade_no, upstream_trade_no, str(reviewed_by or '')[:254], str(review_note or '')[:500],
+                )
+        return {"settled": True, "order": self._organization_order_payload(updated)}
+
+    async def fail_organization_order(self, trade_no: str, *, reviewed_by: str = "", review_note: str = "") -> bool:
+        result = await self._require_pool().execute(
+            "UPDATE organization_billing_order SET status='failed', reviewed_by=$2, review_note=$3, completed_at=now() WHERE trade_no=$1 AND status='pending'",
+            trade_no, str(reviewed_by or '')[:254], str(review_note or '')[:500],
+        )
+        return result.endswith("1")
 
     # ---- 订单 ----
 
