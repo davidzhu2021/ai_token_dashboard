@@ -146,7 +146,7 @@ class MockBillingStore:
             "userId": str(user_id), "balanceUsd": 0.0, "topupTotalUsd": 0.0, "updatedAt": "",
         }))
 
-    async def create_order(self, trade_no: str, user_id: str, channel: str, amount_usd: float, money_cny: float, exchange_rate: float, payment_method: str = "", status: str = "pending") -> dict[str, Any]:
+    async def create_order(self, trade_no: str, user_id: str, channel: str, amount_usd: float, money_cny: float, exchange_rate: float, payment_method: str = "", cursor_amount_usd: float = 0.0, claude_code_amount_usd: float = 0.0, status: str = "pending") -> dict[str, Any]:
         now = datetime.now(timezone.utc).isoformat()
         self.orders[str(trade_no)] = {
             "tradeNo": str(trade_no), "userId": str(user_id), "channel": str(channel),

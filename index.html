@@ -8966,6 +8966,15 @@
                   />
                   <p id="topupError" class="field-error" aria-live="polite"></p>
                 </div>
+                <div class="field">
+                  <label for="cursorAmountUsd">Cursor 分配额度（美元）</label>
+                  <input id="cursorAmountUsd" class="input" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0" />
+                </div>
+                <div class="field">
+                  <label for="claudeCodeAmountUsd">Claude Code 分配额度（美元）</label>
+                  <input id="claudeCodeAmountUsd" class="input" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0" />
+                </div>
+                <p id="topupAllocationHint" class="hint">请将充值总额分配到 Cursor 和 Claude Code，两项合计必须等于充值额度。</p>
                 <div id="topupMethodRow" class="billing-method-row" role="radiogroup" aria-label="支付方式"></div>
                 <p id="topupPayable" class="billing-payable">应付 ¥0.00</p>
                 <button id="topupSubmit" class="primary-btn" type="submit">立即充值</button>

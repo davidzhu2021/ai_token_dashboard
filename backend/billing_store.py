@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import os
 import secrets
 from datetime import datetime, timezone
@@ -53,6 +54,9 @@ ALTER TABLE billing_order ADD COLUMN IF NOT EXISTS payer_note TEXT NOT NULL DEFA
 ALTER TABLE billing_order ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMPTZ;
 ALTER TABLE billing_order ADD COLUMN IF NOT EXISTS review_note TEXT NOT NULL DEFAULT '';
 ALTER TABLE billing_order ADD COLUMN IF NOT EXISTS reviewed_by TEXT NOT NULL DEFAULT '';
+ALTER TABLE billing_order ADD COLUMN IF NOT EXISTS cursor_amount_usd NUMERIC(16,6) NOT NULL DEFAULT 0;
+ALTER TABLE billing_order ADD COLUMN IF NOT EXISTS claude_code_amount_usd NUMERIC(16,6) NOT NULL DEFAULT 0;
+ALTER TABLE billing_order ADD COLUMN IF NOT EXISTS key_sync JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE INDEX IF NOT EXISTS billing_order_user_idx
     ON billing_order (user_id, created_at DESC);
@@ -137,6 +141,7 @@ ORDER_COLUMNS = """
     trade_no, user_id, channel, amount_usd, money_cny, exchange_rate,
     status, payment_method, upstream_trade_no, sync_state, sync_error,
     payer_note, review_note, reviewed_by, submitted_at,
+    cursor_amount_usd, claude_code_amount_usd, key_sync,
     created_at, completed_at
 """
 
@@ -366,6 +371,8 @@ class BillingStore:
         money_cny: float,
         exchange_rate: float,
         payment_method: str = "",
+        cursor_amount_usd: float = 0.0,
+        claude_code_amount_usd: float = 0.0,
         status: str = ORDER_PENDING,
     ) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
@@ -374,9 +381,10 @@ class BillingStore:
                 """
                 INSERT INTO billing_order (
                     trade_no, user_id, channel, amount_usd, money_cny,
-                    exchange_rate, status, payment_method, created_at
+                    exchange_rate, status, payment_method, cursor_amount_usd,
+                    claude_code_amount_usd, created_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 RETURNING trade_no, status
                 """,
                 str(trade_no),
@@ -387,6 +395,8 @@ class BillingStore:
                 _as_decimal(exchange_rate),
                 str(status),
                 str(payment_method or ""),
+                _as_decimal(cursor_amount_usd),
+                _as_decimal(claude_code_amount_usd),
                 now,
             )
         except Exception as exc:  # pragma: no cover - 依赖真实驱动的唯一键冲突
@@ -416,6 +426,9 @@ class BillingStore:
             "payerNote": str(row["payer_note"] or ""),
             "reviewNote": str(row["review_note"] or ""),
             "reviewedBy": str(row["reviewed_by"] or ""),
+            "cursorAmountUsd": _money(row["cursor_amount_usd"]),
+            "claudeCodeAmountUsd": _money(row["claude_code_amount_usd"]),
+            "keySync": row["key_sync"] if isinstance(row["key_sync"], dict) else {},
             "submittedAt": _iso(row["submitted_at"]),
             "createdAt": _iso(row["created_at"]),
             "completedAt": _iso(row["completed_at"]),
@@ -662,6 +675,19 @@ class BillingStore:
             str(state),
             str(error or "")[:500],
         )
+
+    async def mark_key_sync(self, trade_no: str, details: dict[str, Any], error: str = "") -> None:
+        await self._require_pool().execute(
+            "UPDATE billing_order SET key_sync=$2::jsonb, sync_error=$3 WHERE trade_no=$1",
+            str(trade_no), json.dumps(details, ensure_ascii=False), str(error or "")[:500],
+        )
+
+    async def allocated_totals(self, user_id: str) -> dict[str, float]:
+        row = await self._require_pool().fetchrow(
+            "SELECT COALESCE(SUM(cursor_amount_usd),0) AS cursor, COALESCE(SUM(claude_code_amount_usd),0) AS claude FROM billing_order WHERE user_id=$1 AND status=$2",
+            str(user_id), ORDER_SUCCESS,
+        )
+        return {"cursor": _money(row["cursor"]), "claude": _money(row["claude"])}
 
     async def pending_sync_orders(self, limit: int = 50) -> list[dict[str, Any]]:
         rows = await self._require_pool().fetch(

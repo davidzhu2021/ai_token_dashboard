@@ -5679,9 +5679,15 @@ async function submitTopup(event) {
   event?.preventDefault();
   if (isCreatingTopup) return;
   const amount = Number(el("topupAmount")?.value || 0);
+  const cursorAmountUsd = Number(el("cursorAmountUsd")?.value || 0);
+  const claudeCodeAmountUsd = Number(el("claudeCodeAmountUsd")?.value || 0);
   setFieldError("topupError", "");
   if (!Number.isFinite(amount) || amount <= 0) {
     setFieldError("topupError", "请输入有效的充值额度");
+    return;
+  }
+  if (cursorAmountUsd < 0 || claudeCodeAmountUsd < 0 || cursorAmountUsd + claudeCodeAmountUsd <= 0 || Math.abs(cursorAmountUsd + claudeCodeAmountUsd - amount) > 0.001) {
+    setFieldError("topupError", "Cursor 与 Claude Code 分配金额必须大于 0 且合计等于充值额度");
     return;
   }
   const minTopup = Number(billingConfig?.minTopupUsd || 0);
@@ -5704,7 +5710,7 @@ async function submitTopup(event) {
   try {
     const payload = await api("/api/me/billing/orders", {
       method: "POST",
-      body: JSON.stringify({ amount, paymentMethod: channel === "mock" ? "mock" : method, channel }),
+      body: JSON.stringify({ amount, cursorAmountUsd, claudeCodeAmountUsd, paymentMethod: channel === "mock" ? "mock" : method, channel }),
     });
     pendingTopupTradeNo = String(payload.tradeNo || "");
     if (payload.channel === "mock") {
@@ -5712,6 +5718,7 @@ async function submitTopup(event) {
         ? "充值已到账，但访问 Key 正在补偿生成，请稍后刷新或联系管理员。"
         : "模拟充值已完成，未发起真实付款。额度已立即到账，访问 Key 已刷新。");
       await refreshEntitlementAfterTopup();
+      await loadKeys(true);
     } else if (payload.channel === "manual_qr") {
       showManualPayPanel(payload);
       startTopupPolling();
@@ -5721,6 +5728,7 @@ async function submitTopup(event) {
     }
     if (payload.channel !== "mock") startTopupPolling();
     await loadBillingData(true);
+    await loadKeys(true);
   } catch (error) {
     setFieldError("topupError", error.message || "创建充值订单失败，请稍后重试");
   } finally {

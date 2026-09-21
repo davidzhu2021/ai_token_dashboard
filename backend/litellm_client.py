@@ -1550,6 +1550,70 @@ class LiteLLMClient:
                 return records
             page += 1
 
+    async def personal_template_key(self, kind: str, backend: LiteLLMBackend | None = None) -> dict[str, Any]:
+        """Read the live 198 template key used for personal tool accounts."""
+        if kind not in {"cursor", "claude-code"}:
+            raise HTTPException(status_code=400, detail="不支持的客户端类型")
+        backend = backend or self.backends[0]
+        payload = await self.request_backend(backend, "GET", "/key/list", params={"page": 1, "size": 100, "return_full_object": "true"})
+        records = _records(payload)
+        prefix = f"{kind}-liuguoxian-"
+        candidates = []
+        for record in records:
+            alias = _clean_text(_first(record, "key_alias", "keyAlias", "alias", default=""))
+            if not alias.startswith(prefix) or alias.endswith("-test"):
+                continue
+            if bool(_first(record, "blocked", "disabled", default=False)):
+                continue
+            identity = self.report_only_key_identity(record)
+            key_hash = identity["hash"]
+            info_payload = await self.request_backend(
+                backend, "GET", "/key/info", params={"key": key_hash}
+            )
+            info = info_payload.get("info") if isinstance(info_payload, dict) else None
+            if not isinstance(info, dict):
+                continue
+            models = self._clean_model_list(info.get("models"))
+            aliases = info.get("aliases") if isinstance(info.get("aliases"), dict) else {}
+            if not models:
+                continue
+            candidates.append({"alias": alias, "info": info, "models": models, "aliases": aliases})
+        if len(candidates) != 1:
+            raise HTTPException(status_code=503, detail=f"未能唯一确定 {kind} 模板 Key，请联系管理员")
+        return candidates[0]
+
+    async def create_personal_template_key(
+        self, user_id: str, kind: str, account_alias: str, *, max_budget: float, changed_by: str
+    ) -> dict[str, str]:
+        template = await self.personal_template_key(kind)
+        info = template["info"]
+        body: dict[str, Any] = {
+            "key_alias": f"{kind}-{account_alias}-{secrets.token_hex(2)}",
+            "key_type": "llm_api",
+            "user_id": user_id,
+            "models": template["models"],
+            "aliases": template["aliases"],
+            "max_budget": max(0.0, float(max_budget)),
+            "budget_duration": _first(info, "budget_duration", "budgetDuration", default="1d") or "1d",
+            "metadata": {"display_name": f"{kind} 充值访问密钥", "purpose": "topup", "created_via": "ai-usage-center"},
+        }
+        for field in ("max_parallel_requests", "tpm_limit", "rpm_limit", "model_max_budget", "config", "permissions", "object_permission"):
+            if field in info:
+                body[field] = info[field]
+        payload = await self.request_backend(backend := self.backends[0], "POST", "/key/generate", headers={"litellm-changed-by": changed_by}, json=body)
+        token = _clean_text(_first(payload, "key", "token", default=""))
+        if not token.startswith("sk-"):
+            raise HTTPException(status_code=502, detail="上游未返回新的访问密钥")
+        key_id = _clean_text(_first(payload, "token_id", "token_hash", "token", default=""))
+        if not key_id or key_id.startswith("sk-"):
+            key_id = safe_key_id(token)
+        verify_payload = await self.request_backend(backend, "GET", "/key/info", params={"key": key_id})
+        verified = verify_payload.get("info") if isinstance(verify_payload, dict) else None
+        if not isinstance(verified, dict) or self._clean_model_list(verified.get("models")) != template["models"] or (verified.get("aliases") or {}) != template["aliases"]:
+            raise HTTPException(status_code=502, detail="新密钥模型或映射与模板不一致")
+        await self.ensure_personal_key_budget(backend, key_id, changed_by, user_id, max_budget=max(0.0, float(max_budget)), budget_duration=body["budget_duration"])
+        return {"key": token, "id": key_id, "masked": mask_key(token)}
+
     @staticmethod
     def report_only_key_identity(record: dict[str, Any]) -> dict[str, Any]:
         """Normalize a persisted key row without accepting cleartext credentials.

@@ -5692,6 +5692,8 @@ class CreateTopupOrderRequest(BaseModel):
     amount: float = Field(gt=0)
     paymentMethod: Literal["", "alipay", "wxpay", "mock"] = ""
     channel: Literal["epay", "manual_qr", "mock"] = "epay"
+    cursorAmountUsd: float = Field(default=0, ge=0)
+    claudeCodeAmountUsd: float = Field(default=0, ge=0)
 
 
 class SubmitManualPaymentRequest(BaseModel):
@@ -13235,10 +13237,14 @@ async def apply_topup_entitlement(trade_no: str, user_id: str, upstream_user_id:
     """
     store = require_billing_store()
     account = await store.get_account(user_id)
+    order = await store.get_order(trade_no)
     try:
-        result = await billing.sync_upstream_entitlement(
-            client(), upstream_user_id, float(account["topupTotalUsd"])
-        )
+        if order and (float(order.get("cursorAmountUsd") or 0) > 0 or float(order.get("claudeCodeAmountUsd") or 0) > 0):
+            result = {"budget": 0.0, "models": [], "keys": []}
+        else:
+            result = await billing.sync_upstream_entitlement(
+                client(), upstream_user_id, float(account["topupTotalUsd"])
+            )
     except Exception as exc:
         error = f"{exc.__class__.__name__}: {exc}"
         await store.mark_sync_state(trade_no, SYNC_PENDING, error)
@@ -13248,7 +13254,15 @@ async def apply_topup_entitlement(trade_no: str, user_id: str, upstream_user_id:
     # 权限可能刚被放开，清缓存让前端立刻看到可用状态。
     local_entitlement_cache.delete(f"local-entitlement:{upstream_user_id}")
     try:
-        key_result = await ensure_personal_key_after_entitlement(user_id, upstream_user_id)
+        if order and (float(order.get("cursorAmountUsd") or 0) > 0 or float(order.get("claudeCodeAmountUsd") or 0) > 0):
+            allocations = await store.allocated_totals(user_id)
+            key_result = await ensure_template_keys_after_entitlement(
+                user_id,
+                allocations["cursor"],
+                allocations["claude"],
+            )
+        else:
+            key_result = await ensure_personal_key_after_entitlement(user_id, upstream_user_id)
     except Exception as exc:
         error = f"key_provisioning:{exc.__class__.__name__}: {exc}"[:500]
         await store.mark_sync_state(trade_no, SYNC_PENDING, error)
@@ -13273,6 +13287,50 @@ async def ensure_personal_key_after_entitlement(user_id: str, upstream_user_id: 
     )
     warning = store_created_key(upstream_user_id, created)
     return {"created": True, "keyCount": 1, "keyId": created.get("id"), "warning": warning}
+
+
+async def ensure_template_keys_after_entitlement(
+    user_id: str, cursor_amount: float, claude_code_amount: float
+) -> dict[str, Any]:
+    """Provision the two 198 tool keys from live liuguoxian templates."""
+    local_user = await auth_store_call("get_user", user_id)
+    if not local_user:
+        raise HTTPException(status_code=404, detail="本地账号不存在")
+    stable = str(user_id)
+    email = str(local_user.get("email") or "").strip().lower()
+    suffix = email.split("@", 1)[0] or stable[:8]
+    results: dict[str, Any] = {}
+    for kind, amount in (("cursor", cursor_amount), ("claude-code", claude_code_amount)):
+        if amount <= 0:
+            results[kind] = {"skipped": True}
+            continue
+        upstream_id = f"{kind}-{suffix}"
+        try:
+            info = await client().user_info(upstream_id)
+            actual = str(info.get("user_id") or info.get("userId") or "") if isinstance(info, dict) else ""
+            if actual != upstream_id:
+                raise HTTPException(status_code=502, detail=f"{kind} 工具账号归属校验失败")
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            await client().create_internal_user(upstream_id, email, str(local_user.get("name") or ""))
+        # The generated key must be authorized on the tool user first; the
+        # template models are the sole source of truth for this grant.
+        template = await client().personal_template_key(kind)
+        await client().set_user_budget(upstream_id, amount)
+        await client().grant_default_models(upstream_id, template["models"])
+        keys = await client().keys_for_user_ids([upstream_id], refresh=True)
+        active = [item for item in keys if str(item.get("status") or "正常") not in {"已停用", "已删除", "blocked"}]
+        if active:
+            await client().set_user_budget(upstream_id, amount)
+            results[kind] = {"created": False, "keyCount": len(active), "userId": upstream_id}
+            continue
+        created = await client().create_personal_template_key(
+            upstream_id, kind, suffix, max_budget=amount, changed_by="billing-provisioning"
+        )
+        warning = store_created_key(upstream_id, created)
+        results[kind] = {"created": True, "keyCount": 1, "userId": upstream_id, "warning": warning}
+    return results
 
 
 async def retry_pending_billing_sync(limit: int = 20) -> int:
@@ -13357,6 +13415,12 @@ async def create_topup_order(data: CreateTopupOrderRequest, request: Request) ->
         amount = billing.normalize_amount(data.amount)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    cursor_amount = round(float(data.cursorAmountUsd), 6)
+    claude_amount = round(float(data.claudeCodeAmountUsd), 6)
+    if cursor_amount <= 0 and claude_amount <= 0:
+        raise HTTPException(status_code=400, detail="至少分配一类客户端额度")
+    if abs(cursor_amount + claude_amount - amount) > 0.000001:
+        raise HTTPException(status_code=400, detail="Cursor 与 Claude Code 分配金额必须等于充值总额")
     money = 0.0 if channel == CHANNEL_MOCK else billing.money_for_amount(amount)
     if channel != CHANNEL_MOCK and money < 0.01:
         raise HTTPException(status_code=400, detail="充值金额过小，请提高充值额度")
@@ -13390,6 +13454,8 @@ async def create_topup_order(data: CreateTopupOrderRequest, request: Request) ->
             money,
             billing.exchange_rate(),
             "mock" if channel == CHANNEL_MOCK else data.paymentMethod,
+            cursor_amount,
+            claude_amount,
         )
     except BillingStoreError as exc:
         raise HTTPException(status_code=500, detail="创建充值订单失败，请稍后重试") from exc
@@ -13397,6 +13463,8 @@ async def create_topup_order(data: CreateTopupOrderRequest, request: Request) ->
         "tradeNo": trade_no,
         "channel": channel,
         "amountUsd": amount,
+        "cursorAmountUsd": cursor_amount,
+        "claudeCodeAmountUsd": claude_amount,
         "moneyCny": money,
         "paymentMethod": "mock" if channel == CHANNEL_MOCK else data.paymentMethod,
     }
