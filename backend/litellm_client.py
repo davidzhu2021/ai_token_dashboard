@@ -2461,7 +2461,7 @@ class LiteLLMClient:
                         backend,
                         email_lower,
                         name,
-                        lambda user_id, source: her_matches.append((user_id, source)),
+                        lambda matched_backend, user_id, source: her_matches.append((user_id, source)),
                     )
                 except HTTPException as exc:
                     # Her is an optional secondary source. Its legacy index
