@@ -4227,6 +4227,13 @@ def add_usage_totals(target: dict[str, Any], row: dict[str, Any]) -> None:
     target["spend"] += float(row.get("spend") or 0)
 
 
+def aggregate_usage_totals(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    totals = empty_usage_totals()
+    for row in rows:
+        add_usage_totals(totals, row)
+    return totals
+
+
 def reaggregate_team_employees_after_model_filter(
     employees: list[dict[str, Any]], rows: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -4806,7 +4813,7 @@ async def person_usage_rows(email: str, name: str | None, start_date: str, end_d
     return payload["rows"], user_ids
 
 
-async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: str, source: str, employee: str | None, refresh: bool = False) -> dict[str, Any]:
+async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: str, source: str, employee: str | None, refresh: bool = False, model: list[str] | None = None) -> dict[str, Any]:
     request_started = asyncio.get_running_loop().time()
     revision = "development-upstream"
     if usage_store() is not None:
@@ -4845,6 +4852,33 @@ async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: 
                 stored = dict(stored)
                 last_synced = stored.pop("lastSyncedAt", None)
                 attach_snapshot_freshness(stored, last_synced, start_date, end_date, revision)
+                default_scope = source == "all" and not employee and not (model or [])
+                if default_scope:
+                    try:
+                        live = await client().global_activity_totals(start_date, end_date)
+                    except Exception as exc:
+                        live = {"available": False, "complete": False, "totals": empty_usage_totals(), "perBackend": {}, "missingBackends": ["unknown"], "source": "upstream_global_activity", "errorCode": exc.__class__.__name__}
+                    snapshot_totals = aggregate_usage_totals(stored.get("summaryRows") or stored.get("rows") or [])
+                    live_totals = live.get("totals") or empty_usage_totals()
+                    # /global/activity exposes requests and tokens only. Keep
+                    # status/spend fields from the same snapshot rather than
+                    # displaying fabricated zeroes for unsupported metrics.
+                    live_totals["spend"] = snapshot_totals.get("spend", 0.0)
+                    live_totals["successCount"] = snapshot_totals.get("successCount", 0)
+                    live_totals["failureCount"] = snapshot_totals.get("failureCount", 0)
+                    live["totals"] = live_totals
+                    live["differenceFromSnapshot"] = {
+                        field: abs(float(live_totals.get(field, 0)) - float(snapshot_totals.get(field, 0))) / max(1.0, abs(float(snapshot_totals.get(field, 0))))
+                        for field in ("totalTokens", "requestCount", "spend")
+                    }
+                    if not live.get("complete"):
+                        quality = dict(stored.get("dataQuality") or {})
+                        quality.update({"liveTotalsStatus": "partial", "liveTotalsSource": "database_snapshot", "missingBackends": live.get("missingBackends") or [], "liveTotalsReason": "实时汇总不可用"})
+                        stored["dataQuality"] = quality
+                        live.update({"available": False, "fallback": True, "fallbackSource": "database_snapshot"})
+                    else:
+                        live["fallback"] = False
+                    stored["liveTotals"] = live
                 admin_usage_cache.set(cache_key, stored, env_int("ADMIN_USAGE_CACHE_TTL_SECONDS", 300))
                 stored["cache"] = {"hit": False, "ttlSeconds": 0}
                 return stored
@@ -10164,7 +10198,7 @@ async def admin_usage(
     source_filter = normalize_usage_sources(source)
     source = next(iter(source_filter), "all") if len(source_filter) <= 1 else "all"
     start_date, end_date = resolve_usage_range(start_date, end_date)
-    payload = apply_usage_source_filter(apply_usage_model_filter(await admin_usage_payload(admin, start_date, end_date, source, employee, refresh), model), list(source_filter))
+    payload = apply_usage_source_filter(apply_usage_model_filter(await admin_usage_payload(admin, start_date, end_date, source, employee, refresh, model), model), list(source_filter))
     return {
         "admin": {"email": admin["email"], "name": admin["name"]},
         "startDate": start_date,

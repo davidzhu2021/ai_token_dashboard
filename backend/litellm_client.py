@@ -4122,6 +4122,51 @@ class LiteLLMClient:
             raise HTTPException(status_code=502, detail="上游全员用量响应缺少日期字段")
         return sorted(rows, key=lambda item: (item["date"], item["model"]))
 
+    async def global_activity_totals(self, start_date: str, end_date: str) -> dict[str, Any]:
+        """Read the upstream global request/token totals independently per backend."""
+        totals = self._usage_totals([])
+        per_backend: dict[str, dict[str, Any]] = {}
+        missing: list[str] = []
+        for backend in self.backends:
+            result: dict[str, Any] = {
+                "backend": backend.id, "status": "ok", "totals": self._usage_totals([]),
+                "pagesRead": 1, "totalPages": 1, "totalRecords": 0,
+                "complete": False, "errorCode": "",
+            }
+            try:
+                payload = await self.request_backend(
+                    backend, "GET", "/global/activity",
+                    params={"start_date": start_date, "end_date": end_date},
+                )
+                if not isinstance(payload, dict):
+                    raise ValueError("malformed global activity response")
+                rows = payload.get("daily_data") or payload.get("data") or payload.get("results") or []
+                if not isinstance(rows, list):
+                    raise ValueError("malformed global activity rows")
+                item_totals = self._usage_totals([])
+                item_totals["requestCount"] = _as_int(_first(payload, "sum_api_requests", "sumApiRequests"))
+                item_totals["totalTokens"] = _as_int(_first(payload, "sum_total_tokens", "sumTotalTokens"))
+                if not item_totals["requestCount"]:
+                    item_totals["requestCount"] = sum(_as_int(_first(row, "api_requests", "requestCount")) for row in rows if isinstance(row, dict))
+                if not item_totals["totalTokens"]:
+                    item_totals["totalTokens"] = sum(_as_int(_first(row, "total_tokens", "totalTokens")) for row in rows if isinstance(row, dict))
+                result.update({"totals": item_totals, "totalRecords": len(rows), "complete": True})
+            except Exception as exc:
+                result.update({"status": "error", "complete": False, "errorCode": exc.__class__.__name__})
+                missing.append(backend.id)
+            per_backend[backend.id] = result
+            if result["complete"]:
+                for field in totals:
+                    totals[field] += result["totals"].get(field, 0)
+        return {
+            "available": bool(per_backend) and not missing,
+            "complete": bool(per_backend) and not missing,
+            "totals": totals,
+            "perBackend": per_backend,
+            "missingBackends": missing,
+            "source": "upstream_global_activity",
+        }
+
     async def admin_usage_rows(self, start_date: str, end_date: str, source: str | None, employee: str | None = None) -> dict[str, Any]:
         employee_filter = (employee or "").strip().lower()
         grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
@@ -4233,6 +4278,7 @@ class LiteLLMClient:
 
     async def admin_usage_compare(self, start_date: str, end_date: str, source: str | None) -> dict[str, Any]:
         payload = await self.admin_usage_rows(start_date, end_date, source, None)
+        live = await self.global_activity_totals(start_date, end_date) if not source or source == "all" else {"available": False, "missingBackends": []}
         rows = payload.get("rows", [])
         summary_rows = payload.get("summaryRows", [])
         employee_ids = {str(row.get("employeeId") or "") for row in rows}
@@ -4265,6 +4311,10 @@ class LiteLLMClient:
                 )
                 for field in ("totalTokens", "requestCount", "spend")
             },
+            "liveTotals": live,
+            "liveTotalsStatus": "complete" if live.get("complete") else "partial",
+            "liveTotalsSource": live.get("source", "upstream_global_activity"),
+            "missingBackends": live.get("missingBackends", []),
         }
 
     async def team_map(self, backend: LiteLLMBackend | None = None) -> dict[str, dict[str, str]]:

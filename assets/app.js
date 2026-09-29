@@ -31,6 +31,7 @@ let personalDataQuality = null;
 let personalCoverage = null;
 let adminDataFreshness = null;
 let adminDataQuality = null;
+let adminLiveTotals = null;
 let adminCoverage = null;
 let departmentDataFreshness = null;
 let departmentDataQuality = null;
@@ -1951,13 +1952,14 @@ function renderDailyOverview(config) {
     sideSub = "当前筛选范围",
     showShare = false,
     compactSingleDay = false,
+    totalsOverride = null,
   } = config;
   const latest = latestUsageDay(data, summary);
   const latestDate = latest.date || "";
-  const rangeTokens = sum(data, "totalTokens");
-  const rangeSpend = sum(data, "spend");
-  const rangeRequests = sum(data, "requestCount");
-  const rangeSuccesses = sum(data, "successCount");
+  const rangeTokens = totalsOverride ? Number(totalsOverride.totalTokens || 0) : sum(data, "totalTokens");
+  const rangeSpend = totalsOverride ? Number(totalsOverride.spend || 0) : sum(data, "spend");
+  const rangeRequests = totalsOverride ? Number(totalsOverride.requestCount || 0) : sum(data, "requestCount");
+  const rangeSuccesses = totalsOverride ? Number(totalsOverride.successCount || 0) : sum(data, "successCount");
   const baseId = prefix ? `${prefix}Hero` : "hero";
   const personalOverview = el("personalDailyOverview");
   const teamOverview = el("teamDailyOverview");
@@ -2249,6 +2251,9 @@ function updateAdminChartTitles() {
 
 function renderAdminMetrics(data) {
   const totalData = adminSummaryData.length ? adminSummaryData : data;
+  const liveTotals = (!selectedAdminEmployee && !dashboardModelQueryValues().length && !selectedDashboardSources.size)
+    ? adminLiveTotals?.totals
+    : null;
   const label = rangeLabel();
   const source = sourceText();
   const scope = organizationUsageScope();
@@ -2262,6 +2267,7 @@ function renderAdminMetrics(data) {
     sideLabel: "活跃员工",
     sideValue: adminEmployees.length,
     sideSub: "当前筛选范围",
+    totalsOverride: adminLiveTotals?.fallback ? null : liveTotals,
   });
   el("adminAvgSpendWrap")?.classList.add("hidden");
   el("adminDailyOverview")?.classList.remove("personal-single-day");
@@ -4973,6 +4979,16 @@ function updateTopupPayable() {
   if (billingChannel() === "mock") {
     setText("topupPayable", "无需付款 · 模拟充值");
     return;
+  }
+  if (quality.liveTotalsStatus) {
+    const missing = Array.isArray(quality.missingBackends) && quality.missingBackends.length
+      ? `；缺失来源：${quality.missingBackends.join("、")}`
+      : "";
+    return {
+      tone: "warning",
+      title: "实时汇总暂不可用",
+      description: `当前显示最近有效快照${missing}`,
+    };
   }
   const payable = topupPayableAmount();
   setText("topupPayable", payable > 0 ? `应付 ${formatCny(payable)}` : "应付 ¥0.00");
@@ -10241,6 +10257,7 @@ function loadAdminData(forceRefresh = false) {
       adminEmployees = payload.employees || [];
       adminDataFreshness = payload.dataFreshness || null;
       adminDataQuality = payload.dataQuality || null;
+      adminLiveTotals = payload.liveTotals || null;
       adminCoverage = payload.coverage || null;
       adminUsageScopeKey = scopeKey;
       lastAdminUsageCacheHit = Boolean(payload.cache?.hit);
@@ -10706,6 +10723,7 @@ function showLogin() {
   adminUsageRequestController?.abort();
   adminUsageData = [];
   adminSummaryData = [];
+  adminLiveTotals = null;
   adminEmployees = [];
   adminDataQuality = null;
   adminCoverage = null;
