@@ -4856,23 +4856,45 @@ async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: 
                 default_scope = source == "all" and not employee and not (model or [])
                 if default_scope:
                     try:
-                        live = await client().global_activity_totals(start_date, end_date)
+                        activity_live, spend_live = await asyncio.gather(
+                            client().global_activity_totals(start_date, end_date),
+                            client().global_spend_totals(start_date, end_date),
+                        )
                     except Exception as exc:
-                        live = {"available": False, "complete": False, "totals": empty_usage_totals(), "perBackend": {}, "missingBackends": ["unknown"], "source": "upstream_global_activity", "errorCode": exc.__class__.__name__}
+                        activity_live = {"available": False, "complete": False, "totals": empty_usage_totals(), "perBackend": {}, "missingBackends": ["unknown"], "source": "upstream_global_activity", "errorCode": exc.__class__.__name__}
+                        spend_live = {"available": False, "complete": False, "totals": empty_usage_totals(), "perBackend": {}, "missingBackends": ["unknown"], "source": "spend_logs_ui", "errorCode": exc.__class__.__name__}
                     snapshot_totals = aggregate_usage_totals(stored.get("summaryRows") or stored.get("rows") or [])
-                    live_totals = live.get("totals") or empty_usage_totals()
-                    live["totals"] = live_totals
+                    activity_totals = activity_live.get("totals") or empty_usage_totals()
+                    spend_totals = spend_live.get("totals") or empty_usage_totals()
+                    live = {
+                        "activityTotals": activity_totals,
+                        "spendTotals": spend_totals if spend_live.get("complete") else {"spend": None},
+                        "totals": {**activity_totals, "spend": spend_totals.get("spend") if spend_live.get("complete") else None},
+                        "perBackendActivity": activity_live.get("perBackend") or {},
+                        "perBackendSpend": spend_live.get("perBackend") or {},
+                        "activitySource": "daily_activity_aggregated",
+                        "spendSource": "spend_logs_ui",
+                        "complete": bool(activity_live.get("complete") and spend_live.get("complete")),
+                        "activityStatus": "complete" if activity_live.get("complete") else "partial",
+                        "spendStatus": "complete" if spend_live.get("complete") else "unavailable",
+                        "spendAvailable": bool(spend_live.get("complete")),
+                        "spendFallback": False,
+                        "missingActivityBackends": activity_live.get("missingBackends") or [],
+                        "missingSpendBackends": spend_live.get("missingBackends") or [],
+                        "missingBackends": list(dict.fromkeys((activity_live.get("missingBackends") or []) + (spend_live.get("missingBackends") or []))),
+                        "source": "upstream_global_activity_and_spend_logs",
+                    }
                     live["differenceFromSnapshot"] = {
-                        field: abs(float(live_totals.get(field, 0)) - float(snapshot_totals.get(field, 0))) / max(1.0, abs(float(snapshot_totals.get(field, 0))))
+                        field: abs(float((activity_totals if field != "spend" or spend_live.get("complete") else {}).get(field, 0) or 0) - float(snapshot_totals.get(field, 0))) / max(1.0, abs(float(snapshot_totals.get(field, 0))))
                         for field in ("totalTokens", "requestCount", "spend")
                     }
-                    if not live.get("complete"):
-                        quality = dict(stored.get("dataQuality") or {})
-                        quality.update({"liveTotalsStatus": "partial", "liveTotalsSource": "database_snapshot", "missingBackends": live.get("missingBackends") or [], "liveTotalsReason": "实时汇总不可用"})
-                        stored["dataQuality"] = quality
-                        live.update({"available": False, "fallback": True, "fallbackSource": "database_snapshot"})
-                    else:
-                        live["fallback"] = False
+                    quality = dict(stored.get("dataQuality") or {})
+                    if not activity_live.get("complete"):
+                        quality.update({"liveTotalsStatus": "partial", "liveTotalsSource": "daily_activity_aggregated", "missingBackends": live["missingBackends"], "liveTotalsReason": "实时活动汇总不可用"})
+                    if not spend_live.get("complete"):
+                        quality.update({"liveSpendStatus": "unavailable", "liveSpendSource": "spend_logs_ui", "missingSpendBackends": live["missingSpendBackends"], "liveSpendReason": "实时金额暂不可用，未显示可能不完整的金额"})
+                    stored["dataQuality"] = quality
+                    live["available"] = bool(activity_live.get("complete") or spend_live.get("complete"))
                     stored["liveTotals"] = live
                 admin_usage_cache.set(cache_key, stored, env_int("ADMIN_USAGE_CACHE_TTL_SECONDS", 300))
                 stored["cache"] = {"hit": False, "ttlSeconds": 0}

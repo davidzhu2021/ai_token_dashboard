@@ -4173,6 +4173,105 @@ class LiteLLMClient:
             "source": "upstream_global_activity",
         }
 
+    async def global_spend_totals(self, start_date: str, end_date: str) -> dict[str, Any]:
+        """Aggregate Spend Logs using the same source as the upstream Cost UI."""
+        totals = self._usage_totals([])
+        per_backend: dict[str, dict[str, Any]] = {}
+        missing: list[str] = []
+        page_size = 100
+        max_pages = max(1, _env_int("ADMIN_LIVE_SPEND_MAX_PAGES", 5000))
+        utc_start, utc_end = _local_date_window_as_utc_text(start_date, end_date)
+        for backend in self.backends:
+            backend_totals = self._usage_totals([])
+            result = {
+                "backend": backend.id, "status": "ok", "spend": 0.0,
+                "totals": backend_totals,
+                "recordsRead": 0, "pagesRead": 0, "totalPages": 0,
+                "totalRecords": 0, "complete": False, "errorCode": "",
+            }
+            seen_ids: set[str] = set()
+            try:
+                for page in range(1, max_pages + 1):
+                    payload = await self.request_backend(
+                        backend, "GET", "/spend/logs/ui",
+                        params={
+                            "start_date": utc_start,
+                            "end_date": utc_end,
+                            "page": page,
+                            "page_size": page_size,
+                            "sort_by": "startTime",
+                            "sort_order": "asc",
+                        },
+                    )
+                    if not isinstance(payload, dict):
+                        raise ValueError("malformed spend logs response")
+                    logs = _records(payload)
+                    total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=0))
+                    total_records = _as_int(_first(payload, "total", "total_count", "count", default=0))
+                    has_more = bool(_first(payload, "has_more", "hasMore", default=False))
+                    result["pagesRead"] = page
+                    result["totalPages"] = max(result["totalPages"], total_pages)
+                    result["totalRecords"] = max(result["totalRecords"], total_records)
+                    if not logs:
+                        # An empty page before a declared final page means the
+                        # upstream pagination contract was not fulfilled.
+                        result["complete"] = not total_pages or page >= total_pages
+                        if not result["complete"]:
+                            result["errorCode"] = "UnexpectedEmptyPage"
+                        break
+                    for log in logs:
+                        request_id = _clean_text(_first(log, "request_id", "requestId", "litellm_call_id", default=""))
+                        identity = request_id or json.dumps(
+                            {key: log.get(key) for key in ("startTime", "user", "model", "spend", "total_tokens")},
+                            sort_keys=True, default=str,
+                        )
+                        if identity in seen_ids:
+                            continue
+                        seen_ids.add(identity)
+                        result["recordsRead"] += 1
+                        totals_row = {
+                            "promptTokens": _as_int(_first(log, "prompt_tokens", "promptTokens")),
+                            "completionTokens": _as_int(_first(log, "completion_tokens", "completionTokens")),
+                            "totalTokens": _as_int(_first(log, "total_tokens", "totalTokens")),
+                            "requestCount": 1,
+                            "spend": _as_number(_first(log, "spend", "cost", "total_spend")),
+                        }
+                        status = _clean_text(log.get("status")).lower()
+                        if "fail" in status or "error" in status:
+                            totals_row["failureCount"] = 1
+                        else:
+                            totals_row["successCount"] = 1
+                        for field in backend_totals:
+                            backend_totals[field] += totals_row.get(field, 0)
+                    if total_pages and page >= total_pages:
+                        result["complete"] = True
+                        break
+                    if not total_pages and not has_more and len(logs) < page_size:
+                        result["complete"] = True
+                        break
+                else:
+                    result["errorCode"] = "PageLimitExceeded"
+                if not result["complete"]:
+                    raise RuntimeError(result["errorCode"] or "incomplete spend logs pagination")
+                result["totals"] = backend_totals
+                result["spend"] = backend_totals["spend"]
+                for field in totals:
+                    totals[field] += backend_totals[field]
+            except Exception as exc:
+                result["status"] = "error"
+                result["complete"] = False
+                result["errorCode"] = result.get("errorCode") or exc.__class__.__name__
+                missing.append(backend.id)
+            per_backend[backend.id] = result
+        return {
+            "available": bool(per_backend) and not missing,
+            "complete": bool(per_backend) and not missing,
+            "totals": totals,
+            "perBackend": per_backend,
+            "missingBackends": missing,
+            "source": "spend_logs_ui",
+        }
+
     async def admin_usage_rows(self, start_date: str, end_date: str, source: str | None, employee: str | None = None) -> dict[str, Any]:
         employee_filter = (employee or "").strip().lower()
         grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
@@ -4284,7 +4383,14 @@ class LiteLLMClient:
 
     async def admin_usage_compare(self, start_date: str, end_date: str, source: str | None) -> dict[str, Any]:
         payload = await self.admin_usage_rows(start_date, end_date, source, None)
-        live = await self.global_activity_totals(start_date, end_date) if not source or source == "all" else {"available": False, "missingBackends": []}
+        if not source or source == "all":
+            live_activity, live_spend = await asyncio.gather(
+                self.global_activity_totals(start_date, end_date),
+                self.global_spend_totals(start_date, end_date),
+            )
+        else:
+            live_activity = {"available": False, "missingBackends": []}
+            live_spend = {"available": False, "missingBackends": []}
         rows = payload.get("rows", [])
         summary_rows = payload.get("summaryRows", [])
         employee_ids = {str(row.get("employeeId") or "") for row in rows}
@@ -4317,10 +4423,18 @@ class LiteLLMClient:
                 )
                 for field in ("totalTokens", "requestCount", "spend")
             },
-            "liveTotals": live,
-            "liveTotalsStatus": "complete" if live.get("complete") else "partial",
-            "liveTotalsSource": live.get("source", "upstream_global_activity"),
-            "missingBackends": live.get("missingBackends", []),
+            "liveActivityTotals": live_activity.get("totals", {}),
+            "liveSpendTotals": live_spend.get("totals", {}) if live_spend.get("complete") else {},
+            "perBackendActivity": live_activity.get("perBackend", {}),
+            "perBackendSpend": live_spend.get("perBackend", {}),
+            "missingActivityBackends": live_activity.get("missingBackends", []),
+            "missingSpendBackends": live_spend.get("missingBackends", []),
+            "activitySource": "daily_activity_aggregated",
+            "spendSource": "spend_logs_ui",
+            "spendPagesRead": sum(_as_int(item.get("pagesRead")) for item in (live_spend.get("perBackend") or {}).values()),
+            "spendTotalPages": sum(_as_int(item.get("totalPages")) for item in (live_spend.get("perBackend") or {}).values()),
+            "spendTotalRecords": sum(_as_int(item.get("totalRecords")) for item in (live_spend.get("perBackend") or {}).values()),
+            "spendCompleteness": "complete" if live_spend.get("complete") else "unavailable",
         }
 
     async def team_map(self, backend: LiteLLMBackend | None = None) -> dict[str, dict[str, str]]:

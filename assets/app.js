@@ -1957,6 +1957,7 @@ function renderDailyOverview(config) {
   const latest = latestUsageDay(data, summary);
   const latestDate = latest.date || "";
   const rangeTokens = totalsOverride ? Number(totalsOverride.totalTokens || 0) : sum(data, "totalTokens");
+  const spendUnavailable = Boolean(totalsOverride && totalsOverride.spendAvailable === false);
   const rangeSpend = totalsOverride ? Number(totalsOverride.spend || 0) : sum(data, "spend");
   const rangeRequests = totalsOverride ? Number(totalsOverride.requestCount || 0) : sum(data, "requestCount");
   const rangeSuccesses = totalsOverride ? Number(totalsOverride.successCount || 0) : sum(data, "successCount");
@@ -1973,7 +1974,7 @@ function renderDailyOverview(config) {
 
   setText(`${baseId}TotalLabel`, totalLabel);
   setDailyTokenValue(`${baseId}Total`, formatTokens(rangeTokens));
-  setText(`${baseId}Spend`, money.format(rangeSpend));
+  setText(`${baseId}Spend`, spendUnavailable ? "暂不可用" : money.format(rangeSpend));
   setText(`${baseId}Requests`, fmt.format(rangeRequests));
   setText(`${baseId}RequestsSub`, "所选范围累计");
   setText(`${baseId}Success`, successRateText(rangeRequests, rangeSuccesses));
@@ -2252,7 +2253,7 @@ function updateAdminChartTitles() {
 function renderAdminMetrics(data) {
   const totalData = adminSummaryData.length ? adminSummaryData : data;
   const liveTotals = (!selectedAdminEmployee && !dashboardModelQueryValues().length && !selectedDashboardSources.size)
-    ? adminLiveTotals?.totals
+    ? (adminLiveTotals ? { ...(adminLiveTotals.activityTotals || adminLiveTotals.totals || {}), spend: adminLiveTotals.spendAvailable ? adminLiveTotals.spendTotals?.spend : null, spendAvailable: adminLiveTotals.spendAvailable !== false } : null)
     : null;
   const label = rangeLabel();
   const source = sourceText();
@@ -2267,7 +2268,7 @@ function renderAdminMetrics(data) {
     sideLabel: "活跃员工",
     sideValue: adminEmployees.length,
     sideSub: "当前筛选范围",
-    totalsOverride: adminLiveTotals?.fallback ? null : liveTotals,
+    totalsOverride: liveTotals,
   });
   el("adminAvgSpendWrap")?.classList.add("hidden");
   el("adminDailyOverview")?.classList.remove("personal-single-day");
@@ -4979,6 +4980,16 @@ function updateTopupPayable() {
   if (billingChannel() === "mock") {
     setText("topupPayable", "无需付款 · 模拟充值");
     return;
+  }
+  if (quality.liveSpendStatus === "unavailable" || quality.liveSpendStatus === "partial") {
+    const missing = Array.isArray(quality.missingSpendBackends) && quality.missingSpendBackends.length
+      ? `；缺失来源：${quality.missingSpendBackends.join("、")}`
+      : "";
+    return {
+      tone: "warning",
+      title: "实时金额暂不可用",
+      description: `未显示可能不完整的金额${missing}`,
+    };
   }
   if (quality.liveTotalsStatus) {
     const missing = Array.isArray(quality.missingBackends) && quality.missingBackends.length
