@@ -4991,6 +4991,13 @@ function updateTopupPayable() {
       description: `未显示可能不完整的金额${missing}`,
     };
   }
+  if (quality.liveCacheStatus === "stale") {
+    return {
+      tone: "warning",
+      title: "实时汇总正在刷新",
+      description: "当前数据来自最近缓存，可能有短暂延迟。",
+    };
+  }
   if (quality.liveTotalsStatus) {
     const missing = Array.isArray(quality.missingBackends) && quality.missingBackends.length
       ? `；缺失来源：${quality.missingBackends.join("、")}`

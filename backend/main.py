@@ -38,7 +38,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.types import Scope
 
-from .cache import AsyncJSONCache, TTLCache
+from .cache import AsyncJSONCache, AsyncStaleJSONCache, TTLCache
 from .auth import (
     SESSION_USER_KEY,
     allowed_email_domain,
@@ -223,6 +223,7 @@ async def app_lifespan(_app: FastAPI):
     await start_billing_store()
     await start_organization_service()
     await start_usage_sync()
+    start_admin_live_totals_prefetch()
     if _litellm_stability_reader is not None:
         try:
             await _litellm_stability_reader.start()
@@ -232,6 +233,7 @@ async def app_lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        await stop_admin_live_totals_prefetch()
         await stop_observability_warmup()
         if _litellm_stability_reader is not None:
             await _litellm_stability_reader.close()
@@ -380,6 +382,21 @@ try:
 except ValueError:
     _observability_drilldown_ttl = 60
 _observability_drilldown_cache = AsyncJSONCache(ttl_seconds=_observability_drilldown_ttl)
+def _startup_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+_admin_live_totals_cache = AsyncStaleJSONCache(
+    ttl_seconds=max(1, _startup_env_int("ADMIN_LIVE_TOTALS_CACHE_TTL_SECONDS", 60)),
+    stale_seconds=max(1, _startup_env_int("ADMIN_LIVE_TOTALS_STALE_SECONDS", 300)),
+)
+_admin_live_refresh_tasks: dict[str, asyncio.Task[Any]] = {}
+_admin_live_refresh_lock = asyncio.Lock()
+_admin_live_prefetch_task: asyncio.Task[Any] | None = None
+_admin_live_prefetch_stop: asyncio.Event | None = None
 _usage_singleflight: dict[str, asyncio.Task[Any]] = {}
 _usage_singleflight_lock = asyncio.Lock()
 _usage_last_good_payloads: dict[str, dict[str, Any]] = {}
@@ -4131,6 +4148,113 @@ def admin_usage_cache_key(email: str, start_date: str, end_date: str, source: st
     return f"admin-usage:v7:{revision}:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(employee or '').strip().lower()}:{model_key}"
 
 
+def admin_live_totals_cache_key(kind: str, start_date: str, end_date: str) -> str:
+    backend_ids = []
+    try:
+        backend_ids = sorted(str(item.id) for item in client().backends)
+    except Exception:
+        backend_ids = []
+    fingerprint = hashlib.sha256(
+        json.dumps({"backends": backend_ids, "timezone": usage_timezone_offset_minutes()}, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"admin-live:v2:{kind}:{start_date}:{end_date}:{fingerprint}"
+
+
+async def _refresh_admin_live_totals(kind: str, start_date: str, end_date: str, key: str) -> dict[str, Any]:
+    started = asyncio.get_running_loop().time()
+    try:
+        operation = client().global_activity_totals(start_date, end_date) if kind == "activity" else client().global_spend_totals(start_date, end_date)
+        value = await asyncio.wait_for(operation, timeout=max(5, env_int("ADMIN_LIVE_TOTALS_REFRESH_TIMEOUT_SECONDS", 120)))
+        value = dict(value or {})
+        value["complete"] = bool(value.get("complete"))
+        value["cachedAt"] = datetime.now(timezone.utc).isoformat()
+        value["refreshDurationMs"] = round((asyncio.get_running_loop().time() - started) * 1000, 1)
+        # Never replace a good cache with an incomplete multi-backend result.
+        if value["complete"]:
+            await _admin_live_totals_cache.set(key, value)
+        return {"value": value, "cacheStatus": "fresh" if value["complete"] else "miss", "cacheAgeSeconds": 0, "refreshInProgress": False, "refreshError": ""}
+    finally:
+        task = asyncio.current_task()
+        if task is not None and _admin_live_refresh_tasks.get(key) is task:
+            _admin_live_refresh_tasks.pop(key, None)
+
+
+async def get_live_totals_cached(kind: str, start_date: str, end_date: str, refresh: bool = False) -> dict[str, Any]:
+    key = admin_live_totals_cache_key(kind, start_date, end_date)
+    cached = None if refresh else await _admin_live_totals_cache.get(key)
+    ttl = max(1, env_int("ADMIN_LIVE_TOTALS_CACHE_TTL_SECONDS", 60))
+    stale = max(ttl, env_int("ADMIN_LIVE_TOTALS_STALE_SECONDS", 300))
+    if cached and isinstance(cached.get("value"), dict):
+        age = float(cached.get("ageSeconds") or 0)
+        if age <= ttl and not refresh:
+            return {"value": cached["value"], "cacheStatus": "fresh", "cacheAgeSeconds": age, "refreshInProgress": False, "refreshError": ""}
+        if age <= stale and not refresh:
+            async with _admin_live_refresh_lock:
+                task = _admin_live_refresh_tasks.get(key)
+                if task is None or task.done():
+                    task = asyncio.create_task(_refresh_admin_live_totals(kind, start_date, end_date, key))
+                    _admin_live_refresh_tasks[key] = task
+                    task.add_done_callback(lambda completed: completed.exception() if not completed.cancelled() else None)
+            return {"value": cached["value"], "cacheStatus": "stale", "cacheAgeSeconds": age, "refreshInProgress": True, "refreshError": ""}
+    async with _admin_live_refresh_lock:
+        task = _admin_live_refresh_tasks.get(key)
+        if task is None or task.done():
+            task = asyncio.create_task(_refresh_admin_live_totals(kind, start_date, end_date, key))
+            _admin_live_refresh_tasks[key] = task
+            task.add_done_callback(lambda completed: completed.exception() if not completed.cancelled() else None)
+    try:
+        return await asyncio.shield(task)
+    except Exception as exc:
+        if cached and isinstance(cached.get("value"), dict):
+            return {"value": cached["value"], "cacheStatus": "stale", "cacheAgeSeconds": cached.get("ageSeconds", 0), "refreshInProgress": False, "refreshError": exc.__class__.__name__}
+        return {"value": {"available": False, "complete": False, "missingBackends": ["unknown"], "errorCode": exc.__class__.__name__}, "cacheStatus": "miss", "cacheAgeSeconds": 0, "refreshInProgress": False, "refreshError": exc.__class__.__name__}
+
+
+async def admin_live_totals_prefetch_loop() -> None:
+    stop = _admin_live_prefetch_stop
+    interval = max(30, env_int("ADMIN_LIVE_TOTALS_PREFETCH_INTERVAL_SECONDS", 60))
+    while stop is None or not stop.is_set():
+        today = usage_today()
+        windows = [(today - timedelta(days=days - 1)).isoformat() for days in (1, 3)]
+        for start_date in windows:
+            try:
+                await asyncio.gather(
+                    get_live_totals_cached("activity", start_date, today.isoformat()),
+                    get_live_totals_cached("spend", start_date, today.isoformat()),
+                )
+            except Exception as exc:
+                logger.warning("admin live totals prefetch failed error=%s", exc.__class__.__name__)
+        if stop is None:
+            await asyncio.sleep(interval)
+        else:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+
+
+def start_admin_live_totals_prefetch() -> None:
+    global _admin_live_prefetch_task, _admin_live_prefetch_stop
+    if not env_bool("ADMIN_LIVE_TOTALS_PREFETCH_ENABLED", True) or _admin_live_prefetch_task is not None:
+        return
+    _admin_live_prefetch_stop = asyncio.Event()
+    _admin_live_prefetch_task = asyncio.create_task(admin_live_totals_prefetch_loop(), name="admin-live-totals-prefetch")
+
+
+async def stop_admin_live_totals_prefetch() -> None:
+    global _admin_live_prefetch_task, _admin_live_prefetch_stop
+    if _admin_live_prefetch_stop is not None:
+        _admin_live_prefetch_stop.set()
+    if _admin_live_prefetch_task is not None:
+        _admin_live_prefetch_task.cancel()
+        try:
+            await _admin_live_prefetch_task
+        except asyncio.CancelledError:
+            pass
+    _admin_live_prefetch_task = None
+    _admin_live_prefetch_stop = None
+
+
 def department_usage_cache_key(email: str, start_date: str, end_date: str, source: str, department: str | None, revision: str = "") -> str:
     return f"department-usage:v7:{revision}:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(department or '').strip().lower()}"
 
@@ -4855,14 +4979,12 @@ async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: 
                 attach_snapshot_freshness(stored, last_synced, start_date, end_date, revision)
                 default_scope = source == "all" and not employee and not (model or [])
                 if default_scope:
-                    try:
-                        activity_live, spend_live = await asyncio.gather(
-                            client().global_activity_totals(start_date, end_date),
-                            client().global_spend_totals(start_date, end_date),
-                        )
-                    except Exception as exc:
-                        activity_live = {"available": False, "complete": False, "totals": empty_usage_totals(), "perBackend": {}, "missingBackends": ["unknown"], "source": "upstream_global_activity", "errorCode": exc.__class__.__name__}
-                        spend_live = {"available": False, "complete": False, "totals": empty_usage_totals(), "perBackend": {}, "missingBackends": ["unknown"], "source": "spend_logs_ui", "errorCode": exc.__class__.__name__}
+                    activity_cached, spend_cached = await asyncio.gather(
+                        get_live_totals_cached("activity", start_date, end_date, refresh),
+                        get_live_totals_cached("spend", start_date, end_date, refresh),
+                    )
+                    activity_live = activity_cached.get("value") or {}
+                    spend_live = spend_cached.get("value") or {}
                     snapshot_totals = aggregate_usage_totals(stored.get("summaryRows") or stored.get("rows") or [])
                     activity_totals = activity_live.get("totals") or empty_usage_totals()
                     spend_totals = spend_live.get("totals") or empty_usage_totals()
@@ -4883,12 +5005,17 @@ async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: 
                         "missingSpendBackends": spend_live.get("missingBackends") or [],
                         "missingBackends": list(dict.fromkeys((activity_live.get("missingBackends") or []) + (spend_live.get("missingBackends") or []))),
                         "source": "upstream_global_activity_and_spend_logs",
+                        "cacheStatus": "stale" if "stale" in {activity_cached.get("cacheStatus"), spend_cached.get("cacheStatus")} else ("miss" if "miss" in {activity_cached.get("cacheStatus"), spend_cached.get("cacheStatus")} else "fresh"),
+                        "cacheAgeSeconds": max(float(activity_cached.get("cacheAgeSeconds") or 0), float(spend_cached.get("cacheAgeSeconds") or 0)),
+                        "refreshInProgress": bool(activity_cached.get("refreshInProgress") or spend_cached.get("refreshInProgress")),
+                        "refreshError": ";".join(str(item) for item in (activity_cached.get("refreshError"), spend_cached.get("refreshError")) if item),
                     }
                     live["differenceFromSnapshot"] = {
                         field: abs(float((activity_totals if field != "spend" or spend_live.get("complete") else {}).get(field, 0) or 0) - float(snapshot_totals.get(field, 0))) / max(1.0, abs(float(snapshot_totals.get(field, 0))))
                         for field in ("totalTokens", "requestCount", "spend")
                     }
                     quality = dict(stored.get("dataQuality") or {})
+                    quality.update({"liveCacheStatus": live.get("cacheStatus"), "liveCacheAgeSeconds": live.get("cacheAgeSeconds"), "liveRefreshInProgress": live.get("refreshInProgress", False), "liveRefreshError": live.get("refreshError", "")})
                     if not activity_live.get("complete"):
                         quality.update({"liveTotalsStatus": "partial", "liveTotalsSource": "daily_activity_aggregated", "missingBackends": live["missingBackends"], "liveTotalsReason": "实时活动汇总不可用"})
                     if not spend_live.get("complete"):

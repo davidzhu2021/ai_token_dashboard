@@ -136,3 +136,55 @@ class AsyncJSONCache:
                 self._generations[key] = self._generations.get(key, 0) + 1
                 self._tasks.pop(key, None)
         self._local.clear()
+
+
+class AsyncStaleJSONCache:
+    """Redis-backed JSON cache that keeps values readable past the fresh TTL."""
+
+    def __init__(self, *, url: str | None = None, ttl_seconds: int = 60, stale_seconds: int = 300) -> None:
+        self._url = url if url is not None else os.getenv("USAGE_REDIS_URL", "").strip()
+        self._ttl_seconds = max(1, ttl_seconds)
+        self._stale_seconds = max(self._ttl_seconds, stale_seconds)
+        self._client: Any | None = None
+        self._local: dict[str, CacheEntry] = {}
+
+    async def _redis(self) -> Any | None:
+        if not self._url or redis is None:
+            return None
+        if self._client is None:
+            self._client = redis.from_url(
+                self._url, decode_responses=True, socket_connect_timeout=0.2, socket_timeout=0.2
+            )
+        return self._client
+
+    async def get(self, key: str) -> dict[str, Any] | None:
+        entry = self._local.get(key)
+        now = time.time()
+        if entry:
+            age = max(0.0, now - (entry.value.get("cachedAt") or now)) if isinstance(entry.value, dict) else 0.0
+            if age <= self._stale_seconds:
+                return {"value": entry.value.get("value"), "cachedAt": entry.value.get("cachedAt"), "ageSeconds": age}
+            self._local.pop(key, None)
+        try:
+            client = await self._redis()
+            raw = await client.get(key) if client is not None else None
+            envelope = json.loads(raw) if raw else None
+            if not isinstance(envelope, dict) or "value" not in envelope:
+                return None
+            self._local[key] = CacheEntry(envelope, now + self._stale_seconds)
+            return {"value": envelope.get("value"), "cachedAt": envelope.get("cachedAt"), "ageSeconds": max(0.0, now - float(envelope.get("cachedAt") or now))}
+        except Exception:
+            logger.warning("stale cache read unavailable")
+            return None
+
+    async def set(self, key: str, value: Any) -> float:
+        cached_at = time.time()
+        envelope = {"cachedAt": cached_at, "value": value}
+        self._local[key] = CacheEntry(envelope, cached_at + self._stale_seconds)
+        try:
+            client = await self._redis()
+            if client is not None:
+                await client.set(key, json.dumps(envelope, ensure_ascii=True, separators=(",", ":"), default=str), ex=self._stale_seconds)
+        except Exception:
+            logger.warning("stale cache write unavailable")
+        return cached_at
