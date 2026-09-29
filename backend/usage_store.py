@@ -2994,8 +2994,8 @@ class UsageStore:
                             error_message=EXCLUDED.error_message
                         """,
                         str(snapshot.backend_id),
-                        getattr(snapshot, "event_start_date", None) or state_start,
-                        getattr(snapshot, "event_end_date", None) or state_end,
+                        _as_date(getattr(snapshot, "event_start_date", None) or state_start),
+                        _as_date(getattr(snapshot, "event_end_date", None) or state_end),
                         "complete" if state_complete else "partial",
                         not state_complete,
                         event_count,
