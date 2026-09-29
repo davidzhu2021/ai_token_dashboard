@@ -1318,8 +1318,24 @@ class UsageSynchronizer:
                 and fallback_stats["failedUsers"] == 0
             )
         )
+        expected_nonempty = max(
+            1,
+            int(
+                fallback_stats["attemptedUsers"]
+                * max(0.0, min(1.0, float(os.getenv("USAGE_SYNC_FALLBACK_MIN_NONEMPTY_RATIO", "0.05"))))
+            ),
+        )
+        sparse_fallback = (
+            not using_logs
+            and fallback_stats["attemptedUsers"] >= 20
+            and fallback_stats["usersWithUsage"] < expected_nonempty
+        )
         quality = {
-            "complete": bool(fallback_complete and (using_logs or fallback_stats["successfulUsers"] == len(account_users))),
+            "complete": bool(
+                fallback_complete
+                and (using_logs or fallback_stats["successfulUsers"] == len(account_users))
+                and not sparse_fallback
+            ),
             "recordsRead": len(rows),
             "userCountWithUsage": len({str(row.get("_userId")) for row in rows if row.get("_userId")}),
             "totalTokens": total_tokens,
@@ -1328,7 +1344,13 @@ class UsageSynchronizer:
             "sourcePath": "spend_logs" if using_logs else "daily_activity_fallback",
             "paginationComplete": True if using_logs else None,
             "fallback": fallback_stats,
-            "degradedReason": "用户 daily activity 请求存在失败" if not fallback_complete else "",
+            "degradedReason": (
+                "用户 daily activity 返回非空用户过少"
+                if sparse_fallback
+                else "用户 daily activity 请求存在失败"
+                if not fallback_complete
+                else ""
+            ),
         }
         return BackendSnapshot(
             backend.id,
