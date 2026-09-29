@@ -4861,12 +4861,6 @@ async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: 
                         live = {"available": False, "complete": False, "totals": empty_usage_totals(), "perBackend": {}, "missingBackends": ["unknown"], "source": "upstream_global_activity", "errorCode": exc.__class__.__name__}
                     snapshot_totals = aggregate_usage_totals(stored.get("summaryRows") or stored.get("rows") or [])
                     live_totals = live.get("totals") or empty_usage_totals()
-                    # /global/activity exposes requests and tokens only. Keep
-                    # status/spend fields from the same snapshot rather than
-                    # displaying fabricated zeroes for unsupported metrics.
-                    live_totals["spend"] = snapshot_totals.get("spend", 0.0)
-                    live_totals["successCount"] = snapshot_totals.get("successCount", 0)
-                    live_totals["failureCount"] = snapshot_totals.get("failureCount", 0)
                     live["totals"] = live_totals
                     live["differenceFromSnapshot"] = {
                         field: abs(float(live_totals.get(field, 0)) - float(snapshot_totals.get(field, 0))) / max(1.0, abs(float(snapshot_totals.get(field, 0))))

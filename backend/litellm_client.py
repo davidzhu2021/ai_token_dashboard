@@ -4135,8 +4135,8 @@ class LiteLLMClient:
             }
             try:
                 payload = await self.request_backend(
-                    backend, "GET", "/global/activity",
-                    params={"start_date": start_date, "end_date": end_date},
+                    backend, "GET", "/user/daily/activity/aggregated",
+                    params={"start_date": start_date, "end_date": end_date, "timezone": usage_timezone_offset_minutes()},
                 )
                 if not isinstance(payload, dict):
                     raise ValueError("malformed global activity response")
@@ -4144,13 +4144,19 @@ class LiteLLMClient:
                 if not isinstance(rows, list):
                     raise ValueError("malformed global activity rows")
                 item_totals = self._usage_totals([])
-                item_totals["requestCount"] = _as_int(_first(payload, "sum_api_requests", "sumApiRequests"))
-                item_totals["totalTokens"] = _as_int(_first(payload, "sum_total_tokens", "sumTotalTokens"))
+                metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+                item_totals["promptTokens"] = _as_int(_first(metadata, "total_prompt_tokens", "totalPromptTokens"))
+                item_totals["completionTokens"] = _as_int(_first(metadata, "total_completion_tokens", "totalCompletionTokens"))
+                item_totals["requestCount"] = _as_int(_first(metadata, "total_api_requests", "totalApiRequests"))
+                item_totals["totalTokens"] = _as_int(_first(metadata, "total_tokens", "totalTokens"))
+                item_totals["successCount"] = _as_int(_first(metadata, "total_successful_requests", "totalSuccessfulRequests"))
+                item_totals["failureCount"] = _as_int(_first(metadata, "total_failed_requests", "totalFailedRequests"))
+                item_totals["spend"] = _as_number(_first(metadata, "total_spend", "totalSpend", "spend"))
                 if not item_totals["requestCount"]:
                     item_totals["requestCount"] = sum(_as_int(_first(row, "api_requests", "requestCount")) for row in rows if isinstance(row, dict))
                 if not item_totals["totalTokens"]:
                     item_totals["totalTokens"] = sum(_as_int(_first(row, "total_tokens", "totalTokens")) for row in rows if isinstance(row, dict))
-                result.update({"totals": item_totals, "totalRecords": len(rows), "complete": True})
+                result.update({"totals": item_totals, "totalRecords": len(rows), "complete": True, "sourcePath": "daily_activity_aggregated"})
             except Exception as exc:
                 result.update({"status": "error", "complete": False, "errorCode": exc.__class__.__name__})
                 missing.append(backend.id)
