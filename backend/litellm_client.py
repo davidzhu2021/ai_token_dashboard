@@ -2065,12 +2065,21 @@ class LiteLLMClient:
 
         max_pages = max(1, _env_int("HER_KEY_LIST_MAX_PAGES", 20))
         for page in range(1, max_pages + 1):
-            payload = await self.request_backend(
-                backend,
-                "GET",
-                "/key/list",
-                params={"return_full_object": "true", "page": page, "size": 100},
-            )
+            try:
+                payload = await self.request_backend(
+                    backend,
+                    "GET",
+                    "/key/list",
+                    params={"return_full_object": "true", "page": page, "size": 100},
+                )
+            except HTTPException as exc:
+                # Some Her deployments expose user metadata but intentionally
+                # do not expose the key directory.  User-derived identity
+                # facts remain valid; only key metadata is unavailable.
+                if exc.status_code in {404, 405, 501}:
+                    logger.warning("optional Her key directory unavailable status=%s", exc.status_code)
+                    break
+                raise
             keys = _records(payload)
             if not keys:
                 break

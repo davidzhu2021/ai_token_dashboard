@@ -57,6 +57,25 @@ def build_index(client: LiteLLMClient, accounts: list[dict[str, Any]]) -> dict[s
     return asyncio.run(client.her_account_index(client.backends[0]))
 
 
+def test_her_account_index_keeps_user_directory_when_key_list_is_unavailable() -> None:
+    client = make_client()
+    accounts = [account("carher-alice", alias="Alice", email="alice@example.com")]
+
+    async def fake_request_backend(backend: LiteLLMBackend, method: str, path: str, **kwargs: Any) -> Any:
+        if path == "/user/list":
+            page = int((kwargs.get("params") or {}).get("page") or 1)
+            return {"users": accounts if page == 1 else [], "total_pages": 1}
+        if path == "/key/list":
+            raise HTTPException(status_code=404, detail="not implemented")
+        raise AssertionError(f"unexpected call {method} {path}")
+
+    client.request_backend = fake_request_backend  # type: ignore[assignment]
+    index = asyncio.run(client.her_account_index(client.backends[0]))
+
+    assert index["profiles"]["carher-alice"]["email"] == "alice@example.com"
+    assert index["emails"]["alice@example.com"]["carher-alice"]["sources"] == {"her_user_email"}
+
+
 def matched_user_ids(client: LiteLLMClient, index: dict[str, Any], email: str, name: str) -> list[str]:
     collected: list[tuple[str, str]] = []
 

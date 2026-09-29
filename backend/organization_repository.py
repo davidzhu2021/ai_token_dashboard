@@ -3375,6 +3375,12 @@ class PostgreSQLOrganizationRepository(OrganizationValidationMixin):
     ) -> dict[str, Any]:
         """Persist monotonic coverage for one completed three-day window."""
 
+        # Keep this repository boundary defensive because callers may receive
+        # ISO strings from queue payloads, while asyncpg requires date objects
+        # for DATE parameters.
+        covered_from = date.fromisoformat(str(covered_from)[:10])
+        covered_through = date.fromisoformat(str(covered_through)[:10])
+
         row = await self._require_pool().fetchrow(
             "UPDATE customer_usage_backfill SET "
             "covered_from=LEAST(COALESCE(covered_from,$2),$2),"

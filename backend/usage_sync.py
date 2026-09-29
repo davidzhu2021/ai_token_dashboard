@@ -82,6 +82,15 @@ def _email(value: Any) -> str:
     return value if "@" in value else ""
 
 
+def _iso_date_text(value: Any) -> str:
+    """Normalize queue/API date values before passing them between layers."""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return date.fromisoformat(str(value).strip()[:10]).isoformat()
+
+
 def resolve_display_identity(
     *,
     user_id: str,
@@ -858,6 +867,12 @@ class UsageSynchronizer:
         return start.isoformat(), end.isoformat()
 
     async def sync(self, start_date: str, end_date: str) -> dict[str, Any]:
+        # Normalize the public string-shaped window at the synchronization
+        # boundary.  asyncpg DATE parameters must receive datetime.date
+        # values; keeping the wire-facing strings for LiteLLM is fine, but
+        # database-facing calls must never inherit them accidentally.
+        start_date = _iso_date_text(start_date)
+        end_date = _iso_date_text(end_date)
         run_id = await self.store.begin_sync_run(start_date, end_date)
         lock = None
         try:
