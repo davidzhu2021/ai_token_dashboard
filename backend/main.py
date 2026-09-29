@@ -4210,6 +4210,25 @@ async def get_live_totals_cached(kind: str, start_date: str, end_date: str, refr
         return {"value": {"available": False, "complete": False, "missingBackends": ["unknown"], "errorCode": exc.__class__.__name__}, "cacheStatus": "miss", "cacheAgeSeconds": 0, "refreshInProgress": False, "refreshError": exc.__class__.__name__}
 
 
+async def live_totals_cache_diagnostics(start_date: str, end_date: str) -> dict[str, Any]:
+    items = {}
+    for kind in ("activity", "spend"):
+        cached = await _admin_live_totals_cache.get(admin_live_totals_cache_key(kind, start_date, end_date))
+        if cached is None:
+            items[kind] = {"status": "miss", "ageSeconds": None}
+            continue
+        age = float(cached.get("ageSeconds") or 0)
+        ttl = max(1, env_int("ADMIN_LIVE_TOTALS_CACHE_TTL_SECONDS", 60))
+        items[kind] = {"status": "fresh" if age <= ttl else "stale", "ageSeconds": round(age, 1)}
+    return {
+        "liveCacheStatus": "stale" if any(item["status"] == "stale" for item in items.values()) else ("miss" if any(item["status"] == "miss" for item in items.values()) else "fresh"),
+        "liveCacheAgeSeconds": max((item["ageSeconds"] or 0 for item in items.values()), default=0),
+        "activityCacheStatus": items["activity"]["status"],
+        "spendCacheStatus": items["spend"]["status"],
+        "liveRefreshInProgress": any(key.startswith(f"admin-live:v2:{kind}:{start_date}:{end_date}:") for key in _admin_live_refresh_tasks for kind in ("activity", "spend")),
+    }
+
+
 async def admin_live_totals_prefetch_loop() -> None:
     stop = _admin_live_prefetch_stop
     interval = max(30, env_int("ADMIN_LIVE_TOTALS_PREFETCH_INTERVAL_SECONDS", 60))
@@ -6432,7 +6451,9 @@ async def debug_admin_usage_compare(
         raise HTTPException(status_code=404, detail="接口不存在")
     require_admin(request)
     start_date, end_date = resolve_usage_range(start_date, end_date)
-    return await client().admin_usage_compare(start_date, end_date, source)
+    result = await client().admin_usage_compare(start_date, end_date, source)
+    result.update(await live_totals_cache_diagnostics(start_date, end_date))
+    return result
 
 
 @app.get("/api/health")
