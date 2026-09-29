@@ -4126,8 +4126,9 @@ def local_personal_usage_cache_key(user_id: str, start_date: str, end_date: str,
     return f"usage:local:v3:{revision}:{user_id}:{start_date}:{end_date}:{source or 'all'}"
 
 
-def admin_usage_cache_key(email: str, start_date: str, end_date: str, source: str, employee: str | None, revision: str = "") -> str:
-    return f"admin-usage:v6:{revision}:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(employee or '').strip().lower()}"
+def admin_usage_cache_key(email: str, start_date: str, end_date: str, source: str, employee: str | None, revision: str = "", model: list[str] | None = None) -> str:
+    model_key = ",".join(sorted(str(item).strip().lower() for item in (model or []) if str(item).strip()))
+    return f"admin-usage:v7:{revision}:{email.strip().lower()}:{start_date}:{end_date}:{source or 'all'}:{(employee or '').strip().lower()}:{model_key}"
 
 
 def department_usage_cache_key(email: str, start_date: str, end_date: str, source: str, department: str | None, revision: str = "") -> str:
@@ -4818,7 +4819,7 @@ async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: 
     revision = "development-upstream"
     if usage_store() is not None:
         revision = await snapshot_revision(start_date, end_date)
-    cache_key = admin_usage_cache_key(admin["email"], start_date, end_date, source, employee, revision)
+    cache_key = admin_usage_cache_key(admin["email"], start_date, end_date, source, employee, revision, model)
     if not refresh:
         hit, value, ttl_seconds = admin_usage_cache.get(cache_key)
         if hit:
