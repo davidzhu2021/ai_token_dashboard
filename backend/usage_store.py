@@ -2682,6 +2682,20 @@ class UsageStore:
 
         if not snapshots:
             return {"rowCount": 0, "snapshotRevision": None}
+        rejected = []
+        for snapshot in snapshots:
+            quality = getattr(snapshot, "quality", None) or {}
+            if quality and quality.get("complete") is False:
+                rejected.append({
+                    "backend": str(getattr(snapshot, "backend_id", "")),
+                    "reason": str(quality.get("degradedReason") or "采集质量未通过"),
+                    "recordsRead": int(quality.get("recordsRead") or 0),
+                    "usersWithUsage": int(quality.get("userCountWithUsage") or 0),
+                })
+        if rejected:
+            # Never delete the previous valid rows when a fallback is sparse.
+            logger.warning("snapshot publish rejected by quality gate: %s", rejected)
+            return {"rowCount": 0, "snapshotRevision": None, "status": "partial", "quality": rejected}
         # Normalize at the database boundary so DATE parameters are native date values.
         start_day = _as_date(start_date)
         end_day = _as_date(end_date)

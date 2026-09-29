@@ -2774,6 +2774,27 @@ class LiteLLMClient:
                 return list(grouped.values())
         return [self._row_from_daily_activity_item(item, source, backend=backend)]
 
+    def parse_daily_activity_payload(
+        self, payload: Any, source: str, backend: LiteLLMBackend | None = None
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Parse aggregated activity while retaining structural quality data."""
+        items = _records(payload)
+        rows: list[dict[str, Any]] = []
+        malformed = 0
+        for item in items:
+            if not isinstance(item, dict) or not _first(item, "date", "day"):
+                malformed += 1
+                continue
+            parsed = self._rows_from_daily_activity_item(item, source, backend)
+            rows.extend(parsed)
+        quality = {
+            "recordsRead": len(items),
+            "rowsProduced": len(rows),
+            "malformedRecords": malformed,
+            "valid": bool(not malformed),
+        }
+        return rows, quality
+
     async def _usage_from_daily_activity(
         self,
         user_id: str,
@@ -2797,9 +2818,9 @@ class LiteLLMClient:
             if exc.status_code not in {404, 405, 501}:
                 raise
             payload = await self.request_backend(backend, "GET", "/user/daily/activity", params=params)
-        rows = []
-        for item in _records(payload):
-            rows.extend(self._rows_from_daily_activity_item(item, source_override or "其他", backend))
+        rows, quality = self.parse_daily_activity_payload(payload, source_override or "其他", backend)
+        if not quality["valid"]:
+            raise HTTPException(status_code=502, detail="上游用量响应缺少日期字段")
         return rows
 
     async def _load_keys_for_user(
@@ -3609,7 +3630,7 @@ class LiteLLMClient:
             else _env_int("USAGE_SYNC_LOG_PAGE_RETRIES", 2),
         )
 
-        async def fetch_page(page: int) -> tuple[list[dict[str, Any]], int]:
+        async def fetch_page(page: int) -> tuple[list[dict[str, Any]], int, bool]:
             params: dict[str, Any] = {
                 "start_date": utc_start,
                 "end_date": utc_end,
@@ -3638,15 +3659,18 @@ class LiteLLMClient:
             else:  # pragma: no cover - loop either breaks or raises
                 raise last_error or RuntimeError("spend log page failed")
             total_pages = _as_int(_first(payload, "total_pages", "totalPages", default=0)) if isinstance(payload, dict) else 0
-            return _records(payload), total_pages
+            has_more = bool(_first(payload, "has_more", "hasMore", default=False)) if isinstance(payload, dict) else False
+            return _records(payload), total_pages, has_more
 
         page_failed = False
         try:
-            first_logs, total_pages = await fetch_page(1)
+            first_logs, total_pages, has_more = await fetch_page(1)
         except Exception:
             logger.exception("usage log first page failed backend=%s", backend.id)
             raise
-        pages_to_fetch = min(total_pages or 1, max_pages)
+        # total_pages=0 is used by some deployments even when records exist;
+        # continue until an empty page or an explicit has_more=false.
+        pages_to_fetch = min(total_pages, max_pages) if total_pages else (max_pages if (first_logs or has_more) else 1)
         truncated = bool(total_pages and total_pages > max_pages)
 
         grouped: dict[str, dict[tuple[str, str, str, str, str, str], dict[str, Any]]] = defaultdict(dict)
@@ -3771,25 +3795,27 @@ class LiteLLMClient:
         if pages_to_fetch > 1:
             semaphore = asyncio.Semaphore(concurrency)
 
-            async def load(page: int) -> list[dict[str, Any]]:
+            async def load(page: int) -> tuple[list[dict[str, Any]], bool]:
                 nonlocal page_failed
                 async with semaphore:
                     try:
-                        logs, _ = await fetch_page(page)
-                        return logs
+                        logs, _, page_has_more = await fetch_page(page)
+                        return logs, page_has_more
                     except Exception:
                         logger.exception("usage log page %s failed backend=%s", page, backend.id)
                         if allow_partial:
                             page_failed = True
-                            return []
+                            return [], False
                         raise
 
             batch_size = max(concurrency, _env_int("USAGE_SYNC_LOG_BATCH_PAGES", 50))
             for batch_start in range(2, pages_to_fetch + 1, batch_size):
                 batch_end = min(pages_to_fetch + 1, batch_start + batch_size)
                 batches = await asyncio.gather(*(load(page) for page in range(batch_start, batch_end)))
-                for batch in batches:
+                for batch, page_has_more in batches:
                     absorb(batch)
+                if not total_pages and (any(not batch for batch, _ in batches) or any(not more for _, more in batches)):
+                    break
 
         logger.info(
             "usage log scan backend=%s pages=%s/%s users=%s start=%s end=%s truncated=%s",
@@ -3813,7 +3839,8 @@ class LiteLLMClient:
             user_id: sorted(bucket.values(), key=lambda item: (item["date"], item["source"], item["model"]))
             for user_id, bucket in grouped.items()
         }, events=event_rows)
-        return result, not truncated and not page_failed
+        complete = not truncated and not page_failed and (bool(total_pages) or not has_more)
+        return result, complete
 
     async def incremental_events_from_logs(
         self,
@@ -4090,7 +4117,9 @@ class LiteLLMClient:
                 "timezone": usage_timezone_offset_minutes(),
             },
         )
-        rows = [self._row_from_daily_activity_item(item, backend.source or "其他", "全量") for item in _records(payload)]
+        rows, quality = self.parse_daily_activity_payload(payload, backend.source or "其他", backend)
+        if not quality["valid"]:
+            raise HTTPException(status_code=502, detail="上游全员用量响应缺少日期字段")
         return sorted(rows, key=lambda item: (item["date"], item["model"]))
 
     async def admin_usage_rows(self, start_date: str, end_date: str, source: str | None, employee: str | None = None) -> dict[str, Any]:
@@ -4166,6 +4195,7 @@ class LiteLLMClient:
                     day = _date_text_in_usage_timezone(_first(log, "startTime", "start_time", "created_at", "date"))
                     key = (day, employee_key, detected_source, model)
                     row = grouped.setdefault(key, self._admin_empty_row(day, employee_info, detected_source, model))
+                    row["backend"] = backend.id
                     self._add_log_to_row(row, log)
 
                 if backend_total_pages and page >= backend_total_pages:
@@ -4207,6 +4237,12 @@ class LiteLLMClient:
         summary_rows = payload.get("summaryRows", [])
         employee_ids = {str(row.get("employeeId") or "") for row in rows}
         employee_emails = {str(row.get("employeeEmail") or "").lower() for row in rows if row.get("employeeEmail")}
+        def grouped_totals(items: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]]:
+            grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for item in items:
+                grouped[str(item.get(key) or "unknown")].append(item)
+            return {name: self._usage_totals(values) for name, values in grouped.items()}
+
         return {
             "startDate": start_date,
             "endDate": end_date,
@@ -4220,6 +4256,15 @@ class LiteLLMClient:
             "employeesAfterMerge": len(employee_ids),
             "boundEmailCount": len(employee_emails),
             "dataQuality": payload.get("dataQuality", {}),
+            "perBackend": grouped_totals(rows, "backend"),
+            "perSource": grouped_totals(rows, "source"),
+            "differenceRatio": {
+                field: (
+                    abs(float(self._usage_totals(summary_rows).get(field, 0)) - float(self._usage_totals(rows).get(field, 0)))
+                    / max(1.0, abs(float(self._usage_totals(summary_rows).get(field, 0))))
+                )
+                for field in ("totalTokens", "requestCount", "spend")
+            },
         }
 
     async def team_map(self, backend: LiteLLMBackend | None = None) -> dict[str, dict[str, str]]:

@@ -243,6 +243,10 @@ class BackendSnapshot:
     event_replace_start_date: str | None = None
     event_replace_end_date: str | None = None
     event_window_complete: bool | None = None
+    # Collection diagnostics are persisted in the sync result/logs and are
+    # intentionally kept separate from usage rows so a sparse fallback cannot
+    # masquerade as a complete snapshot.
+    quality: dict[str, Any] | None = None
 
 
 def _stability_scan_plan(
@@ -912,6 +916,14 @@ class UsageSynchronizer:
             snapshot_revision: str | None = None
             expected_backend_count = len(self.client.backends)
             publish_snapshots = getattr(self.store, "publish_snapshots", None)
+            quality_errors = [
+                f"{snapshot.backend_id}: {(_text((getattr(snapshot, 'quality', None) or {}).get('degradedReason')) or '采集质量未通过')}"
+                for snapshot in snapshots
+                if not bool((getattr(snapshot, 'quality', None) or {}).get("complete", True))
+            ]
+            if quality_errors:
+                errors.extend(quality_errors)
+                logger.warning("usage snapshot publish blocked by quality gate: %s", "; ".join(quality_errors))
             if not errors and len(snapshots) == expected_backend_count and callable(publish_snapshots):
                 published = await publish_snapshots(start_date, end_date, snapshots)
                 row_count = int(published.get("rowCount") or 0)
@@ -1154,15 +1166,30 @@ class UsageSynchronizer:
                     event_window_complete = None
 
         semaphore = asyncio.Semaphore(max(1, _env_int("USAGE_SYNC_USER_CONCURRENCY", 4)))
+        fallback_stats = {
+            "attemptedUsers": 0,
+            "successfulUsers": 0,
+            "usersWithUsage": 0,
+            "failedUsers": 0,
+            "malformedUsers": 0,
+        }
 
         async def collect_user(user_id: str, info: dict[str, Any]) -> list[dict[str, Any]]:
+            fallback_stats["attemptedUsers"] += 1
             if log_rows is not None:
                 rows = log_rows.get(user_id, [])
             else:
                 async with semaphore:
                     encoder = getattr(self.client, "_encode_account_id", None)
                     routed_user_id = encoder(backend, user_id) if encoder else user_id
-                    rows = await self.client.usage_rows(routed_user_id, start_date, end_date, "all")
+                    try:
+                        rows = await self.client.usage_rows(routed_user_id, start_date, end_date, "all")
+                    except Exception:
+                        fallback_stats["failedUsers"] += 1
+                        raise
+            fallback_stats["successfulUsers"] += 1
+            if rows:
+                fallback_stats["usersWithUsage"] += 1
             result: list[dict[str, Any]] = []
             for row in rows:
                 item = dict(row)
@@ -1190,9 +1217,16 @@ class UsageSynchronizer:
                 result.append(item)
             return result
 
-        results = await asyncio.gather(
+        gathered = await asyncio.gather(
             *(collect_user(user_id, info) for user_id, info in account_users.items()),
+            return_exceptions=True,
         )
+        results = [item for item in gathered if isinstance(item, list)]
+        if any(isinstance(item, Exception) for item in gathered):
+            logger.warning(
+                "usage fallback incomplete backend=%s attempted=%s succeeded=%s failed=%s",
+                backend.id, fallback_stats["attemptedUsers"], fallback_stats["successfulUsers"], fallback_stats["failedUsers"],
+            )
         rows = [row for batch in results for row in batch]
         # Full scans may contain user ids missing from /user/list. Preserve all
         # buckets so stable principal mappings can still attribute them and
@@ -1267,6 +1301,35 @@ class UsageSynchronizer:
                     "emailSource": _text(info.get("emailSource")),
                 }
             )
+        def numeric(value: Any) -> float:
+            try:
+                return float(value or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        total_tokens = int(sum(numeric(row.get("totalTokens")) for row in rows))
+        request_count = int(sum(numeric(row.get("requestCount")) for row in rows))
+        spend = sum(numeric(row.get("spend")) for row in rows)
+        using_logs = log_rows is not None
+        fallback_complete = (
+            using_logs
+            or (
+                fallback_stats["attemptedUsers"] == fallback_stats["successfulUsers"]
+                and fallback_stats["failedUsers"] == 0
+            )
+        )
+        quality = {
+            "complete": bool(fallback_complete and (using_logs or fallback_stats["successfulUsers"] == len(account_users))),
+            "recordsRead": len(rows),
+            "userCountWithUsage": len({str(row.get("_userId")) for row in rows if row.get("_userId")}),
+            "totalTokens": total_tokens,
+            "requestCount": request_count,
+            "spend": spend,
+            "sourcePath": "spend_logs" if using_logs else "daily_activity_fallback",
+            "paginationComplete": True if using_logs else None,
+            "fallback": fallback_stats,
+            "degradedReason": "用户 daily activity 请求存在失败" if not fallback_complete else "",
+        }
         return BackendSnapshot(
             backend.id,
             rows,
@@ -1280,6 +1343,7 @@ class UsageSynchronizer:
             event_replace_start_date,
             event_replace_end_date,
             event_window_complete,
+            quality,
         )
 
     async def collect_memberships(
