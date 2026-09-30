@@ -438,6 +438,34 @@ def test_publish_mirror_uses_the_durable_request_audit_rows() -> None:
     assert published == [(date(2026, 8, 13), [{"backendId": "primary", "date": "2026-08-13", "spend": 9.5}])]
 
 
+def test_publish_mirror_does_not_mark_moving_day_complete() -> None:
+    states = []
+
+    class Store:
+        async def realtime_event_rows(self, _day):
+            return []
+
+        async def replace_realtime_aggregates(self, *_args):
+            return None
+
+        async def publish_realtime_state(self, *args, **kwargs):
+            states.append((args, kwargs))
+
+    class Realtime:
+        async def status(self):
+            return {"revision": 1, "latestEventAt": None}
+
+    worker = UsageRealtimeWorker.__new__(UsageRealtimeWorker)
+    worker.store = Store()
+    worker.realtime = Realtime()
+    worker.current_day = date(2026, 8, 13)
+
+    asyncio.run(worker.publish_mirror())
+
+    assert states[0][1]["ready"] is True
+    assert states[0][1]["complete"] is False
+
+
 def test_recovery_discards_legacy_page_backfill_checkpoints() -> None:
     cleared = []
 
@@ -663,7 +691,7 @@ def test_usage_query_view_replaces_ready_day_instead_of_adding_it() -> None:
 
     assert "CREATE OR REPLACE VIEW usage_query_daily" in USAGE_SCHEMA
     assert "WHERE NOT EXISTS" in USAGE_SCHEMA
-    assert "JOIN usage_realtime_state s ON s.usage_date=r.usage_date AND s.ready" in USAGE_SCHEMA
+    assert "JOIN usage_realtime_state s ON s.usage_date=r.usage_date AND s.ready AND s.complete" in USAGE_SCHEMA
 
 
 def test_realtime_latest_event_watermark_never_moves_backward() -> None:

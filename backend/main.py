@@ -5007,20 +5007,29 @@ async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: 
                     spend_live = spend_cached.get("value") or {}
                     snapshot_totals = aggregate_usage_totals(stored.get("summaryRows") or stored.get("rows") or [])
                     activity_totals = activity_live.get("totals") or empty_usage_totals()
-                    spend_totals = spend_live.get("totals") or empty_usage_totals()
+                    # Activity metadata is the complete upstream aggregate;
+                    # request-level Spend Logs may be capped by the UI API.
+                    activity_spend_available = bool(
+                        activity_live.get("complete") and activity_live.get("spendAvailable", True)
+                    )
+                    spend_totals = (
+                        {**empty_usage_totals(), "spend": activity_totals.get("spend", 0)}
+                        if activity_spend_available
+                        else (spend_live.get("totals") or empty_usage_totals())
+                    )
                     live = {
                         "activityTotals": activity_totals,
-                        "spendTotals": spend_totals if spend_live.get("complete") else {"spend": None},
-                        "totals": {**activity_totals, "spend": spend_totals.get("spend") if spend_live.get("complete") else None},
+                        "spendTotals": spend_totals if activity_spend_available else {"spend": None},
+                        "totals": {**activity_totals, "spend": spend_totals.get("spend") if activity_spend_available else None},
                         "perBackendActivity": activity_live.get("perBackend") or {},
                         "perBackendSpend": spend_live.get("perBackend") or {},
                         "activitySource": "daily_activity_aggregated",
-                        "spendSource": "spend_logs_ui",
-                        "complete": bool(activity_live.get("complete") and spend_live.get("complete")),
+                        "spendSource": "daily_activity_aggregated" if activity_spend_available else "spend_logs_ui",
+                        "complete": bool(activity_live.get("complete")),
                         "activityStatus": "complete" if activity_live.get("complete") else "partial",
-                        "spendStatus": "complete" if spend_live.get("complete") else "unavailable",
-                        "spendAvailable": bool(spend_live.get("complete")),
-                        "spendFallback": False,
+                        "spendStatus": "complete" if activity_spend_available else "unavailable",
+                        "spendAvailable": activity_spend_available,
+                        "spendFallback": bool(activity_spend_available and not spend_live.get("complete")),
                         "missingActivityBackends": activity_live.get("missingBackends") or [],
                         "missingSpendBackends": spend_live.get("missingBackends") or [],
                         "missingBackends": list(dict.fromkeys((activity_live.get("missingBackends") or []) + (spend_live.get("missingBackends") or []))),
@@ -5031,7 +5040,7 @@ async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: 
                         "refreshError": ";".join(str(item) for item in (activity_cached.get("refreshError"), spend_cached.get("refreshError")) if item),
                     }
                     live["differenceFromSnapshot"] = {
-                        field: abs(float((activity_totals if field != "spend" or spend_live.get("complete") else {}).get(field, 0) or 0) - float(snapshot_totals.get(field, 0))) / max(1.0, abs(float(snapshot_totals.get(field, 0))))
+                        field: abs(float((activity_totals if field != "spend" or activity_spend_available else {}).get(field, 0) or 0) - float(snapshot_totals.get(field, 0))) / max(1.0, abs(float(snapshot_totals.get(field, 0))))
                         for field in ("totalTokens", "requestCount", "spend")
                     }
                     quality = dict(stored.get("dataQuality") or {})
@@ -5040,8 +5049,10 @@ async def admin_usage_payload(admin: dict[str, Any], start_date: str, end_date: 
                         quality.update({"liveTotalsStatus": "partial", "liveTotalsSource": "daily_activity_aggregated", "missingBackends": live["missingBackends"], "liveTotalsReason": "实时活动汇总不可用"})
                     if not spend_live.get("complete"):
                         quality.update({"liveSpendStatus": "unavailable", "liveSpendSource": "spend_logs_ui", "missingSpendBackends": live["missingSpendBackends"], "liveSpendReason": "实时金额暂不可用，未显示可能不完整的金额"})
+                    if live["spendFallback"]:
+                        quality.update({"liveSpendStatus": "fallback", "liveSpendSource": "daily_activity_aggregated", "liveSpendReason": "逐请求明细达到上游返回上限，金额采用完整活动汇总"})
                     stored["dataQuality"] = quality
-                    live["available"] = bool(activity_live.get("complete") or spend_live.get("complete"))
+                    live["available"] = bool(activity_live.get("complete"))
                     stored["liveTotals"] = live
                 admin_usage_cache.set(cache_key, stored, env_int("ADMIN_USAGE_CACHE_TTL_SECONDS", 300))
                 stored["cache"] = {"hit": False, "ttlSeconds": 0}
