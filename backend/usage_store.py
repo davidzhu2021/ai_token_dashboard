@@ -334,11 +334,16 @@ CREATE INDEX IF NOT EXISTS usage_realtime_daily_date_idx
 CREATE TABLE IF NOT EXISTS usage_realtime_state (
     usage_date DATE PRIMARY KEY,
     ready BOOLEAN NOT NULL DEFAULT FALSE,
+    -- ready means the worker is serving; complete means the day's mirror is
+    -- safe to replace the historical snapshot. They are intentionally distinct.
+    complete BOOLEAN NOT NULL DEFAULT FALSE,
     revision BIGINT NOT NULL DEFAULT 0,
     latest_event_at TIMESTAMPTZ,
     last_archived_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ NOT NULL
 );
+ALTER TABLE usage_realtime_state
+    ADD COLUMN IF NOT EXISTS complete BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- A watermark is advanced only after every request in its closed interval has
 -- been durably recorded. It survives worker restarts and replaces page cursors.
@@ -371,12 +376,23 @@ SELECT u.*
 FROM usage_daily u
 WHERE NOT EXISTS (
     SELECT 1 FROM usage_realtime_state s
-    WHERE s.usage_date=u.usage_date AND s.ready
+    WHERE s.usage_date=u.usage_date AND s.ready AND s.complete
 )
 UNION ALL
 SELECT r.*
 FROM usage_realtime_daily r
-JOIN usage_realtime_state s ON s.usage_date=r.usage_date AND s.ready;
+JOIN usage_realtime_state s ON s.usage_date=r.usage_date AND s.ready AND s.complete;
+
+-- A live-only current day has no historical rows yet. Expose its moving
+-- mirror for charts while keeping historical rows authoritative whenever they
+-- exist; the completeness flag still prevents replacement of a real snapshot.
+UNION ALL
+SELECT r.*
+FROM usage_realtime_daily r
+JOIN usage_realtime_state s ON s.usage_date=r.usage_date AND s.ready AND NOT s.complete
+WHERE NOT EXISTS (
+    SELECT 1 FROM usage_daily u WHERE u.usage_date=r.usage_date
+);
 
 -- Dashboard-facing API cost facts. Request-level attribution remains the
 -- audit source; this table keeps overview queries bounded as history grows.
@@ -1582,7 +1598,7 @@ class UsageStore:
             realtime = await self._require_pool().fetchrow(
                 """
                 SELECT revision, updated_at FROM usage_realtime_state
-                WHERE usage_date=$1 AND ready
+                WHERE usage_date=$1 AND ready AND complete
                 """,
                 _as_date(end_date),
             )
@@ -1837,6 +1853,7 @@ class UsageStore:
         usage_date: date,
         *,
         ready: bool,
+        complete: bool = False,
         revision: int,
         latest_event_at: datetime | None,
     ) -> None:
@@ -1844,15 +1861,16 @@ class UsageStore:
         await self._require_pool().execute(
             """
             INSERT INTO usage_realtime_state (
-                usage_date, ready, revision, latest_event_at, last_archived_at, updated_at
-            ) VALUES ($1,$2,$3,$4,$5,$5)
+                usage_date, ready, complete, revision, latest_event_at, last_archived_at, updated_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$6)
             ON CONFLICT (usage_date) DO UPDATE SET
-                ready=EXCLUDED.ready, revision=EXCLUDED.revision,
+                ready=EXCLUDED.ready, complete=EXCLUDED.complete, revision=EXCLUDED.revision,
                 latest_event_at=COALESCE(EXCLUDED.latest_event_at, usage_realtime_state.latest_event_at),
                 last_archived_at=EXCLUDED.last_archived_at, updated_at=EXCLUDED.updated_at
             """,
             usage_date,
             ready,
+            complete,
             revision,
             latest_event_at,
             now,
@@ -1978,7 +1996,7 @@ class UsageStore:
                     usage_date,
                 )
                 await connection.execute(
-                    "UPDATE usage_realtime_state SET ready=FALSE, updated_at=$2 WHERE usage_date=$1",
+                    "UPDATE usage_realtime_state SET ready=FALSE, complete=FALSE, updated_at=$2 WHERE usage_date=$1",
                     usage_date,
                     datetime.now(timezone.utc),
                 )
@@ -1990,7 +2008,7 @@ class UsageStore:
     async def realtime_state(self, usage_date: date) -> dict[str, Any]:
         row = await self._require_pool().fetchrow(
             """
-            SELECT ready, revision, latest_event_at, last_archived_at, updated_at
+            SELECT ready, complete, revision, latest_event_at, last_archived_at, updated_at
             FROM usage_realtime_state WHERE usage_date=$1
             """,
             usage_date,

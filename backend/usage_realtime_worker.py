@@ -830,14 +830,26 @@ class UsageRealtimeWorker:
         local_start = datetime.combine(
             previous_day, datetime.min.time(), tzinfo=local_tz
         )
+        day_complete = True
         for hour in range(24):
             window_start = (local_start + timedelta(hours=hour)).astimezone(timezone.utc)
             window_end = (local_start + timedelta(hours=hour + 1)).astimezone(timezone.utc)
             for backend in self.client.backends:
-                events, complete = await self.client.incremental_events_from_logs(
-                    window_start, window_end, backend, page_size=100
-                )
+                try:
+                    events, complete = await self.client.incremental_events_from_logs(
+                        window_start, window_end, backend, page_size=100
+                    )
+                except Exception:
+                    day_complete = False
+                    logger.exception(
+                        "realtime day calibration failed backend=%s window=%s/%s",
+                        backend.id,
+                        window_start.isoformat(),
+                        window_end.isoformat(),
+                    )
+                    continue
                 if not complete:
+                    day_complete = False
                     continue
                 await self.store.archive_realtime_events(
                     [
@@ -845,6 +857,9 @@ class UsageRealtimeWorker:
                         for event in events
                     ]
                 )
+        if not day_complete:
+            logger.warning("realtime day calibration incomplete; preserving historical snapshot day=%s", previous_day)
+            return
         await self.store.finalize_realtime_day(previous_day, identities)
 
     async def publish_mirror(self, *, ready: bool = True) -> None:
@@ -855,6 +870,9 @@ class UsageRealtimeWorker:
         await self.store.publish_realtime_state(
             today,
             ready=ready,
+            # A moving live mirror is not a complete day and must not replace
+            # the historical snapshot until the closed-day rebuild succeeds.
+            complete=False,
             revision=int(status.get("revision") or 0),
             latest_event_at=status.get("latestEventAt"),
         )

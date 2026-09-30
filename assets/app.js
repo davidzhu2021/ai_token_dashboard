@@ -2252,7 +2252,10 @@ function updateAdminChartTitles() {
 
 function renderAdminMetrics(data) {
   const totalData = adminSummaryData.length ? adminSummaryData : data;
-  const liveTotals = (!selectedAdminEmployee && !dashboardModelQueryValues().length && !selectedDashboardSources.size)
+  // The default state selects every source, so an empty Set is not the only
+  // representation of the unfiltered all-source scope.
+  const allDashboardSourcesSelected = selectedDashboardSources.size === dashboardSourceOptions.length;
+  const liveTotals = (!selectedAdminEmployee && !dashboardModelQueryValues().length && allDashboardSourcesSelected)
     ? (adminLiveTotals ? { ...(adminLiveTotals.activityTotals || adminLiveTotals.totals || {}), spend: adminLiveTotals.spendAvailable ? adminLiveTotals.spendTotals?.spend : null, spendAvailable: adminLiveTotals.spendAvailable !== false } : null)
     : null;
   const label = rangeLabel();

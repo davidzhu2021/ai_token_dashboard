@@ -4131,7 +4131,7 @@ class LiteLLMClient:
             result: dict[str, Any] = {
                 "backend": backend.id, "status": "ok", "totals": self._usage_totals([]),
                 "pagesRead": 1, "totalPages": 1, "totalRecords": 0,
-                "complete": False, "errorCode": "",
+                "complete": False, "errorCode": "", "spendAvailable": False,
             }
             try:
                 payload = await self.request_backend(
@@ -4145,6 +4145,7 @@ class LiteLLMClient:
                     raise ValueError("malformed global activity rows")
                 item_totals = self._usage_totals([])
                 metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+                spend_keys = ("total_spend", "totalSpend", "spend")
                 item_totals["promptTokens"] = _as_int(_first(metadata, "total_prompt_tokens", "totalPromptTokens"))
                 item_totals["completionTokens"] = _as_int(_first(metadata, "total_completion_tokens", "totalCompletionTokens"))
                 item_totals["requestCount"] = _as_int(_first(metadata, "total_api_requests", "totalApiRequests"))
@@ -4152,6 +4153,9 @@ class LiteLLMClient:
                 item_totals["successCount"] = _as_int(_first(metadata, "total_successful_requests", "totalSuccessfulRequests"))
                 item_totals["failureCount"] = _as_int(_first(metadata, "total_failed_requests", "totalFailedRequests"))
                 item_totals["spend"] = _as_number(_first(metadata, "total_spend", "totalSpend", "spend"))
+                result["spendAvailable"] = any(
+                    key in metadata and metadata.get(key) is not None for key in spend_keys
+                )
                 if not item_totals["requestCount"]:
                     item_totals["requestCount"] = sum(_as_int(_first(row, "api_requests", "requestCount")) for row in rows if isinstance(row, dict))
                 if not item_totals["totalTokens"]:
@@ -4170,6 +4174,9 @@ class LiteLLMClient:
             "totals": totals,
             "perBackend": per_backend,
             "missingBackends": missing,
+            "spendAvailable": bool(per_backend) and not missing and all(
+                bool(item.get("spendAvailable")) for item in per_backend.values()
+            ),
             "source": "upstream_global_activity",
         }
 
@@ -4212,6 +4219,19 @@ class LiteLLMClient:
                     result["pagesRead"] = page
                     result["totalPages"] = max(result["totalPages"], total_pages)
                     result["totalRecords"] = max(result["totalRecords"], total_records)
+                    # LiteLLM's UI endpoint can cap the reported result at
+                    # 10,000 rows while still returning a seemingly complete
+                    # 100-page response. Never use a capped scan as an exact
+                    # billing total.
+                    suspected_limit = (
+                        total_records == 10000
+                        and total_pages == 100
+                        and total_records == total_pages * page_size
+                    )
+                    if suspected_limit:
+                        result["errorCode"] = "UpstreamResultLimit"
+                        result["complete"] = False
+                        break
                     if not logs:
                         # An empty page before a declared final page means the
                         # upstream pagination contract was not fulfilled.
