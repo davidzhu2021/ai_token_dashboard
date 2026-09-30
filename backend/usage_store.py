@@ -381,7 +381,7 @@ WHERE NOT EXISTS (
 UNION ALL
 SELECT r.*
 FROM usage_realtime_daily r
-JOIN usage_realtime_state s ON s.usage_date=r.usage_date AND s.ready AND s.complete;
+JOIN usage_realtime_state s ON s.usage_date=r.usage_date AND s.ready AND s.complete
 
 -- A live-only current day has no historical rows yet. Expose its moving
 -- mirror for charts while keeping historical rows authoritative whenever they
