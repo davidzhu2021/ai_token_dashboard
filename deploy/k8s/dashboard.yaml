@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-token-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: ai-token-dashboard}
+  template:
+    metadata:
+      labels: {app: ai-token-dashboard}
+    spec:
+      containers:
+        - name: dashboard
+          image: ai-token-dashboard:latest
+          imagePullPolicy: Never
+          ports: [{name: http, containerPort: 8000}]
+          envFrom:
+            - {configMapRef: {name: dashboard-config}}
+            - {secretRef: {name: dashboard-secrets}}
+          env:
+            - {name: USAGE_SYNC_ROLE, value: reader}
+            - {name: USAGE_DB_POOL_MIN_SIZE, value: "1"}
+            - {name: USAGE_DB_POOL_MAX_SIZE, value: "5"}
+            - {name: USAGE_REDIS_URL, value: redis://usage-redis:6379/0}
+          readinessProbe: {httpGet: {path: /api/health, port: http}, periodSeconds: 10}
+          livenessProbe: {httpGet: {path: /api/health, port: http}, initialDelaySeconds: 20, periodSeconds: 30}
+          volumeMounts: [{name: app-data, mountPath: /app/.data}]
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "2", memory: 2Gi}
+      volumes: [{name: app-data, persistentVolumeClaim: {claimName: app-data}}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-token-dashboard
+spec:
+  selector: {app: ai-token-dashboard}
+  ports: [{name: http, port: 8000, targetPort: http}]

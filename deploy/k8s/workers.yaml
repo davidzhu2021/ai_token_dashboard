@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: usage-sync-worker
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: usage-sync-worker}}
+  template:
+    metadata: {labels: {app: usage-sync-worker}}
+    spec:
+      containers:
+        - name: worker
+          image: ai-token-dashboard:latest
+          imagePullPolicy: Never
+          command: [python, -m, backend.usage_worker]
+          envFrom: [{configMapRef: {name: dashboard-config}}, {secretRef: {name: dashboard-secrets}}]
+          env:
+            - {name: USAGE_SYNC_ROLE, value: worker}
+            - {name: USAGE_REALTIME_ENABLED, value: "false"}
+            - {name: USAGE_REDIS_URL, value: redis://usage-redis:6379/0}
+          volumeMounts: [{name: app-data, mountPath: /app/.data}]
+          resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {cpu: "2", memory: 2Gi}}
+      volumes: [{name: app-data, persistentVolumeClaim: {claimName: app-data}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: usage-realtime-worker
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: usage-realtime-worker}}
+  template:
+    metadata: {labels: {app: usage-realtime-worker}}
+    spec:
+      containers:
+        - name: worker
+          image: ai-token-dashboard:latest
+          imagePullPolicy: Never
+          command: [python, -m, backend.usage_worker]
+          envFrom: [{configMapRef: {name: dashboard-config}}, {secretRef: {name: dashboard-secrets}}]
+          env:
+            - {name: USAGE_SYNC_ROLE, value: worker}
+            - {name: USAGE_REALTIME_ENABLED, value: "true"}
+            - {name: USAGE_REDIS_URL, value: redis://usage-redis:6379/0}
+          volumeMounts: [{name: app-data, mountPath: /app/.data}]
+          resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {cpu: "2", memory: 2Gi}}
+      volumes: [{name: app-data, persistentVolumeClaim: {claimName: app-data}}]

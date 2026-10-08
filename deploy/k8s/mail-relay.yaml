@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mail-relay
+spec:
+  serviceName: mail-relay
+  replicas: 1
+  selector:
+    matchLabels: {app: mail-relay}
+  template:
+    metadata:
+      labels: {app: mail-relay}
+    spec:
+      hostname: mail-notify
+      containers:
+        - name: postfix
+          image: boky/postfix:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: ALLOWED_SENDER_DOMAINS, valueFrom: {configMapKeyRef: {name: dashboard-config, key: MAIL_RELAY_SENDER_DOMAINS}}}
+            - {name: POSTFIX_myhostname, valueFrom: {configMapKeyRef: {name: dashboard-config, key: MAIL_RELAY_HELO_NAME}}}
+            - {name: POSTFIX_mydestination, value: localhost}
+            - {name: POSTFIX_inet_protocols, value: ipv4}
+            - {name: POSTFIX_smtp_tls_security_level, value: may}
+            - {name: DKIM_SELECTOR, valueFrom: {configMapKeyRef: {name: dashboard-config, key: MAIL_RELAY_DKIM_SELECTOR}}}
+            - {name: DKIM_AUTOGENERATE, value: "true"}
+          readinessProbe:
+            exec: {command: [sh, -c, postfix status]}
+            initialDelaySeconds: 20
+            periodSeconds: 30
+          volumeMounts:
+            - {name: dkim, mountPath: /etc/opendkim/keys}
+            - {name: spool, mountPath: /var/spool/postfix}
+          resources:
+            requests: {cpu: 25m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+      volumes:
+        - {name: dkim, persistentVolumeClaim: {claimName: mail-dkim}}
+        - {name: spool, persistentVolumeClaim: {claimName: mail-spool}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mail-relay
+spec:
+  selector: {app: mail-relay}
+  ports: [{name: smtp, port: 25, targetPort: 25}]

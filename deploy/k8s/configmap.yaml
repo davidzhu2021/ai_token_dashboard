@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dashboard-config
+data:
+  APP_BASE_URL: https://myai.carher.net
+  USAGE_SYNC_ROLE: reader
+  USAGE_REDIS_URL: redis://usage-redis:6379/0
+  USAGE_DB_POOL_MIN_SIZE: "1"
+  USAGE_DB_POOL_MAX_SIZE: "5"
+  USAGE_WEB_DB_POOL_MIN_SIZE: "1"
+  USAGE_WEB_DB_POOL_MAX_SIZE: "5"
+  USAGE_WORKER_DB_POOL_MIN_SIZE: "1"
+  USAGE_WORKER_DB_POOL_MAX_SIZE: "3"
+  USAGE_REALTIME_ENABLED: "true"
+  USAGE_REFRESH_REALTIME_GUARD_ENABLED: "true"
+  MAIL_RELAY_HELO_NAME: mail.notify.carher.net
+  MAIL_RELAY_SENDER_DOMAINS: notify.carher.net
+  MAIL_RELAY_DKIM_SELECTOR: mail
+  SMTP_LOCAL_RELAY: "true"
+  SMTP_HOST: mail-relay
+  SMTP_PORT: "25"
+  AUTH_ENABLED: "false"
+  PASSWORD_LOGIN_ENABLED: "false"
+  PUBLIC_SIGNUP_ENABLED: "false"
+  DEV_LOGIN_ENABLED: "false"
+  DEBUG_MAPPING_ENABLED: "false"
+  DEBUG_OIDC_CLAIMS: "false"
+  CLOUDFLARED_CONFIG: /etc/cloudflared/config.yml

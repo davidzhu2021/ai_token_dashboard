@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ai-token-dashboard
+resources:
+  - namespace.yaml
+  - storage.yaml
+  - configmap.yaml
+  - postgres.yaml
+  - redis.yaml
+  - mail-relay.yaml
+  - dashboard.yaml
+  - workers.yaml
+  - ingress.yaml

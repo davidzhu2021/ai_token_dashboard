@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: usage-db
+spec:
+  serviceName: usage-db
+  replicas: 1
+  selector:
+    matchLabels: {app: usage-db}
+  template:
+    metadata:
+      labels: {app: usage-db}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports: [{name: postgres, containerPort: 5432}]
+          env:
+            - name: POSTGRES_DB
+              value: ai_usage
+            - name: POSTGRES_USER
+              value: ai_dashboard
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: dashboard-secrets, key: USAGE_DB_PASSWORD}}
+          readinessProbe:
+            exec: {command: [sh, -c, pg_isready -U ai_dashboard -d ai_usage]}
+            periodSeconds: 10
+          volumeMounts: [{name: data, mountPath: /var/lib/postgresql/data}]
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "2", memory: 4Gi}
+      volumes: [{name: data, persistentVolumeClaim: {claimName: postgres-data}}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: usage-db
+spec:
+  clusterIP: None
+  selector: {app: usage-db}
+  ports: [{name: postgres, port: 5432, targetPort: postgres}]

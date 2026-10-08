@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: usage-redis
+spec:
+  serviceName: usage-redis
+  replicas: 1
+  selector:
+    matchLabels: {app: usage-redis}
+  template:
+    metadata:
+      labels: {app: usage-redis}
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          imagePullPolicy: IfNotPresent
+          command: [redis-server, --appendonly, "yes", --appendfsync, everysec, --maxmemory, 2gb, --maxmemory-policy, volatile-ttl]
+          ports: [{name: redis, containerPort: 6379}]
+          readinessProbe: {exec: {command: [redis-cli, ping]}, periodSeconds: 5}
+          volumeMounts: [{name: data, mountPath: /data}]
+          resources:
+            requests: {cpu: 50m, memory: 256Mi}
+            limits: {cpu: "1", memory: 3Gi}
+      volumes: [{name: data, persistentVolumeClaim: {claimName: redis-data}}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: usage-redis
+spec:
+  selector: {app: usage-redis}
+  ports: [{name: redis, port: 6379, targetPort: redis}]

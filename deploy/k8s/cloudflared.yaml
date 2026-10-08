@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: cloudflared}}
+  template:
+    metadata: {labels: {app: cloudflared}}
+    spec:
+      containers:
+        - name: cloudflared
+          image: cloudflare/cloudflared:latest
+          args: [tunnel, --no-autoupdate, --config, /etc/cloudflared/config.yml, run]
+          volumeMounts:
+            - {name: credentials, mountPath: /etc/cloudflared/credentials.json, subPath: credentials.json, readOnly: true}
+            - {name: config, mountPath: /etc/cloudflared/config.yml, subPath: config.yml, readOnly: true}
+          resources: {requests: {cpu: 25m, memory: 64Mi}, limits: {cpu: 250m, memory: 256Mi}}
+      volumes:
+        - name: credentials
+          secret: {secretName: cloudflared-credentials}
+        - name: config
+          configMap: {name: cloudflared-config}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudflared-config
+data:
+  config.yml: |
+    # Replace tunnel with the existing tunnel UUID before deployment.
+    tunnel: replace-with-tunnel-uuid
+    credentials-file: /etc/cloudflared/credentials.json
+    ingress:
+      - hostname: myai.carher.net
+        service: http://traefik.kube-system.svc.cluster.local:80
+      - service: http_status:404

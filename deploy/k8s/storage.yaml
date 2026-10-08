@@ -1,0 +1,129 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ai-token-dashboard-postgres-pv
+spec:
+  capacity:
+    storage: 40Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ai-token-dashboard-local
+  hostPath:
+    path: /Data/k3s-storage/postgres
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ai-token-dashboard-local
+  resources:
+    requests:
+      storage: 40Gi
+  volumeName: ai-token-dashboard-postgres-pv
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ai-token-dashboard-redis-pv
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ai-token-dashboard-local
+  hostPath:
+    path: /Data/k3s-storage/redis
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ai-token-dashboard-local
+  resources:
+    requests:
+      storage: 5Gi
+  volumeName: ai-token-dashboard-redis-pv
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ai-token-dashboard-app-pv
+spec:
+  capacity:
+    storage: 2Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ai-token-dashboard-local
+  hostPath:
+    path: /Data/k3s-storage/app-data
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ai-token-dashboard-local
+  resources:
+    requests:
+      storage: 2Gi
+  volumeName: ai-token-dashboard-app-pv
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ai-token-dashboard-mail-dkim-pv
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ai-token-dashboard-local
+  hostPath:
+    path: /Data/k3s-storage/mail-dkim
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mail-dkim
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ai-token-dashboard-local
+  resources:
+    requests:
+      storage: 1Gi
+  volumeName: ai-token-dashboard-mail-dkim-pv
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ai-token-dashboard-mail-spool-pv
+spec:
+  capacity:
+    storage: 2Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ai-token-dashboard-local
+  hostPath:
+    path: /Data/k3s-storage/mail-spool
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mail-spool
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ai-token-dashboard-local
+  resources:
+    requests:
+      storage: 2Gi
+  volumeName: ai-token-dashboard-mail-spool-pv
