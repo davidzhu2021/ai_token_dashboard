@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: usage-sync-worker
+  namespace: ai-token-dashboard
 spec:
   replicas: 1
   selector: {matchLabels: {app: usage-sync-worker}}
@@ -26,6 +27,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: usage-realtime-worker
+  namespace: ai-token-dashboard
 spec:
   replicas: 1
   selector: {matchLabels: {app: usage-realtime-worker}}

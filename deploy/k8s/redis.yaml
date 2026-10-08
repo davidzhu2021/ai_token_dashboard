@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: usage-redis
+  namespace: ai-token-dashboard
 spec:
   serviceName: usage-redis
   replicas: 1
@@ -28,6 +29,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: usage-redis
+  namespace: ai-token-dashboard
 spec:
   selector: {app: usage-redis}
   ports: [{name: redis, port: 6379, targetPort: redis}]

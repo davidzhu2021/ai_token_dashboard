@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: mail-relay
+  namespace: ai-token-dashboard
 spec:
   serviceName: mail-relay
   replicas: 1
@@ -42,6 +43,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: mail-relay
+  namespace: ai-token-dashboard
 spec:
   selector: {app: mail-relay}
   ports: [{name: smtp, port: 25, targetPort: 25}]

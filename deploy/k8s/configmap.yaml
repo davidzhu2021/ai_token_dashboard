@@ -2,6 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: dashboard-config
+  namespace: ai-token-dashboard
 data:
   APP_BASE_URL: https://myai.carher.net
   USAGE_SYNC_ROLE: reader

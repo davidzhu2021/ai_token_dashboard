@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: usage-db
+  namespace: ai-token-dashboard
 spec:
   serviceName: usage-db
   replicas: 1
@@ -36,6 +37,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: usage-db
+  namespace: ai-token-dashboard
 spec:
   clusterIP: None
   selector: {app: usage-db}

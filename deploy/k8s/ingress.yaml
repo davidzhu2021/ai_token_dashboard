@@ -2,6 +2,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: ai-token-dashboard
+  namespace: ai-token-dashboard
   annotations:
     traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
 spec:
