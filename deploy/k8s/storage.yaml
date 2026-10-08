@@ -16,6 +16,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: postgres-data
+  namespace: ai-token-dashboard
 spec:
   accessModes: [ReadWriteOnce]
   storageClassName: ai-token-dashboard-local
@@ -42,6 +43,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: redis-data
+  namespace: ai-token-dashboard
 spec:
   accessModes: [ReadWriteOnce]
   storageClassName: ai-token-dashboard-local
@@ -68,6 +70,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: app-data
+  namespace: ai-token-dashboard
 spec:
   accessModes: [ReadWriteOnce]
   storageClassName: ai-token-dashboard-local
@@ -94,6 +97,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: mail-dkim
+  namespace: ai-token-dashboard
 spec:
   accessModes: [ReadWriteOnce]
   storageClassName: ai-token-dashboard-local
@@ -120,6 +124,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: mail-spool
+  namespace: ai-token-dashboard
 spec:
   accessModes: [ReadWriteOnce]
   storageClassName: ai-token-dashboard-local
