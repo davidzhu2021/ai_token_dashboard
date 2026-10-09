@@ -110,21 +110,22 @@ Pull requests should include a brief change summary, configuration or migration 
 After modifying project files, finish by reviewing `git diff`, committing the intended changes, and pushing them to the configured GitHub remote. After a successful push, synchronize the remote production server and update the running system from the pushed GitHub revision. Do not include `.env`, secrets, generated logs, virtual environments, or unrelated user changes in those commits.
 
 
-## Production Sync: JSZX-AI-03 / 188
+## Production Sync: AIYJY-243 / 10.68.13.243
 
 After a successful GitHub push, update the production server from the pushed `master` revision. Production details:
 
 - Public URL: `https://myai.carher.net`
-- JumpServer asset: `JSZX-AI-03`
-- Server: `JSZX-AI-03 / 188`
-- Deploy directory: `/home/cltx/apps/ai-token-dashboard/current`
-- Docker Compose service/container: `ai-token-dashboard`
-- Port mapping: host `8000` -> container `8000`
+- JumpServer asset: `AIYJY-243`
+- Server: `AIYJY-243 / 10.68.13.243`
+- Runtime: single-node K3s, namespace `ai-token-dashboard`
+- Persistent data: `/Data/k3s-storage` (PostgreSQL, Redis, app data, mail data)
+- Formal entry: `myai.carher.net` through the independent `ai-token-dashboard-myai` Tunnel
+- Old host `JSZX-AI-03` remains a rollback copy and may still run the shared `carher-s3` Tunnel for other services; do not use it as the dashboard deployment target.
 
 Standard sync command from Windows PowerShell:
 
 ```powershell
-wsl bash -lc "cd /home/zhuyida/codes/carher-admin/scripts && ./jms ssh JSZX-AI-03 'cd /home/cltx/apps/ai-token-dashboard/current && git pull origin master && docker compose up -d --build && sleep 5 && curl -fsS http://127.0.0.1:8000/api/health'"
+wsl bash -lc "cd /home/zhuyida/codes/carher-admin/scripts && ./jms ssh AIYJY-243 'kubectl -n ai-token-dashboard rollout restart deploy/ai-token-dashboard deploy/usage-sync-worker deploy/usage-realtime-worker && kubectl -n ai-token-dashboard rollout status deploy/ai-token-dashboard --timeout=180s && kubectl -n ai-token-dashboard get pods -o wide'"
 ```
 
 Post-deploy verification:
@@ -133,8 +134,8 @@ Post-deploy verification:
 # Public health check from local Windows
 Invoke-RestMethod -Uri 'https://myai.carher.net/api/health' -TimeoutSec 12
 
-# Optional server-side status check
-wsl bash -lc "cd /home/zhuyida/codes/carher-admin/scripts && ./jms ssh JSZX-AI-03 'cd /home/cltx/apps/ai-token-dashboard/current && docker compose ps && git log --oneline -1'"
+# Server-side status and storage check
+wsl bash -lc "cd /home/zhuyida/codes/carher-admin/scripts && ./jms ssh AIYJY-243 'kubectl -n ai-token-dashboard get pods,pvc -o wide && df -h / /Data'"
 ```
 
 Operational rules:
@@ -142,8 +143,9 @@ Operational rules:
 - Only sync production after `git push origin master` succeeds.
 - Do not hot-edit code on the server; make changes locally, commit, push, then pull on the server.
 - Never print, copy, or commit the server `.env` file or any secret values.
-- If the first health check fails with a connection reset immediately after `docker compose up`, wait 5-10 seconds and retry once; the container may still be starting.
-- If JumpServer, DNS, GitHub, or Docker fails, report the exact failing step and stop. Do not use destructive cleanup commands such as `docker system prune -a`, `git reset --hard`, or deleting shared Docker resources unless the user explicitly approves.
+- If the first health check fails immediately after a rollout, wait 5-10 seconds and retry once; the Pod may still be starting.
+- New data and historical sync writes must target the K3s PostgreSQL/PVCs on `/Data`; never start a second dashboard writer on the old host.
+- If JumpServer, DNS, GitHub, or Kubernetes fails, report the exact failing step and stop. Do not use destructive cleanup commands such as `docker system prune -a`, `git reset --hard`, deleting shared Docker resources, or deleting old rollback volumes unless the user explicitly approves.
 
 
 ## Security & Configuration Tips

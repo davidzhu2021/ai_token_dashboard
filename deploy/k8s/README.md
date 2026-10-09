@@ -1,5 +1,10 @@
 # K3s deployment
 
+This is the formal production deployment for `AIYJY-243` (`10.68.13.243`).
+The dashboard namespace is `ai-token-dashboard`; all durable dashboard data is
+stored on `/Data/k3s-storage`. The old Docker host is rollback-only for this
+dashboard and must not be started as a second writer.
+
 This directory contains the Kubernetes manifests for running the dashboard on
 the single-node K3s host. It deliberately uses static hostPath PVs under
 `/Data/k3s-storage` instead of changing K3s' cluster-wide `local-path`
@@ -24,3 +29,17 @@ StorageClass. That keeps existing LiteLLM PVCs on their current path.
 The manifests do not stop the old Compose deployment or switch Cloudflare.
 Perform those actions only during the approved maintenance window described in
 the migration runbook.
+
+## Current operations
+
+- Write authority: the K3s PostgreSQL StatefulSet and PVC `postgres-data`.
+- Authentication and key-vault authority: PVC `app-data`.
+- Formal public entry: the independent `ai-token-dashboard-myai` Tunnel.
+- Keep the old database, volumes, and rollback configuration until historical
+  backfill is complete and the public/login/admin regression checks pass.
+- After changing a ConfigMap or Deployment, verify worker progress through
+  `/api/health`; a `Running` Pod alone does not prove that the snapshot cursor
+  is advancing.
+- The current conservative backfill settings use one-day windows, page size
+  50, low concurrency, and retries. Do not reset the backfill queue to recover
+  from an upstream timeout; let failed windows retry idempotently.

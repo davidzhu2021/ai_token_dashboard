@@ -610,12 +610,18 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:8000/api/health'
 
 README-only 修改通常不需要跑完整后端测试，但提交前仍应检查 UTF-8 中文、接口路径、环境变量名和 git diff。
 
-## 生产同步
+## 生产同步（K3s 新服务器）
 
-只在 `git push origin master` 成功后同步生产服务器。标准同步命令：
+当前正式看板运行在 `AIYJY-243 / 10.68.13.243` 的单节点 K3s 中，命名空间为
+`ai-token-dashboard`。PostgreSQL、Redis、认证/密钥库和邮件数据使用
+`/Data/k3s-storage` 下的 PVC；后续同步和数据写入必须以新机为唯一正式写入端。
+旧机 `JSZX-AI-03` 只保留回滚数据，并可能继续运行其他业务共用的 `carher-s3`
+Tunnel，不能再启动旧 Docker 看板写入服务。
+
+只在 `git push origin master` 成功后更新生产清单或镜像。标准状态/发布检查命令：
 
 ```powershell
-wsl bash -lc "cd /home/zhuyida/codes/carher-admin/scripts && ./jms ssh JSZX-AI-03 'cd /home/cltx/apps/ai-token-dashboard/current && git pull origin master && docker compose up -d --build && sleep 5 && curl -fsS http://127.0.0.1:8000/api/health'"
+wsl bash -lc "cd /home/zhuyida/codes/carher-admin/scripts && ./jms ssh AIYJY-243 'kubectl -n ai-token-dashboard get pods,pvc -o wide && kubectl -n ai-token-dashboard rollout status deploy/ai-token-dashboard --timeout=180s'"
 ```
 
 本地公开健康检查：
@@ -627,10 +633,10 @@ Invoke-RestMethod -Uri 'https://myai.carher.net/api/health' -TimeoutSec 12
 可选服务器状态检查：
 
 ```powershell
-wsl bash -lc "cd /home/zhuyida/codes/carher-admin/scripts && ./jms ssh JSZX-AI-03 'cd /home/cltx/apps/ai-token-dashboard/current && docker compose ps && git log --oneline -1'"
+wsl bash -lc "cd /home/zhuyida/codes/carher-admin/scripts && ./jms ssh AIYJY-243 'kubectl -n ai-token-dashboard get pods,pvc -o wide; df -h / /Data'"
 ```
 
-不要在服务器上热修改代码；所有变更都应本地修改、提交、推送，再由服务器拉取 `master` 构建发布。
+不要在服务器上热修改代码；所有代码/清单变更都应本地修改、提交、推送，再按 K3s 发布流程更新。不要删除旧机数据库、volume、密钥库或备份，直到新机历史同步追平并完成回滚演练。
 
 ## 常见问题
 
