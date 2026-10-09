@@ -1,4 +1,8 @@
-# Remote Read-Only Demonstration
+# Remote Read-Only Demonstration (Legacy)
+
+> This is a separate legacy read-only demo, not the long-term production
+> deployment. Production runs on `AIYJY-243` through the K3s manifests under
+> `deploy/k8s/`. Keep this demo isolated unless it is explicitly needed.
 
 This Compose project runs only the dashboard Web container. It reads committed
 usage snapshots from the production `ai_usage` database through a separate
@@ -26,7 +30,7 @@ workers, billing, organization management, or any upstream management client.
 1. Copy `.env.remote-demo.example` to `.env.remote-demo` and set a distinct
    session secret, SSO callback configuration, internal bind IP, and read-only
    database URL. Keep all upstream management key variables empty.
-2. On `JSZX-AI-03`, deploy from the pushed revision:
+2. On the legacy demo host `JSZX-AI-03`, deploy from the pushed revision:
 
    ```bash
    docker compose -p ai-token-dashboard-remote-demo \

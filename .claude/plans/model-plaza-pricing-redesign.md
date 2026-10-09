@@ -105,7 +105,7 @@
 
 1. `python -m pytest tests/ -q`（全量，确认无回归）。
 2. `127.0.0.1:8000` 起本地服务（遵守 AGENTS.md：仅用 8000，端口占用先查进程，收尾停掉临时服务），验证 `GET /api/health`、`GET /api/models` 返回带价格字段、模型广场卡片/表格双视图、筛选与搜索、复制按钮。
-3. `git diff` review 后提交推送，再按 AGENTS.md 同步生产 JSZX-AI-03 并做健康检查。
+3. `git diff` review 后提交推送，再按 AGENTS.md 同步生产到 `AIYJY-243` 的 K3s，并做健康检查。
 
 ## 范围外
 

@@ -119,7 +119,7 @@ CSS 尽量复用 `.organization-*`、`.model-choice*`、`.new-key-box`；只在 
 - `README.md` 的「客户企业 Mock V2 演示」章节补一段令牌管理：谁能用、字段含义、明文只显示一次、平台只读、演示数据重启即恢复。
 - `.env.example` 无需改动（沿用 `ORGANIZATION_DEMO_ENABLED`）。
 - 验证：`python -m pytest tests/`，再在 `127.0.0.1:8000` 用 dev-login 以 `owner@demo.example`（甲方管理员）和平台管理员各走一遍新增/撤销/只读，结束后停掉临时进程。
-- 最后 `git diff` review → commit → push origin master → 按 AGENTS.md 同步 JSZX-AI-03 生产并做健康检查。
+- 最后 `git diff` review → commit → push origin master → 按 AGENTS.md 同步 `AIYJY-243` 的 K3s 生产并做健康检查。
 
 ## 明确不做
 

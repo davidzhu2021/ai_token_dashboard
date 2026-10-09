@@ -21,7 +21,11 @@ LiteLLM Proxy (custom callback)
 补写为 `event_type='final_request'` 的尝试事件，让「上游异常率」「重试恢复率」在
 推送方接入**之前**即可从原始日志推导；「兜底恢复率」仍只依赖推送方。
 
-## 一、看板侧配置（本仓库，JSZX-AI-03 / myai.carher.net）
+## 一、看板侧配置（本仓库，新机 K3s / myai.carher.net）
+
+正式看板运行在 `AIYJY-243 / 10.68.13.243` 的
+`ai-token-dashboard` 命名空间，持久化数据位于 `/Data/k3s-storage`。
+旧 Docker 主机只作为回滚副本，不应重新启动看板或 worker。
 
 1. 在服务器 `.env` 生成独立随机密钥（不要与其他密钥复用）：
 

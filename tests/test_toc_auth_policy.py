@@ -75,6 +75,8 @@ def test_bot_protection_opt_out_does_not_bypass_other_signup_gates(monkeypatch) 
     assert main.signup_unavailable_code() == "AUTH_SIGNUP_EMAIL_NOT_CONFIGURED"
 
 
+# Private relay allowlist coverage; the old-host address remains here only as
+# a private-network regression case, not as a production dependency.
 @pytest.mark.parametrize("host", ("127.0.0.1", "10.68.13.188", "172.28.0.5", "192.168.10.4"))
 def test_local_relay_accepts_private_smtp_host_without_credentials(monkeypatch, host: str) -> None:
     _configure_public_signup_env(monkeypatch)

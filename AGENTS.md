@@ -71,7 +71,7 @@ Before making code changes, review the relevant LiteLLM behavior against the loc
 
 ## LiteLLM Deployment Reference
 
-The upstream LiteLLM service is deployed separately from this dashboard. Do not confuse the LiteLLM cluster with this dashboard's production host `JSZX-AI-03 / 10.68.13.188`.
+The upstream LiteLLM service is deployed separately from this dashboard. Do not confuse the LiteLLM cluster with this dashboard's production host `AIYJY-243 / 10.68.13.243`.
 
 - JumpServer asset: `AIYJY-litellm`
 - K3s control-plane node: `10.68.13.198` (`aiyjy-litellm`)
