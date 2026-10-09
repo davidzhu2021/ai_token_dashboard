@@ -228,3 +228,37 @@ def test_partial_multi_backend_snapshot_skips_event_window_delete() -> None:
         query.startswith("DELETE FROM usage_event_attribution")
         for query in pool.connection.queries
     )
+
+
+def test_stability_publish_batches_and_deduplicates_events(monkeypatch) -> None:
+    monkeypatch.setenv("STABILITY_PUBLISH_BATCH_SIZE", "100")
+    store = UsageStore("postgresql://unused")
+    pool = _Pool()
+    store.pool = pool
+    events = [_event(f"request-{index}") for index in range(101)]
+    events.append(_event("request-100"))
+
+    asyncio.run(
+        store.publish_stability_events(
+            "primary",
+            "2026-08-01",
+            "2026-08-07",
+            events,
+            "2026-08-01",
+            "2026-08-07",
+            False,
+        )
+    )
+
+    usage_inserts = [
+        query for query in pool.connection.queries
+        if query.startswith("INSERT INTO usage_event_attribution")
+    ]
+    attempt_inserts = [
+        query for query in pool.connection.queries
+        if query.startswith("INSERT INTO stability_attempt_events")
+    ]
+    assert len(usage_inserts) == 2
+    assert len(attempt_inserts) == 2
+    assert len(pool.connection.usage_event_attribution) == 101
+    assert len(pool.connection.stability_attempt_events) == 101

@@ -50,6 +50,7 @@ class UsageSyncWorker:
         self.stop_event = asyncio.Event()
         self._heartbeat_task: asyncio.Task[Any] | None = None
         self._current_status = "starting"
+        self._refresh_defer_count = 0
 
     async def _realtime_settlement_lagging(self) -> bool:
         """Yield to the realtime worker while its verification watermark is behind."""
@@ -202,8 +203,22 @@ class UsageSyncWorker:
         if not callable(claim) or not callable(finish):
             return False
         if await self._realtime_settlement_lagging():
-            logger.warning("deferring queued usage refresh while realtime settlement is lagging")
-            return False
+            self._refresh_defer_count += 1
+            max_defers = max(0, _env_int("USAGE_REFRESH_REALTIME_MAX_DEFERS", 3))
+            if self._refresh_defer_count <= max_defers:
+                logger.warning(
+                    "deferring queued usage refresh while realtime settlement is lagging "
+                    "defer=%s/%s",
+                    self._refresh_defer_count,
+                    max_defers,
+                )
+                return False
+            logger.warning(
+                "realtime settlement remains lagging; processing durable refresh after max defers=%s",
+                max_defers,
+            )
+        else:
+            self._refresh_defer_count = 0
         stale_after_seconds = max(
             60, _env_int("USAGE_REFRESH_CLAIM_STALE_SECONDS", 300)
         )

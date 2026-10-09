@@ -29,6 +29,13 @@ from .observability import redact_error_message
 logger = logging.getLogger("ai-token-dashboard.usage-store")
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 USAGE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS usage_daily (
     backend_id TEXT NOT NULL,
@@ -2546,6 +2553,18 @@ class UsageStore:
             )
             is not None
         ]
+        # Keep one atomic transaction while bounding each client-side bind batch.
+        # This prevents large overlap scans from holding the connection until the
+        # worker timeout, and dedupes boundary duplicates before UPSERT.
+        batch_size = max(100, _env_int("STABILITY_PUBLISH_BATCH_SIZE", 1000))
+        records = list({(record[0], record[1]): record for record in records}.values())
+        final_attempt_records = list(
+            {(record[0], record[1]): record for record in final_attempt_records}.values()
+        )
+
+        async def execute_batches(connection: Any, query: str, values: list[tuple[Any, ...]]) -> None:
+            for offset in range(0, len(values), batch_size):
+                await connection.executemany(query, values[offset : offset + batch_size])
         async with pool.acquire() as connection:
             async with connection.transaction():
                 if complete:
@@ -2558,7 +2577,7 @@ class UsageStore:
                         _as_date(replace_end_date),
                     )
                 if records:
-                    await connection.executemany(
+                    await execute_batches(connection,
                         """
                         INSERT INTO usage_event_attribution (
                             backend_id, request_id, event_time, usage_date, raw_user_id,
@@ -2610,7 +2629,7 @@ class UsageStore:
                         _as_date(replace_end_date),
                     )
                 if final_attempt_records:
-                    await connection.executemany(
+                    await execute_batches(connection,
                         """
                         INSERT INTO stability_attempt_events (
                             backend_id, event_id, request_id, trace_id, attempt_id,
