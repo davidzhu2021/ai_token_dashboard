@@ -21,6 +21,13 @@ def test_dashboard_model_filter_isolated_by_board_scope() -> None:
     assert 'updateDashboardModelFilterOptions(payload.summaryRows || payload.rows || [], payload.modelOptions, "department",' in source
     assert 'updateDashboardModelFilterOptions(payload.summaryRows || payload.rows || [], payload.modelOptions, "team",' in source
     assert 'const hasMemberRoster = Array.isArray(payload.employees);' in source
+    assert "function prepareDashboardModelFilterContext(scopeKey, dataKey)" in source
+    assert "state.allSelected !== false" in source
+    assert 'prepareDashboardModelFilterContext("personal"' in source
+    assert 'prepareDashboardModelFilterContext("admin"' in source
+    assert 'prepareDashboardModelFilterContext("department"' in source
+    assert 'prepareDashboardModelFilterContext("team"' in source
+    assert 'const queryKey = `${startDate}|${endDate}|${source}|${models.join(",")}`;' in source
 
 
 def test_team_model_filter_keeps_full_member_roster() -> None:
