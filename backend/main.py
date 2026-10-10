@@ -1507,6 +1507,27 @@ def attach_snapshot_freshness(
             }
         )
     payload["dataFreshness"] = freshness
+    # An empty result must remain distinguishable from a real zero-usage result.
+    # Only mark it unavailable when the snapshot itself is incomplete or stale;
+    # a complete, healthy snapshot with no rows is a valid zero-usage answer.
+    quality = dict(payload.get("dataQuality") or {})
+    rows = payload.get("rows")
+    coverage = payload.get("coverage") or {}
+    if isinstance(rows, list) and not rows:
+        unavailable = bool(
+            freshness.get("stale")
+            or freshness.get("degraded")
+            or coverage.get("complete") is False
+            or payload.get("missingBackends")
+        )
+        if unavailable:
+            quality["snapshotUnavailable"] = True
+            quality["emptyReason"] = (
+                "realtime_snapshot_not_settled"
+                if freshness.get("source") == "realtime"
+                else "snapshot_incomplete"
+            )
+    payload["dataQuality"] = quality
     return payload
 
 

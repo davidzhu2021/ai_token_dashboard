@@ -14,6 +14,7 @@ let currentUser = null;
 let currentView = "dashboard";
 let usageData = [];
 let usageSummary = null;
+let personalDataUnavailable = false;
 let dashboardModelOptions = [];
 let selectedDashboardModels = new Set();
 let dashboardModelFilterScopeKey = "";
@@ -902,13 +903,6 @@ function usageStatusState(freshness = null, dataQuality = null, coverage = null)
       tone: "danger",
       title: "实时快照发布失败",
       description: "当前数据可能尚未包含最新用量，请稍后刷新后再核对。",
-    };
-  }
-  if (freshness?.stale) {
-    return {
-      tone: "warning",
-      title: "数据同步中",
-      description: "最新用量正在同步，当前显示的 0 可能尚未包含刚刚发生的请求。",
     };
   }
   if (quality.snapshotUnavailable) {
@@ -1953,7 +1947,16 @@ function renderDailyOverview(config) {
     showShare = false,
     compactSingleDay = false,
     totalsOverride = null,
+    unavailable = false,
   } = config;
+  const qualityForPrefix = prefix === "admin"
+    ? adminDataQuality
+    : prefix === "team"
+      ? (selectedTeamEmployee ? teamMemberDataQuality || teamDataQuality : teamDataQuality)
+      : prefix === "department"
+        ? departmentDataQuality
+        : personalDataQuality;
+  unavailable = unavailable || Boolean(qualityForPrefix?.snapshotUnavailable && !data.length);
   const latest = latestUsageDay(data, summary);
   const latestDate = latest.date || "";
   const rangeTokens = totalsOverride ? Number(totalsOverride.totalTokens || 0) : sum(data, "totalTokens");
@@ -1973,12 +1976,13 @@ function renderDailyOverview(config) {
   }
 
   setText(`${baseId}TotalLabel`, totalLabel);
-  setDailyTokenValue(`${baseId}Total`, formatTokens(rangeTokens));
-  setText(`${baseId}Spend`, spendUnavailable ? "暂不可用" : money.format(rangeSpend));
-  setText(`${baseId}Requests`, fmt.format(rangeRequests));
+  const unavailableValue = unavailable ? "暂不可用" : null;
+  setDailyTokenValue(`${baseId}Total`, unavailableValue || formatTokens(rangeTokens));
+  setText(`${baseId}Spend`, unavailableValue || (spendUnavailable ? "暂不可用" : money.format(rangeSpend)));
+  setText(`${baseId}Requests`, unavailableValue || fmt.format(rangeRequests));
   setText(`${baseId}RequestsSub`, "所选范围累计");
-  setText(`${baseId}Success`, successRateText(rangeRequests, rangeSuccesses));
-  setText(`${baseId}SuccessSub`, `${fmt.format(rangeSuccesses)} / ${fmt.format(rangeRequests)} 次成功`);
+  setText(`${baseId}Success`, unavailableValue || successRateText(rangeRequests, rangeSuccesses));
+  setText(`${baseId}SuccessSub`, unavailableValue || `${fmt.format(rangeSuccesses)} / ${fmt.format(rangeRequests)} 次成功`);
   setText(`${baseId}Context`, overviewContext(latestDate));
   setText(`${baseId}Date`, selectedDateRangeText());
 
@@ -2192,6 +2196,10 @@ function renderMetricGroups(containerId, data, mode = "personal", summary = null
   const source = sourceText();
   const scopeSuffix = metricScopeSuffix(mode);
 
+  if (mode === "personal" && personalDataUnavailable) {
+    container.innerHTML = `<section class="metric-group"><div class="metric-group-head"><div><h3>当前用量暂不可用</h3><p>快照或身份匹配尚未完成，请稍后刷新。</p></div></div></section>`;
+    return;
+  }
   container.innerHTML = [
     metricGroup("所选范围请求", `${label} · ${source}${scopeSuffix}`, [
       metric(`${label} 请求次数`, fmt.format(requests), "按当前筛选累计", "请求", "blue", "request"),
@@ -2213,6 +2221,7 @@ function renderPersonalMetrics(data) {
     data,
     summary: usageSummary,
     showShare: true,
+    unavailable: personalDataUnavailable,
   });
   el("trendBadge").textContent = `${label} · ${source}`;
   el("spendBadge").textContent = `${label} · ${source}`;
@@ -3817,6 +3826,14 @@ function renderPersonal() {
   toggleTrendGrid("personalTrendGrid");
   setupUsageTableFilters(usageData);
   renderPersonalMetrics(usageData);
+  if (personalDataUnavailable) {
+    ["trendChart", "spendChart", "sourceDonut", "modelBars"].forEach((id) => {
+      const node = el(id);
+      if (node) node.innerHTML = '<div class="empty-state">当前数据暂不可用</div>';
+    });
+    renderTable([]);
+    return;
+  }
   renderTrendTo("trendChart", usageData);
   renderSpendTrendTo("spendChart", usageData);
   renderDonutTo("sourceDonut", "donutTotal", "sourceLegend", usageData);
@@ -10230,6 +10247,7 @@ function loadDashboardData(forceRefresh = false) {
   dashboardRequestController = controller;
   dashboardRequestKey = queryKey;
   const requestId = ++dashboardRequestId;
+  personalDataUnavailable = false;
   isDashboardLoading = true;
   renderPersonal();
   const request = (async () => {
@@ -10242,6 +10260,7 @@ function loadDashboardData(forceRefresh = false) {
       updateDashboardModelFilterOptions(payload.rows || [], payload.modelOptions, "personal", `${startDate}|${endDate}|${source}|personal`);
       usageData = applyDashboardModelFilter(payload.rows || []);
       usageSummary = usageData.length ? null : payload.summary || null;
+      personalDataUnavailable = Boolean(payload.dataQuality?.snapshotUnavailable && !usageData.length);
       personalDataFreshness = payload.dataFreshness || null;
       personalDataQuality = payload.dataQuality || null;
       personalCoverage = payload.coverage || null;
@@ -10249,6 +10268,7 @@ function loadDashboardData(forceRefresh = false) {
     } catch (error) {
       if (error.name !== "AbortError" && requestId === dashboardRequestId) {
         showToast(error.message || "用量数据加载失败");
+        personalDataUnavailable = true;
       }
     } finally {
       if (dashboardInFlight === request) dashboardInFlight = null;

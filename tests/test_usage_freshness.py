@@ -54,3 +54,36 @@ def test_freshness_stays_verifying_when_one_backend_lags(monkeypatch) -> None:
     assert freshness["settlementState"] == "verifying"
     assert freshness["unsettledBackends"] == ["her"]
     assert freshness["verificationLagSeconds"] >= 900
+
+
+def test_empty_rows_are_marked_unavailable_only_when_snapshot_is_degraded(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(main, "realtime_enabled", lambda: True)
+    monkeypatch.setattr(main, "usage_today", lambda: now.date())
+    monkeypatch.setattr(main, "usage_backend_ids", lambda: ["primary"])
+    monkeypatch.setattr(
+        main,
+        "_usage_realtime_read_status",
+        {
+            "latestEventAt": now,
+            "revision": 3,
+            "ready": True,
+            "backfillActive": False,
+            "latestEventLagSeconds": 1,
+            "verifiedThrough": {"primary": now},
+            "settlementStatuses": {"primary": {"status": "settled", "error": ""}},
+        },
+    )
+    healthy = main.attach_snapshot_freshness(
+        {"rows": [], "coverage": {"complete": True}}, now,
+        now.date().isoformat(), now.date().isoformat(), "3",
+    )
+    assert not healthy["dataQuality"].get("snapshotUnavailable")
+
+    monkeypatch.setattr(main, "_usage_realtime_read_status", {"ready": True, "backfillActive": True})
+    degraded = main.attach_snapshot_freshness(
+        {"rows": [], "coverage": {"complete": True}}, now,
+        now.date().isoformat(), now.date().isoformat(), "3",
+    )
+    assert degraded["dataQuality"]["snapshotUnavailable"] is True
+    assert degraded["dataQuality"]["emptyReason"] == "realtime_snapshot_not_settled"
