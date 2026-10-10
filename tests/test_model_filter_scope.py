@@ -3,6 +3,20 @@ from pathlib import Path
 from backend.main import apply_usage_model_filter, reaggregate_team_employees_after_model_filter
 
 
+def test_model_filter_placeholder_means_all_models() -> None:
+    payload = {
+        "rows": [
+            {"model": "gpt-5", "totalTokens": 10},
+            {"model": "claude", "totalTokens": 20},
+        ],
+        "summary": {"rangeTotal": {"totalTokens": 30}},
+    }
+
+    filtered = apply_usage_model_filter(payload, ["__none__"])
+
+    assert [row["model"] for row in filtered["rows"]] == ["gpt-5", "claude"]
+
+
 ROOT = Path(__file__).resolve().parents[1]
 
 

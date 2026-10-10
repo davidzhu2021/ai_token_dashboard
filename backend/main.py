@@ -4513,7 +4513,7 @@ def usage_model_filter(models: list[str] | None) -> set[str]:
         item.strip()
         for value in (models or [])
         for item in str(value or "").split(",")
-        if item.strip()
+        if item.strip() and item.strip() != "__none__"
     }
 
 
