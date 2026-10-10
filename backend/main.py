@@ -4914,7 +4914,12 @@ async def local_personal_usage_payload(
     else:
         await store.connect()
         stored = await store.personal_rows_by_user_ids(
-            [upstream_user_id], start_date, end_date, source, usage_backend_ids()
+            [upstream_user_id],
+            start_date,
+            end_date,
+            source,
+            usage_backend_ids(),
+            str(app_user.get("email") or ""),
         )
         if stored is None:
             raise HTTPException(status_code=503, detail="个人用量快照尚未就绪，请等待后台同步完成")

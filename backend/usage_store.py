@@ -3734,11 +3734,13 @@ class UsageStore:
         end_date: str,
         source: str,
         backend_ids: list[str],
+        employee_email: str = "",
     ) -> dict[str, Any] | None:
         covered = await self.covered_backend_ids(start_date, end_date, backend_ids)
         if set(covered) != set(backend_ids):
             return None
         normalized = sorted({str(item).strip() for item in user_ids if str(item).strip()})
+        normalized_email = str(employee_email or "").strip().lower()
         records = await self._require_pool().fetch(
             """
             SELECT usage_date, source, model,
@@ -3751,7 +3753,10 @@ class UsageStore:
                    SUM(spend) AS spend
             FROM usage_query_daily
             WHERE usage_date BETWEEN $1::date AND $2::date
-              AND user_id=ANY($3::text[])
+              AND (
+                    user_id=ANY($3::text[])
+                    OR ($6 <> '' AND lower(btrim(COALESCE(employee_email, '')))=$6)
+              )
               AND backend_id=ANY($4::text[])
               AND ($5='all' OR source=$5)
             GROUP BY usage_date, source, model
@@ -3762,6 +3767,7 @@ class UsageStore:
             normalized,
             covered,
             source or "all",
+            normalized_email,
         )
         rows = [self._aggregated_usage_row(record, include_identity=False) for record in records]
         return {
