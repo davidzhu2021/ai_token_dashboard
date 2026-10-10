@@ -1593,13 +1593,13 @@ class UsageStore:
             return None
         coverage_revision = await self._require_pool().fetchval(
             """
-            SELECT MIN(synced_at)::text
+            SELECT MAX(synced_at)::text
             FROM usage_sync_coverage
-            WHERE usage_date=$1::date AND backend_id=ANY($2::text[])
-            HAVING COUNT(DISTINCT backend_id)=cardinality($2::text[])
+            WHERE usage_date BETWEEN $1::date AND $3::date AND backend_id=ANY($2::text[])
             """,
-            _as_date(end_date),
+            _as_date(start_date),
             sorted(set(backend_ids)),
+            _as_date(end_date),
         )
         try:
             realtime = await self._require_pool().fetchrow(
@@ -2715,7 +2715,7 @@ class UsageStore:
         end_date: str,
         snapshots: list[Any],
     ) -> dict[str, Any]:
-        """COPY a complete multi-backend snapshot, then publish it atomically."""
+        """Atomically publish healthy sources while retaining rejected sources."""
 
         if not snapshots:
             return {"rowCount": 0, "snapshotRevision": None}

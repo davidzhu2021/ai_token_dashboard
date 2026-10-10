@@ -914,9 +914,7 @@ class UsageSynchronizer:
 
             row_count = 0
             snapshot_revision: str | None = None
-            expected_backend_count = len(self.client.backends)
             publish_snapshots = getattr(self.store, "publish_snapshots", None)
-            collection_errors = list(errors)
             quality_errors = [
                 f"{snapshot.backend_id}: {(_text((getattr(snapshot, 'quality', None) or {}).get('degradedReason')) or '采集质量未通过')}"
                 for snapshot in snapshots
@@ -925,19 +923,16 @@ class UsageSynchronizer:
             if quality_errors:
                 logger.warning("usage snapshot publish blocked by quality gate: %s", "; ".join(quality_errors))
                 errors.extend(quality_errors)
-            collection_complete = len(snapshots) == expected_backend_count and not collection_errors
-            if collection_complete and callable(publish_snapshots):
-                published = await publish_snapshots(start_date, end_date, snapshots)
+            accepted = [
+                snapshot for snapshot in snapshots
+                if bool((getattr(snapshot, "quality", None) or {}).get("complete", True))
+            ]
+            if accepted and callable(publish_snapshots):
+                published = await publish_snapshots(start_date, end_date, accepted)
                 row_count = int(published.get("rowCount") or 0)
                 snapshot_revision = _text(published.get("snapshotRevision")) or None
-            elif errors:
-                logger.warning(
-                    "usage snapshot publish skipped because collection was incomplete backends=%s/%s",
-                    len(snapshots),
-                    expected_backend_count,
-                )
             else:
-                for snapshot in snapshots:
+                for snapshot in accepted:
                     replace_snapshot = self.store.replace_backend_snapshot
                     events = getattr(snapshot, "events", None)
                     departments = getattr(snapshot, "departments", None)
@@ -980,13 +975,14 @@ class UsageSynchronizer:
                         snapshot.memberships,
                         **kwargs,
                     )
-            status = "partial" if errors and snapshots else "failed" if errors else "ok"
-            await self._refresh_historical_identity(snapshots)
+            status = "partial" if errors and accepted else "failed" if errors else "ok"
+            await self._refresh_historical_identity(accepted)
             await self.store.finish_sync_run(run_id, status, len(snapshots), row_count, "; ".join(errors))
             return {
                 "status": status,
                 "rowCount": row_count,
                 "backendCount": len(snapshots),
+                "publishedBackends": [snapshot.backend_id for snapshot in accepted],
                 "errors": errors,
                 "snapshotRevision": snapshot_revision,
             }
