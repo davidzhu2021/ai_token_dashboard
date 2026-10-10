@@ -383,23 +383,20 @@ SELECT u.*
 FROM usage_daily u
 WHERE NOT EXISTS (
     SELECT 1 FROM usage_realtime_state s
-    WHERE s.usage_date=u.usage_date AND s.ready AND s.complete
+    WHERE s.usage_date=u.usage_date AND s.ready
 )
 UNION ALL
 SELECT r.*
 FROM usage_realtime_daily r
 JOIN usage_realtime_state s ON s.usage_date=r.usage_date AND s.ready AND s.complete
 
--- A live-only current day has no historical rows yet. Expose its moving
--- mirror for charts while keeping historical rows authoritative whenever they
--- exist; the completeness flag still prevents replacement of a real snapshot.
+-- A live current day must win over the historical snapshot while its mirror is
+-- serving. This prevents a stale/partial daily row from hiding newer events.
 UNION ALL
 SELECT r.*
 FROM usage_realtime_daily r
 JOIN usage_realtime_state s ON s.usage_date=r.usage_date AND s.ready AND NOT s.complete
-WHERE NOT EXISTS (
-    SELECT 1 FROM usage_daily u WHERE u.usage_date=r.usage_date
-);
+;
 
 -- Dashboard-facing API cost facts. Request-level attribution remains the
 -- audit source; this table keeps overview queries bounded as history grows.
