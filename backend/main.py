@@ -4687,7 +4687,9 @@ async def _personal_usage_payload(app_user: dict[str, Any], start_date: str, end
                     "rows": rows,
                     "summary": usage_summary(rows),
                     "mappingCache": {"hit": True, "ttlSeconds": 0},
-                }, stored.get("lastSyncedAt"), start_date, end_date, revision)
+                    "coveredBackends": stored.get("coveredBackends", usage_backend_ids()),
+                    "missingBackends": stored.get("missingBackends", []),
+                    }, stored.get("lastSyncedAt"), start_date, end_date, revision)
                 cache_usage_payload(
                     personal_usage_cache,
                     cache_key,

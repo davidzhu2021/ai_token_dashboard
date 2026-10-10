@@ -916,15 +916,17 @@ class UsageSynchronizer:
             snapshot_revision: str | None = None
             expected_backend_count = len(self.client.backends)
             publish_snapshots = getattr(self.store, "publish_snapshots", None)
+            collection_errors = list(errors)
             quality_errors = [
                 f"{snapshot.backend_id}: {(_text((getattr(snapshot, 'quality', None) or {}).get('degradedReason')) or '采集质量未通过')}"
                 for snapshot in snapshots
                 if not bool((getattr(snapshot, 'quality', None) or {}).get("complete", True))
             ]
             if quality_errors:
-                errors.extend(quality_errors)
                 logger.warning("usage snapshot publish blocked by quality gate: %s", "; ".join(quality_errors))
-            if not errors and len(snapshots) == expected_backend_count and callable(publish_snapshots):
+                errors.extend(quality_errors)
+            collection_complete = len(snapshots) == expected_backend_count and not collection_errors
+            if collection_complete and callable(publish_snapshots):
                 published = await publish_snapshots(start_date, end_date, snapshots)
                 row_count = int(published.get("rowCount") or 0)
                 snapshot_revision = _text(published.get("snapshotRevision")) or None

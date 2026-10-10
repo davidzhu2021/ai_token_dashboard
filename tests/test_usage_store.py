@@ -1255,6 +1255,59 @@ def test_usage_sync_isolates_backend_failures() -> None:
     assert result["errors"] == ["her: RuntimeError"]
 
 
+def test_usage_sync_publishes_healthy_backend_when_other_source_is_sparse() -> None:
+    class FakeStore:
+        def __init__(self) -> None:
+            self.finished = None
+            self.published = None
+
+        async def begin_sync_run(self, *_args):
+            return 1
+
+        async def try_acquire_sync_lock(self):
+            return object()
+
+        async def release_sync_lock(self, _lock):
+            return None
+
+        async def publish_snapshots(self, _start, _end, snapshots):
+            self.published = [
+                item.backend_id
+                for item in snapshots
+                if (getattr(item, "quality", None) or {}).get("complete", True)
+            ]
+            return {"rowCount": 3, "snapshotRevision": "rev-1", "status": "partial"}
+
+        async def finish_sync_run(self, *args):
+            self.finished = args
+
+    class FakeClient:
+        backends = [
+            type("Backend", (), {"id": "primary"})(),
+            type("Backend", (), {"id": "her"})(),
+        ]
+
+    synchronizer = UsageSynchronizer(FakeClient(), FakeStore())
+
+    async def fake_collect(backend, *_args):
+        quality = {"complete": backend.id == "primary"}
+        if backend.id == "her":
+            quality["degradedReason"] = "用户 daily activity 返回非空用户过少"
+        return type("Snapshot", (), {
+            "backend_id": backend.id,
+            "rows": [],
+            "memberships": [],
+            "quality": quality,
+        })()
+
+    synchronizer.collect_backend = fake_collect
+    result = asyncio.run(synchronizer.sync("2026-07-20", "2026-07-22"))
+
+    assert result["status"] == "partial"
+    assert synchronizer.store.published == ["primary"]
+    assert result["errors"] == ["her: 用户 daily activity 返回非空用户过少"]
+
+
 def test_organization_daily_spend_groups_only_explicit_attribution() -> None:
     class Pool:
         async def fetch(self, query, *args):

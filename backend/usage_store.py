@@ -2720,6 +2720,7 @@ class UsageStore:
         if not snapshots:
             return {"rowCount": 0, "snapshotRevision": None}
         rejected = []
+        publishable = []
         for snapshot in snapshots:
             quality = getattr(snapshot, "quality", None) or {}
             if quality and quality.get("complete") is False:
@@ -2729,10 +2730,15 @@ class UsageStore:
                     "recordsRead": int(quality.get("recordsRead") or 0),
                     "usersWithUsage": int(quality.get("userCountWithUsage") or 0),
                 })
+                continue
+            publishable.append(snapshot)
         if rejected:
-            # Never delete the previous valid rows when a fallback is sparse.
-            logger.warning("snapshot publish rejected by quality gate: %s", rejected)
+            # A sparse source must keep its last good rows, while healthy
+            # sources continue to advance independently.
+            logger.warning("snapshot publish partially rejected by quality gate: %s", rejected)
+        if not publishable:
             return {"rowCount": 0, "snapshotRevision": None, "status": "partial", "quality": rejected}
+        snapshots = publishable
         # Normalize at the database boundary so DATE parameters are native date values.
         start_day = _as_date(start_date)
         end_day = _as_date(end_date)
@@ -3078,6 +3084,8 @@ class UsageStore:
             "rowCount": len(usage_records),
             "snapshotRevision": str(revision or ""),
             "publishedAt": collected_at,
+            "status": "partial" if rejected else "ok",
+            "quality": rejected,
         }
 
     async def upsert_attributed_usage(
@@ -3683,7 +3691,7 @@ class UsageStore:
 
     async def personal_rows(self, email: str, start_date: str, end_date: str, source: str, backend_ids: list[str]) -> dict[str, Any] | None:
         covered = await self.covered_backend_ids(start_date, end_date, backend_ids)
-        if set(covered) != set(backend_ids):
+        if not covered:
             return None
         records = await self._require_pool().fetch(
             """
@@ -3715,7 +3723,12 @@ class UsageStore:
             }
             for record in records
         ]
-        return {"rows": self._group_rows(rows, ("date", "source", "model")), "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered)}
+        return {
+            "rows": self._group_rows(rows, ("date", "source", "model")),
+            "lastSyncedAt": await self.latest_sync_at(start_date, end_date, covered),
+            "coveredBackends": covered,
+            "missingBackends": sorted(set(backend_ids) - set(covered)),
+        }
 
     async def personal_rows_by_user_ids(
         self,
